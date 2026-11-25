@@ -116,7 +116,7 @@ fn load_const_of_a_literal_shape_or_methodref_is_rejected() {
             keys: vec![],
             values: vec![ConstId::new(0)],
         },
-        Const::MethodRef(FuncId::new(0)),
+        Const::method_ref(FuncId::new(0)),
     ] {
         let want = format!("{shape:?}");
         let (module, func) = lower_one_param(|b, _| {
@@ -244,79 +244,70 @@ fn alloc_closure_of_a_non_definefunc_value_is_rejected() {
     );
 }
 
-// ── By-index ops with a non-constant index (isel.rs:1284-1312 + fusion
-//    guard bails 953/956/959/963) ─────────────────────────────────────────
+// ── By-index ops with non-constant / unfused indices (`R3-X5`) ───────────
 
-/// `LoadPropIdx` whose index is not in the suppression set: the fused
-/// immediate cannot be recovered and the ISA has no by-index register form.
+/// `LoadPropIdx`, `StorePropIdx`, and plain `StoreOwnPropIdx` whose index is
+/// not a fused `0..=u32::MAX` constant fall back cleanly to `*byvalue`
+/// (`ldobjbyvalue` / `stobjbyvalue` / `stownbyvalue`), whereas `WithNameSet`
+/// and `Private` own-stores on `StoreOwnPropIdx` fail with `UnsupportedInstruction`.
 #[test]
-fn load_prop_idx_with_a_non_constant_index_is_rejected() {
+fn non_constant_prop_idx_falls_back_to_byvalue_and_invalid_own_store_kinds_error() {
     let (module, func) = lower_one_param(|b, p| {
-        b.emit_val(Op::LoadPropIdx {
+        let _ = b.emit_val(Op::LoadPropIdx {
             object: p,
             index: p,
         });
+        b.emit_void(Op::StorePropIdx {
+            object: p,
+            index: p,
+            value: p,
+        });
+        b.emit_void(Op::StoreOwnPropIdx {
+            object: p,
+            index: p,
+            value: p,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
+        });
     });
-    let err = lower_function(&module, func).expect_err("non-constant index must be rejected");
-    let msg = unsupported_message(&err, func);
+    let lowered = lower_function(&module, func).expect("non-const *PropIdx must fall back");
     assert!(
-        msg.contains("LoadPropIdx with a non-constant index"),
-        "expected the LoadPropIdx message, got {msg:?}"
+        lowered
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Ldobjbyvalue(..)))
+            && lowered
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, Bytecode::Stobjbyvalue(..)))
+            && lowered
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, Bytecode::Stownbyvalue(..)))
     );
+
+    for bad_kind in [
+        abcd_ir::OwnStoreKind::OwnPropWithNameSet,
+        abcd_ir::OwnStoreKind::DefineProperty,
+    ] {
+        let (module, func) = lower_one_param(|b, p| {
+            b.emit_void(Op::StoreOwnPropIdx {
+                object: p,
+                index: p,
+                value: p,
+                kind: bad_kind,
+            });
+        });
+        let err = lower_function(&module, func)
+            .expect_err("StoreOwnPropIdx with non-Plain kind must be rejected");
+        assert!(unsupported_message(&err, func).contains("StoreOwnPropIdx"));
+    }
 }
 
-/// The fused-index helper's early returns, driven one by one through
-/// `isel::select` with a hand-built suppression: index defined by a const
-/// value (not an instruction), by a non-LoadConst instruction, and by a
-/// fractional `LoadConst`.
+/// Even when `Suppression` erroneously marks a non-`u32` index value as
+/// suppressed, `LoadPropIdx` falls back to `ldobjbyvalue` via the home slot
+/// when colored, or fails cleanly with `UnallocatedOperand` if uncolored.
 #[test]
-fn fused_index_imm_bails_close_the_by_index_arms() {
-    // (a) The index is a frame-initial CONST value (def is not Inst).
-    let mut module = Module::new();
-    let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
-    let (obj, index, load);
-    {
-        let mut b = V2Builder::new(&mut module, func);
-        obj = b.create_param();
-        index = b.create_const_value(Const::number(3.0));
-        load = b.emit_val(Op::LoadPropIdx { object: obj, index });
-        b.emit_void(Op::Return { value: Some(load) });
-    }
-    let mut suppression = fusion::Suppression::default();
-    suppression.values.insert(index);
-    let alloc = pinned_alloc(&[(obj, 0), (load, 1)], 2);
-    let err = select_err(&module, func, &alloc, &suppression);
-    assert!(
-        unsupported_message(&err, func).contains("non-constant index"),
-        "(a) const-defined index: {err:?}"
-    );
-
-    // (b) The index's defining instruction is not a LoadConst.
-    let mut module = Module::new();
-    let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
-    let (obj, index, load);
-    {
-        let mut b = V2Builder::new(&mut module, func);
-        obj = b.create_param();
-        index = b.emit_val(Op::BinaryOp {
-            op: BinOp::Add,
-            left: obj,
-            right: obj,
-        });
-        load = b.emit_val(Op::LoadPropIdx { object: obj, index });
-        b.emit_void(Op::Return { value: Some(load) });
-    }
-    let mut suppression = fusion::Suppression::default();
-    suppression.values.insert(index);
-    let alloc = pinned_alloc(&[(obj, 0), (index, 1), (load, 2)], 3);
-    let err = select_err(&module, func, &alloc, &suppression);
-    assert!(
-        unsupported_message(&err, func).contains("non-constant index"),
-        "(b) non-LoadConst def: {err:?}"
-    );
-
-    // (c) The index's constant is fractional — a by-index immediate is
-    // always integral.
+fn fused_index_imm_bails_fall_back_cleanly_to_ldobjbyvalue() {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     let (obj, index, load);
@@ -331,47 +322,16 @@ fn fused_index_imm_bails_close_the_by_index_arms() {
     let mut suppression = fusion::Suppression::default();
     suppression.values.insert(index);
     let alloc = pinned_alloc(&[(obj, 0), (index, 1), (load, 2)], 3);
-    let err = select_err(&module, func, &alloc, &suppression);
+    let rpo = vec![module.functions[func.index()].blocks[0]];
+    let selected = isel::select(&module, func, &alloc, &rpo, &suppression)
+        .expect("fractional index with a colored home falls back to ldobjbyvalue");
     assert!(
-        unsupported_message(&err, func).contains("non-constant index"),
-        "(c) fractional const: {err:?}"
+        selected.block_codes[0]
+            .1
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Ldobjbyvalue(..)))
     );
-}
-
-/// `StorePropIdx` with a non-constant index has no encoding either.
-#[test]
-fn store_prop_idx_with_a_non_constant_index_is_rejected() {
-    let (module, func) = lower_one_param(|b, p| {
-        b.emit_void(Op::StorePropIdx {
-            object: p,
-            index: p,
-            value: p,
-        });
-    });
-    let err = lower_function(&module, func).expect_err("non-constant index must be rejected");
-    let msg = unsupported_message(&err, func);
-    assert!(
-        msg.contains("StorePropIdx with a non-constant index"),
-        "expected the StorePropIdx message, got {msg:?}"
-    );
-}
-
-/// `StoreOwnPropIdx` with a non-constant index (the own-property twin).
-#[test]
-fn store_own_prop_idx_with_a_non_constant_index_is_rejected() {
-    let (module, func) = lower_one_param(|b, p| {
-        b.emit_void(Op::StoreOwnPropIdx {
-            object: p,
-            index: p,
-            value: p,
-        });
-    });
-    let err = lower_function(&module, func).expect_err("non-constant index must be rejected");
-    let msg = unsupported_message(&err, func);
-    assert!(
-        msg.contains("StoreOwnPropIdx with a non-constant index"),
-        "expected the StoreOwnPropIdx message, got {msg:?}"
-    );
+    let _ = BinOp::Add;
 }
 
 // ── Unsupported ops the lift never produces (isel.rs:1364-1369,
@@ -862,6 +822,7 @@ fn store_own_prop_dyn_with_a_high_home_and_no_scratch_is_rejected() {
                 object: ps[0],
                 key: ps[1],
                 value: ps[2],
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             });
         },
         &[(0, HIGH), (1, 1), (2, 2)],
@@ -935,6 +896,7 @@ fn define_getter_setter_by_value_with_a_high_home_and_no_scratch_is_rejected() {
                 key: ps[1],
                 getter: ps[2],
                 setter: ps[3],
+                set_name: ps[3],
             });
         },
         &[(0, HIGH), (1, 1), (2, 2), (3, 3)],

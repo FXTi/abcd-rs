@@ -80,16 +80,24 @@ impl TryFrom<u8> for LiteralTag {
 }
 
 /// Index into [`File::literal_arrays`](crate::File::literal_arrays).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LiteralArrayIdx(pub u32);
+
+impl LiteralArrayIdx {
+    /// Underlying `usize` index into [`File::literal_arrays`](crate::File::literal_arrays).
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// A single literal value from a literal array.
 ///
-/// Each variant corresponds to a `LiteralTag` and carries the correctly-typed
-/// data for that tag.
-///
-/// Entity offsets (e.g. in `Method`, `Getter`, `Setter`) can be resolved via
-/// [`File::resolve_entity()`](crate::File::resolve_entity).
+/// Each variant corresponds to a `LiteralTag` and carries table-indexed
+/// semantic handles ([`StringId`](crate::StringId),
+/// [`MethodIdx`](crate::MethodIdx), [`LiteralArrayIdx`]) rather than raw `.abc`
+/// source-file offsets (`#50` `R3-D2`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
     Bool(bool),
@@ -101,33 +109,29 @@ pub enum LiteralValue {
     Double(f64),
     /// Interned string content.
     String(crate::StringId),
-    /// Method entity offset — resolve via `File::resolve_entity()`.
-    Method(u32),
-    /// Generator method entity offset — resolve via `File::resolve_entity()`.
-    GeneratorMethod(u32),
-    /// Async generator method entity offset — resolve via `File::resolve_entity()`.
-    AsyncGeneratorMethod(u32),
-    /// Getter method entity offset — resolve via `File::resolve_entity()`.
-    Getter(u32),
-    /// Setter method entity offset — resolve via `File::resolve_entity()`.
-    Setter(u32),
+    /// Method reference — index into [`File::all_methods`](crate::File::all_methods).
+    Method(crate::MethodIdx),
+    /// Generator method reference — index into [`File::all_methods`](crate::File::all_methods).
+    GeneratorMethod(crate::MethodIdx),
+    /// Async generator method reference — index into [`File::all_methods`](crate::File::all_methods).
+    AsyncGeneratorMethod(crate::MethodIdx),
+    /// Getter method reference — index into [`File::all_methods`](crate::File::all_methods).
+    Getter(crate::MethodIdx),
+    /// Setter method reference — index into [`File::all_methods`](crate::File::all_methods).
+    Setter(crate::MethodIdx),
     /// Accessor kind tag (0 = getter, 1 = setter, 2 = getter+setter).
     Accessor(u8),
     /// Method affiliate data (index into auxiliary tables).
     MethodAffiliate(u16),
     /// Index into [`File::literal_arrays`](crate::File::literal_arrays).
     ///
-    /// On the wire the payload is the target array's FILE OFFSET; decode
-    /// rewrites it to a table index through
-    /// [`File::literal_array_offsets`](crate::File::literal_array_offsets)
-    /// across both top-level literal arrays and annotation-embedded literal
-    /// arrays (`AnnotationValue::LiteralArray`), recovering nested targets
-    /// transitively (header-table, method-index-region, scope-names, and
-    /// annotation-embedded nested references). A payload whose target is
-    /// excluded (module-record / request-phase blobs) or unrecoverable fails
-    /// relocation loudly on [`encode`](crate::encode).
+    /// On the wire the payload is the target array's file offset; decode
+    /// rewrites it to a dense [`LiteralArrayIdx`] across both top-level literal
+    /// arrays and annotation-embedded literal arrays (`AnnotationValue::LiteralArray`),
+    /// recovering nested targets transitively.
     LiteralArray(LiteralArrayIdx),
-    /// Index into the literal buffer table.
+    /// Index into [`File::literal_arrays`](crate::File::literal_arrays) for a
+    /// literal buffer reference (`LITERALBUFFERINDEX`).
     LiteralBufferIndex(LiteralArrayIdx),
     /// Builtin type index for ArkTS static typing.
     BuiltinTypeIndex(u8),
@@ -135,32 +139,83 @@ pub enum LiteralValue {
     EtsImplements(crate::StringId),
     /// Null sentinel value.
     NullValue(u8),
-    /// Typed `bool[]` data — raw source-file offset of the untagged payload
-    /// (u32 element count + elements; N52 wart: NOT a table index, unlike
-    /// [`LiteralValue::LiteralArray`], and never rewritten by decode).
+    /// Typed `bool[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayU1(LiteralArrayIdx),
-    /// Typed `u8[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `u8[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayU8(LiteralArrayIdx),
-    /// Typed `i8[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `i8[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayI8(LiteralArrayIdx),
-    /// Typed `u16[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `u16[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayU16(LiteralArrayIdx),
-    /// Typed `i16[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `i16[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayI16(LiteralArrayIdx),
-    /// Typed `u32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `u32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayU32(LiteralArrayIdx),
-    /// Typed `i32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `i32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayI32(LiteralArrayIdx),
-    /// Typed `u64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `u64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayU64(LiteralArrayIdx),
-    /// Typed `i64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `i64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayI64(LiteralArrayIdx),
-    /// Typed `f32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `f32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayF32(LiteralArrayIdx),
-    /// Typed `f64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `f64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayF64(LiteralArrayIdx),
-    /// Typed `string[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
+    /// Typed `string[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
     ArrayString(LiteralArrayIdx),
+}
+
+impl LiteralValue {
+    /// If this item carries a [`LiteralArrayIdx`] (`LiteralArray`,
+    /// `LiteralBufferIndex`, or `ArrayU1..ArrayString`), return it.
+    #[inline]
+    #[must_use]
+    pub const fn literal_array_idx(&self) -> Option<LiteralArrayIdx> {
+        match self {
+            Self::LiteralArray(idx)
+            | Self::LiteralBufferIndex(idx)
+            | Self::ArrayU1(idx)
+            | Self::ArrayU8(idx)
+            | Self::ArrayI8(idx)
+            | Self::ArrayU16(idx)
+            | Self::ArrayI16(idx)
+            | Self::ArrayU32(idx)
+            | Self::ArrayI32(idx)
+            | Self::ArrayU64(idx)
+            | Self::ArrayI64(idx)
+            | Self::ArrayF32(idx)
+            | Self::ArrayF64(idx)
+            | Self::ArrayString(idx) => Some(*idx),
+            _ => None,
+        }
+    }
+
+    /// Mutable counterpart to [`Self::method_idx`].
+    #[inline]
+    pub fn method_idx_mut(&mut self) -> Option<&mut crate::MethodIdx> {
+        match self {
+            Self::Method(idx)
+            | Self::GeneratorMethod(idx)
+            | Self::AsyncGeneratorMethod(idx)
+            | Self::Getter(idx)
+            | Self::Setter(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// If this item is one of the five method-reference tags, return its [`MethodIdx`](crate::MethodIdx).
+    #[inline]
+    #[must_use]
+    pub const fn method_idx(&self) -> Option<crate::MethodIdx> {
+        match self {
+            Self::Method(idx)
+            | Self::GeneratorMethod(idx)
+            | Self::AsyncGeneratorMethod(idx)
+            | Self::Getter(idx)
+            | Self::Setter(idx) => Some(*idx),
+            _ => None,
+        }
+    }
 }
 
 /// Context passed through the C callback for collecting literal values.
@@ -254,16 +309,16 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
             }
         }
         LiteralTag::Method => {
-            // SAFETY: `v.tag == METHOD` selects `u32_val`.
-            LiteralValue::Method(unsafe { v.data.u32_val })
+            // SAFETY: `v.tag == METHOD` selects `u32_val` (raw method offset, rewritten by decode).
+            LiteralValue::Method(crate::MethodIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::GeneratorMethod => {
-            // SAFETY: `v.tag == GENERATORMETHOD` selects `u32_val`.
-            LiteralValue::GeneratorMethod(unsafe { v.data.u32_val })
+            // SAFETY: `v.tag == GENERATORMETHOD` selects `u32_val` (raw method offset, rewritten by decode).
+            LiteralValue::GeneratorMethod(crate::MethodIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::AsyncGeneratorMethod => {
-            // SAFETY: `v.tag == ASYNCGENERATORMETHOD` selects `u32_val`.
-            LiteralValue::AsyncGeneratorMethod(unsafe { v.data.u32_val })
+            // SAFETY: `v.tag == ASYNCGENERATORMETHOD` selects `u32_val` (raw method offset, rewritten by decode).
+            LiteralValue::AsyncGeneratorMethod(crate::MethodIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::Accessor => {
             // SAFETY: `v.tag == ACCESSOR` selects `u8_val`.
@@ -274,12 +329,12 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
             LiteralValue::MethodAffiliate(unsafe { v.data.u16_val })
         }
         LiteralTag::Getter => {
-            // SAFETY: `v.tag == GETTER` selects `u32_val`.
-            LiteralValue::Getter(unsafe { v.data.u32_val })
+            // SAFETY: `v.tag == GETTER` selects `u32_val` (raw method offset, rewritten by decode).
+            LiteralValue::Getter(crate::MethodIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::Setter => {
-            // SAFETY: `v.tag == SETTER` selects `u32_val`.
-            LiteralValue::Setter(unsafe { v.data.u32_val })
+            // SAFETY: `v.tag == SETTER` selects `u32_val` (raw method offset, rewritten by decode).
+            LiteralValue::Setter(crate::MethodIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::LiteralArray => {
             // SAFETY: `v.tag == LITERALARRAY` selects `u32_val`.

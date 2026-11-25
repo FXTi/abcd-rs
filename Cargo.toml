@@ -10,7 +10,7 @@ rust-version.workspace = true
 publish = false
 
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "abcd-isa-sys",
     "abcd-isa",
@@ -50,6 +50,7 @@ toml = "0.9"
 mimalloc = "0.1"
 miniz_oxide = "0.9"
 rayon = "1"
+libm = { version = "0.2", default-features = false }
 
 abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }
@@ -83,7 +84,7 @@ abcd-taint = { workspace = true }
 abcd-decompile = { workspace = true }
 abcd-hap = { workspace = true }
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 # Test-only: the corpus gates' per-fixture loops parallelize with rayon
 # (cargo's harness parallelism splits across test FUNCTIONS, not the
 # fixture loop inside one gate). Aggregation stays deterministic: every

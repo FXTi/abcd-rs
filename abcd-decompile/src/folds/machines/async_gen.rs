@@ -1,8 +1,8 @@
 //! Async-generator (`async function*`) state-machine fold.
 
 use crate::folds::machines::async_fn::{
-    AsyncMachineCx, AsyncSite, check_async_throw_arm, match_await_site, prev_non_phi,
-    sweep_async_machinery,
+    AsyncMachineCx, AsyncSite, check_async_throw_arm, is_phi_or_gen_state, match_await_site,
+    prev_non_phi, sweep_async_machinery,
 };
 use crate::folds::machines::generator::resolve_num;
 use crate::folds::*;
@@ -121,22 +121,28 @@ pub fn async_generator_machine_fold(
         return;
     }
     let mut const_env = BTreeMap::new();
-    walk_leaves(nodes, &mut |l| {
-        if let Leaf::Raw(Stmt::Declare {
+    let mut bool_env = BTreeMap::new();
+    walk_leaves(nodes, &mut |l| match l {
+        Leaf::Raw(Stmt::Declare {
             value: Expr::Lit(Lit::Number(bits)),
             value_id,
             ..
-        }) = l
-        {
+        }) => {
             const_env.insert(*value_id, *bits);
         }
+        Leaf::Raw(Stmt::Declare {
+            value: Expr::Lit(Lit::Bool(b)),
+            value_id,
+            ..
+        }) => {
+            bool_env.insert(*value_id, *b);
+        }
+        _ => {}
     });
     let mut uses = BTreeMap::new();
     count_temp_uses(nodes, &mut uses);
-    // N70 note: the async-GENERATOR body keeps the d-P14 singleton
-    // genobj (no phi-alias closure, no break-routed dispatch) — its
-    // corpus coverage is exact; extending it is future work if a
-    // loop-driving async-generator body shows the same routing.
+    // N70 note: keep singleton `genobj` (no phi-alias closure) so
+    // `yield*`'s loop-phi `genobj` sites remain intact for `yield_star_fold`.
     let mut cx = AsyncMachineCx {
         genobj,
         aliases: [genobj].into_iter().collect(),
@@ -145,23 +151,19 @@ pub fn async_generator_machine_fold(
         consumed_consts: BTreeSet::new(),
         uses,
     };
-    agen_fold_seq(nodes, &mut cx, stats);
+    agen_fold_seq_inner(nodes, &mut cx, &bool_env, stats);
     // Sweep the temps the fold made dead: resolved mode-immediate
     // consts, and the genObj temp itself once its remaining uses are
     // only dead catch-region phi assigns. A partially folded function
     // keeps the temp — and the surviving sites keep their loud
     // fallbacks.
-    sweep_async_machinery(nodes, genobj, &cx.aliases, &cx.consumed_consts);
+    sweep_async_machinery(nodes, cx.genobj, &cx.aliases, &cx.consumed_consts);
 }
 
 /// The machinery-use gate: every occurrence of the genObj temp is a
-/// `GeneratorDriver` genobj operand, an `IterResultObj` value slot
-/// (the lifted `AsyncGeneratorResolve` completion form), or a phi
-/// assign of the temp.
+/// `GeneratorDriver` genobj operand, an `IterResultObj` value slot,
+/// an `AsyncGeneratorResolve` genobj operand, or a phi assign of the temp.
 pub(in crate::folds) fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
-    /// `slot` marks the legal direct-operand positions (the
-    /// `GeneratorDriver::genobj` operand, the `IterResultObj::value`
-    /// operand).
     fn expr_ok(e: &Expr, genobj: ValueId, slot: bool) -> bool {
         if temp_value(e) == Some(genobj) {
             return slot;
@@ -170,6 +172,15 @@ pub(in crate::folds) fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId
             Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, genobj, true),
             Expr::IterResultObj { value, done } => {
                 expr_ok(value, genobj, true) && expr_ok(done, genobj, false)
+            }
+            Expr::AsyncGeneratorResolve {
+                genobj: g,
+                value,
+                done,
+            } => {
+                expr_ok(g, genobj, true)
+                    && expr_ok(value, genobj, false)
+                    && expr_ok(done, genobj, false)
             }
             _ => expr_children(e).iter().all(|c| expr_ok(c, genobj, false)),
         }
@@ -220,18 +231,22 @@ pub(in crate::folds) fn agen_entry_elide(
                 });
                 if let Some(j) = decl_at {
                     // Skip pure const decls (the optimized profile
-                    // materializes the mode immediates early).
+                    // materializes the mode immediates early) and
+                    // entry `SetGeneratorState` markers.
+                    let mut elide = Vec::new();
                     let mut k = j + 1;
-                    while k < run.len()
-                        && matches!(
-                            run[k],
+                    while k < run.len() {
+                        match &run[k] {
                             Leaf::Raw(Stmt::Declare {
                                 value: Expr::Lit(_),
                                 ..
-                            })
-                        )
-                    {
-                        k += 1;
+                            }) => k += 1,
+                            Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState" => {
+                                elide.push(k);
+                                k += 1;
+                            }
+                            _ => break,
+                        }
                     }
                     // The entry protocol suspend: bare `yield
                     // undefined`.
@@ -242,7 +257,7 @@ pub(in crate::folds) fn agen_entry_elide(
                     ) {
                         return false;
                     }
-                    let mut elide = vec![k];
+                    elide.push(k);
                     k += 1;
                     // The dead entry resume/mode results, when they
                     // survived as expression statements (impure ops
@@ -264,6 +279,12 @@ pub(in crate::folds) fn agen_entry_elide(
                                 genobj: g,
                             }))) if temp_value(g) == Some(genobj) && !seen_mode => {
                                 seen_mode = true;
+                                elide.push(k);
+                                k += 1;
+                            }
+                            Some(Leaf::Raw(Stmt::Elided { op, .. }))
+                                if *op == "SetGeneratorState" =>
+                            {
                                 elide.push(k);
                                 k += 1;
                             }
@@ -348,13 +369,30 @@ pub(in crate::folds) struct AGYieldSite {
     pub(in crate::folds) continuation: Vec<SNode>,
 }
 
+fn resolve_bool(
+    e: &Expr,
+    bool_env: &BTreeMap<ValueId, bool>,
+    consumed: &mut BTreeSet<ValueId>,
+) -> Option<bool> {
+    match e {
+        Expr::Lit(Lit::Bool(b)) => Some(*b),
+        Expr::Temp { value, .. } => {
+            let b = *bool_env.get(value)?;
+            consumed.insert(*value);
+            Some(b)
+        }
+        _ => None,
+    }
+}
+
 /// The rewrite pass: children first (inner sites fold before the
 /// outer sites whose continuations contain them), then per-run
 /// completion folds, then the sequence scan (yield site →
 /// explicit-return site → plain await site).
-pub(in crate::folds) fn agen_fold_seq(
+fn agen_fold_seq_inner(
     nodes: &mut Vec<SNode>,
     cx: &mut AsyncMachineCx,
+    bool_env: &BTreeMap<ValueId, bool>,
     stats: &mut FoldStats,
 ) {
     for n in nodes.iter_mut() {
@@ -362,8 +400,8 @@ pub(in crate::folds) fn agen_fold_seq(
             SNode::If {
                 then, otherwise, ..
             } => {
-                agen_fold_seq(then, cx, stats);
-                agen_fold_seq(otherwise, cx, stats);
+                agen_fold_seq_inner(then, cx, bool_env, stats);
+                agen_fold_seq_inner(otherwise, cx, bool_env, stats);
             }
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
@@ -372,22 +410,22 @@ pub(in crate::folds) fn agen_fold_seq(
             // (folds.rs:1418/1433/2577), which runs after
             // async_generator_machine_fold (emit.rs:524 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => agen_fold_seq(body, cx, stats),
+            | SNode::ForIn { body, .. } => agen_fold_seq_inner(body, cx, bool_env, stats),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                agen_fold_seq(body, cx, stats);
+                agen_fold_seq_inner(body, cx, bool_env, stats);
                 for c in catches {
-                    agen_fold_seq(&mut c.body, cx, stats);
+                    agen_fold_seq_inner(&mut c.body, cx, bool_env, stats);
                 }
                 // unreachable: Try.finally is Some only after fold_finally
                 // (folds.rs:4143/4154) inside fold(), which runs after
                 // async_generator_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
-                    agen_fold_seq(f, cx, stats);
+                    agen_fold_seq_inner(f, cx, bool_env, stats);
                 }
             }
             // unreachable: SNode::Switch is created only by fold_switches
@@ -395,26 +433,33 @@ pub(in crate::folds) fn agen_fold_seq(
             // async_generator_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
-                    agen_fold_seq(&mut c.body, cx, stats);
+                    agen_fold_seq_inner(&mut c.body, cx, bool_env, stats);
                 }
             }
             SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
-    // Per-run rewrites: the completion resolves
-    // (`return { value: genobj, done: X }` — the lifted
-    // `AsyncGeneratorResolve(gen, X, true)` + return) fold to
-    // `return X`, and the explicit-return await sites fold with them.
+    // Per-run rewrites: completion resolves (`return { value: genobj, done: X }`
+    // or `return AsyncGeneratorResolve(gen, X, true)`) fold to `return X`,
+    // and explicit-return await sites fold with them.
     for n in nodes.iter_mut() {
         if let SNode::Stmts(run) = n {
-            agen_fold_run(run, cx.genobj, stats);
+            agen_fold_run_inner(
+                run,
+                &cx.aliases,
+                bool_env,
+                &cx.uses,
+                &mut cx.consumed_consts,
+                stats,
+            );
         }
     }
+    agen_fold_multi_run_explicit_returns(nodes, &cx.aliases, stats);
     let mut i = 0;
     while i + 1 < nodes.len() {
         // The yield site first: the pre-yield await must fold with its
         // yield machinery, never as a bare `await`.
-        if let Some(site) = match_ag_yield(nodes, i, cx) {
+        if let Some(site) = match_ag_yield_inner(nodes, i, cx, bool_env) {
             let &(insert_ni, insert_li) = site
                 .await_site
                 .remove
@@ -515,18 +560,92 @@ pub(in crate::folds) fn agen_fold_seq(
 /// (`ExplicitReturn`: `AsyncFunctionAwait(v)` + `SuspendGenerator` +
 /// the resumption pair — NO `HandleCompletion` — then the `done=true`
 /// resolve + return) → `return v`.
+#[cfg(test)]
 pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stats: &mut FoldStats) {
-    // The completion resolve fold.
+    let aliases = [genobj].into_iter().collect();
+    let mut consumed = BTreeSet::new();
+    agen_fold_run_inner(
+        run,
+        &aliases,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &mut consumed,
+        stats,
+    );
+}
+
+fn agen_fold_run_inner(
+    run: &mut Vec<Leaf>,
+    aliases: &BTreeSet<ValueId>,
+    bool_env: &BTreeMap<ValueId, bool>,
+    uses: &BTreeMap<ValueId, usize>,
+    consumed: &mut BTreeSet<ValueId>,
+    stats: &mut FoldStats,
+) {
+    // 1a. Inline completion resolve (`IterResultObj` or `AsyncGeneratorResolve(..., true)`).
     for l in run.iter_mut() {
-        if let Leaf::Raw(Stmt::Return(Some(Expr::IterResultObj { value, done }))) = l
-            && temp_value(value) == Some(genobj)
-        {
-            let x = (**done).clone();
-            *l = Leaf::Raw(Stmt::Return(Some(x)));
-            stats.agen_returns += 1;
+        match l {
+            Leaf::Raw(Stmt::Return(Some(Expr::IterResultObj { value, done })))
+                if temp_value(value).is_some_and(|v| aliases.contains(&v)) =>
+            {
+                let x = (**done).clone();
+                *l = Leaf::Raw(Stmt::Return(Some(x)));
+                stats.agen_returns += 1;
+            }
+            Leaf::Raw(Stmt::Return(Some(Expr::AsyncGeneratorResolve {
+                genobj: g,
+                value,
+                done,
+            }))) if temp_value(g).is_some_and(|v| aliases.contains(&v)) => {
+                let mut spec = BTreeSet::new();
+                if resolve_bool(done, bool_env, &mut spec) == Some(true) {
+                    consumed.extend(spec);
+                    let x = (**value).clone();
+                    *l = Leaf::Raw(Stmt::Return(Some(x)));
+                    stats.agen_returns += 1;
+                }
+            }
+            _ => {}
         }
     }
-    // The explicit-return await site (run-local, phi assigns skipped):
+    // 1b. Temp-bound completion resolve: `const t = AsyncGeneratorResolve(g, x, true); return t;`.
+    let mut idx = 0;
+    while idx < run.len() {
+        if let Leaf::Raw(Stmt::Declare {
+            value:
+                Expr::AsyncGeneratorResolve {
+                    genobj: g,
+                    value: x,
+                    done,
+                },
+            value_id,
+            ..
+        }) = &run[idx]
+            && temp_value(g).is_some_and(|v| aliases.contains(&v))
+            && uses.get(value_id).copied().unwrap_or(1) <= 1
+        {
+            let mut spec = BTreeSet::new();
+            if resolve_bool(done, bool_env, &mut spec) == Some(true) {
+                let mut next_idx = idx + 1;
+                while next_idx < run.len() && is_phi_or_gen_state(&run[next_idx]) {
+                    next_idx += 1;
+                }
+                if matches!(
+                    run.get(next_idx),
+                    Some(Leaf::Raw(Stmt::Return(Some(e)))) if temp_value(e) == Some(*value_id)
+                ) {
+                    consumed.extend(spec);
+                    let ret_val = (**x).clone();
+                    run[next_idx] = Leaf::Raw(Stmt::Return(Some(ret_val)));
+                    run.remove(idx);
+                    stats.agen_returns += 1;
+                    continue;
+                }
+            }
+        }
+        idx += 1;
+    }
+    // 2. Explicit-return await site (run-local, phi/SetGeneratorState skipped):
     // `[decl a = await v, suspend-stmt(a), decl r = ResumeGenerator(g),
     //   return r]` → `return v`.
     let Some(ret_at) = run.iter().position(|l| {
@@ -538,7 +657,6 @@ pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stat
         return;
     };
     let mut cur = ret_at;
-    // The resume decl.
     let Some(j) = prev_non_phi(run, &mut cur) else {
         return;
     };
@@ -553,7 +671,7 @@ pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stat
     else {
         return;
     };
-    if temp_value(g) != Some(genobj) {
+    if !temp_value(g).is_some_and(|v| aliases.contains(&v)) {
         return;
     }
     let Leaf::Raw(Stmt::Return(Some(Expr::Temp { value: rt, .. }))) = &run[ret_at] else {
@@ -562,7 +680,6 @@ pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stat
     if rt != rv {
         return;
     }
-    // The suspend stmt + the await decl.
     let Some(j2) = prev_non_phi(run, &mut cur) else {
         return;
     };
@@ -591,7 +708,6 @@ pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stat
         return;
     }
     let awaited = (**x).clone();
-    // All four machinery leaves fold to the plain return.
     run.remove(ret_at);
     run.remove(j);
     run.remove(j2);
@@ -600,39 +716,184 @@ pub(in crate::folds) fn agen_fold_run(run: &mut Vec<Leaf>, genobj: ValueId, stat
     stats.agen_returns += 1;
 }
 
+/// Multi-run explicit-return fold when `R2-C1`/`R2-C2` split the await
+/// machinery across adjacent `SNode::Stmts` runs ahead of `return r`.
+fn agen_fold_multi_run_explicit_returns(
+    nodes: &mut [SNode],
+    aliases: &BTreeSet<ValueId>,
+    stats: &mut FoldStats,
+) {
+    use crate::folds::machines::async_fn::prev_non_phi_multi;
+    for ret_ni in 0..nodes.len() {
+        let SNode::Stmts(run) = &nodes[ret_ni] else {
+            continue;
+        };
+        let Some(ret_li) = run.iter().position(|l| {
+            matches!(
+                l,
+                Leaf::Raw(Stmt::Return(Some(e))) if matches!(e, Expr::Temp { .. })
+            )
+        }) else {
+            continue;
+        };
+        let Leaf::Raw(Stmt::Return(Some(Expr::Temp { value: rt, .. }))) = &run[ret_li] else {
+            unreachable!()
+        };
+        let rt = *rt;
+        let mut ni = ret_ni;
+        let mut li = ret_li;
+        let Some((rni, rli, rleaf)) = prev_non_phi_multi(nodes, &mut ni, &mut li) else {
+            continue;
+        };
+        let Leaf::Raw(Stmt::Declare {
+            value:
+                Expr::GeneratorDriver {
+                    resume: true,
+                    genobj: g,
+                },
+            value_id: rv,
+            ..
+        }) = rleaf
+        else {
+            continue;
+        };
+        if *rv != rt || !temp_value(g).is_some_and(|v| aliases.contains(&v)) {
+            continue;
+        }
+        let Some((sni, sli, sleaf)) = prev_non_phi_multi(nodes, &mut ni, &mut li) else {
+            continue;
+        };
+        let Leaf::Raw(Stmt::Expr(Expr::Yield { value })) = sleaf else {
+            continue;
+        };
+        let Expr::Temp { value: at, .. } = value.as_ref() else {
+            continue;
+        };
+        let at = *at;
+        let Some((ani, ali, aleaf)) = prev_non_phi_multi(nodes, &mut ni, &mut li) else {
+            continue;
+        };
+        let Leaf::Raw(Stmt::Declare {
+            value:
+                Expr::Await {
+                    value: x,
+                    uncaught: true,
+                },
+            value_id,
+            ..
+        }) = aleaf
+        else {
+            continue;
+        };
+        if *value_id != at {
+            continue;
+        }
+        let awaited = (**x).clone();
+        for (rm_ni, rm_li) in [(ret_ni, ret_li), (rni, rli), (sni, sli), (ani, ali)] {
+            let SNode::Stmts(rm_run) = &mut nodes[rm_ni] else {
+                unreachable!()
+            };
+            rm_run.remove(rm_li);
+        }
+        let SNode::Stmts(ins_run) = &mut nodes[ani] else {
+            unreachable!()
+        };
+        ins_run.insert(
+            ali.min(ins_run.len()),
+            Leaf::Raw(Stmt::Return(Some(awaited))),
+        );
+        stats.agen_returns += 1;
+    }
+}
+
 /// Match a full yield site at `nodes[i]`: the pre-yield await
 /// machinery + its THROW-only dispatch (d-P13's await-site shape),
 /// whose continuation opens with the yield-point resumption pair and
 /// the THREE-way resume-mode dispatch.
+#[cfg(test)]
 pub(in crate::folds) fn match_ag_yield(
     nodes: &[SNode],
     i: usize,
     cx: &mut AsyncMachineCx,
 ) -> Option<AGYieldSite> {
+    match_ag_yield_inner(nodes, i, cx, &BTreeMap::new())
+}
+
+fn match_ag_yield_inner(
+    nodes: &[SNode],
+    i: usize,
+    cx: &mut AsyncMachineCx,
+    bool_env: &BTreeMap<ValueId, bool>,
+) -> Option<AGYieldSite> {
     let site = match_await_site(nodes, i, cx)?;
-    // The pre-yield resume value: when declared, its only use may be
-    // the (removed) throw arm — the yielded value is the await's
-    // awaited operand, and an escaped resume is not the vendor shape.
+    // The continuation: one or more `SNode::Stmts` runs carrying the
+    // optional `AsyncGeneratorResolve(gen, r, false)` yield point plus
+    // the resumption pair, followed by the three-way dispatch `If`.
+    let cont = &site.continuation;
+    if cont.len() < 2 {
+        return None;
+    }
+    let dispatch = cont.last()?;
+    if !matches!(dispatch, SNode::If { .. }) {
+        return None;
+    }
+    let mut sig_leaves: Vec<&Leaf> = Vec::new();
+    for pre in &cont[..cont.len() - 1] {
+        let SNode::Stmts(run) = pre else {
+            return None;
+        };
+        for l in run {
+            if !is_phi_or_gen_state(l) {
+                sig_leaves.push(l);
+            }
+        }
+    }
+    let mut cursor = 0;
+    let mut spec_consts = BTreeSet::new();
+    let mut local_false = None;
+    if let Some(Leaf::Raw(Stmt::Declare {
+        value: Expr::Lit(Lit::Bool(false)),
+        value_id,
+        ..
+    })) = sig_leaves.get(cursor).copied()
+    {
+        local_false = Some(*value_id);
+        cursor += 1;
+    }
+    let mut ag_resolve_uses_r = 0usize;
+    if let Some(Leaf::Raw(Stmt::Expr(Expr::AsyncGeneratorResolve {
+        genobj: ag_g,
+        value: ag_v,
+        done: ag_d,
+    }))) = sig_leaves.get(cursor).copied()
+    {
+        if !temp_value(ag_g).is_some_and(|v| cx.aliases.contains(&v)) {
+            return None;
+        }
+        let done_ok = resolve_bool(ag_d, bool_env, &mut spec_consts) == Some(false)
+            || local_false.is_some_and(|lf| temp_value(ag_d) == Some(lf));
+        if !done_ok {
+            return None;
+        }
+        if let Some((r, _)) = &site.resume {
+            if temp_value(ag_v) != Some(*r) {
+                return None;
+            }
+            ag_resolve_uses_r = 1;
+        }
+        cursor += 1;
+    } else if local_false.is_some() {
+        return None;
+    }
+    // Pre-yield resume value: its only uses may be the (removed) throw arm
+    // plus the (removed) yield-point `AsyncGeneratorResolve`.
     if let Some((r, _)) = &site.resume
-        && cx.uses.get(r).copied().unwrap_or(0) != 1
+        && cx.uses.get(r).copied().unwrap_or(0) != 1 + ag_resolve_uses_r
     {
         return None;
     }
-    // The continuation: leading phi-partition runs, the resumption
-    // pair decl run, more phi runs, then the three-way dispatch.
-    let cont = &site.continuation;
-    let mut at = 0;
-    while at < cont.len() && phi_only_run(&cont[at]) {
-        at += 1;
-    }
-    let SNode::Stmts(decl_run) = cont.get(at)? else {
-        return None;
-    };
-    let mut sig = decl_run
-        .iter()
-        .filter(|l| !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })));
     // The yield-point resume decl (required).
-    let (ry, ry_name) = match sig.next() {
+    let (ry, ry_name) = match sig_leaves.get(cursor).copied() {
         Some(Leaf::Raw(Stmt::Declare {
             name,
             value:
@@ -642,13 +903,13 @@ pub(in crate::folds) fn match_ag_yield(
                 },
             value_id,
             ..
-        })) if temp_value(rg) == Some(cx.genobj) => (*value_id, name.clone()),
+        })) if temp_value(rg).is_some_and(|v| cx.aliases.contains(&v)) => (*value_id, name.clone()),
         _ => return None,
     };
+    cursor += 1;
     // The yield-point mode decl (optional — it may be inlined into
     // the dispatch tests).
     let mut my = None;
-    let mut rest = sig.clone();
     if let Some(Leaf::Raw(Stmt::Declare {
         value: Expr::GeneratorDriver {
             resume: false,
@@ -656,24 +917,17 @@ pub(in crate::folds) fn match_ag_yield(
         },
         value_id,
         ..
-    })) = rest.next()
-        && temp_value(mg) == Some(cx.genobj)
+    })) = sig_leaves.get(cursor).copied()
+        && temp_value(mg).is_some_and(|v| cx.aliases.contains(&v))
     {
         my = Some(*value_id);
-        sig.next();
+        cursor += 1;
     }
-    if sig.next().is_some() {
-        return None;
-    }
-    at += 1;
-    while at < cont.len() && phi_only_run(&cont[at]) {
-        at += 1;
-    }
-    let dispatch = cont.get(at)?;
-    if at + 1 != cont.len() {
+    if cursor != sig_leaves.len() {
         return None;
     }
     let continuation = match_ag_three_way(dispatch, my, ry, cx)?;
+    cx.consumed_consts.extend(spec_consts);
     Some(AGYieldSite {
         await_site: site,
         ry,
@@ -682,15 +936,11 @@ pub(in crate::folds) fn match_ag_yield(
     })
 }
 
-/// A `Stmts` run carrying only phi assigns (block-end bookkeeping).
+/// A `Stmts` run carrying only phi assigns or `SetGeneratorState` markers.
 pub(in crate::folds) fn phi_only_run(n: &SNode) -> bool {
     matches!(
         n,
-        SNode::Stmts(run)
-            if !run.is_empty()
-                && run
-                    .iter()
-                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
+        SNode::Stmts(run) if !run.is_empty() && run.iter().all(is_phi_or_gen_state)
     )
 }
 
@@ -732,7 +982,7 @@ pub(in crate::folds) fn match_ag_three_way(
                 seen_return = true;
             }
             1.0 if !seen_throw => {
-                check_async_throw_arm(case_arm, Some(ry), &[cx.genobj].into_iter().collect())?;
+                check_async_throw_arm(case_arm, Some(ry), &cx.aliases)?;
                 seen_throw = true;
             }
             _ => return None,
@@ -745,7 +995,8 @@ pub(in crate::folds) fn match_ag_three_way(
         // phi-partition runs or pure number-const decls.
         let mut k = 0;
         while k < cont.len()
-            && (phi_only_run(&cont[k])
+            && (matches!(&cont[k], SNode::Honest(_))
+                || phi_only_run(&cont[k])
                 || matches!(
                     &cont[k],
                     SNode::Stmts(run)
@@ -781,14 +1032,14 @@ pub(in crate::folds) fn ag_mode_test(
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsFalse,
+                op: UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot,
                 operand,
             } => {
                 positive = !positive;
                 e = operand;
             }
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => {
                 e = operand;
@@ -804,7 +1055,7 @@ pub(in crate::folds) fn ag_mode_test(
     else {
         return None;
     };
-    let genobj = cx.genobj;
+    let aliases = &cx.aliases;
     let is_mode = |e: &Expr| match my {
         Some(md) => temp_value(e) == Some(md),
         None => matches!(
@@ -812,7 +1063,7 @@ pub(in crate::folds) fn ag_mode_test(
             Expr::GeneratorDriver {
                 resume: false,
                 genobj: mg,
-            } if temp_value(mg) == Some(genobj)
+            } if temp_value(mg).is_some_and(|v| aliases.contains(&v))
         ),
     };
     let bits = if is_mode(left) {
@@ -835,15 +1086,11 @@ pub(in crate::folds) fn check_ag_return_arm(arm: &[SNode], ry: ValueId) -> Optio
         match n {
             SNode::Stmts(_) if phi_only_run(n) => {}
             SNode::Stmts(run) => {
-                let significant: Vec<&Leaf> = run
-                    .iter()
-                    .filter(|l| !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
-                    .collect();
-                match (awaited, returned, significant.as_slice()) {
-                    (
-                        None,
-                        false,
-                        [
+                for l in run.iter().filter(|l| !is_phi_or_gen_state(l)) {
+                    match (awaited, returned, l) {
+                        (
+                            None,
+                            false,
                             Leaf::Raw(Stmt::Declare {
                                 value:
                                     Expr::Await {
@@ -853,19 +1100,19 @@ pub(in crate::folds) fn check_ag_return_arm(arm: &[SNode], ry: ValueId) -> Optio
                                 value_id,
                                 ..
                             }),
-                        ],
-                    ) if temp_value(value) == Some(ry) => {
-                        awaited = Some(*value_id);
+                        ) if temp_value(value) == Some(ry) => {
+                            awaited = Some(*value_id);
+                        }
+                        (Some(a), false, Leaf::Raw(Stmt::Return(Some(e))))
+                            if temp_value(e) == Some(a) =>
+                        {
+                            returned = true;
+                        }
+                        _ => return None,
                     }
-                    (Some(a), false, [Leaf::Raw(Stmt::Return(Some(e)))])
-                        if temp_value(e) == Some(a) =>
-                    {
-                        returned = true;
-                    }
-                    _ => return None,
                 }
             }
-            SNode::Break { .. } => {}
+            SNode::Break { .. } | SNode::Honest(_) => {}
             _ => return None,
         }
     }
@@ -874,9 +1121,9 @@ pub(in crate::folds) fn check_ag_return_arm(arm: &[SNode], ry: ValueId) -> Optio
 
 /// Match a source-level await site (d-P13's shape) — refusing the
 /// pre-yield await of an unmatched yield point (the yield-point
-/// guard): a continuation opening with the resumption pair on the
-/// same genObj is yield machinery, and folding the await there would
-/// orphan the yield.
+/// guard): a continuation opening with `AsyncGeneratorResolve(gen, ...)`
+/// or the resumption pair on `genObj` is yield machinery, and folding
+/// the await there would orphan the yield.
 pub(in crate::folds) fn match_ag_await(
     nodes: &[SNode],
     i: usize,
@@ -884,24 +1131,40 @@ pub(in crate::folds) fn match_ag_await(
 ) -> Option<AsyncSite> {
     let site = match_await_site(nodes, i, cx)?;
     let mut at = 0;
-    while at < site.continuation.len() && phi_only_run(&site.continuation[at]) {
+    while at < site.continuation.len()
+        && (matches!(&site.continuation[at], SNode::Honest(_))
+            || phi_only_run(&site.continuation[at]))
+    {
         at += 1;
     }
     if let Some(SNode::Stmts(run)) = site.continuation.get(at) {
-        let first = run
-            .iter()
-            .find(|l| !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })));
-        if let Some(Leaf::Raw(Stmt::Declare {
-            value:
-                Expr::GeneratorDriver {
-                    resume: true,
-                    genobj: g,
-                },
-            ..
-        })) = first
-            && temp_value(g) == Some(cx.genobj)
-        {
-            return None;
+        let mut sig = run.iter().filter(|l| !is_phi_or_gen_state(l)).peekable();
+        if matches!(
+            sig.peek().copied(),
+            Some(Leaf::Raw(Stmt::Declare {
+                value: Expr::Lit(Lit::Bool(false)),
+                ..
+            }))
+        ) {
+            sig.next();
+        }
+        match sig.next() {
+            Some(Leaf::Raw(Stmt::Declare {
+                value:
+                    Expr::GeneratorDriver {
+                        resume: true,
+                        genobj: g,
+                    },
+                ..
+            })) if temp_value(g).is_some_and(|v| cx.aliases.contains(&v)) => {
+                return None;
+            }
+            Some(Leaf::Raw(Stmt::Expr(Expr::AsyncGeneratorResolve { genobj: g, .. })))
+                if temp_value(g).is_some_and(|v| cx.aliases.contains(&v)) =>
+            {
+                return None;
+            }
+            _ => {}
         }
     }
     Some(site)

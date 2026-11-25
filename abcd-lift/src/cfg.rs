@@ -11,6 +11,8 @@ use std::collections::{BTreeSet, HashMap};
 use abcd_file::MethodBody;
 use abcd_isa::Bytecode;
 
+use crate::LiftError;
+
 /// A raw basic block before SSA construction.
 ///
 /// Represents a contiguous range of bytecodes `[start..end)` with known
@@ -37,51 +39,80 @@ pub struct RawCfg {
     pub leader_to_block: HashMap<usize, usize>,
 }
 
-/// Build a CFG from a method body's bytecodes and try-blocks.
-///
-/// Returns `None` if the method body has no bytecodes.
-pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
+/// Build a CFG from a method body's bytecodes and try-blocks, validating
+/// jump targets, terminal fall-throughs, and try/catch bounds (`R3-M3`).
+pub fn build_cfg(body: &MethodBody) -> Result<RawCfg, LiftError> {
     let bytecodes = &body.bytecodes;
-    // unreachable in production: the only non-test caller (lib.rs:441) is
-    // dominated by the `body.bytecodes.is_empty()` hard error at
-    // lib.rs:421-423 — c-COV diagnosis
     if bytecodes.is_empty() {
-        return None;
+        return Err(LiftError::EmptyBytecode);
     }
 
     let n = bytecodes.len();
 
-    // Phase 1a: Natural leaders (entry, jump targets, post-jump/terminator
-    // fall-throughs, and catch handler entries).
+    // Phase 1a: Validate control-flow bounds (R3-M3) and collect natural
+    // leaders (entry, jump targets, post-jump/terminator fall-throughs, and
+    // catch handler entries).
     let mut natural_leaders = BTreeSet::new();
     natural_leaders.insert(0);
 
     for (idx, bc) in bytecodes.iter().enumerate() {
         if bc.is_jump() {
-            if let Some(target) = jump_target(bc)
-                && target < n
-            {
+            if let Some(target) = jump_target(bc) {
+                if target >= n {
+                    return Err(LiftError::JumpTargetOutOfBounds {
+                        pc: idx,
+                        target,
+                        len: n,
+                    });
+                }
                 natural_leaders.insert(target);
+            }
+            if is_conditional_jump(bc) && idx + 1 >= n {
+                return Err(LiftError::FallthroughOutOfBounds { pc: idx, len: n });
             }
             if idx + 1 < n {
                 natural_leaders.insert(idx + 1);
             }
-        } else if bc.is_terminator() && idx + 1 < n {
-            natural_leaders.insert(idx + 1);
+        } else if bc.is_terminator() || bc.is_return_or_throw() {
+            if idx + 1 < n {
+                natural_leaders.insert(idx + 1);
+            }
+        } else if idx + 1 >= n {
+            return Err(LiftError::FallthroughOutOfBounds { pc: idx, len: n });
         }
     }
 
     for try_block in &body.try_blocks {
+        let Some(try_end) = (try_block.start as usize)
+            .checked_add(try_block.len as usize)
+            .filter(|&end| end <= n)
+        else {
+            return Err(LiftError::TryRangeOutOfBounds {
+                start: try_block.start,
+                len: try_block.len,
+                bytecode_len: n,
+            });
+        };
+        let _ = try_end;
         for catch in &try_block.catches {
             let handler = catch.handler as usize;
-            if handler < n {
-                natural_leaders.insert(handler);
+            if handler >= n
+                || handler
+                    .checked_add(catch.len as usize)
+                    .is_none_or(|end| end > n)
+            {
+                return Err(LiftError::CatchRangeOutOfBounds {
+                    handler: catch.handler,
+                    len: catch.len,
+                    bytecode_len: n,
+                });
             }
+            natural_leaders.insert(handler);
         }
     }
 
     if body.try_blocks.is_empty() {
-        return Some(partition_and_wire(
+        return Ok(partition_and_wire(
             bytecodes,
             &body.try_blocks,
             &natural_leaders,
@@ -121,9 +152,9 @@ pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
     // Phase 1c: Handler-liveness-guided pre-write block splitting (R2-C1).
     let pre_cfg = partition_and_wire(bytecodes, &body.try_blocks, &leaders);
     if split_protected_live_writes(bytecodes, &pre_cfg, &mut leaders) {
-        Some(partition_and_wire(bytecodes, &body.try_blocks, &leaders))
+        Ok(partition_and_wire(bytecodes, &body.try_blocks, &leaders))
     } else {
-        Some(pre_cfg)
+        Ok(pre_cfg)
     }
 }
 
@@ -171,7 +202,7 @@ fn partition_and_wire(
             {
                 block.succs.push(fall_bi);
             }
-        } else if !last_bc.is_terminator()
+        } else if !(last_bc.is_terminator() || last_bc.is_return_or_throw())
             && block_end < bytecodes.len()
             && let Some(&fall_bi) = leader_to_block.get(&block_end)
         {
@@ -264,7 +295,6 @@ fn is_guaranteed_non_throwing(bc: &Bytecode) -> bool {
             | Sta(..)
             | Setgeneratorstate(..)
             | CallruntimeNotifyconcurrentresult
-            | CallruntimeTopropertykey
             | Ldundefined
             | Ldnull
             | Ldtrue
@@ -272,6 +302,7 @@ fn is_guaranteed_non_throwing(bc: &Bytecode) -> bool {
             | Ldhole
             | Ldnan
             | Ldinfinity
+            | Ldsymbol
             | Ldai(..)
             | Fldai(..)
             | LdaStr(..)
@@ -301,7 +332,6 @@ fn is_guaranteed_non_throwing(bc: &Bytecode) -> bool {
             | Getunmappedargs
             | Definefunc(..)
             | Createiterresultobj(..)
-            | Asyncgeneratorresolve(..)
             | Creategeneratorobj(..)
             | Createasyncgeneratorobj(..)
             | Getresumemode
@@ -607,7 +637,7 @@ mod tests {
 
     fn make_body(bytecodes: Vec<Bytecode>) -> MethodBody {
         MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 0,
             num_args: 0,
             bytecodes,
@@ -658,7 +688,7 @@ mod tests {
     #[test]
     fn try_catch_edges() {
         let body = MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 0,
             num_args: 0,
             bytecodes: vec![
@@ -671,7 +701,7 @@ mod tests {
                 start: 0,
                 len: 2,
                 catches: vec![CatchBlock {
-                    type_idx: 0,
+                    type_class: None,
                     handler: 2,
                     len: 2,
                 }],
@@ -689,7 +719,7 @@ mod tests {
         // live-in virtual registers, so `Sta` writes inside the try range must
         // NOT shatter the protected block.
         let body = MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 3,
             num_args: 0,
             bytecodes: vec![
@@ -707,7 +737,7 @@ mod tests {
                 start: 0,
                 len: 4,
                 catches: vec![CatchBlock {
-                    type_idx: u32::MAX,
+                    type_class: None,
                     handler: 5,
                     len: 4,
                 }],
@@ -725,7 +755,7 @@ mod tests {
         // keeps the pure `jmp` tail attached to the protected block instead of
         // splitting an unprotected back-edge block.
         let body = MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 1,
             num_args: 0,
             bytecodes: vec![
@@ -737,7 +767,7 @@ mod tests {
                 start: 0,
                 len: 1,
                 catches: vec![CatchBlock {
-                    type_idx: u32::MAX,
+                    type_class: None,
                     handler: 2,
                     len: 1,
                 }],
@@ -757,7 +787,7 @@ mod tests {
         // emit `may_throw: false` IR ops, so they must NOT split before `sta`
         // even when `v0`/`v1` are read in the reject catch handler.
         let body = MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 3,
             num_args: 0,
             bytecodes: vec![
@@ -775,7 +805,7 @@ mod tests {
                 start: 0,
                 len: 5,
                 catches: vec![CatchBlock {
-                    type_idx: u32::MAX,
+                    type_class: None,
                     handler: 6,
                     len: 3,
                 }],
@@ -795,7 +825,7 @@ mod tests {
     fn try_end_mov_tail_splits_iff_written_reg_is_handler_live() {
         // Handler reads `v2` (`live_in = {v2}`), while `v3` is dead at handler.
         let make = |written: u16| MethodBody {
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             num_vregs: 4,
             num_args: 0,
             bytecodes: vec![
@@ -810,7 +840,7 @@ mod tests {
                 start: 0,
                 len: 1,
                 catches: vec![CatchBlock {
-                    type_idx: u32::MAX,
+                    type_class: None,
                     handler: 3,
                     len: 2,
                 }],

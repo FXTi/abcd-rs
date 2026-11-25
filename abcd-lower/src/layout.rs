@@ -26,8 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use abcd_file::TryBlock;
-use abcd_ir::{BlockId, FuncId, Module, Op};
+use abcd_ir::{BlockId, ClassId, FuncId, InstId, Module, Op};
 use abcd_isa::{Bytecode, EntityKind, Label};
 
 use crate::LowerError;
@@ -36,28 +35,45 @@ use crate::copy_resolve::{emit_copy, resolve_slot_copies};
 use crate::isel::{EntityTrace, IselResult};
 use crate::regalloc::{RegAlloc, RegSlot};
 
+/// Format-independent catch handler range on [`LayoutResult`] (`#50` `R3-D2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LoweredCatchBlock {
+    /// Caught exception class in [`Module::classes`], or `None` for catch-all.
+    pub type_class: Option<ClassId>,
+    /// Instruction index where the catch handler starts.
+    pub handler: u32,
+    /// Number of instructions in the catch handler.
+    pub len: u32,
+}
+
+/// Format-independent try range on [`LayoutResult`] (`#50` `R3-D2`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoweredTryBlock {
+    /// Instruction index where the try region starts.
+    pub start: u32,
+    /// Number of instructions covered by the try region.
+    pub len: u32,
+    /// Catch handlers in dispatch priority order.
+    pub catches: Vec<LoweredCatchBlock>,
+}
+
 /// Result of layout: a flat bytecode sequence + try blocks + frame size.
 #[derive(Debug)]
 pub struct LayoutResult {
     /// The flattened bytecodes.
     pub bytecodes: Vec<Bytecode>,
-    /// The reconstructed try blocks.
-    pub try_blocks: Vec<TryBlock>,
+    /// The reconstructed IR-typed try blocks.
+    pub try_blocks: Vec<LoweredTryBlock>,
+    /// Post-layout instruction index per IR [`InstId`] (`#57` `R3-H8`).
+    pub inst_pcs: HashMap<InstId, u32>,
     /// Final register count for the function frame, including the reserved
     /// phi-copy temporary register (if any).
     pub num_regs: u16,
     /// Entity operand traceability inherited from instruction selection,
     /// keyed by (entity kind, raw operand value).
-    /// Layout only inserts `Mov` copies and `Jmp` trampolines — none of
-    /// which carry entity operands — so the selection-time records
-    /// stay valid for the flattened sequence.
     pub entity_traces: HashMap<(EntityKind, u32), EntityTrace>,
     /// Total IC-slot consumption of the flattened sequence (after the
-    /// N71 rearrangement, when it fired). Every IC-slot immediate in
-    /// `bytecodes` is `< ic_size` (or the 0xFF no-IC sentinel). Encode
-    /// syncs the method's `_ESSlotNumberAnnotation`/`SlotNumber` to this
-    /// value (N73 — the runtime sizes the method's ProfileTypeInfo array
-    /// from the annotation and indexes it unchecked).
+    /// N71 rearrangement, when it fired).
     pub ic_size: u32,
 }
 
@@ -145,16 +161,17 @@ pub fn layout(
         }
     }
 
-    // Step 2: Place copies on their edges.
-    let mut block_codes: HashMap<BlockId, Vec<Bytecode>> = HashMap::new();
+    // Step 2: Place copies on their edges, invert boolean CondBranch when
+    // `true_dest` falls through (`R3-X1`), and elide fallthrough `Jmp`s (`R3-A7`).
+    let mut block_codes: HashMap<BlockId, Vec<Bytecode>> =
+        HashMap::with_capacity(isel.block_codes.len());
     for (bb, codes) in &isel.block_codes {
         block_codes.insert(*bb, codes.clone());
     }
+    let mut copy_shift: HashMap<BlockId, (usize, usize)> = HashMap::new();
 
     // Synthetic trampoline blocks (copy sequence + `Jmp succ`), appended
-    // after all real blocks. Keys are synthetic Block ids counting down from
-    // `u32::MAX - 1`; real Block ids are module block-vector indices and
-    // cannot reach that range.
+    // after all real blocks. Keys count down from `u32::MAX - 1`.
     let mut trampolines: Vec<(BlockId, Vec<Bytecode>)> = Vec::new();
 
     for (i, &bb) in rpo.iter().enumerate() {
@@ -165,7 +182,11 @@ pub fn layout(
         let term = block_data
             .insts
             .last()
-            .and_then(|&inst| module.inst(inst).map(|i| &i.op));
+            .and_then(|&inst| module.inst(inst).map(|n| &n.op));
+
+        let can_fallthrough_to = |dest: BlockId| -> bool {
+            next_bb == Some(dest) && isel.handler_prologue_len.get(&dest).copied().unwrap_or(0) == 0
+        };
 
         if let Some(Op::CondBranch {
             true_dest,
@@ -174,108 +195,139 @@ pub fn layout(
         }) = term
         {
             let (true_dest, false_dest) = (*true_dest, *false_dest);
-
-            // The edge validation above guarantees that every copy-bearing
-            // edge out of a CondBranch predecessor targets one of the two
-            // branch destinations: copies keyed to any other block are an
-            // exception edge (hard error) or inconsistent input (hard
-            // error) — there is no in-block placement for them (that legacy
-            // fallback executed copies on the NORMAL path and clobbered
-            // coalesced slots; deleted, N21).
-
-            // True edge: redirect the conditional branch (always the last
-            // bytecode of the block) to the trampoline when the edge has copies.
-            let true_target = match edge_codes.get(&(bb, true_dest)) {
-                Some(copies) => add_trampoline(&mut trampolines, copies, true_dest),
-                None => true_dest,
-            };
-            // False edge: route to its trampoline when it has copies;
-            // otherwise keep the fall-through / explicit-Jmp behavior.
-            let false_target = edge_codes
-                .get(&(bb, false_dest))
-                .map(|copies| add_trampoline(&mut trampolines, copies, false_dest));
+            let true_copies = edge_codes.get(&(bb, true_dest));
+            let false_copies = edge_codes.get(&(bb, false_dest));
 
             let Some(codes) = block_codes.get_mut(&bb) else {
                 continue;
             };
+
+            // R3-X1 Case 3/4: When `acc` is guaranteed boolean (`bool_cond_blocks`)
+            // and `true_dest` immediately follows in RPO with no edge copies or
+            // handler prologue, invert `Jnez` -> `Jeqz` targeting `false_target`
+            // and fall straight through into `true_dest` with zero trailing `Jmp`.
+            if isel.bool_cond_blocks.contains(&bb)
+                && true_copies.is_none()
+                && true_dest != false_dest
+                && can_fallthrough_to(true_dest)
+            {
+                let false_target = match false_copies {
+                    Some(copies) => add_trampoline(&mut trampolines, copies, false_dest),
+                    None => false_dest,
+                };
+                if let Some(last) = codes.last_mut() {
+                    invert_bool_branch(last, false_target);
+                }
+                continue;
+            }
+
+            let true_target = match true_copies {
+                Some(copies) => add_trampoline(&mut trampolines, copies, true_dest),
+                None => true_dest,
+            };
+            let false_target =
+                false_copies.map(|copies| add_trampoline(&mut trampolines, copies, false_dest));
+
             if let Some(last) = codes.last_mut() {
                 rewrite_branch_target(last, true_target);
             }
             match false_target {
                 Some(tramp) => codes.push(Bytecode::Jmp(Label(tramp.0))),
                 None => {
-                    if next_bb != Some(false_dest) {
+                    if !can_fallthrough_to(false_dest) {
                         codes.push(Bytecode::Jmp(Label(false_dest.0)));
                     }
                 }
             }
         } else {
-            // Unconditional (or no) terminator: copies inserted before the
-            // terminator run on exactly the outgoing edge(s).
+            // R3-A3: Query outgoing copies of `bb` in O(log E + out_degree) via
+            // BTreeMap::range instead of rescanning all edges per block.
             let mut copy_codes: Vec<Bytecode> = Vec::new();
-            for (&(pred, _), codes) in &edge_codes {
-                if pred == bb {
-                    copy_codes.extend(codes.iter().cloned());
-                }
-            }
-            if copy_codes.is_empty() {
-                continue;
+            for (_, codes) in edge_codes.range((bb, BlockId::new(0))..=(bb, BlockId::new(u32::MAX)))
+            {
+                copy_codes.extend(codes.iter().cloned());
             }
             let Some(codes) = block_codes.get_mut(&bb) else {
                 continue;
             };
-            let insert_pos = codes.len().saturating_sub(1);
-            for (j, bc) in copy_codes.into_iter().enumerate() {
-                codes.insert(insert_pos + j, bc);
+            if !copy_codes.is_empty() {
+                let insert_pos = codes.len().saturating_sub(1);
+                let copy_len = copy_codes.len();
+                codes.splice(insert_pos..insert_pos, copy_codes);
+                copy_shift.insert(bb, (insert_pos, copy_len));
+            }
+            // R3-A7: Elide trailing unconditional `Jmp(dest)` when `dest` is next
+            // in RPO (with no handler prologue) and `bb` retains >= 1 bytecode (N49).
+            if let Some(Op::Branch { dest }) = term
+                && can_fallthrough_to(*dest)
+                && codes.len() >= 2
+                && matches!(codes.last(), Some(Bytecode::Jmp(l)) if l.0 == dest.0)
+            {
+                codes.pop();
             }
         }
     }
 
-    // Step 3: Flatten blocks in RPO order, then trampolines, recording offsets.
+    // Step 3: Flatten blocks in RPO order, then trampolines, recording spans & inst PCs.
     let mut flat: Vec<Bytecode> = Vec::new();
-    let mut final_offsets: HashMap<BlockId, usize> = HashMap::new();
+    let mut block_spans: HashMap<BlockId, (usize, usize)> = HashMap::with_capacity(rpo.len());
+    let mut jump_targets: HashMap<u32, usize> =
+        HashMap::with_capacity(rpo.len() + trampolines.len() + isel.internal_labels.len());
+    let mut inst_pcs: HashMap<InstId, u32> = HashMap::new();
 
     for &bb in rpo {
         let start = flat.len();
-        final_offsets.insert(bb, start);
         if let Some(codes) = block_codes.get(&bb) {
             flat.extend(codes.iter().cloned());
         }
-        // N49: every block must emit at least one bytecode. On verified IR
-        // this is guaranteed — every block ends in a terminator and every
-        // terminator arm of `select_inst` emits >= 1 bytecode — so flat
-        // offsets are strictly increasing and the next-greater-offset
-        // extent in `reconstruct_try_blocks` is exactly `[own, next)`. A
-        // zero-emission block (reachable only via unverified input: a
-        // block with no terminator) would alias the next block's offset,
-        // and its extent would swallow the following block into this one's
-        // try/handler range — silent exception misdispatch. Fail loudly.
-        if flat.len() == start {
+        let end = flat.len();
+        if end == start {
             return Err(LowerError::ZeroExtentBlock {
                 func: func_id,
                 block: bb,
             });
         }
+        block_spans.insert(bb, (start, end));
+        let prol_len = isel.handler_prologue_len.get(&bb).copied().unwrap_or(0);
+        jump_targets.insert(bb.0, (start + prol_len).min(end - 1));
+
+        if let Some(local_pcs) = isel.block_inst_pcs.get(&bb) {
+            let shift = copy_shift.get(&bb).copied();
+            for &(iid, local_pc) in local_pcs {
+                let adjusted = match shift {
+                    Some((insert_pos, copy_len)) if local_pc >= insert_pos => local_pc + copy_len,
+                    _ => local_pc,
+                };
+                inst_pcs.insert(iid, (start + adjusted) as u32);
+            }
+        }
+    }
+    for &(lbl, bb, local_pc) in &isel.internal_labels {
+        if let Some(&(start, _)) = block_spans.get(&bb) {
+            let adjusted = match copy_shift.get(&bb).copied() {
+                Some((insert_pos, copy_len)) if local_pc >= insert_pos => local_pc + copy_len,
+                _ => local_pc,
+            };
+            jump_targets.insert(lbl, start + adjusted);
+        }
     }
     for (key, codes) in &trampolines {
-        final_offsets.insert(*key, flat.len());
+        jump_targets.insert(key.0, flat.len());
         flat.extend(codes.iter().cloned());
     }
 
-    // Step 4: Resolve jump targets (Block references → instruction indices).
-    // Synthetic trampoline keys resolve through the same map.
+    // Step 4: Resolve jump targets; unresolved labels fail loudly (R3-M3).
     for bc in &mut flat {
-        resolve_labels(bc, &final_offsets);
+        resolve_labels(func_id, bc, &jump_targets)?;
     }
 
-    // Step 5: Reconstruct try blocks from IR try_regions. Trampoline offsets
-    // sort after every real block, so try/handler ranges computed as
-    // "distance to the next greater offset" exclude them.
-    let try_blocks = reconstruct_try_blocks(module, func_id, &final_offsets, flat.len());
+    // Step 5: Reconstruct IR-typed try blocks in O(R * P log P) (R3-A3).
+    let try_blocks = reconstruct_try_blocks(module, func_id, &block_spans);
 
     Ok(LayoutResult {
         bytecodes: flat,
         try_blocks,
+        inst_pcs,
         num_regs: alloc.num_regs,
         entity_traces: isel.entity_traces.clone(),
         ic_size: isel.ic_size,
@@ -309,71 +361,25 @@ fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
     *label = Label(target.0);
 }
 
-/// Reconstruct TryBlock entries from the function's try_regions using final block offsets.
-///
-/// N43: ONE TryBlock PER CONTIGUOUS RUN of protected blocks — no contiguity
-/// assumption. `compute_rpo` may interleave an unprotected block between two
-/// protected blocks of the same region (shape: `try { if (c) return 1; }
-/// catch {…}; o.p` — the after-try block sorts between the protected entry
-/// and the protected return block in RPO). The old single
-/// `[min_start, max_end)` span then covered the unprotected block, and the
-/// VM's linear first-match scan (vendored
-/// arkcompiler_ets_runtime-master/ecmascript/method.cpp:86-107,
-/// `Method::FindCatchBlock`) would misdispatch an exception raised in the
-/// AFTER-try code to the region's handler.
-///
-/// Multiple try blocks per code item are native to the format: the vendored
-/// writer stores a `std::vector<TryBlock>` per CodeItem
-/// (`vendor/arkcompiler_runtime_core/static_core/libpandafile/file_items.h`), our
-/// encode path emits one file entry per model TryBlock
-/// (abcd-file/src/encode.rs:1313-1348), and decode enumerates every try
-/// block independently (abcd-file/src/decode.rs:1790-1839), so several
-/// ranges sharing the same catch entries round-trip. Region order in the
-/// output vector follows `func.try_regions` order, preserving the
-/// first-match-wins dispatch priority for nested regions (the inner region
-/// must precede the outer one — the same ordering the old overlapping spans
-/// relied on).
-///
-/// Ranges of the SAME region that are adjacent in the flat stream coalesce:
-/// a region whose blocks are contiguous yields exactly one
-/// `[min_start, max_end)` TryBlock — byte-identical to the pre-N43 output.
-///
-/// Phi-copy placement vs ranges: copies for an unconditional predecessor are
-/// inserted before its terminator, INSIDE the block's extent, and are pure
-/// `Mov` sequences that cannot throw — covering them is harmless. Copies on
-/// `CondBranch` edges live in trampolines, which sort after every real block
-/// offset and therefore stay outside every try/handler range. Handler-edge
-/// copies cannot exist (hard `LowerError::HandlerEdgeCopies`, N21).
+/// Invert a boolean `Jnez` / `Jeqz` branch and point it at `target`.
+fn invert_bool_branch(bc: &mut Bytecode, target: BlockId) {
+    match bc {
+        Bytecode::Jnez(_) => *bc = Bytecode::Jeqz(Label(target.0)),
+        Bytecode::Jeqz(_) => *bc = Bytecode::Jnez(Label(target.0)),
+        _ => rewrite_branch_target(bc, target),
+    }
+}
+
+/// Reconstruct [`LoweredTryBlock`] entries from `func.try_regions` using exact
+/// O(1) per-block `(start, end)` spans (`R3-A3`, `N43`).
 fn reconstruct_try_blocks(
     module: &Module,
     func_id: FuncId,
-    block_offsets: &HashMap<BlockId, usize>,
-    total_len: usize,
-) -> Vec<TryBlock> {
-    use abcd_file::CatchBlock;
-
+    block_spans: &HashMap<BlockId, (usize, usize)>,
+) -> Vec<LoweredTryBlock> {
     let mut try_blocks = Vec::new();
     let Some(func) = module.func(func_id) else {
         return try_blocks;
-    };
-
-    // Extent of a block in the flat stream: [offset, next greater offset).
-    // Trampoline offsets sort after every real block, so a range end never
-    // extends over a trampoline. Correctness depends on strictly
-    // increasing block offsets (N49): layout hard-errors
-    // (`LowerError::ZeroExtentBlock`) on any block that emits zero
-    // bytecodes, so the "next greater offset" is always the IMMEDIATELY
-    // following block's start — a zero-extent block can never swallow its
-    // successor into this range.
-    let extent_of = |bb: BlockId| -> Option<(usize, usize)> {
-        let &start = block_offsets.get(&bb)?;
-        let end = block_offsets
-            .values()
-            .filter(|&&o| o > start)
-            .min()
-            .copied()
-            .unwrap_or(total_len);
-        Some((start, end))
     };
 
     for region in &func.try_regions {
@@ -381,11 +387,10 @@ fn reconstruct_try_blocks(
             continue;
         }
 
-        // Per-block extents, coalesced into contiguous runs (N43).
         let mut extents: Vec<(usize, usize)> = region
             .protected
             .iter()
-            .filter_map(|&bb| extent_of(bb))
+            .filter_map(|bb| block_spans.get(bb).copied())
             .collect();
         if extents.is_empty() {
             continue;
@@ -399,16 +404,13 @@ fn reconstruct_try_blocks(
             }
         }
 
-        // Build catch entries (shared by every run of this region).
-        // `Catch::type_idx: Option<u32>` maps `None` back to the container's
-        // `u32::MAX` catch-all sentinel.
-        let catches: Vec<CatchBlock> = region
+        let catches: Vec<LoweredCatchBlock> = region
             .catches
             .iter()
             .filter_map(|ch| {
-                let (handler_start, handler_end) = extent_of(ch.handler)?;
-                Some(CatchBlock {
-                    type_idx: ch.type_idx.unwrap_or(u32::MAX),
+                let &(handler_start, handler_end) = block_spans.get(&ch.handler)?;
+                Some(LoweredCatchBlock {
+                    type_class: ch.type_class,
                     handler: handler_start as u32,
                     len: (handler_end - handler_start) as u32,
                 })
@@ -420,7 +422,7 @@ fn reconstruct_try_blocks(
         }
 
         for (start, end) in runs {
-            try_blocks.push(TryBlock {
+            try_blocks.push(LoweredTryBlock {
                 start: start as u32,
                 len: (end - start) as u32,
                 catches: catches.clone(),
@@ -431,16 +433,24 @@ fn reconstruct_try_blocks(
     try_blocks
 }
 
-/// Resolve Block-encoded labels in jump instructions to instruction indices.
-fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
-    // Only `Jmp`, `Jeqz`, and `Jnez` are legal ArkCompiler branch bytecodes
-    // (ruling 2026-10-04).
+/// Resolve Block/internal labels in jump instructions to flat instruction indices (`R3-M3`).
+fn resolve_labels(
+    func_id: FuncId,
+    bc: &mut Bytecode,
+    jump_targets: &HashMap<u32, usize>,
+) -> Result<(), LowerError> {
     match bc {
         Bytecode::Jmp(label) | Bytecode::Jeqz(label) | Bytecode::Jnez(label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
-                *label = Label(off as u32);
-            }
+            let target = label.0;
+            let &off = jump_targets
+                .get(&target)
+                .ok_or(LowerError::UnresolvedLabel {
+                    func: func_id,
+                    target,
+                })?;
+            *label = Label(off as u32);
         }
         _ => {}
     }
+    Ok(())
 }

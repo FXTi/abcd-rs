@@ -142,11 +142,14 @@ pub(in crate::folds) fn switch_test(cond: &Expr) -> Option<(Expr, Expr, bool)> {
     loop {
         match c {
             Expr::Unary {
-                op: abcd_ir::op::UnOp::IsTrue,
+                op: abcd_ir::op::UnOp::IsTrue | abcd_ir::op::UnOp::JumpNez,
                 operand,
             } => c = operand,
             Expr::Unary {
-                op: abcd_ir::op::UnOp::IsFalse | abcd_ir::op::UnOp::LogicalNot,
+                op:
+                    abcd_ir::op::UnOp::IsFalse
+                    | abcd_ir::op::UnOp::JumpEqz
+                    | abcd_ir::op::UnOp::LogicalNot,
                 operand,
             } => {
                 positive = !positive;
@@ -620,11 +623,14 @@ pub(in crate::folds) fn ft_rethrow_temp(
     loop {
         match e {
             Expr::Unary {
-                op: abcd_ir::op::UnOp::IsTrue,
+                op: abcd_ir::op::UnOp::IsTrue | abcd_ir::op::UnOp::JumpNez,
                 operand,
             } => e = operand,
             Expr::Unary {
-                op: abcd_ir::op::UnOp::IsFalse | abcd_ir::op::UnOp::LogicalNot,
+                op:
+                    abcd_ir::op::UnOp::IsFalse
+                    | abcd_ir::op::UnOp::JumpEqz
+                    | abcd_ir::op::UnOp::LogicalNot,
                 operand,
             } => {
                 negated = !negated;

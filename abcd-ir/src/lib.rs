@@ -79,7 +79,7 @@ pub mod ty;
 pub mod verify;
 
 pub use cfg::{DomTree, ExceptionHandlerMap, normal_succs_inline};
-pub use consts::{Const, ConstPool};
+pub use consts::{Const, ConstPool, LitMethodKind, TypedArrayTag};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use frame::{FrameSlots, this_param_index};
 pub use function::{
@@ -92,8 +92,8 @@ pub use module::{
     ImportDecl, Modifiers, Module, ModuleRequest, Signature, SourceLang,
 };
 pub use op::{
-    Arity, BinOp, CallKind, CmpOp, DefineClassData, MemberAttrs, ModuleVarKind, Op, PropKey,
-    SuperCheck, SuperKey, UnOp,
+    Arity, BinOp, CallKind, CmpOp, DefineClassData, LexEnvKind, MemberAttrs, ModuleVarKind, Op,
+    OwnStoreKind, PropKey, SuperCheck, SuperKey, UnOp,
 };
 pub use symbol::SymbolTable;
 pub use ty::{DynPrim, StaticTy, Ty};

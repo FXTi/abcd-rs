@@ -545,11 +545,11 @@ pub(in crate::folds) fn match_single_pass_for_in(
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => e = operand,
             Expr::Unary {
-                op: UnOp::IsFalse | UnOp::LogicalNot,
+                op: UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot,
                 operand,
             } => {
                 inverted = !inverted;
@@ -1386,11 +1386,11 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => e = operand,
             Expr::Unary {
-                op: UnOp::IsFalse | UnOp::LogicalNot,
+                op: UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot,
                 operand,
             } => {
                 positive = !positive;

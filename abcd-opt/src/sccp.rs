@@ -22,31 +22,40 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_ir::{
-    BinOp, BlockId, CmpOp, Const, Edge, EdgeKind, FuncId, InstId, Module, Op, UnOp, ValueDef,
+    BinOp, BlockId, CmpOp, Const, Edge, EdgeKind, FuncId, InstId, Module, Op, Sym, UnOp, ValueDef,
     ValueId,
 };
 
 use crate::FuncPass;
-use crate::{to_int32, to_uint32};
+use crate::{canonicalize_f64_bits, ecma_pow, has_static_ty, to_int32, to_uint32};
 
 /// Lattice value for SCCP.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum LatticeVal {
     Top,                // Unknown / not yet reached
     Constant(ConstVal), // Known constant
     Bottom,             // Overdefined (multiple values possible)
 }
 
-/// Constant value representation. `Number` keeps the host `f64` (the
-/// lattice meet compares numbers with host `==`, so `0.0 == -0.0` meet to
-/// whichever arrived first; conversion back to a pooled [`Const::Number`]
-/// is bit-exact, preserving `-0.0`/NaN payloads — `N37`).
-#[derive(Clone, Debug, PartialEq)]
+/// Constant value representation. `Number` stores raw IEEE-754 `u64` bits so
+/// lattice `meet()` compares bit-exactly (`meet(+0.0, -0.0) == Bottom`,
+/// `R3-H5` / `N37`), while newly folded arithmetic canonicalizes `NaN` to
+/// [`crate::CANONICAL_NAN_BITS`] (`#60`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConstVal {
-    Number(f64),
+    Number(u64),
     Bool(bool),
     Null,
     Undefined,
+    String(Sym),
+    BigInt(Sym),
+}
+
+impl ConstVal {
+    #[inline]
+    fn number(n: f64) -> Self {
+        Self::Number(canonicalize_f64_bits(n))
+    }
 }
 
 /// The SCCP pass.
@@ -99,9 +108,9 @@ impl FuncPass for Sccp {
                 let Some(inst) = module.inst(inst_id) else {
                     continue;
                 };
-                for val in inst.op.operands() {
+                inst.op.for_each_operand(|val| {
                     use_list.entry(val).or_default().push(inst_id);
-                }
+                });
             }
         }
 
@@ -257,6 +266,7 @@ impl FuncPass for Sccp {
             };
             let all_insts: Vec<InstId> = block.insts.clone();
 
+            let mut folded_phis: Vec<InstId> = Vec::new();
             for inst_id in all_insts {
                 let Some(result) = module.inst(inst_id).and_then(|i| i.result) else {
                     continue;
@@ -269,44 +279,50 @@ impl FuncPass for Sccp {
                         continue;
                     }
                     let was_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
-                    let cid = module.consts.push(const_to_const(&c));
+                    let cid = module.consts.intern(const_to_const(&c));
                     if let Some(inst) = module.inst_mut(inst_id) {
                         inst.op = Op::LoadConst(cid);
                     }
                     if was_phi {
-                        // Move the folded phi out of the phi prefix to
-                        // just past the remaining phis (the verifier
-                        // requires phis to lead the block).
-                        if let Some(block) = module.block(bb) {
-                            let insert_at =
-                                if let Some(pos) = block.insts.iter().position(|&i| i == inst_id) {
-                                    let mut rest: Vec<InstId> = block.insts.clone();
-                                    rest.remove(pos);
-                                    let insert_at = rest
-                                        .iter()
-                                        .take_while(|&&i| {
-                                            module.inst(i).is_some_and(|inst| inst.op.is_phi())
-                                        })
-                                        .count();
-                                    if let Some(block) = module.block_mut(bb) {
-                                        block.insts = rest;
-                                    }
-                                    Some(insert_at)
-                                } else {
-                                    None
-                                };
-                            if let Some(insert_at) = insert_at
-                                && let Some(block) = module.block_mut(bb)
-                            {
-                                block.insts.insert(insert_at, inst_id);
-                            }
-                        }
+                        folded_phis.push(inst_id);
                     }
                     changed = true;
                 }
             }
 
-            // Fold CondBranch with known condition.
+            // Batch-move all folded phis out of the leading phi prefix in a
+            // single `O(|insts|)` pass per block (`R3-X7`).
+            if !folded_phis.is_empty()
+                && let Some(block) = module.block(bb)
+            {
+                let folded_set: HashSet<InstId> = folded_phis.iter().copied().collect();
+                let mut reordered = Vec::with_capacity(block.insts.len());
+                let mut tail_start = 0usize;
+                for (idx, &iid) in block.insts.iter().enumerate() {
+                    if folded_set.contains(&iid) {
+                        tail_start = idx + 1;
+                        continue;
+                    }
+                    if module.inst(iid).is_some_and(|inst| inst.op.is_phi()) {
+                        reordered.push(iid);
+                        tail_start = idx + 1;
+                    } else {
+                        break;
+                    }
+                }
+                reordered.extend(folded_phis.iter().copied());
+                for &iid in &block.insts[tail_start..] {
+                    if !folded_set.contains(&iid) {
+                        reordered.push(iid);
+                    }
+                }
+                if let Some(block) = module.block_mut(bb) {
+                    block.insts = reordered;
+                }
+            }
+
+            // Fold CondBranch with known condition (`R3-M6`: query `get_lattice`
+            // so `ValueDef::Const` conditions also rewrite `CondBranch -> Branch`).
             let Some(block) = module.block(bb) else {
                 continue;
             };
@@ -325,8 +341,9 @@ impl FuncPass for Sccp {
                 let cond = *cond;
                 let true_dest = *true_dest;
                 let false_dest = *false_dest;
-                if let Some(LatticeVal::Constant(c)) = lattice.get(&cond) {
-                    let is_true = const_is_truthy(c);
+                if let LatticeVal::Constant(c) = get_lattice(module, &lattice, cond)
+                    && let Some(is_true) = const_is_truthy(&c)
+                {
                     let target = if is_true { true_dest } else { false_dest };
                     let dead = if is_true { false_dest } else { true_dest };
                     if let Some(inst) = module.inst_mut(last) {
@@ -437,20 +454,22 @@ fn evaluate_inst(
 
     match &inst.op {
         Op::LoadConst(cid) => match module.consts.get(*cid) {
-            // Only scalar constants (Number, Bool, Null, Undefined) enter the
-            // lattice; strings, bigints, literal arrays, and the hole evaluate
+            // Scalar and string/bigint constants enter the lattice; literal
+            // buffers, typed integer/float literal tags, and the hole evaluate
             // to Bottom.
             Some(Const::Undefined) => Some(LatticeVal::Constant(ConstVal::Undefined)),
             Some(Const::Null) => Some(LatticeVal::Constant(ConstVal::Null)),
             Some(Const::Bool(b)) => Some(LatticeVal::Constant(ConstVal::Bool(*b))),
-            Some(Const::Number(bits)) => Some(LatticeVal::Constant(ConstVal::Number(
-                f64::from_bits(*bits),
-            ))),
-            Some(_) => Some(LatticeVal::Bottom),
-            None => Some(LatticeVal::Bottom),
+            Some(Const::Number(bits)) => Some(LatticeVal::Constant(ConstVal::Number(*bits))),
+            Some(Const::String(sym)) => Some(LatticeVal::Constant(ConstVal::String(*sym))),
+            Some(Const::BigInt(sym)) => Some(LatticeVal::Constant(ConstVal::BigInt(*sym))),
+            Some(_) | None => Some(LatticeVal::Bottom),
         },
 
         Op::BinaryOp { op, left, right } => {
+            if has_static_ty(module, inst_id) {
+                return Some(LatticeVal::Bottom);
+            }
             let lv = get_lattice(module, lattice, *left);
             let rv = get_lattice(module, lattice, *right);
             match (&lv, &rv) {
@@ -465,6 +484,9 @@ fn evaluate_inst(
         }
 
         Op::Compare { op, left, right } => {
+            if has_static_ty(module, inst_id) {
+                return Some(LatticeVal::Bottom);
+            }
             let lv = get_lattice(module, lattice, *left);
             let rv = get_lattice(module, lattice, *right);
             match (&lv, &rv) {
@@ -479,6 +501,9 @@ fn evaluate_inst(
         }
 
         Op::UnaryOp { op, operand } => {
+            if has_static_ty(module, inst_id) {
+                return Some(LatticeVal::Bottom);
+            }
             let v = get_lattice(module, lattice, *operand);
             match &v {
                 LatticeVal::Bottom => Some(LatticeVal::Bottom),
@@ -487,26 +512,26 @@ fn evaluate_inst(
             }
         }
 
-        // Everything else: if any operand is Bottom → Bottom, else Top.
+        // Everything else: if any operand is Bottom → Bottom, else if any is
+        // Top → None, else Bottom (`R3-A5`: zero Vec allocation).
         _ => {
-            let ops = inst.op.operands();
-            if ops.is_empty() {
-                // No operands but produces a value (e.g. LoadNewTarget) → Bottom.
-                Some(LatticeVal::Bottom)
-            } else {
-                let mut has_top = false;
-                for val in ops {
+            let mut any_operand = false;
+            let mut has_bottom = false;
+            let mut has_top = false;
+            inst.op.for_each_operand(|val| {
+                any_operand = true;
+                if !has_bottom {
                     match get_lattice(module, lattice, val) {
-                        LatticeVal::Bottom => return Some(LatticeVal::Bottom),
+                        LatticeVal::Bottom => has_bottom = true,
                         LatticeVal::Top => has_top = true,
-                        _ => {}
+                        LatticeVal::Constant(_) => {}
                     }
                 }
-                if has_top {
-                    None
-                } else {
-                    Some(LatticeVal::Bottom)
-                }
+            });
+            if !any_operand || has_bottom || !has_top {
+                Some(LatticeVal::Bottom)
+            } else {
+                None
             }
         }
     }
@@ -574,13 +599,14 @@ fn add_cfg_edges(
             false_dest,
         } => {
             match get_lattice(module, lattice, *cond) {
-                LatticeVal::Constant(c) => {
-                    if const_is_truthy(&c) {
+                LatticeVal::Constant(c) => match const_is_truthy(&c) {
+                    Some(true) => dests.push((block, *true_dest, EdgeKind::Normal)),
+                    Some(false) => dests.push((block, *false_dest, EdgeKind::Normal)),
+                    None => {
                         dests.push((block, *true_dest, EdgeKind::Normal));
-                    } else {
                         dests.push((block, *false_dest, EdgeKind::Normal));
                     }
-                }
+                },
                 _ => {
                     // Unknown or Bottom: both edges are possible.
                     dests.push((block, *true_dest, EdgeKind::Normal));
@@ -635,9 +661,9 @@ fn get_lattice(
             Some(Const::Undefined) => LatticeVal::Constant(ConstVal::Undefined),
             Some(Const::Null) => LatticeVal::Constant(ConstVal::Null),
             Some(Const::Bool(b)) => LatticeVal::Constant(ConstVal::Bool(*b)),
-            Some(Const::Number(bits)) => {
-                LatticeVal::Constant(ConstVal::Number(f64::from_bits(*bits)))
-            }
+            Some(Const::Number(bits)) => LatticeVal::Constant(ConstVal::Number(*bits)),
+            Some(Const::String(sym)) => LatticeVal::Constant(ConstVal::String(*sym)),
+            Some(Const::BigInt(sym)) => LatticeVal::Constant(ConstVal::BigInt(*sym)),
             _ => LatticeVal::Bottom,
         },
         ValueDef::ExceptionParam(_) => LatticeVal::Bottom,
@@ -656,79 +682,77 @@ fn inst_is_const(module: &Module, inst_id: InstId, c: &ConstVal) -> bool {
         return false;
     };
     match (module.consts.get(cid), c) {
-        (Some(Const::Number(bits)), ConstVal::Number(n)) => *bits == n.to_bits(),
+        (Some(Const::Number(bits)), ConstVal::Number(n_bits)) => *bits == *n_bits,
         (Some(Const::Bool(x)), ConstVal::Bool(y)) => x == y,
         (Some(Const::Null), ConstVal::Null) => true,
         (Some(Const::Undefined), ConstVal::Undefined) => true,
+        (Some(Const::String(x)), ConstVal::String(y)) => x == y,
+        (Some(Const::BigInt(x)), ConstVal::BigInt(y)) => x == y,
         _ => false,
     }
 }
 
 fn const_to_const(c: &ConstVal) -> Const {
     match c {
-        ConstVal::Number(n) => Const::number(*n), // bit-exact (N37)
+        ConstVal::Number(bits) => Const::Number(*bits), // bit-exact (N37)
         ConstVal::Bool(b) => Const::Bool(*b),
         ConstVal::Null => Const::Null,
         ConstVal::Undefined => Const::Undefined,
+        ConstVal::String(sym) => Const::String(*sym),
+        ConstVal::BigInt(sym) => Const::BigInt(*sym),
     }
 }
 
-fn const_is_truthy(c: &ConstVal) -> bool {
+fn const_is_truthy(c: &ConstVal) -> Option<bool> {
     match c {
-        ConstVal::Bool(b) => *b,
-        ConstVal::Number(n) => *n != 0.0 && !n.is_nan(),
-        ConstVal::Null | ConstVal::Undefined => false,
+        ConstVal::Bool(b) => Some(*b),
+        ConstVal::Number(bits) => {
+            let n = f64::from_bits(*bits);
+            Some(n != 0.0 && !n.is_nan())
+        }
+        ConstVal::Null | ConstVal::Undefined => Some(false),
+        ConstVal::String(_) | ConstVal::BigInt(_) => None,
     }
 }
 
 fn const_to_number(c: &ConstVal) -> Option<f64> {
     match c {
-        ConstVal::Number(n) => Some(*n),
+        ConstVal::Number(bits) => Some(f64::from_bits(*bits)),
         ConstVal::Bool(true) => Some(1.0),
         ConstVal::Bool(false) => Some(0.0),
         ConstVal::Null => Some(0.0),
         ConstVal::Undefined => Some(f64::NAN),
+        ConstVal::String(_) | ConstVal::BigInt(_) => None,
     }
 }
 
 fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVal> {
-    let an = const_to_number(a)?;
-    let bn = const_to_number(b)?;
+    let (Some(an), Some(bn)) = (const_to_number(a), const_to_number(b)) else {
+        return Some(LatticeVal::Bottom);
+    };
     // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
     // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's saturating
     // `as` casts — matches vendored DoubleToInt (number_helper.cpp:1137).
     // The shift count is masked `& 0x1f` AFTER the wrap, so -1 → 31.
-    match op {
-        BinOp::Add => Some(LatticeVal::Constant(ConstVal::Number(an + bn))),
-        BinOp::Sub => Some(LatticeVal::Constant(ConstVal::Number(an - bn))),
-        BinOp::Mul => Some(LatticeVal::Constant(ConstVal::Number(an * bn))),
-        BinOp::Div => Some(LatticeVal::Constant(ConstVal::Number(an / bn))),
-        BinOp::Mod => Some(LatticeVal::Constant(ConstVal::Number(an % bn))),
-        BinOp::Exp => Some(LatticeVal::Constant(ConstVal::Number(an.powf(bn)))),
-        BinOp::Shl => Some(LatticeVal::Constant(ConstVal::Number(
-            (to_int32(an) << (to_uint32(bn) & 0x1f)) as f64,
-        ))),
-        BinOp::Shr => Some(LatticeVal::Constant(ConstVal::Number(
-            // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift —
-            // (uint32)ToInt32(v) >> shift, so the unsigned reinterpret
-            // goes through i32 (a direct `as u32` saturates negatives).
-            ((to_int32(an) as u32) >> (to_uint32(bn) & 0x1f)) as f64,
-        ))),
-        BinOp::Ashr => Some(LatticeVal::Constant(ConstVal::Number(
-            // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift.
-            // The two arms were inverted.
-            (to_int32(an) >> (to_uint32(bn) & 0x1f)) as f64,
-        ))),
-        BinOp::BitAnd => Some(LatticeVal::Constant(ConstVal::Number(
-            (to_int32(an) & to_int32(bn)) as f64,
-        ))),
-        BinOp::BitOr => Some(LatticeVal::Constant(ConstVal::Number(
-            (to_int32(an) | to_int32(bn)) as f64,
-        ))),
-        BinOp::BitXor => Some(LatticeVal::Constant(ConstVal::Number(
-            (to_int32(an) ^ to_int32(bn)) as f64,
-        ))),
-    }
+    let res = match op {
+        BinOp::Add => an + bn,
+        BinOp::Sub => an - bn,
+        BinOp::Mul => an * bn,
+        BinOp::Div => an / bn,
+        BinOp::Mod => an % bn,
+        BinOp::Exp => ecma_pow(an, bn),
+        BinOp::Shl => (to_int32(an) << (to_uint32(bn) & 0x1f)) as f64,
+        // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift —
+        // (uint32)ToInt32(v) >> shift, so the unsigned reinterpret
+        // goes through i32 (a direct `as u32` saturates negatives).
+        BinOp::Shr => ((to_int32(an) as u32) >> (to_uint32(bn) & 0x1f)) as f64,
+        // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift.
+        BinOp::Ashr => (to_int32(an) >> (to_uint32(bn) & 0x1f)) as f64,
+        BinOp::BitAnd => (to_int32(an) & to_int32(bn)) as f64,
+        BinOp::BitOr => (to_int32(an) | to_int32(bn)) as f64,
+        BinOp::BitXor => (to_int32(an) ^ to_int32(bn)) as f64,
+    };
+    Some(LatticeVal::Constant(ConstVal::number(res)))
 }
 
 /// Evaluate a [`CmpOp`] comparison over constant lattice inputs.
@@ -748,8 +772,9 @@ fn eval_compare_lattice(op: CmpOp, a: &ConstVal, b: &ConstVal) -> Option<Lattice
     {
         return Some(LatticeVal::Bottom);
     }
-    let an = const_to_number(a)?;
-    let bn = const_to_number(b)?;
+    let (Some(an), Some(bn)) = (const_to_number(a), const_to_number(b)) else {
+        return Some(LatticeVal::Bottom);
+    };
     match op {
         CmpOp::Eq => Some(LatticeVal::Constant(ConstVal::Bool(an == bn))),
         CmpOp::NotEq => Some(LatticeVal::Constant(ConstVal::Bool(an != bn))),
@@ -765,22 +790,60 @@ fn eval_compare_lattice(op: CmpOp, a: &ConstVal, b: &ConstVal) -> Option<Lattice
 fn eval_unop_lattice(op: UnOp, c: &ConstVal) -> Option<LatticeVal> {
     match op {
         UnOp::Minus => {
-            let n = const_to_number(c)?;
-            Some(LatticeVal::Constant(ConstVal::Number(-n)))
+            let Some(n) = const_to_number(c) else {
+                return Some(LatticeVal::Bottom);
+            };
+            Some(LatticeVal::Constant(ConstVal::number(-n)))
         }
         UnOp::BitNot => {
-            let n = const_to_number(c)?;
+            let Some(n) = const_to_number(c) else {
+                return Some(LatticeVal::Bottom);
+            };
             // ECMA-262 ToInt32 (wrap, NaN/±Inf → 0), not saturating (N42).
-            Some(LatticeVal::Constant(ConstVal::Number(!to_int32(n) as f64)))
+            Some(LatticeVal::Constant(ConstVal::number(!to_int32(n) as f64)))
         }
-        UnOp::LogicalNot => Some(LatticeVal::Constant(ConstVal::Bool(!const_is_truthy(c)))),
-        UnOp::IsTrue => Some(LatticeVal::Constant(ConstVal::Bool(const_is_truthy(c)))),
-        UnOp::IsFalse => Some(LatticeVal::Constant(ConstVal::Bool(!const_is_truthy(c)))),
+        UnOp::LogicalNot => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
+            LatticeVal::Constant(ConstVal::Bool(!b))
+        })),
+        UnOp::IsTrue => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
+            LatticeVal::Constant(ConstVal::Bool(b))
+        })),
+        UnOp::IsFalse => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
+            LatticeVal::Constant(ConstVal::Bool(!b))
+        })),
         UnOp::ToNumber | UnOp::ToNumeric => {
-            let n = const_to_number(c)?;
-            Some(LatticeVal::Constant(ConstVal::Number(n)))
+            let Some(n) = const_to_number(c) else {
+                return Some(LatticeVal::Bottom);
+            };
+            Some(LatticeVal::Constant(ConstVal::number(n)))
         }
+        UnOp::ToPropertyKey => match c {
+            ConstVal::String(sym) => Some(LatticeVal::Constant(ConstVal::String(*sym))),
+            _ => Some(LatticeVal::Bottom),
+        },
         UnOp::Void => Some(LatticeVal::Constant(ConstVal::Undefined)),
+        UnOp::JumpEqz => {
+            let b = match c {
+                ConstVal::Bool(b) => !*b,
+                ConstVal::Number(bits) => f64::from_bits(*bits) == 0.0,
+                ConstVal::Null
+                | ConstVal::Undefined
+                | ConstVal::String(_)
+                | ConstVal::BigInt(_) => false,
+            };
+            Some(LatticeVal::Constant(ConstVal::Bool(b)))
+        }
+        UnOp::JumpNez => {
+            let b = match c {
+                ConstVal::Bool(b) => *b,
+                ConstVal::Number(bits) => f64::from_bits(*bits) != 0.0,
+                ConstVal::Null
+                | ConstVal::Undefined
+                | ConstVal::String(_)
+                | ConstVal::BigInt(_) => false,
+            };
+            Some(LatticeVal::Constant(ConstVal::Bool(b)))
+        }
         _ => Some(LatticeVal::Bottom),
     }
 }

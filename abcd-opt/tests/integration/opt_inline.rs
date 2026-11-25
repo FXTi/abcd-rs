@@ -1155,12 +1155,19 @@ fn forbidden_callee_ops_are_skipped() {
     let cases: Vec<(&str, Op, SkipReason)> = vec![
         (
             "lexenv",
-            Op::NewLexEnv { num_vars: 1 },
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
             SkipReason::CalleeUsesLexEnv,
         ),
         (
             "getlexvar",
-            Op::GetLexVar { level: 0, slot: 0 },
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
             SkipReason::CalleeUsesLexEnv,
         ),
         (
@@ -1264,7 +1271,11 @@ fn forbidden_callee_ops_are_skipped() {
         // The nested body OBSERVES the captured environment — unsafe
         // to inline its parent.
         let mut b = V2Builder::new(&mut module, h);
-        b.emit(Op::GetLexVar { level: 1, slot: 0 });
+        b.emit(Op::GetLexVar {
+            level: 1,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        });
         b.emit_void(Op::Return { value: None });
     }
     {
@@ -1720,7 +1731,7 @@ fn inline_inside_shared_handler_try_regions_dedupes_edges_and_verifies() {
             catches: vec![abcd_ir::Catch {
                 handler: probe.handler,
                 exception: exc,
-                type_idx: Some(1),
+                type_class: Some(abcd_ir::ClassId::new(0)),
             }],
         });
     verify_ok(&probe.module);

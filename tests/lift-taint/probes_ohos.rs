@@ -827,8 +827,8 @@ fn probe_ohos_03_uiability_want_lifecycle_and_receiver_isolation() {
     let s_fg = m.sym.intern("onForeground");
     let c_s_oc = m.consts.intern(Const::String(s_oc));
     let c_s_fg = m.consts.intern(Const::String(s_fg));
-    let c_m_oc1 = m.consts.intern(Const::MethodRef(oc1));
-    let c_m_fg1 = m.consts.intern(Const::MethodRef(fg1));
+    let c_m_oc1 = m.consts.intern(Const::method_ref(oc1));
+    let c_m_fg1 = m.consts.intern(Const::method_ref(fg1));
     let mem1 = m.consts.push_array(vec![c_s_oc, c_m_oc1, c_s_fg, c_m_fg1]);
     let _ = emit_val(
         &mut m,
@@ -841,8 +841,8 @@ fn probe_ohos_03_uiability_want_lifecycle_and_receiver_isolation() {
             count: 0,
         })),
     );
-    let c_m_oc2 = m.consts.intern(Const::MethodRef(oc2));
-    let c_m_fg2 = m.consts.intern(Const::MethodRef(fg2));
+    let c_m_oc2 = m.consts.intern(Const::method_ref(oc2));
+    let c_m_fg2 = m.consts.intern(Const::method_ref(fg2));
     let mem2 = m.consts.push_array(vec![c_s_oc, c_m_oc2, c_s_fg, c_m_fg2]);
     let _ = emit_val(
         &mut m,
@@ -925,7 +925,7 @@ fn probe_ohos_04_extension_ability_manifest_discovery_and_fs_sink() {
     let (_, bmain, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
     let s_af = m.sym.intern("onAddForm");
     let c_s_af = m.consts.intern(Const::String(s_af));
-    let c_m_add = m.consts.intern(Const::MethodRef(on_add));
+    let c_m_add = m.consts.intern(Const::method_ref(on_add));
     let mem = m.consts.push_array(vec![c_s_af, c_m_add]);
     let _ = emit_val(
         &mut m,
@@ -1049,7 +1049,15 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
 
     // `onClick` arrow closure inside `observeComponentCreation2` (reads `_this` via `GetLexVar(0, 0)`):
     let (click1, bclk1, _) = add_fn(&mut m, cid, "onClick_1", FunctionKind::Arrow, 3);
-    let cap_this1 = emit_val(&mut m, bclk1, Op::GetLexVar { level: 0, slot: 0 });
+    let cap_this1 = emit_val(
+        &mut m,
+        bclk1,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let c1 = load_prop(&mut m, bclk1, cap_this1, "webCtrl");
     let load_url1 = load_prop(&mut m, bclk1, c1, "loadUrl");
     let t1 = load_prop(&mut m, bclk1, cap_this1, "token");
@@ -1095,7 +1103,14 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
     emit_void(&mut m, bobs1, Op::Return { value: None });
 
     let (render1, brn1, prn1) = add_fn(&mut m, cid, "initialRender", FunctionKind::Function, 3);
-    let _ = emit_val(&mut m, brn1, Op::NewLexEnv { num_vars: 1 });
+    let _ = emit_val(
+        &mut m,
+        brn1,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(
         &mut m,
         brn1,
@@ -1103,6 +1118,7 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
             level: 0,
             slot: 0,
             value: prn1[2],
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let obs_fn1 = load_prop(&mut m, brn1, prn1[2], "observeComponentCreation2");
@@ -1151,7 +1167,15 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
     emit_void(&mut m, bab2, Op::Return { value: None });
 
     let (click2, bclk2, _) = add_fn(&mut m, cid, "onClick_2", FunctionKind::Arrow, 3);
-    let cap_this2 = emit_val(&mut m, bclk2, Op::GetLexVar { level: 0, slot: 0 });
+    let cap_this2 = emit_val(
+        &mut m,
+        bclk2,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let c2 = load_prop(&mut m, bclk2, cap_this2, "webCtrl");
     let load_url2 = load_prop(&mut m, bclk2, c2, "loadUrl");
     let t2 = load_prop(&mut m, bclk2, cap_this2, "token");
@@ -1169,7 +1193,14 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
     emit_void(&mut m, bclk2, Op::Return { value: None });
 
     let (render2, brn2, prn2) = add_fn(&mut m, cid, "initialRender2", FunctionKind::Function, 3);
-    let _ = emit_val(&mut m, brn2, Op::NewLexEnv { num_vars: 1 });
+    let _ = emit_val(
+        &mut m,
+        brn2,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(
         &mut m,
         brn2,
@@ -1177,6 +1208,7 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
             level: 0,
             slot: 0,
             value: prn2[2],
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let btn2 = try_global(&mut m, brn2, "Button");
@@ -1201,8 +1233,8 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
     let s_ir = m.sym.intern("initialRender");
     let c_s_ata = m.consts.intern(Const::String(s_ata));
     let c_s_ir = m.consts.intern(Const::String(s_ir));
-    let c_m_about1 = m.consts.intern(Const::MethodRef(about1));
-    let c_m_render1 = m.consts.intern(Const::MethodRef(render1));
+    let c_m_about1 = m.consts.intern(Const::method_ref(about1));
+    let c_m_render1 = m.consts.intern(Const::method_ref(render1));
     let mem1 = m
         .consts
         .push_array(vec![c_s_ata, c_m_about1, c_s_ir, c_m_render1]);
@@ -1217,8 +1249,8 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
             count: 0,
         })),
     );
-    let c_m_about2 = m.consts.intern(Const::MethodRef(about2));
-    let c_m_render2 = m.consts.intern(Const::MethodRef(render2));
+    let c_m_about2 = m.consts.intern(Const::method_ref(about2));
+    let c_m_render2 = m.consts.intern(Const::method_ref(render2));
     let mem2 = m
         .consts
         .push_array(vec![c_s_ata, c_m_about2, c_s_ir, c_m_render2]);
@@ -2010,9 +2042,9 @@ fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
     let s_send = m.sym.intern("send");
     let s_forward = m.sym.intern("forward");
     let c_s_noop = m.consts.intern(Const::String(s_noop));
-    let c_m_noop = m.consts.intern(Const::MethodRef(base_noop));
+    let c_m_noop = m.consts.intern(Const::method_ref(base_noop));
     let c_s_send = m.consts.intern(Const::String(s_send));
-    let c_m_send = m.consts.intern(Const::MethodRef(base_send));
+    let c_m_send = m.consts.intern(Const::method_ref(base_send));
     let c_n2 = m.consts.intern(Const::number(2.0));
     let base_mem = m
         .consts
@@ -2029,7 +2061,7 @@ fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
         })),
     );
     let c_s_fwd = m.consts.intern(Const::String(s_forward));
-    let c_m_fwd = m.consts.intern(Const::MethodRef(oauth_fwd));
+    let c_m_fwd = m.consts.intern(Const::method_ref(oauth_fwd));
     let c_n1 = m.consts.intern(Const::number(1.0));
     let oauth_mem = m.consts.push_array(vec![c_s_fwd, c_m_fwd, c_n1]);
     let oauth_cls_val = emit_val(
@@ -2142,7 +2174,7 @@ fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
     let (_, b_app_main, _) = add_fn(&mut m, c_app, "func_main_0", FunctionKind::Function, 3);
     let s_sync = m.sym.intern("syncTainted");
     let c_s_sync = m.consts.intern(Const::String(s_sync));
-    let c_m_sync = m.consts.intern(Const::MethodRef(svc_sync));
+    let c_m_sync = m.consts.intern(Const::method_ref(svc_sync));
     let c_svc_n1 = m.consts.intern(Const::number(1.0));
     let svc_mem = m.consts.push_array(vec![c_s_sync, c_m_sync, c_svc_n1]);
     let svc_cls = emit_val(
@@ -2251,7 +2283,7 @@ fn probe_ohos_10_large_bundle_demand_driven_pta_and_ifds_scalability() {
 
         let (_, bm, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
         let c_s_work = m.consts.intern(Const::String(s_work));
-        let c_m_wk = m.consts.intern(Const::MethodRef(wk));
+        let c_m_wk = m.consts.intern(Const::method_ref(wk));
         let c_wk_n1 = m.consts.intern(Const::number(1.0));
         let mem = m.consts.push_array(vec![c_s_work, c_m_wk, c_wk_n1]);
         let cls_v = emit_val(

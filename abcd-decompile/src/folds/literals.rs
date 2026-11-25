@@ -981,6 +981,13 @@ pub(in crate::folds) fn fold_rest_destructure(leaves: &mut Vec<Leaf>, stats: &mu
                     .iter()
                     .map(|k| match k {
                         Expr::Lit(Lit::String(s)) => Some(s.clone()),
+                        Expr::Unary {
+                            op: abcd_ir::op::UnOp::ToPropertyKey,
+                            operand,
+                        } => match operand.as_ref() {
+                            Expr::Lit(Lit::String(s)) => Some(s.clone()),
+                            _ => None,
+                        },
                         _ => None,
                     })
                     .collect();
@@ -1045,16 +1052,21 @@ pub(in crate::folds) fn fold_rest_destructure(leaves: &mut Vec<Leaf>, stats: &mu
 /// The key a `obj.k` / `obj["k"]` load extracts, when `value` is such
 /// a load on `obj`.
 pub(in crate::folds) fn key_load_target<'v>(value: &'v Expr, obj: &Expr) -> Option<&'v String> {
+    let lit_str = |e: &'v Expr| match e {
+        Expr::Lit(Lit::String(s)) => Some(s),
+        Expr::Unary {
+            op: abcd_ir::op::UnOp::ToPropertyKey,
+            operand,
+        } => match operand.as_ref() {
+            Expr::Lit(Lit::String(s)) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    };
     match value {
         Expr::PropName { object, name, .. } if object.as_ref() == obj => Some(name),
-        Expr::PropDyn { object, key } if object.as_ref() == obj => match key.as_ref() {
-            Expr::Lit(Lit::String(s)) => Some(s),
-            _ => None,
-        },
-        Expr::PropIndex { object, index } if object.as_ref() == obj => match index.as_ref() {
-            Expr::Lit(Lit::String(s)) => Some(s),
-            _ => None,
-        },
+        Expr::PropDyn { object, key } if object.as_ref() == obj => lit_str(key),
+        Expr::PropIndex { object, index } if object.as_ref() == obj => lit_str(index),
         _ => None,
     }
 }

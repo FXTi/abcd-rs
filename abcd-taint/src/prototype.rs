@@ -181,7 +181,12 @@ fn family_of_alloc(op: &Op) -> Option<ProtoFamily> {
 fn family_of_const(c: &Const) -> Option<ProtoFamily> {
     match c {
         Const::String(_) => Some(ProtoFamily::Str),
-        Const::Number(_) | Const::Int64(_) | Const::UInt64(_) => Some(ProtoFamily::Num),
+        Const::Int8(_)
+        | Const::Int32(_)
+        | Const::Float32(_)
+        | Const::Number(_)
+        | Const::Int64(_)
+        | Const::UInt64(_) => Some(ProtoFamily::Num),
         Const::Bool(_) => Some(ProtoFamily::Bool),
         _ => None,
     }
@@ -389,7 +394,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                                 }
                             }
                             Some(Op::Call {
-                                kind: abcd_ir::CallKind::New,
+                                kind: abcd_ir::CallKind::New | abcd_ir::CallKind::NewSpread,
                                 callee,
                                 ..
                             }) => {
@@ -567,7 +572,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     }
                 }
                 Some(Op::LoadConst(cid)) => {
-                    if let Some(Const::MethodRef(f)) = self.module.consts.get(*cid)
+                    if let Some(Const::MethodRef { func: f, .. }) = self.module.consts.get(*cid)
                         && self.module.func(*f).is_some_and(|fd| {
                             matches!(
                                 fd.kind,

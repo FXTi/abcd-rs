@@ -89,25 +89,17 @@ fn defining_op(m: &abcd_ir::Module, v: ValueId) -> &Op {
     }
 }
 
-// ── ldsymbol → TryGetGlobal{Symbol, default: undefined} ──────────────
+// ── ldsymbol → LoadSymbol (`R3-H4`) ──────────────────────────────────
 
 #[test]
-fn ldsymbol_loads_the_symbol_global_with_undefined_default() {
-    // translate.rs:478-490 (isa.yaml:335): ldsymbol lifts to a tolerant
-    // global load of the name "Symbol".
+fn ldsymbol_lifts_to_load_symbol() {
     let file = build(&[Bytecode::Ldsymbol, Bytecode::Return], 0);
-    let mut m = lift_file(&file).expect("lift");
+    let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let sym = m.sym.intern("Symbol");
-    let Op::TryGetGlobal { name, default } = find_op(&m, |o| matches!(o, Op::TryGetGlobal { .. }))
-    else {
+    let Op::Return { value: Some(v) } = find_op(&m, |o| matches!(o, Op::Return { .. })) else {
         unreachable!()
     };
-    assert_eq!(*name, sym);
-    let Some(d) = default else {
-        panic!("ldsymbol carries an explicit undefined default")
-    };
-    assert_eq!(const_of(&m, *d), Const::Undefined);
+    assert!(matches!(defining_op(&m, *v), Op::LoadSymbol));
 }
 
 // ── createregexpwithliteral → AllocRegExp ────────────────────────────
@@ -200,13 +192,10 @@ fn stobjbyindex_materializes_the_immediate_index() {
     }
 }
 
-// ── supercallarrowrange (+wide) → Call{Super} ────────────────────────
+// ── supercallarrowrange (+wide) → Call{SuperArrow} (`R3-C5`) ─────────
 
 #[test]
-fn supercallarrowrange_lifts_to_super_call() {
-    // translate.rs:1301-1317: callee = acc, this = None (inherited),
-    // args = the register window; the arrow distinction folds into
-    // CallKind::Super.
+fn supercallarrowrange_lifts_to_super_arrow_call() {
     let cases: [Bytecode; 2] = [
         Bytecode::Supercallarrowrange(Imm(0), Imm(2), Reg(1)),
         Bytecode::WideSupercallarrowrange(Imm(2), Reg(1)),
@@ -235,7 +224,7 @@ fn supercallarrowrange_lifts_to_super_call() {
         else {
             unreachable!()
         };
-        assert_eq!(*kind, CallKind::Super, "arrowrange folds into Super");
+        assert_eq!(*kind, CallKind::SuperArrow);
         assert_eq!(this, &None, "super this is inherited");
         assert_eq!(const_of(&m, *callee), Const::number(99.0), "callee = acc");
         assert_eq!(args.len(), 2);
@@ -244,12 +233,10 @@ fn supercallarrowrange_lifts_to_super_call() {
     }
 }
 
-// ── newobjapply → Call{New}, callee = register, args = [acc] ─────────
+// ── newobjapply → Call{NewSpread}, callee = register, args = [acc] ───
 
 #[test]
-fn newobjapply_normalizes_the_swapped_roles() {
-    // translate.rs:1379-1397: the REGISTER is the constructor, the ACC
-    // is the spread array (v0.1's swapped NewObjApply roles normalized).
+fn newobjapply_lifts_to_new_spread() {
     let file = build(
         &[
             Bytecode::Ldai(Imm(44)), // ctor
@@ -271,7 +258,7 @@ fn newobjapply_normalizes_the_swapped_roles() {
     else {
         unreachable!()
     };
-    assert_eq!(*kind, CallKind::New);
+    assert_eq!(*kind, CallKind::NewSpread);
     assert_eq!(this, &None);
     assert_eq!(
         const_of(&m, *callee),
@@ -524,9 +511,6 @@ fn throw_deletesuperproperty_lifts_to_the_dedicated_op() {
 
 #[test]
 fn throw_undefinedifhole_two_register_roles() {
-    // translate.rs:1672-1679 (isa.yaml:998-1002): v1 carries the
-    // variable name AS A RUNTIME STRING VALUE, v2 the checked value;
-    // acc untouched.
     let file = build(
         &[
             Bytecode::Ldai(Imm(10)), // name value
@@ -534,6 +518,7 @@ fn throw_undefinedifhole_two_register_roles() {
             Bytecode::Ldai(Imm(20)), // checked value
             Bytecode::Sta(Reg(1)),
             Bytecode::ThrowUndefinedifhole(Reg(0), Reg(1)),
+            Bytecode::Returnundefined,
         ],
         2,
     );
@@ -552,9 +537,13 @@ fn throw_undefinedifhole_two_register_roles() {
 
 #[test]
 fn throw_ifsupernotcorrectcall_rejects_unknown_check_kind() {
-    // translate.rs:1702: only 0 (NotCalled) and 1 (Rebind) are
-    // vendor-defined check kinds.
-    let file = build(&[Bytecode::ThrowIfsupernotcorrectcall(Imm(2))], 0);
+    let file = build(
+        &[
+            Bytecode::ThrowIfsupernotcorrectcall(Imm(2)),
+            Bytecode::Returnundefined,
+        ],
+        0,
+    );
     let err = lift_file(&file).expect_err("imm = 2 is not a vendor check kind");
     assert!(
         matches!(err, LiftError::InvalidSuperCheckKind(2)),
@@ -562,21 +551,20 @@ fn throw_ifsupernotcorrectcall_rejects_unknown_check_kind() {
     );
 }
 
-// ── wide.ldpatchvar / wide.stpatchvar → GetLexVar/PutLexVar ──────────
-// translate.rs:1900-1922 (isa.yaml:1647/1652): the patch opcodes are
-// wide-only (hot-reload feature); they fold to the level-0 lexical
-// variable forms.
+// ── wide.ldpatchvar / wide.stpatchvar → GetLexVar/PutLexVar{Patch} ───
 
 #[test]
 fn wide_ldpatchvar_lifts_to_get_lex_var() {
     let file = build(&[Bytecode::WideLdpatchvar(Imm(300)), Bytecode::Return], 0);
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let Op::GetLexVar { level, slot } = find_op(&m, |o| matches!(o, Op::GetLexVar { .. })) else {
+    let Op::GetLexVar { level, slot, kind } = find_op(&m, |o| matches!(o, Op::GetLexVar { .. }))
+    else {
         unreachable!()
     };
     assert_eq!(*level, 0, "patch vars live at level 0");
     assert_eq!(*slot, 300);
+    assert_eq!(*kind, abcd_ir::LexEnvKind::Patch);
 }
 
 #[test]
@@ -591,42 +579,31 @@ fn wide_stpatchvar_lifts_to_put_lex_var() {
     );
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let Op::PutLexVar { level, slot, value } = find_op(&m, |o| matches!(o, Op::PutLexVar { .. }))
+    let Op::PutLexVar {
+        level,
+        slot,
+        value,
+        kind,
+    } = find_op(&m, |o| matches!(o, Op::PutLexVar { .. }))
     else {
         unreachable!()
     };
     assert_eq!(*level, 0);
     assert_eq!(*slot, 301);
+    assert_eq!(*kind, abcd_ir::LexEnvKind::Patch);
     assert_eq!(const_of(&m, *value), Const::number(17.0), "value = acc");
 }
 
-// ── fallthrough_block last-block fallback ────────────────────────────
+// ── conditional branch as final instruction → FallthroughOutOfBounds ──
 
 #[test]
-fn conditional_branch_as_final_instruction_falls_back_to_last_block() {
-    // translate.rs:396-400: es2abc always terminates methods with
-    // return/throw, so the fall-through of a conditional branch always
-    // has a block — except in hand-built bytecode where the branch is
-    // the final instruction. Here the jeqz targets ITSELF (Label(1)),
-    // so the taken and fall-through destinations both land on the
-    // branch's own block.
+fn conditional_branch_as_final_instruction_returns_fallthrough_error() {
+    // R3-M3: a conditional branch at the end of `body.bytecodes` with no
+    // fall-through instruction must return a typed error, never wrap around.
     let file = build(&[Bytecode::Lda(Reg(0)), Bytecode::Jeqz(Label(1))], 1);
-    let m = lift_file(&file).expect("lift");
-    verify_clean(&m);
-    let Op::CondBranch {
-        true_dest,
-        false_dest,
-        ..
-    } = find_op(&m, |o| matches!(o, Op::CondBranch { .. }))
-    else {
-        unreachable!()
-    };
-    let f = &m.functions[0];
-    assert_eq!(f.blocks.len(), 2, "entry block + the self-loop block");
-    let loop_block = f.blocks[1];
-    assert_eq!(*true_dest, loop_block);
-    assert_eq!(
-        *false_dest, loop_block,
-        "the fall-through past the final instruction maps to the last block"
+    let err = lift_file(&file).expect_err("jeqz on final instruction has no fallthrough");
+    assert!(
+        matches!(err, LiftError::FallthroughOutOfBounds { pc: 1, len: 2 }),
+        "got {err:?}"
     );
 }

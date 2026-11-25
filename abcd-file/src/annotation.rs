@@ -46,13 +46,21 @@ impl MethodHandleType {
 }
 
 /// A resolved method handle reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ResolvedMethodHandle {
     pub handle_type: MethodHandleType,
     /// Interned name of the referenced field or method.
     pub entity: crate::StringId,
+    /// Dense method index in [`File::all_methods`](crate::File::all_methods)
+    /// when `handle_type` is a method op and the target is a class method in
+    /// this file (`None` for foreign items or unindexed hand-built refs).
+    pub target_method: Option<crate::MethodIdx>,
+    /// Dense field index in [`File::all_fields`](crate::File::all_fields)
+    /// when `handle_type` is a field op and the target is a class field in
+    /// this file (`None` for foreign items or unindexed hand-built refs).
+    pub target_field: Option<crate::FieldIdx>,
     /// Offset of the referenced field/method item in the source file;
-    /// 0 when the reference could not be resolved to an entity.
+    /// 0 when the reference could not be resolved or has no wire provenance.
     pub entity_offset: u32,
 }
 
@@ -60,12 +68,13 @@ pub struct ResolvedMethodHandle {
 ///
 /// All variants are fully resolved at decode time:
 /// - String, Record, Method, Enum → interned [`StringId`](crate::StringId)
+///   (plus dense [`MethodIdx`](crate::MethodIdx) / [`FieldIdx`](crate::FieldIdx) handles)
 /// - Annotation → recursively resolved nested [`Annotation`](crate::Annotation)
 /// - MethodHandle → resolved [`ResolvedMethodHandle`]
 /// - LiteralArray → resolved [`LiteralValue`](crate::LiteralValue) items
-///   (nested [`LiteralValue::LiteralArray`](crate::LiteralValue::LiteralArray)
-///   items are rewritten to [`File::literal_arrays`](crate::File::literal_arrays) indices)
-/// - Array → element count preserved with original tag and entity offset
+///   (nested [`LiteralArrayIdx`](crate::LiteralArrayIdx) and
+///   [`MethodIdx`](crate::MethodIdx) items are rewritten to table indices)
+/// - Array → element count preserved with original tag
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnnotationValue {
     Bool(bool),
@@ -83,16 +92,20 @@ pub enum AnnotationValue {
     String(crate::StringId),
     /// Interned class descriptor.
     Record(crate::StringId),
-    /// Referenced method: interned name plus the method item offset in the
-    /// source file (the unique entity identity; names repeat across classes).
+    /// Referenced method: interned name, optional [`MethodIdx`](crate::MethodIdx)
+    /// into [`File::all_methods`](crate::File::all_methods), and source-file
+    /// item offset (`0` when hand-built).
     Method {
         name: crate::StringId,
+        method: Option<crate::MethodIdx>,
         offset: u32,
     },
-    /// Referenced enum field: interned name plus the field item offset in
-    /// the source file.
+    /// Referenced enum field: interned name, optional [`FieldIdx`](crate::FieldIdx)
+    /// into [`File::all_fields`](crate::File::all_fields), and source-file
+    /// item offset (`0` when hand-built).
     Enum {
         name: crate::StringId,
+        field: Option<crate::FieldIdx>,
         offset: u32,
     },
     /// Recursively resolved nested annotation.

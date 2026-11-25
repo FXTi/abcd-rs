@@ -508,7 +508,7 @@ fn try_handler_values_interfere_across_the_exception_edge() {
             catches: vec![Catch {
                 handler,
                 exception,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }
@@ -825,13 +825,13 @@ fn dangling_cond_inst_lowers_from_home_with_jnez() {
     assert_eq!(halt, Halt::Return(ELSE), "cond = 0 takes the else edge");
 }
 
-/// Iterative literal-array shape traversal pin: 64 nested `ArrayLiteral`
-/// levels succeed through `lower_module`, `EntityResolver::to_method_body`,
-/// and `abcd_lift::lift_file`, while 65 nested levels, cyclic `ConstId`
-/// graphs, and out-of-range child `ConstId`s fail cleanly with
-/// `LowerError::UntraceableEntity` (zero call-stack recursion, `R2-D3`).
+/// Iterative literal-array shape traversal pin: deep nested `ArrayLiteral`
+/// chains (well beyond the old 64-level cap) succeed through `lower_module`,
+/// `EntityResolver::to_method_body`, and `abcd_lift::lift_file`, while cyclic
+/// `ConstId` graphs and out-of-range child `ConstId`s fail cleanly with
+/// `LowerError::UntraceableEntity` (zero call-stack recursion, `#57` `R3-H9`).
 #[test]
-fn iterative_deep_literal_array_shapes_respect_depth_limit() {
+fn iterative_deep_literal_array_shapes_and_cycle_rejection() {
     fn build_nested_array_module(nesting: usize) -> (Module, abcd_ir::FuncId) {
         let mut module = Module::new();
         let func = V2Builder::create_function(&mut module, "nested", FunctionKind::Function);
@@ -849,26 +849,17 @@ fn iterative_deep_literal_array_shapes_respect_depth_limit() {
         (module, func)
     }
 
-    // 64 nested child levels (depth 0..=64) must lower, relocate via
-    // EntityResolver, encode, and re-lift cleanly.
-    let (ok_mod, ok_fn) = build_nested_array_module(64);
-    let file = lower_module(&ok_mod, Version::new(12, 0, 6, 0)).expect("depth 64 must materialize");
-    let encoded = abcd_file::encode(&file).expect("encode depth 64");
-    let decoded = abcd_file::decode(&encoded).expect("decode depth 64");
-    let lowered_layout = lower_function(&ok_mod, ok_fn).expect("lower depth 64");
+    // 128 nested child levels lower, relocate via EntityResolver, encode, and re-lift cleanly.
+    let (ok_mod, ok_fn) = build_nested_array_module(128);
+    let file =
+        lower_module(&ok_mod, Version::new(12, 0, 6, 0)).expect("depth 128 must materialize");
+    let encoded = abcd_file::encode(&file).expect("encode depth 128");
+    let decoded = abcd_file::decode(&encoded).expect("decode depth 128");
+    let lowered_layout = lower_function(&ok_mod, ok_fn).expect("lower depth 128");
     let resolver = EntityResolver::new(&ok_mod, &decoded);
     resolver
         .to_method_body(ok_fn, &lowered_layout)
-        .expect("EntityResolver must resolve depth-64 nested literal array iteratively");
-
-    // 65 nested child levels (depth 65 > 64) must fail cleanly without stack overflow.
-    let (too_deep_mod, _) = build_nested_array_module(65);
-    let err = lower_module(&too_deep_mod, Version::new(12, 0, 6, 0))
-        .expect_err("depth 65 must exceed the 64-level nesting cap");
-    assert!(
-        matches!(err, LowerError::UntraceableEntity { .. }),
-        "expected UntraceableEntity for over-deep literal array, got {err:?}"
-    );
+        .expect("EntityResolver must resolve deep nested literal array iteratively");
 
     // Self-cyclic ConstId (c0 = ArrayLiteral([c0])) and out-of-range child ConstId
     // must fail cleanly with UntraceableEntity in both lower_module and EntityResolver.

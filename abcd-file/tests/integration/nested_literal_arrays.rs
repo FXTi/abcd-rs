@@ -62,9 +62,9 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
         .collect()
 }
 
-/// Table indices registered in `File::literal_array_offsets`.
+/// Valid table indices in `File::literal_arrays`.
 fn registered_indices(file: &abcd_file::File) -> HashSet<u32> {
-    file.literal_array_offsets.values().copied().collect()
+    (0..file.literal_arrays.len() as u32).collect()
 }
 
 /// Every `LiteralValue::LiteralArray` slot in the decoded table must resolve
@@ -223,19 +223,31 @@ fn render_value(
         String(sid) | EtsImplements(sid) => {
             format!("s:{}", file.strings.resolve(*sid).unwrap_or("?"))
         }
-        Method(off)
-        | GeneratorMethod(off)
-        | AsyncGeneratorMethod(off)
-        | Getter(off)
-        | Setter(off) => format!("m:{}", file.resolve_entity_str(*off).unwrap_or("?")),
+        Method(midx)
+        | GeneratorMethod(midx)
+        | AsyncGeneratorMethod(midx)
+        | Getter(midx)
+        | Setter(midx) => {
+            let name = file
+                .method_by_idx(*midx)
+                .and_then(|(_, _, m)| file.strings.resolve(m.name))
+                .unwrap_or("?");
+            format!("m:{name}")
+        }
         LiteralArray(idx) => render_array(file, bytes, idx.0, visiting),
         ArrayU1(idx) | ArrayU8(idx) | ArrayI8(idx) | ArrayU16(idx) | ArrayI16(idx)
         | ArrayU32(idx) | ArrayI32(idx) | ArrayU64(idx) | ArrayI64(idx) | ArrayF32(idx)
         | ArrayF64(idx) | ArrayString(idx) => {
-            // Typed-array payload at the raw source offset: u32 element
-            // count followed by the elements (vendor
-            // literal_data_accessor-inl.h:94-115; N52 keeps this raw).
-            let off = idx.0 as usize;
+            // Typed-array payload starts at `array_source_offset + 5`
+            // (`[u32 item_count][u8 tag][u32 elem_count][elems...]`).
+            let Some(arr_off) = file
+                .literal_arrays
+                .get(idx.index())
+                .and_then(|la| la.source_offset)
+            else {
+                return format!("typed:{value:?}@oob");
+            };
+            let off = arr_off as usize + 5;
             let Some(raw) = bytes.get(off..off + 4) else {
                 return format!("typed:{value:?}@oob");
             };
@@ -355,11 +367,11 @@ fn nested_array_missing_from_index_region_is_recovered() {
 
     // Identify the inner array by decoding the unpatched file.
     let file = decode(&data).expect("decode unpatched");
-    let inner_offset = *file
-        .literal_array_offsets
+    let inner_offset = file
+        .literal_arrays
         .iter()
-        .find(|&(_, &i)| file.literal_arrays[i as usize].values == vec![LiteralValue::Integer(5)])
-        .map(|(o, _)| o)
+        .find(|la| la.values == vec![LiteralValue::Integer(5)])
+        .and_then(|la| la.source_offset)
         .expect("inner array decoded");
     let outer_offset = *entries
         .iter()
@@ -403,9 +415,9 @@ fn nested_array_missing_from_index_region_is_recovered() {
         }
         other => panic!("expected nested LiteralArray, got {other:?}"),
     }
-    // …and `literal_array_offsets` must expose the dropped source offset.
+    // …and `literal_array_by_offset` must expose the dropped source offset.
     assert!(
-        file.literal_array_offsets.contains_key(&inner_offset),
+        file.literal_array_by_offset(inner_offset).is_some(),
         "the recovered array's source offset must map to its table index"
     );
 }

@@ -13,7 +13,7 @@
 //! any pending copy), breaking remaining slot cycles through a reserved
 //! temporary slot. [`emit_copy`] maps one resolved slot pair to its bytecode.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_isa::{Bytecode, Reg};
 
@@ -28,11 +28,11 @@ pub enum CopyResolveError {
     CycleNeedsTemp,
 }
 
-/// Sequentialize a parallel copy set in slot space.
+/// Sequentialize a parallel copy set in slot space (`O(N)`, `#61` `R3-X7`).
 ///
 /// `copies` are `(src_slot, dst_slot)` pairs. `temp` is the per-function
 /// reserved temporary slot ([`crate::regalloc::RegAlloc::copy_temp`]); it
-/// must be a slot that does not participate in the copy set.
+/// must be a slot that does not participate in any remaining cycle.
 ///
 /// Same-slot copies are dropped (they are no-ops). The remaining copies are
 /// returned in an order that preserves parallel-copy semantics when emitted
@@ -45,53 +45,163 @@ pub fn resolve_slot_copies(
     copies: &[(RegSlot, RegSlot)],
     temp: Option<RegSlot>,
 ) -> Result<Vec<(RegSlot, RegSlot)>, CopyResolveError> {
-    // Drop same-slot no-ops and duplicate pairs.
-    let mut pending: Vec<(RegSlot, RegSlot)> = Vec::new();
+    if copies.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 1. Deduplicate non-trivial `(src, dst)` pairs in insertion order (`O(N)`).
+    let mut seen: HashSet<(RegSlot, RegSlot)> = HashSet::with_capacity(copies.len());
+    let mut edges: Vec<(RegSlot, RegSlot)> = Vec::with_capacity(copies.len());
+    let mut slot_to_id: HashMap<RegSlot, usize> = HashMap::with_capacity(copies.len() * 2);
+    let next_slot_id = |slot: RegSlot, map: &mut HashMap<RegSlot, usize>| -> usize {
+        let len = map.len();
+        *map.entry(slot).or_insert(len)
+    };
+
     for &(src, dst) in copies {
-        if src != dst && !pending.contains(&(src, dst)) {
-            pending.push((src, dst));
+        if src != dst && seen.insert((src, dst)) {
+            let _ = next_slot_id(src, &mut slot_to_id);
+            let _ = next_slot_id(dst, &mut slot_to_id);
+            edges.push((src, dst));
+        }
+    }
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_slots = slot_to_id.len();
+    let mut src_use_count = vec![0usize; num_slots];
+    let mut writers_of_dst: Vec<Vec<usize>> = vec![Vec::new(); num_slots];
+    let mut edge_slots: Vec<(usize, usize)> = Vec::with_capacity(edges.len());
+
+    for (idx, &(src, dst)) in edges.iter().enumerate() {
+        let s_id = slot_to_id[&src];
+        let d_id = slot_to_id[&dst];
+        src_use_count[s_id] += 1;
+        writers_of_dst[d_id].push(idx);
+        edge_slots.push((s_id, d_id));
+    }
+
+    // 2. Kahn-style ready queue: any edge `(src, dst)` whose `dst` is read by
+    // zero pending edges (`src_use_count[d_id] == 0`) can emit safely (`O(N)`).
+    let mut done = vec![false; edges.len()];
+    let mut queued = vec![false; edges.len()];
+    let mut ready: VecDeque<usize> = VecDeque::with_capacity(edges.len());
+    for (idx, &(_, d_id)) in edge_slots.iter().enumerate() {
+        if src_use_count[d_id] == 0 {
+            queued[idx] = true;
+            ready.push_back(idx);
         }
     }
 
-    let mut result: Vec<(RegSlot, RegSlot)> = Vec::new();
-
-    // Topological passes: emit every copy whose destination slot is not the
-    // source of any pending copy. Overwriting that destination cannot
-    // clobber a value a later copy still needs to read.
-    while !pending.is_empty() {
-        let srcs: HashSet<RegSlot> = pending.iter().map(|(s, _)| *s).collect();
-        let mut next_pending = Vec::new();
-        let mut progress = false;
-        for &(src, dst) in &pending {
-            if !srcs.contains(&dst) {
-                result.push((src, dst));
-                progress = true;
-            } else {
-                next_pending.push((src, dst));
+    let mut result: Vec<(RegSlot, RegSlot)> = Vec::with_capacity(edges.len() + 2);
+    let drain_ready = |ready: &mut VecDeque<usize>,
+                       done: &mut [bool],
+                       queued: &mut [bool],
+                       src_use_count: &mut [usize],
+                       result: &mut Vec<(RegSlot, RegSlot)>| {
+        while let Some(idx) = ready.pop_front() {
+            if done[idx] {
+                continue;
+            }
+            done[idx] = true;
+            result.push(edges[idx]);
+            let (s_id, _) = edge_slots[idx];
+            src_use_count[s_id] -= 1;
+            if src_use_count[s_id] == 0 {
+                for &w_idx in &writers_of_dst[s_id] {
+                    if !done[w_idx] && !queued[w_idx] {
+                        queued[w_idx] = true;
+                        ready.push_back(w_idx);
+                    }
+                }
             }
         }
-        pending = next_pending;
-        if !progress {
-            break;
-        }
-    }
+    };
 
-    // What remains is one or more slot cycles. Break each through the
-    // reserved temporary: save the first source, walk the cycle, restore.
-    while !pending.is_empty() {
-        let usable_temp = match temp {
-            Some(t) if !pending.iter().any(|&(s, d)| s == t || d == t) => t,
-            _ => return Err(CopyResolveError::CycleNeedsTemp),
+    drain_ready(
+        &mut ready,
+        &mut done,
+        &mut queued,
+        &mut src_use_count,
+        &mut result,
+    );
+
+    // 3. Break remaining slot cycles in deterministic input order (`O(N)`).
+    let mut writer_cursor = vec![0usize; num_slots];
+    let mut temp_checked: Option<RegSlot> = None;
+
+    for start_idx in 0..edges.len() {
+        if done[start_idx] {
+            continue;
+        }
+        let usable_temp = match temp_checked {
+            Some(t) => t,
+            None => {
+                let Some(t) = temp else {
+                    return Err(CopyResolveError::CycleNeedsTemp);
+                };
+                if let Some(&t_id) = slot_to_id.get(&t) {
+                    let participates = edges.iter().enumerate().any(|(i, _)| {
+                        !done[i] && (edge_slots[i].0 == t_id || edge_slots[i].1 == t_id)
+                    });
+                    if participates {
+                        return Err(CopyResolveError::CycleNeedsTemp);
+                    }
+                }
+                temp_checked = Some(t);
+                t
+            }
         };
-        let (first_src, first_dst) = pending.remove(0);
+
+        let (first_src, first_dst) = edges[start_idx];
+        let (first_s_id, _) = edge_slots[start_idx];
+        done[start_idx] = true;
+        src_use_count[first_s_id] -= 1;
         result.push((first_src, usable_temp));
-        let mut cur = first_src;
-        while let Some(pos) = pending.iter().position(|&(_, d)| d == cur) {
-            let (s, d) = pending.remove(pos);
-            result.push((s, d));
-            cur = s;
+
+        let mut cur_slot = first_s_id;
+        loop {
+            let writers = &writers_of_dst[cur_slot];
+            let cursor = &mut writer_cursor[cur_slot];
+            while *cursor < writers.len() && done[writers[*cursor]] {
+                *cursor += 1;
+            }
+            if *cursor >= writers.len() {
+                break;
+            }
+            let w_idx = writers[*cursor];
+            *cursor += 1;
+            done[w_idx] = true;
+            result.push(edges[w_idx]);
+            let (s_id, _) = edge_slots[w_idx];
+            src_use_count[s_id] -= 1;
+            if src_use_count[s_id] == 0 {
+                for &u_idx in &writers_of_dst[s_id] {
+                    if !done[u_idx] && !queued[u_idx] {
+                        queued[u_idx] = true;
+                        ready.push_back(u_idx);
+                    }
+                }
+            }
+            cur_slot = s_id;
         }
         result.push((usable_temp, first_dst));
+        if src_use_count[first_s_id] == 0 {
+            for &u_idx in &writers_of_dst[first_s_id] {
+                if !done[u_idx] && !queued[u_idx] {
+                    queued[u_idx] = true;
+                    ready.push_back(u_idx);
+                }
+            }
+        }
+        drain_ready(
+            &mut ready,
+            &mut done,
+            &mut queued,
+            &mut src_use_count,
+            &mut result,
+        );
     }
 
     Ok(result)

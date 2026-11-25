@@ -21,9 +21,9 @@
 //! payload) — the pre-regalloc computation and the isel-time check always
 //! agree.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use abcd_ir::{Const, InstId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{BlockId, Const, InstId, Module, Op, UnOp, ValueDef, ValueId};
 
 /// The result of fusion analysis for one function.
 #[derive(Debug, Default)]
@@ -36,36 +36,67 @@ pub struct Suppression {
     pub values: HashSet<ValueId>,
 }
 
-/// Count the uses of every value in the function (all op operands,
-/// including phi entries).
-fn use_counts(
+/// Extract an exact `0..=u32::MAX` element index from `c`, excluding `-0.0`,
+/// negative integers, fractional floats, and values `>= 2^32` (`#61` `R3-X5`).
+#[must_use]
+pub(crate) fn const_u32_index(c: &Const) -> Option<u32> {
+    match c {
+        Const::Int8(n) => Some(u32::from(*n)),
+        Const::Int32(n) if (*n as i32) >= 0 => Some(*n),
+        Const::Number(bits) => {
+            let n = f64::from_bits(*bits);
+            if !n.is_finite()
+                || (n == 0.0 && n.is_sign_negative())
+                || n < 0.0
+                || n > f64::from(u32::MAX)
+                || n.fract() != 0.0
+            {
+                return None;
+            }
+            Some(n as u32)
+        }
+        _ => None,
+    }
+}
+
+type SingleConsumerMap = HashMap<ValueId, Option<InstId>>;
+type InstPosMap = HashMap<InstId, (BlockId, usize)>;
+
+/// Precompute single-use consumers and `(BlockId, pos)` instruction positions
+/// in a single `O(B + I)` pass (`#61` `R3-X7`).
+fn index_uses_and_positions(
     module: &Module,
-    blocks: &[abcd_ir::BlockId],
-) -> std::collections::HashMap<ValueId, usize> {
-    let mut counts: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
+    blocks: &[BlockId],
+) -> (SingleConsumerMap, InstPosMap) {
+    let mut single_consumer: SingleConsumerMap = HashMap::new();
+    let mut inst_pos: InstPosMap = HashMap::new();
     for &bb in blocks {
         let Some(block) = module.block(bb) else {
             continue;
         };
-        for &iid in &block.insts {
+        for (pos, &iid) in block.insts.iter().enumerate() {
+            inst_pos.entry(iid).or_insert((bb, pos));
             let Some(inst) = module.inst(iid) else {
                 continue;
             };
-            for v in inst.op.operands() {
-                *counts.entry(v).or_default() += 1;
-            }
+            inst.op.for_each_operand(|v| {
+                single_consumer
+                    .entry(v)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(iid));
+            });
         }
     }
-    counts
+    (single_consumer, inst_pos)
 }
 
-/// The payload of a [`Op::LoadConst`] when it is a number constant.
-fn number_const(module: &Module, iid: InstId) -> Option<f64> {
+/// The payload of a [`Op::LoadConst`] when it is a valid `0..=u32::MAX` index.
+fn u32_index_const_load(module: &Module, iid: InstId) -> Option<u32> {
     let inst = module.inst(iid)?;
     let Op::LoadConst(cid) = &inst.op else {
         return None;
     };
-    module.consts.get(*cid)?.as_f64()
+    const_u32_index(module.consts.get(*cid)?)
 }
 
 /// The payload of a [`Op::LoadConst`] when it is the `undefined` constant.
@@ -87,25 +118,20 @@ fn def_inst(module: &Module, v: ValueId) -> Option<InstId> {
     }
 }
 
-/// Whether `v` is used exactly once, by `consumer`.
+/// Whether `v` is used once across the whole function, by `consumer`.
+#[inline]
 fn single_use(
-    counts: &std::collections::HashMap<ValueId, usize>,
+    single_consumer: &HashMap<ValueId, Option<InstId>>,
     v: ValueId,
     consumer: InstId,
-    module: &Module,
 ) -> bool {
-    if counts.get(&v).copied().unwrap_or(0) != 1 {
-        return false;
-    }
-    module
-        .inst(consumer)
-        .is_some_and(|inst| inst.op.operands().contains(&v))
+    single_consumer.get(&v).copied().flatten() == Some(consumer)
 }
 
 /// Compute the suppression set for one function.
-pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
+pub fn analyze(module: &Module, blocks: &[BlockId]) -> Suppression {
     let mut out = Suppression::default();
-    let counts = use_counts(module, blocks);
+    let (single_consumer, inst_pos) = index_uses_and_positions(module, blocks);
 
     for &bb in blocks {
         let Some(block) = module.block(bb) else {
@@ -116,12 +142,9 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                 continue;
             };
             match &inst.op {
-                // `LoadConst(number)` + `LoadPropIdx`/`StorePropIdx` →
-                // ld/stobjbyindex. The fused immediate round-trips any
-                // integral f64 (the vendor imm is i64; the lift stored it
-                // as f64), so no range check is needed for EXACTNESS —
-                // but the const must be integral, or the source could
-                // never have been a by-index bytecode.
+                // `LoadConst(0..=u32::MAX)` + `*PropIdx` → `*byindex` (`R3-X5`).
+                // Non-constant, negative, `-0.0`, fractional, multi-use, or
+                // `>= 2^32` indices stay unfused and lower via `*byvalue`.
                 Op::LoadPropIdx { index, .. }
                 | Op::StorePropIdx { index, .. }
                 | Op::StoreOwnPropIdx { index, .. } => {
@@ -129,22 +152,18 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                         continue;
                     };
                     if pos == 0 || block.insts[pos - 1] != const_inst {
-                        continue; // not adjacent in this block
-                    }
-                    let Some(num) = number_const(module, const_inst) else {
                         continue;
-                    };
-                    if num.fract() != 0.0 {
-                        continue; // a by-index immediate is always integral
                     }
-                    if !single_use(&counts, *index, iid, module) {
+                    if u32_index_const_load(module, const_inst).is_none() {
+                        continue;
+                    }
+                    if !single_use(&single_consumer, *index, iid) {
                         continue;
                     }
                     out.insts.insert(const_inst);
                     out.values.insert(*index);
                 }
-                // `LoadConst(undefined)` + `TryGetGlobal` →
-                // tryldglobalbyname.
+                // `LoadConst(undefined)` + `TryGetGlobal` → `tryldglobalbyname`.
                 Op::TryGetGlobal {
                     default: Some(dflt),
                     ..
@@ -158,11 +177,34 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                     if !is_undefined_const_load(module, const_inst) {
                         continue;
                     }
-                    if !single_use(&counts, *dflt, iid, module) {
+                    if !single_use(&single_consumer, *dflt, iid) {
                         continue;
                     }
                     out.insts.insert(const_inst);
                     out.values.insert(*dflt);
+                }
+                // `UnaryOp(JumpEqz | JumpNez)` + `CondBranch` → raw `jeqz`/`jnez` (`R3-X1`).
+                Op::CondBranch { cond, .. } => {
+                    let Some(pred_inst) = def_inst(module, *cond) else {
+                        continue;
+                    };
+                    if pos == 0 || block.insts[pos - 1] != pred_inst {
+                        continue;
+                    }
+                    let is_raw_jump_pred = module.inst(pred_inst).is_some_and(|i| {
+                        matches!(
+                            i.op,
+                            Op::UnaryOp {
+                                op: UnOp::JumpEqz | UnOp::JumpNez,
+                                ..
+                            }
+                        )
+                    });
+                    if !is_raw_jump_pred || !single_use(&single_consumer, *cond, iid) {
+                        continue;
+                    }
+                    out.insts.insert(pred_inst);
+                    out.values.insert(*cond);
                 }
                 _ => {}
             }
@@ -171,10 +213,6 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
 
     // The define chains: `DefineFunc` + `AllocClosure` → definefunc, and
     // `DefineFunc` + `AllocClosure` + `DefineMethod` → definemethod.
-    // Chains suppress from the CONSUMER side: an AllocClosure suppresses
-    // its adjacent single-use DefineFunc; a DefineMethod suppresses its
-    // adjacent single-use AllocClosure when that closure's DefineFunc is
-    // itself suppressible (adjacent, single-use).
     for &bb in blocks {
         let Some(block) = module.block(bb) else {
             continue;
@@ -192,10 +230,8 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                 continue;
             };
 
-            // Resolve the chain: DefineFunc → AllocClosure → (DefineMethod).
             let (closure_inst, definefunc_value) = match define_method {
                 Some(_) => {
-                    // func must be the result of an adjacent AllocClosure.
                     let Some(closure_iid) = def_inst(module, func_val) else {
                         continue;
                     };
@@ -208,7 +244,7 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                     let Op::AllocClosure { func } = &closure.op else {
                         continue;
                     };
-                    if !single_use(&counts, func_val, iid, module) {
+                    if !single_use(&single_consumer, func_val, iid) {
                         continue;
                     }
                     (Some(closure_iid), *func)
@@ -216,8 +252,6 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                 None => (None, func_val),
             };
 
-            // The DefineFunc must be adjacent (before the closure, or
-            // before the closure's consumer) and single-use.
             let Some(definefunc_iid) = def_inst(module, definefunc_value) else {
                 continue;
             };
@@ -229,15 +263,15 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
                 continue;
             };
             if !captures.is_empty() {
-                continue; // no vendor encoding for explicit captures
-            }
-            if !single_use(&counts, definefunc_value, chain_consumer, module) {
                 continue;
             }
-            // Adjacency: the DefineFunc must immediately precede the
-            // closure (or the closure's own consumer position).
+            if !single_use(&single_consumer, definefunc_value, chain_consumer) {
+                continue;
+            }
             let consumer_pos = match closure_inst {
-                Some(ciid) => block.insts.iter().position(|&x| x == ciid),
+                Some(ciid) => inst_pos
+                    .get(&ciid)
+                    .and_then(|&(cbb, cpos)| (cbb == bb).then_some(cpos)),
                 None => Some(pos),
             };
             match consumer_pos {

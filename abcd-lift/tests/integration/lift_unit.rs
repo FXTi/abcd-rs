@@ -193,10 +193,10 @@ fn literal_array_nested_and_method_ref() {
             .expect("target function") as u32,
     );
     let x_sym = m.sym.intern("x");
-    let c_seven = m.consts.intern(Const::number(7.0));
+    let c_seven = m.consts.intern(Const::Int32(7));
     let c_x = m.consts.intern(Const::String(x_sym));
     let c_nested = m.consts.intern(Const::ArrayLiteral(vec![c_x]));
-    let c_target = m.consts.intern(Const::MethodRef(target_fid));
+    let c_target = m.consts.intern(Const::method_ref(target_fid));
     let expected = Const::ArrayLiteral(vec![c_seven, c_nested, c_target]);
     assert_eq!(m.consts.get(shape), Some(&expected));
     // The MethodRef points at the function named "target".
@@ -340,8 +340,6 @@ fn module_request_phase_flags_become_lazy_requests() {
         strings,
         classes: [(rec_desc, class)].into_iter().collect(),
         literal_arrays: vec![],
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
 
@@ -448,8 +446,6 @@ fn annotation_buckets_merge_in_documented_order() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: vec![],
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
 

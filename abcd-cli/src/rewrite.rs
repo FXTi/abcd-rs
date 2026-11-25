@@ -7,20 +7,16 @@
 //! the process, so a pipeline bug surfaces as a tool error (exit 2)
 //! instead of a corrupt file on disk.
 //!
-//! The whole-file lowering pattern mirrors the corpus pipeline
-//! (tests/lift-lower/rewrite_pipeline.rs): the lifted module is verified
-//! (`abcd_ir::verify_module`), every function is lowered individually, and
-//! the resulting bodies are spliced into the decoded file in place —
-//! function `i` is the `i`-th method in `File::classes` iteration order
-//! (the lift's pass-1 reservation order), so a per-method cursor joins the
-//! two tables.
+//! Whole-file lowering delegates to [`abcd_lower::rewrite_file`]: the lifted
+//! module is verified ([`abcd_ir::verify_module`]), optionally optimized, and
+//! lowered back onto the decoded [`File`] with synced constant/literal pools,
+//! IC slot sizing, and rebuilt per-method debug tables (`R3-H8`).
 
 use std::path::{Path, PathBuf};
 
 use abcd_file::File;
 use abcd_ir::verify_module;
-use abcd_lower::{EntityResolver, LowerOptions, lower_function_with_options};
-use rayon::prelude::*;
+use abcd_lower::LowerOptions;
 
 use crate::CliError;
 use crate::input::InputModule;
@@ -89,7 +85,7 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     let ctx = || format!("rewrite {} ({})", module.name, module.provenance);
 
     // Stage 1: decode the input bytes.
-    let mut file = abcd_file::decode(&module.abc)
+    let file = abcd_file::decode(&module.abc)
         .map_err(|e| CliError::Tool(format!("{}: decode failed: {e}", ctx())))?;
 
     // Stage 2: lift the whole file to the IR, then verify it (same order
@@ -109,66 +105,8 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     // Stage 3 (optional): optimize.
     let optimized_changed = opts.optimize && abcd_opt::optimize_module(&mut ir);
 
-    // Stage 4: lower every function back to a MethodBody and splice the
-    // bodies into the decoded file in place.
-    //
-    // `FuncId`s are collected from `ClassData::methods` (never constructed
-    // by path) and validated to cover the function table contiguously —
-    // the lift's pass-1 reservation (classes in `File::classes` order,
-    // methods in declaration order) makes them exactly
-    // `0..functions.len()`, which is the order the splice cursor below
-    // relies on.
-    let mut func_ids: Vec<_> = ir
-        .classes
-        .iter()
-        .flat_map(|class| class.methods.iter().copied())
-        .collect();
-    func_ids.sort_unstable_by_key(|id| id.index());
-    if func_ids.len() != ir.functions.len()
-        || func_ids.iter().enumerate().any(|(i, id)| id.index() != i)
-    {
-        return Err(CliError::Tool(format!(
-            "{}: lift produced {} functions but class tables reference {}; \
-             cannot map lowered bodies back to file methods",
-            ctx(),
-            ir.functions.len(),
-            func_ids.len()
-        )));
-    }
-
-    let lower_options = LowerOptions::default();
-
-    let resolver = EntityResolver::new(&ir, &file);
-    let per_func: Vec<Result<Option<abcd_file::MethodBody>, CliError>> = func_ids
-        .par_iter()
-        .map(|&func_id| {
-            let func = ir.func(func_id).ok_or_else(|| {
-                CliError::Tool(format!("{}: missing lifted function {func_id:?}", ctx()))
-            })?;
-            if func.blocks.is_empty() {
-                return Ok(None);
-            }
-            let name = ir.sym.resolve(func.name).unwrap_or("?");
-            let layout = lower_function_with_options(&ir, func_id, lower_options)
-                .map_err(|e| CliError::Tool(format!("{}: lower of {name} failed: {e}", ctx())))?;
-            let body = resolver.to_method_body(func_id, &layout).map_err(|e| {
-                CliError::Tool(format!("{}: relocation of {name} failed: {e}", ctx()))
-            })?;
-            Ok(Some(body))
-        })
-        .collect();
-    let mut bodies = Vec::with_capacity(per_func.len());
-    let mut lowered = 0;
-    for res in per_func {
-        let slot = res?;
-        if slot.is_some() {
-            lowered += 1;
-        }
-        bodies.push(slot);
-    }
-    drop(resolver);
-    drop(ir);
-
+    // Stage 4: lower the IR back onto `file` via `abcd_lower::rewrite_file`
+    // (syncing constant/literal pools, IC slot counts, and method debug info).
     let (methods, input_instructions) = shape(&file);
     let before_body_tags: Vec<&'static str> = if opts.check {
         file.all_methods()
@@ -177,32 +115,24 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     } else {
         Vec::new()
     };
+    let lowered = ir.functions.iter().filter(|f| !f.blocks.is_empty()).count();
 
-    let mut cursor = bodies.into_iter();
-    for class in file.classes.values_mut() {
-        for method in &mut class.methods {
-            let body = cursor.next().ok_or_else(|| {
-                CliError::Tool(format!("{}: lowered method-slot count mismatch", ctx()))
-            })?;
-            if method.body.is_some() {
-                method.body = Some(body.ok_or_else(|| {
-                    CliError::Tool(format!(
-                        "{}: missing lowered body for non-empty method",
-                        ctx()
-                    ))
-                })?);
-            }
-        }
-    }
-    debug_assert!(cursor.next().is_none());
+    let rewritten_file = abcd_lower::rewrite_file(&ir, &file, LowerOptions::default())
+        .map_err(|e| CliError::Tool(format!("{}: lower failed: {e}", ctx())))?;
+    drop(ir);
+    drop(file);
 
-    let unchecked_output_instructions = if opts.check { 0 } else { shape(&file).1 };
+    let unchecked_output_instructions = if opts.check {
+        0
+    } else {
+        shape(&rewritten_file).1
+    };
 
     // Stage 5: encode the rewritten file, then drop the in-memory File before
     // `--check` re-decodes `abc` so two `File` models never coexist in RAM.
-    let abc = abcd_file::encode(&file)
+    let abc = abcd_file::encode(&rewritten_file)
         .map_err(|e| CliError::Tool(format!("{}: encode failed: {e}", ctx())))?;
-    drop(file);
+    drop(rewritten_file);
 
     // Stage 6 (optional): `--check` self-check. `abcd_file::decode` is a
     // full structural decode — header, index regions, and every method
@@ -304,7 +234,7 @@ mod tests {
             num_vregs: 0,
             num_args: 0,
             bytecodes,
-            entity_offsets: Default::default(),
+            entities: Default::default(),
             try_blocks: Vec::new(),
             ic_size: None,
         }
@@ -321,6 +251,109 @@ mod tests {
         assert_eq!(
             body_state(&Some(body_with(vec![abcd_isa::Bytecode::Returnundefined]))),
             "body"
+        );
+    }
+
+    #[test]
+    fn rewrite_opt_rebuilds_line_table_in_bounds_and_clears_stale_local_vars() {
+        use abcd_file::{
+            AccessFlags, Builder, LineEntry, LocalVarInfo, MethodDebugInfo, SourceLang, Type,
+        };
+        use abcd_isa::{Bytecode, Imm, Reg};
+
+        // 5-instruction constant-foldable body (`1 + 2` -> `3`), so `--opt`
+        // shrinks `body.bytecodes` and any un-rebuilt `line_table` index 4 or
+        // `local_vars` range `[1, 4]` would point past the rewritten stream.
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, SourceLang::EcmaScript);
+        let proto = b.create_proto(Type::Void, &[]);
+        let (code, _offsets) = abcd_isa::encode(&[
+            Bytecode::Ldai(Imm(1)),         // 0: acc = 1
+            Bytecode::Sta(Reg(0)),          // 1: v0 = 1
+            Bytecode::Ldai(Imm(2)),         // 2: acc = 2
+            Bytecode::Add2(Imm(0), Reg(0)), // 3: acc = 2 + v0
+            Bytecode::Return,               // 4: return acc
+        ])
+        .unwrap();
+        b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 4, 3);
+        b.deduplicate();
+        let seed_abc = b.finalize().expect("seed foldable abc must finalize");
+
+        let mut file = abcd_file::decode(&seed_abc).expect("decode seed abc");
+        let src = file.strings.get_or_intern("main.js");
+        let var_name = file.strings.get_or_intern("tmp");
+        let ty = file.strings.get_or_intern("any");
+        for class in file.classes.values_mut() {
+            for method in &mut class.methods {
+                method.debug = Some(MethodDebugInfo {
+                    source_file: Some(src),
+                    source_code: None,
+                    line_table: vec![
+                        LineEntry { index: 0, line: 10 },
+                        LineEntry { index: 4, line: 14 },
+                    ],
+                    column_table: Vec::new(),
+                    local_vars: vec![LocalVarInfo {
+                        name: var_name,
+                        type_name: ty,
+                        type_signature: ty,
+                        reg_number: 0,
+                        start: 1,
+                        end: 4,
+                    }],
+                    params: Vec::new(),
+                });
+            }
+        }
+        let input_abc = abcd_file::encode(&file).expect("encode input abc with debug");
+        let check_in = abcd_file::decode(&input_abc).expect("re-decode input abc");
+        let (_, in_method) = check_in.all_methods().next().expect("one input method");
+        let in_dbg = in_method.debug.as_ref().expect("input carries debug info");
+        assert!(!in_dbg.line_table.is_empty());
+        assert_eq!(in_dbg.local_vars.len(), 1);
+
+        let module = InputModule {
+            name: "dbg".to_string(),
+            abc: input_abc,
+            module_json: None,
+            provenance: "dbg.abc".to_string(),
+        };
+        let out = rewrite(
+            &module,
+            RewriteOptions {
+                optimize: true,
+                check: true,
+            },
+        )
+        .expect("rewrite --opt --check must succeed");
+        assert!(out.stats.optimized_changed);
+
+        let out_file = abcd_file::decode(&out.abc).expect("re-decode rewritten abc");
+        let (_, out_method) = out_file.all_methods().next().expect("one output method");
+        let body = out_method.body.as_ref().expect("output method has body");
+        assert!(!body.bytecodes.is_empty());
+        let dbg = out_method
+            .debug
+            .as_ref()
+            .expect("output method retains rebuilt debug info");
+        assert!(
+            !dbg.line_table.is_empty(),
+            "rebuilt line_table must preserve mapped source lines"
+        );
+        for entry in &dbg.line_table {
+            assert!(
+                (entry.index as usize) < body.bytecodes.len(),
+                "line_table index {} out of bounds for {} instructions",
+                entry.index,
+                body.bytecodes.len()
+            );
+        }
+        assert!(
+            dbg.local_vars.is_empty(),
+            "stale pre-rewrite local_vars must be cleared: {:?}",
+            dbg.local_vars
         );
     }
 }

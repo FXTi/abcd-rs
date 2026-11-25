@@ -50,7 +50,7 @@ fn single_method_file(
             num_vregs,
             num_args,
             bytecodes,
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks,
             ic_size: None,
         }),
@@ -79,8 +79,6 @@ fn single_method_file(
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: HashMap::new(),
-        literal_array_offsets: HashMap::new(),
         literal_array_header_offsets: Vec::new(),
     }
 }
@@ -264,7 +262,7 @@ fn try_protecting_offset_zero_and_catch_at_offset_zero_verify_cleanly() {
             start: 0,
             len: 3,
             catches: vec![CatchBlock {
-                type_idx: u32::MAX,
+                type_class: None,
                 handler: 5,
                 len: 3,
             }],
@@ -298,7 +296,7 @@ fn try_protecting_offset_zero_and_catch_at_offset_zero_verify_cleanly() {
             start: 2,
             len: 2,
             catches: vec![CatchBlock {
-                type_idx: u32::MAX,
+                type_class: None,
                 handler: 0,
                 len: 2,
             }],
@@ -344,7 +342,7 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
             num_vregs: 0,
             num_args: 3,
             bytecodes: vec![Bytecode::Returnundefined],
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -378,9 +376,15 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
                 ),
                 Bytecode::Return,
             ],
-            entity_offsets: HashMap::from([
-                ((EntityKind::MethodId, 1), 100),
-                ((EntityKind::LiteralarrayId, 2), 500),
+            entities: HashMap::from([
+                (
+                    (EntityKind::MethodId, 1),
+                    abcd_file::EntityRef::Method(abcd_file::MethodIdx(0)),
+                ),
+                (
+                    (EntityKind::LiteralarrayId, 2),
+                    abcd_file::EntityRef::LiteralArray(LiteralArrayIdx(0)),
+                ),
             ]),
             try_blocks: Vec::new(),
             ic_size: None,
@@ -403,25 +407,21 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
         fields: Vec::new(),
         annotations: Default::default(),
     };
-    let member_buf = abcd_file::LiteralArray {
-        values: vec![
-            LiteralValue::String(rule_name),
-            LiteralValue::Getter(200),
-            LiteralValue::MethodAffiliate(0),
-            LiteralValue::String(def_name),
-            LiteralValue::Getter(300),
-            LiteralValue::MethodAffiliate(0),
-            LiteralValue::Integer(1),
-            LiteralValue::LiteralArray(LiteralArrayIdx(1)),
-        ],
-    };
-    let field_buf = abcd_file::LiteralArray {
-        values: vec![
-            LiteralValue::String(field_name),
-            LiteralValue::Integer(2),
-            LiteralValue::Integer(1),
-        ],
-    };
+    let member_buf = abcd_file::LiteralArray::new(vec![
+        LiteralValue::String(rule_name),
+        LiteralValue::Getter(abcd_file::MethodIdx(1)),
+        LiteralValue::MethodAffiliate(0),
+        LiteralValue::String(def_name),
+        LiteralValue::Getter(abcd_file::MethodIdx(2)),
+        LiteralValue::MethodAffiliate(0),
+        LiteralValue::Integer(1),
+        LiteralValue::LiteralArray(LiteralArrayIdx(1)),
+    ]);
+    let field_buf = abcd_file::LiteralArray::new(vec![
+        LiteralValue::String(field_name),
+        LiteralValue::Integer(2),
+        LiteralValue::Integer(1),
+    ]);
     let file = abcd_file::File {
         version: Version::new(12, 0, 6, 0),
         checksum: 0,
@@ -430,8 +430,6 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: vec![member_buf, field_buf],
-        entity_map: HashMap::from([(100, ctor_name)]),
-        literal_array_offsets: HashMap::from([(500, 0), (600, 1)]),
         literal_array_header_offsets: Vec::new(),
     };
 

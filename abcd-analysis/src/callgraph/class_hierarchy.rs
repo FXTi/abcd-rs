@@ -255,7 +255,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 for (&k_cid, &v_cid) in keys.iter().zip(values.iter()) {
                                     if let (
                                         Some(Const::String(k_sym)),
-                                        Some(Const::MethodRef(mfid)),
+                                        Some(Const::MethodRef { func: mfid, .. }),
                                     ) = (module.consts.get(k_cid), module.consts.get(v_cid))
                                     {
                                         obj_lits
@@ -276,6 +276,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                             object,
                             name,
                             value,
+                            ..
                         } => {
                             prop_stores.push((fid, *object, *name, *value));
                         }
@@ -289,12 +290,23 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 push_unique_func(&mut child_funcs_of[fi], body);
                             }
                         }
+                        Op::DefineGetterSetterByValue { getter, setter, .. } => {
+                            for &inner in [getter, setter] {
+                                if let Some(body) = peel_closure_func(module, inner) {
+                                    mark_lex_or_cap = true;
+                                    capture_sites.push((iid, body));
+                                    push_unique_func(&mut child_funcs_of[fi], body);
+                                }
+                            }
+                        }
                         Op::DefineFunc { body, .. } => {
                             mark_lex_or_cap = true;
                             capture_sites.push((iid, *body));
                             push_unique_func(&mut child_funcs_of[fi], *body);
                         }
-                        Op::AllocClosure { func } | Op::CreateGenerator { func } => {
+                        Op::AllocClosure { func }
+                        | Op::CreateGenerator { func }
+                        | Op::CreateAsyncGenerator { func } => {
                             if let Some(body) = peel_closure_func(module, *func) {
                                 mark_lex_or_cap = true;
                                 capture_sites.push((iid, body));
@@ -304,7 +316,12 @@ impl<'m> ClassHierarchyIndex<'m> {
                         Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } | Op::PopLexEnv => {
                             has_env_mut_ops[fi] = true;
                         }
-                        Op::PutLexVar { level, slot, value } => {
+                        Op::PutLexVar {
+                            level,
+                            slot,
+                            value,
+                            kind,
+                        } if *kind != abcd_ir::LexEnvKind::Patch => {
                             mark_lex_or_cap = true;
                             lex_accesses.push((
                                 iid,
@@ -316,7 +333,9 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 },
                             ));
                         }
-                        Op::GetLexVar { level, .. } => {
+                        Op::GetLexVar { level, kind, .. }
+                            if *kind != abcd_ir::LexEnvKind::Patch =>
+                        {
                             mark_lex_or_cap = true;
                             lex_accesses.push((iid, LexAccessKind::Get { level: *level }));
                         }
@@ -643,7 +662,10 @@ impl<'m> ClassHierarchyIndex<'m> {
     ) -> Vec<FuncId> {
         let mut targets = BTreeSet::new();
         match kind {
-            CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs => {
+            CallKind::Super
+            | CallKind::SuperArrow
+            | CallKind::SuperSpread
+            | CallKind::SuperForwardAllArgs => {
                 let owned_ctors = self
                     .ctor_to_classes
                     .get(caller.index())
@@ -663,10 +685,31 @@ impl<'m> ClassHierarchyIndex<'m> {
                     for p in self.infer_prov(caller, callee) {
                         match p {
                             Prov::Callable(f) if f != caller => {
-                                targets.insert(f);
+                                let f_ctors = self
+                                    .ctor_to_classes
+                                    .get(f.index())
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                if !f_ctors.is_empty() {
+                                    for &cid in f_ctors {
+                                        if let Some(cls) = self.classes.get(cid.index()) {
+                                            for &sc in &cls.super_classes {
+                                                if let Some(scls) = self.classes.get(sc.index())
+                                                    && scls.ctor != caller
+                                                {
+                                                    targets.insert(scls.ctor);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    targets.insert(f);
+                                }
                             }
                             Prov::ClassObj(sc) => {
-                                if let Some(scls) = self.classes.get(sc.index()) {
+                                if let Some(scls) = self.classes.get(sc.index())
+                                    && scls.ctor != caller
+                                {
                                     targets.insert(scls.ctor);
                                 }
                             }
@@ -675,7 +718,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                     }
                 }
             }
-            CallKind::New => {
+            CallKind::New | CallKind::NewSpread => {
                 for p in self.infer_prov(caller, callee) {
                     match p {
                         Prov::ClassObj(c) => {
@@ -752,7 +795,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                     }
                     ValueDef::ExceptionParam(_) => {}
                     ValueDef::Const(c) => {
-                        if let Some(Const::MethodRef(f)) = self.module.consts.get(c) {
+                        if let Some(Const::MethodRef { func: f, .. }) = self.module.consts.get(c) {
                             insert_prov(&mut frames[top_idx].out, Prov::Callable(*f));
                         }
                     }
@@ -765,7 +808,9 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 insert_prov(&mut frames[top_idx].out, Prov::Callable(func));
                             }
                             Op::LoadConst(c) => {
-                                if let Some(Const::MethodRef(f)) = self.module.consts.get(*c) {
+                                if let Some(Const::MethodRef { func: f, .. }) =
+                                    self.module.consts.get(*c)
+                                {
                                     insert_prov(&mut frames[top_idx].out, Prov::Callable(*f));
                                 }
                             }
@@ -800,6 +845,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                             }
                             Op::AllocClosure { func: inner }
                             | Op::CreateGenerator { func: inner }
+                            | Op::CreateAsyncGenerator { func: inner }
                             | Op::DefineMethod { func: inner, .. } => {
                                 frames[top_idx].work.push((func, *inner));
                             }
@@ -1007,7 +1053,7 @@ impl<'m> ClassHierarchyIndex<'m> {
         kind: CallKind,
         out: &mut BTreeSet<Prov>,
     ) {
-        if kind == CallKind::New {
+        if matches!(kind, CallKind::New | CallKind::NewSpread) {
             for &p in callee_provs {
                 if let Prov::ClassObj(c) = p {
                     insert_prov(out, Prov::ClassInst(c));
@@ -1227,6 +1273,8 @@ fn index_class_def(
         let tail_count = items
             .last()
             .and_then(|&tail_cid| match module.consts.get(tail_cid) {
+                Some(Const::Int8(v)) => Some(*v as usize),
+                Some(Const::Int32(v)) => ((*v as i32) >= 0).then_some(*v as usize),
                 Some(Const::Number(bits)) => {
                     let v = f64::from_bits(*bits);
                     (v.is_finite() && v >= 0.0).then_some(v as usize)
@@ -1238,17 +1286,28 @@ fn index_class_def(
         let mut idx = 0usize;
         let mut pair_idx = 0usize;
         while idx + 1 < items.len() {
-            if let (Some(Const::String(name_sym)), Some(Const::MethodRef(mfid))) = (
+            if let (
+                Some(Const::String(name_sym)),
+                Some(Const::MethodRef {
+                    func: mfid,
+                    kind: lit_kind,
+                }),
+            ) = (
                 module.consts.get(items[idx]),
                 module.consts.get(items[idx + 1]),
             ) {
+                let fallback_kind = || match lit_kind {
+                    abcd_ir::LitMethodKind::Getter => Some(FunctionKind::Getter),
+                    abcd_ir::LitMethodKind::Setter => Some(FunctionKind::Setter),
+                    _ => module.func(*mfid).map(|f| f.kind),
+                };
                 let (is_static, kind_opt) = if let Some(attr) = member_attrs.get(pair_idx) {
                     (attr.is_static, Some(attr.kind))
                 } else if member_attrs.is_empty() {
                     let static_by_tail = tail_count.is_some_and(|n| pair_idx >= n);
-                    (static_by_tail, module.func(*mfid).map(|f| f.kind))
+                    (static_by_tail, fallback_kind())
                 } else {
-                    (false, module.func(*mfid).map(|f| f.kind))
+                    (false, fallback_kind())
                 };
 
                 if let Some(slot) = method_owner.get_mut(mfid.index()) {
@@ -1282,7 +1341,7 @@ fn index_class_def(
                 pair_idx += 1;
                 idx += 2;
             } else {
-                if let Some(Const::MethodRef(mfid)) = module.consts.get(items[idx]) {
+                if let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(items[idx]) {
                     capture_sites.push((def_iid, *mfid));
                     push_unique_func(parent_children, *mfid);
                 }
@@ -1290,7 +1349,7 @@ fn index_class_def(
             }
         }
         if idx < items.len()
-            && let Some(Const::MethodRef(mfid)) = module.consts.get(items[idx])
+            && let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(items[idx])
         {
             capture_sites.push((def_iid, *mfid));
             push_unique_func(parent_children, *mfid);
@@ -1392,7 +1451,7 @@ fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
         match val.def {
             ValueDef::Const(c) => {
                 return match module.consts.get(c) {
-                    Some(Const::MethodRef(f)) => Some(*f),
+                    Some(Const::MethodRef { func: f, .. }) => Some(*f),
                     _ => None,
                 };
             }
@@ -1400,13 +1459,14 @@ fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
                 Op::Mov { src }
                 | Op::AllocClosure { func: src }
                 | Op::CreateGenerator { func: src }
+                | Op::CreateAsyncGenerator { func: src }
                 | Op::DefineMethod { func: src, .. } => {
                     v = *src;
                 }
                 Op::DefineFunc { body, .. } => return Some(*body),
                 Op::LoadConst(c) => {
                     return match module.consts.get(*c) {
-                        Some(Const::MethodRef(f)) => Some(*f),
+                        Some(Const::MethodRef { func: f, .. }) => Some(*f),
                         _ => None,
                     };
                 }

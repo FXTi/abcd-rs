@@ -258,9 +258,10 @@ fn lift_failure_is_a_tool_error() {
 
 // ---- call-kind tags ----
 
-/// `func_main_0() { f.apply(t, a); super-calls…; new f(); }` — one call
-/// per `CallKind` the lift produces (the `Direct` kind has no lift-side
-/// producer). All callees stay unknown; the kind tags are what matters.
+/// `func_main_0() { f.apply(t, a); super-calls…; new-calls…; callinit; }` —
+/// one call per non-`Dynamic` `CallKind` the lift produces (`Dynamic` is
+/// covered by `call_abc`, and `Direct` has no lift-side producer). All
+/// callees stay unknown; the kind tags are what matters.
 fn call_kinds_abc() -> Vec<u8> {
     let mut b = Builder::new();
     b.set_api(12, "");
@@ -279,13 +280,19 @@ fn call_kinds_abc() -> Vec<u8> {
         Bytecode::Lda(Reg(0)),                            // 8
         Bytecode::Supercallthisrange(Imm(0), Imm(1), Reg(1)), // 9: super f(v1)
         Bytecode::Lda(Reg(0)),                            // 10
-        Bytecode::Supercallspread(Imm(0), Reg(2)),        // 11: super f(...v2)
+        Bytecode::Supercallarrowrange(Imm(0), Imm(1), Reg(1)), // 11: arrow super f(v1)
         Bytecode::Lda(Reg(0)),                            // 12
-        Bytecode::CallruntimeSupercallforwardallargs(Reg(1)), // 13
+        Bytecode::Supercallspread(Imm(0), Reg(2)),        // 13: super f(...v2)
         Bytecode::Lda(Reg(0)),                            // 14
-        Bytecode::Sta(Reg(3)),                            // 15: v3 = f
-        Bytecode::Newobjrange(Imm(0), Imm(1), Reg(3)),    // 16: new f()
-        Bytecode::Returnundefined,                        // 17
+        Bytecode::CallruntimeSupercallforwardallargs(Reg(1)), // 15
+        Bytecode::Lda(Reg(0)),                            // 16
+        Bytecode::Sta(Reg(3)),                            // 17: v3 = f
+        Bytecode::Newobjrange(Imm(0), Imm(1), Reg(3)),    // 18: new f()
+        Bytecode::Lda(Reg(0)),                            // 19: acc = f
+        Bytecode::Newobjapply(Imm(0), Reg(3)),            // 20: new f(...v3)
+        Bytecode::Lda(Reg(0)),                            // 21: acc = f
+        Bytecode::CallruntimeCallinit(Imm(0), Reg(3)),    // 22: callinit f(v3)
+        Bytecode::Returnundefined,                        // 23
     ])
     .unwrap();
     let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 8, 0);
@@ -299,8 +306,8 @@ fn call_kinds_abc() -> Vec<u8> {
 #[test]
 fn callgraph_reports_every_liftable_call_kind() {
     let report = analyze(&call_kinds_abc(), "kinds.abc", ALL);
-    assert_eq!(report.summary.call_sites, 5);
-    assert_eq!(report.summary.resolution.unknown, 5);
+    assert_eq!(report.summary.call_sites, 8);
+    assert_eq!(report.summary.resolution.unknown, 8);
     let cg = report.callgraph.as_ref().unwrap();
     let main = cg
         .functions
@@ -313,9 +320,12 @@ fn callgraph_reports_every_liftable_call_kind() {
         [
             "apply",
             "super",
+            "super_arrow",
             "super_spread",
             "super_forward_all_args",
-            "new"
+            "new",
+            "new_spread",
+            "class_init",
         ],
         "{main:?}"
     );
@@ -323,9 +333,12 @@ fn callgraph_reports_every_liftable_call_kind() {
     for tag in [
         "apply call [",
         "super call [",
+        "super_arrow call [",
         "super_spread call [",
         "super_forward_all_args call [",
         "new call [",
+        "new_spread call [",
+        "class_init call [",
     ] {
         assert!(text.contains(tag), "missing {tag:?} in:\n{text}");
     }

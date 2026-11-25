@@ -42,19 +42,15 @@ fn build(configure: impl FnOnce(&mut Builder)) -> Vec<u8> {
     b.finalize().expect("finalize")
 }
 
-/// Resolve a `LiteralArrayRef(off)` field's summary literal array and expand
+/// Resolve a `LiteralArrayRef` field's summary literal array and expand
 /// any nested `LiteralValue::LiteralArray(idx)` children for structural comparison.
-fn resolve_summary_tree(file: &abcd_file::File, off: u32) -> Vec<String> {
-    let idx = *file
-        .literal_array_offsets
-        .get(&off)
-        .unwrap_or_else(|| panic!("summary offset {off:#x} must be in literal_array_offsets"));
-    let la = &file.literal_arrays[idx as usize];
+fn resolve_summary_tree(file: &abcd_file::File, idx: abcd_file::LiteralArrayIdx) -> Vec<String> {
+    let la = &file.literal_arrays[idx.index()];
     la.values
         .iter()
         .map(|v| match v {
             LiteralValue::LiteralArray(child_idx) => {
-                let child = &file.literal_arrays[child_idx.0 as usize];
+                let child = &file.literal_arrays[child_idx.index()];
                 let items: Vec<String> = child
                     .values
                     .iter()
@@ -107,8 +103,11 @@ fn type_summary_offset_with_nested_literal_arrays_roundtrips_and_relocates() {
         .iter()
         .find(|f| file1.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset field");
-    let orig_off = match f1.initial_value {
-        Some(FieldValue::LiteralArrayRef(off)) => off,
+    let (idx1, orig_off) = match f1.initial_value {
+        Some(FieldValue::LiteralArrayRef {
+            index,
+            source_offset: Some(off),
+        }) => (index, off),
         ref other => panic!("expected LiteralArrayRef, got {other:?}"),
     };
     let expected_tree = vec![
@@ -116,7 +115,7 @@ fn type_summary_offset_with_nested_literal_arrays_roundtrips_and_relocates() {
         "nested[Integer(1), str:UserType]".to_string(),
         "nested[Integer(2), str:OrderType]".to_string(),
     ];
-    assert_eq!(resolve_summary_tree(&file1, orig_off), expected_tree);
+    assert_eq!(resolve_summary_tree(&file1, idx1), expected_tree);
 
     // Inject extra strings/classes before re-encoding so item layout shifts,
     // proving both the field offset and nested `0x18` entries relocate.
@@ -149,15 +148,18 @@ fn type_summary_offset_with_nested_literal_arrays_roundtrips_and_relocates() {
         .iter()
         .find(|f| file2.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset field after reencode");
-    let new_off = match f2.initial_value {
-        Some(FieldValue::LiteralArrayRef(off)) => off,
+    let (idx2, new_off) = match f2.initial_value {
+        Some(FieldValue::LiteralArrayRef {
+            index,
+            source_offset: Some(off),
+        }) => (index, off),
         ref other => panic!("expected LiteralArrayRef after reencode, got {other:?}"),
     };
     assert_ne!(
         orig_off, new_off,
         "padding classes must shift the summary literal array offset"
     );
-    assert_eq!(resolve_summary_tree(&file2, new_off), expected_tree);
+    assert_eq!(resolve_summary_tree(&file2, idx2), expected_tree);
 
     // Pandasm text emit -> parse -> encode -> decode round-trip.
     let pa = pandasm::emit_file(&file2, "summary.abc");
@@ -172,11 +174,11 @@ fn type_summary_offset_with_nested_literal_arrays_roundtrips_and_relocates() {
         .iter()
         .find(|f| file3.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset");
-    let off3 = match f3.initial_value {
-        Some(FieldValue::LiteralArrayRef(off)) => off,
+    let idx3 = match f3.initial_value {
+        Some(FieldValue::LiteralArrayRef { index, .. }) => index,
         ref other => panic!("expected LiteralArrayRef after pandasm roundtrip, got {other:?}"),
     };
-    assert_eq!(resolve_summary_tree(&file3, off3), expected_tree);
+    assert_eq!(resolve_summary_tree(&file3, idx3), expected_tree);
 }
 
 #[test]
@@ -224,12 +226,12 @@ fn type_summary_offset_on_module_record_class_roundtrips() {
         .iter()
         .find(|f| file2.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset field");
-    let off2 = match sum_f2.initial_value {
-        Some(FieldValue::LiteralArrayRef(off)) => off,
+    let idx2 = match sum_f2.initial_value {
+        Some(FieldValue::LiteralArrayRef { index, .. }) => index,
         ref other => panic!("expected LiteralArrayRef, got {other:?}"),
     };
     assert_eq!(
-        resolve_summary_tree(&file2, off2),
+        resolve_summary_tree(&file2, idx2),
         vec!["Integer(1)".to_string(), "nested[Integer(99)]".to_string()]
     );
 }

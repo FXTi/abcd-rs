@@ -339,9 +339,18 @@ fn lexvar_legacy_channel_rungs_0_and_1() {
                 level: 0,
                 slot: 2,
                 value: p,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
-        let x = emit(&mut m, entry, Op::GetLexVar { level: 0, slot: 2 });
+        let x = emit(
+            &mut m,
+            entry,
+            Op::GetLexVar {
+                level: 0,
+                slot: 2,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         print_call(&mut m, entry, vec![x]);
         emit_void(&mut m, entry, Op::Return { value: None });
         m
@@ -380,7 +389,14 @@ fn lexvar_precise_env_channel_rung2() {
         add_param(&mut m, w, 1);
         add_param(&mut m, w, 2);
         let t = add_param(&mut m, w, 3);
-        emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let f1 = intern(&mut m, "f1");
         let a1 = emit(
             &mut m,
@@ -397,9 +413,18 @@ fn lexvar_precise_env_channel_rung2() {
                 level: 0,
                 slot: 0,
                 value: a1,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
-        let x = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let x = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         y = emit(
             &mut m,
             b,
@@ -459,7 +484,14 @@ fn lexvar_imprecise_reader_fallback_rung2() {
         add_param(&mut m, w, 1);
         add_param(&mut m, w, 2);
         let t = add_param(&mut m, w, 3);
-        emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         emit_void(
             &mut m,
             b,
@@ -467,6 +499,7 @@ fn lexvar_imprecise_reader_fallback_rung2() {
                 level: 0,
                 slot: 0,
                 value: t,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         emit_void(&mut m, b, Op::Return { value: None });
@@ -477,7 +510,15 @@ fn lexvar_imprecise_reader_fallback_rung2() {
     m.func_mut(r).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
     {
         let b = entry_of(&m, r);
-        let x = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let x = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         print_call(&mut m, b, vec![x]);
         emit_void(&mut m, b, Op::Return { value: None });
     }

@@ -21,13 +21,15 @@
 //!   to specifier syms; `moduleRequestPhaseIdx` blobs → per-request
 //!   lazy flags on [`ModuleRequest`].
 
+use std::sync::Arc;
+
 use abcd_file::{
     self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord,
     ModuleRequestPhase, Type,
 };
 use abcd_ir::{
     AnnValue, Annotation, ClassData, ClassId, Const, ConstId, EsModule, ExportDecl, FieldData,
-    FieldId, FunctionKind, ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest,
+    FunctionKind, ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest,
     Signature, SourceLang, StaticTy, Sym, Ty, ValueId,
 };
 
@@ -164,16 +166,21 @@ pub fn external_params(lf: &mut Lifter, method: &Method) -> Vec<ValueId> {
 
 /// Lift a class and its fields/methods into the module, returning its
 /// (reserved) class-table index.
-pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, LiftError> {
+pub fn lift_class<'f>(
+    lf: &mut Lifter<'f>,
+    class_key: abcd_file::StringId,
+    class: &'f Class,
+    func_base: u32,
+) -> Result<ClassId, LiftError> {
+    if class.descriptor != class_key {
+        return Err(LiftError::UnresolvedEntity(class.descriptor.index() as u32));
+    }
     let Some(&class_id) = lf.class_to_id.get(&class.descriptor) else {
-        return Err(LiftError::UnresolvedEntity(0));
-    };
-    let Some(&func_base) = lf.func_bases.get(&class.descriptor) else {
-        return Err(LiftError::UnresolvedEntity(0));
+        return Err(LiftError::UnresolvedEntity(class.descriptor.index() as u32));
     };
     let descriptor = lf
         .sym_of_file_sid(class.descriptor)
-        .ok_or(LiftError::UnresolvedEntity(0))?;
+        .ok_or(LiftError::UnresolvedEntity(class.descriptor.index() as u32))?;
     let name = lf.sym_of_file_sid(class.name).unwrap_or(descriptor);
     let source_file = class.source_file.and_then(|s| lf.sym_of_file_sid(s));
     let super_class = class.super_class.and_then(|s| lf.class_of_descriptor(s));
@@ -214,9 +221,6 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
 
     let mut method_ids = Vec::with_capacity(class.methods.len());
     for (mi, method) in class.methods.iter().enumerate() {
-        // FuncIds were reserved in pass 1 in this exact order (base +
-        // declaration index — exact even for hand-built files with
-        // duplicate method offsets).
         let func_id = abcd_ir::FuncId::new(func_base + mi as u32);
         crate::lift_method(lf, class_id, method, func_id)?;
         method_ids.push(func_id);
@@ -250,7 +254,6 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
 /// channels, while `--merge-abc` per-record `moduleRecordIdx` /
 /// `moduleRequestPhaseIdx` / `scopeNames` fields stay paired with their owning
 /// [`ClassData`].
-#[allow(clippy::too_many_arguments)]
 fn lift_field<'f>(
     lf: &mut Lifter<'f>,
     field: &'f Field,
@@ -262,7 +265,7 @@ fn lift_field<'f>(
 ) -> Result<FieldData, LiftError> {
     let name = lf
         .sym_of_file_sid(field.name)
-        .ok_or(LiftError::UnresolvedEntity(0))?;
+        .ok_or(LiftError::UnresolvedEntity(field.name.index() as u32))?;
     let ty = ty_of(lf, &field.field_type);
     let initial_value = match &field.initial_value {
         Some(abcd_file::FieldValue::I32(v)) => Some(lf.const_scalar(Const::number(*v as f64))),
@@ -285,7 +288,7 @@ fn lift_field<'f>(
             }
             None
         }
-        Some(abcd_file::FieldValue::LiteralArrayRef(offset)) => {
+        Some(abcd_file::FieldValue::LiteralArrayRef { index, .. }) => {
             // Standalone `_ESScopeNamesRecord` field: the field NAME is the
             // source file; `--merge-abc` `scopeNames` field: attached to the
             // owning record class itself. Other `LiteralArrayRef` fields
@@ -295,13 +298,7 @@ fn lift_field<'f>(
             if is_standalone_scope_record
                 || lf.file.strings.resolve(field.name) == Some(abcd_file::SCOPE_NAMES_FIELD)
             {
-                let idx = lf
-                    .file
-                    .literal_array_offsets
-                    .get(offset)
-                    .copied()
-                    .ok_or(LiftError::UnresolvedEntity(*offset))?;
-                let konst = resolve::const_for_literal_array(lf, idx)?;
+                let konst = resolve::const_for_literal_array(lf, index.0)?;
                 if is_standalone_scope_record {
                     lf.scope_name_fields.push((name, konst));
                 } else {
@@ -313,7 +310,7 @@ fn lift_field<'f>(
         Some(abcd_file::FieldValue::JsonFileContent { content, .. }) => {
             let sym = lf
                 .sym_of_file_sid(*content)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or(LiftError::UnresolvedEntity(content.index() as u32))?;
             Some(lf.const_scalar(Const::String(sym)))
         }
         None => None,
@@ -395,24 +392,28 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         // (Const::MethodRef — the same identity path as bytecode method
         // references; unresolvable offsets degrade to the display name,
         // documented for hand-built models).
-        AnnotationValue::Method { name, offset } => match resolve::func_of_offset(lf, *offset) {
-            Ok(fid) => AnnValue::Const(lf.const_shape(Const::MethodRef(fid))),
-            Err(_) => {
-                let sym = lf
-                    .sym_of_file_sid(*name)
-                    .unwrap_or_else(|| lf.sym("<unresolved>"));
-                AnnValue::Name(sym)
+        AnnotationValue::Method { name, method, .. } => {
+            match method.and_then(|midx| resolve::func_of_idx(lf, midx).ok()) {
+                Some(fid) => AnnValue::Const(lf.const_shape(Const::method_ref(fid))),
+                None => {
+                    let sym = lf
+                        .sym_of_file_sid(*name)
+                        .unwrap_or_else(|| lf.sym("<unresolved>"));
+                    AnnValue::Name(sym)
+                }
             }
-        },
-        AnnotationValue::Enum { name, offset } => match lf.field_to_id.get(offset).copied() {
-            Some((cid, fi)) => AnnValue::Field(cid, FieldId::new(fi)),
-            None => {
-                let sym = lf
-                    .sym_of_file_sid(*name)
-                    .unwrap_or_else(|| lf.sym("<unresolved>"));
-                AnnValue::Name(sym)
+        }
+        AnnotationValue::Enum { name, field, .. } => {
+            match field.and_then(|fidx| lf.field_ids.get(fidx.index()).copied()) {
+                Some((cid, fid)) => AnnValue::Field(cid, fid),
+                None => {
+                    let sym = lf
+                        .sym_of_file_sid(*name)
+                        .unwrap_or_else(|| lf.sym("<unresolved>"));
+                    AnnValue::Name(sym)
+                }
             }
-        },
+        }
         // Nested annotations have no AnnValue home in v0.2: represent
         // by the nested annotation's CLASS (its element list is
         // unrepresentable — registered taxonomy gap).
@@ -422,12 +423,11 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
                 None => AnnValue::Const(lf.const_scalar(Const::Null)),
             }
         }
-        // Method handles have no AnnValue home (registered gap): keep
-        // the entity name.
+        // Method handles have no AnnValue home (registered gap): resolve
+        // the display name from `entity`, falling back to `target_method` /
+        // `target_field` in the dense pass-1 tables (`#50`).
         AnnotationValue::MethodHandle(rmh) => {
-            let sym = lf
-                .sym_of_file_sid(rmh.entity)
-                .unwrap_or_else(|| lf.sym("<unresolved>"));
+            let sym = method_handle_sym(lf, rmh).unwrap_or_else(|| lf.sym("<unresolved>"));
             AnnValue::Name(sym)
         }
         AnnotationValue::LiteralArray(values) => {
@@ -528,14 +528,16 @@ fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> 
             Some(s) => Const::String(s),
             None => Const::Null,
         },
-        AnnotationValue::Method { name, offset } => match resolve::func_of_offset(lf, *offset) {
-            Ok(fid) => Const::MethodRef(fid),
-            Err(_) => match lf.sym_of_file_sid(*name) {
-                Some(s) => Const::String(s),
-                None => Const::Null,
-            },
-        },
-        AnnotationValue::MethodHandle(rmh) => match lf.sym_of_file_sid(rmh.entity) {
+        AnnotationValue::Method { name, method, .. } => {
+            match method.and_then(|midx| resolve::func_of_idx(lf, midx).ok()) {
+                Some(fid) => Const::method_ref(fid),
+                None => match lf.sym_of_file_sid(*name) {
+                    Some(s) => Const::String(s),
+                    None => Const::Null,
+                },
+            }
+        }
+        AnnotationValue::MethodHandle(rmh) => match method_handle_sym(lf, rmh) {
             Some(s) => Const::String(s),
             None => Const::Null,
         },
@@ -561,6 +563,30 @@ fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> 
         }
     };
     lf.module.consts.intern(c)
+}
+
+/// Resolve the display symbol of a [`abcd_file::ResolvedMethodHandle`] via its
+/// interned `entity` string or dense `target_method` / `target_field` index (`#50`).
+fn method_handle_sym(lf: &mut Lifter, rmh: &abcd_file::ResolvedMethodHandle) -> Option<Sym> {
+    if let Some(s) = lf.sym_of_file_sid(rmh.entity) {
+        return Some(s);
+    }
+    if let Some(midx) = rmh.target_method
+        && let Some(&name) = lf.method_names.get(midx.index())
+    {
+        return Some(name);
+    }
+    if let Some(fidx) = rmh.target_field
+        && let Some(&(cid, fid)) = lf.field_ids.get(fidx.index())
+        && let Some(fd) = lf
+            .module
+            .classes
+            .get(cid.index())
+            .and_then(|c| c.fields.get(fid.index()))
+    {
+        return Some(fd.name);
+    }
+    None
 }
 
 /// Whether a decoded debug record carries no content. Since the N55
@@ -599,15 +625,22 @@ pub fn finish_debug(fx: &mut FnLift) {
 
     let func_id = fx.func_id;
     let source_file = debug.source_file.and_then(|s| fx.lf.sym_of_file_sid(s));
-    let source_code = debug
-        .source_code
-        .and_then(|s| fx.lf.file.strings.resolve(s).map(str::to_owned));
+    let source_code = debug.source_code.and_then(|sid| {
+        if let Some(arc) = fx.lf.source_code_cache.get(&sid) {
+            return Some(Arc::clone(arc));
+        }
+        let s = fx.lf.file.strings.resolve(sid)?;
+        let arc: Arc<str> = Arc::from(s);
+        fx.lf.source_code_cache.insert(sid, Arc::clone(&arc));
+        Some(arc)
+    });
 
     // Line/column tables, keyed by the LIFTED InstIds (block order).
     let mut line_table = Vec::new();
     let mut column_table = Vec::new();
     // Ordered (inst, pc) list for the scope-extent mapping (phis carry
-    // no source position and are skipped).
+    // no source position and are skipped; blocks are ordered monotonically
+    // by raw leader pc, so `inst_pcs` is sorted ascending by `pc`).
     let mut inst_pcs: Vec<(abcd_ir::InstId, u32)> = Vec::new();
     let blocks = fx.lf.module.functions[func_id.index()].blocks.clone();
     for bb in &blocks {
@@ -627,28 +660,22 @@ pub fn finish_debug(fx: &mut FnLift) {
     }
 
     // Local names with their #5 scope extents mapped onto lifted
-    // instructions (start = first lifted inst at-or-after the scope
-    // start pc; end = last lifted inst at-or-before the scope end pc).
+    // instructions via binary search (`R3-A4`: `start` = first lifted inst
+    // at-or-after `lv.start`; `end` = last lifted inst at-or-before `lv.end`).
     let mut local_names: Vec<LocalName> = Vec::new();
     for lv in &debug.local_vars {
         let Some(name) = fx.lf.sym_of_file_sid(lv.name) else {
             continue;
         };
         let ty = local_var_ty(fx.lf, lv.type_signature);
-        let start = inst_pcs
-            .iter()
-            .find(|(_, pc)| *pc >= lv.start)
-            .map(|(iid, _)| *iid);
-        let end = inst_pcs
-            .iter()
-            .rev()
-            .find(|(_, pc)| *pc <= lv.end)
-            .map(|(iid, _)| *iid);
-        let scope = match (start, end) {
-            (Some(start), Some(end)) if start.index() <= end.index() => {
-                Some(LocalScope { start, end })
-            }
-            _ => None,
+        let start_pos = inst_pcs.partition_point(|&(_, pc)| pc < lv.start);
+        let end_pos = inst_pcs.partition_point(|&(_, pc)| pc <= lv.end);
+        let scope = if start_pos < end_pos {
+            let start = inst_pcs[start_pos].0;
+            let end = inst_pcs[end_pos - 1].0;
+            (start.index() <= end.index()).then_some(LocalScope { start, end })
+        } else {
+            None
         };
         let entry = LocalName { name, ty, scope };
         if !local_names.contains(&entry) {
@@ -715,9 +742,9 @@ fn build_es_module(
 ) -> Result<EsModule, LiftError> {
     let mut es = EsModule::default();
     for (qi, &req_sid) in md.requests.iter().enumerate() {
-        let Some(specifier) = lf.sym_of_file_sid(req_sid) else {
-            continue;
-        };
+        let specifier = lf
+            .sym_of_file_sid(req_sid)
+            .ok_or(LiftError::UnresolvedEntity(req_sid.index() as u32))?;
         let lazy = phase.and_then(|p| p.flags.get(qi)).is_some_and(|&f| f > 0);
         es.module_requests.push(ModuleRequest { specifier, lazy });
     }
@@ -749,6 +776,7 @@ fn emit_module_record(
     imports: &mut Vec<ImportDecl>,
     exports: &mut Vec<ExportDecl>,
 ) -> Result<(), LiftError> {
+    let sid_err = |sid: abcd_file::StringId| LiftError::UnresolvedEntity(sid.index() as u32);
     let request_sym = |lf: &mut Lifter, idx: u32| -> Result<Sym, LiftError> {
         let Some(&sid) = md.requests.get(idx as usize) else {
             return Err(LiftError::MalformedModuleData {
@@ -756,8 +784,7 @@ fn emit_module_record(
                 count: md.requests.len(),
             });
         };
-        lf.sym_of_file_sid(sid)
-            .ok_or(LiftError::UnresolvedEntity(idx))
+        lf.sym_of_file_sid(sid).ok_or_else(|| sid_err(sid))
     };
     match record {
         ModuleRecord::RegularImport {
@@ -768,10 +795,10 @@ fn emit_module_record(
             let module_request = request_sym(lf, *module_request_idx)?;
             let local_name = lf
                 .sym_of_file_sid(*local_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*local_name))?;
             let import_name = lf
                 .sym_of_file_sid(*import_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*import_name))?;
             imports.push(ImportDecl::Regular {
                 local_name,
                 import_name,
@@ -785,7 +812,7 @@ fn emit_module_record(
             let module_request = request_sym(lf, *module_request_idx)?;
             let local_name = lf
                 .sym_of_file_sid(*local_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*local_name))?;
             imports.push(ImportDecl::Namespace {
                 local_name,
                 module_request,
@@ -797,10 +824,10 @@ fn emit_module_record(
         } => {
             let local_name = lf
                 .sym_of_file_sid(*local_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*local_name))?;
             let export_name = lf
                 .sym_of_file_sid(*export_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*export_name))?;
             exports.push(ExportDecl::Local {
                 local_name,
                 export_name,
@@ -814,10 +841,10 @@ fn emit_module_record(
             let module_request = request_sym(lf, *module_request_idx)?;
             let export_name = lf
                 .sym_of_file_sid(*export_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*export_name))?;
             let import_name = lf
                 .sym_of_file_sid(*import_name)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or_else(|| sid_err(*import_name))?;
             exports.push(ExportDecl::Indirect {
                 export_name,
                 import_name,

@@ -1,10 +1,6 @@
 //! Shared test infrastructure for `abcd-lower` regression tests:
 //! a minimal deterministic bytecode interpreter and a lightweight hand-builder
 //! for `abcd-ir` modules.
-//!
-//! Every test target uses a different subset of these helpers — allow dead code
-//! module-wide.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 
@@ -186,7 +182,6 @@ impl<'m> V2Builder<'m> {
 // ─── Minimal deterministic bytecode interpreter ──────────────────────────────
 
 /// What the machine observed when execution stopped.
-#[allow(dead_code)] // variants are constructed only when a path executes them
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Halt {
     /// `Return`: accumulator value at the point of return.
@@ -231,7 +226,7 @@ pub enum Halt {
     /// `kind` the imm.
     ThrowIfSuperNotCorrectCall { kind: i64, value: i64 },
     /// `Definegettersetterbyvalue` (record-and-inspect): the four register
-    /// operands' contents (obj, key, getter, setter).
+    /// operands' contents (obj, key, getter, setter) plus `set_name` in `acc`.
     DefineGetterSetterByValue {
         /// Receiver object.
         obj: i64,
@@ -241,6 +236,8 @@ pub enum Halt {
         getter: i64,
         /// Setter closure.
         setter: i64,
+        /// `set_name` flag in accumulator (`R3-H2`).
+        set_name: i64,
     },
     /// `ThrowConstassignment` (record-and-stop): `name` is the register's
     /// contents (the variable name string VALUE).
@@ -278,15 +275,11 @@ pub struct Machine {
 /// so the two VM frame-initial states are modeled as distinct sentinels:
 /// `UNDEFINED` (vreg slots at frame creation) and `HOLE` (acc at frame
 /// creation).
-#[allow(dead_code)] // used by the vreg-hole regressions
 pub const UNDEFINED: i64 = i64::MIN;
-#[allow(dead_code)]
 pub const HOLE: i64 = i64::MIN + 1;
 /// Sentinel for `createemptyobject` — the i64 machine has no objects.
-#[allow(dead_code)]
 pub const EMPTY_OBJECT: i64 = i64::MIN + 2;
 
-#[allow(dead_code)] // helpers are shared across several test binaries
 impl Machine {
     /// A zeroed machine.
     pub fn new() -> Self {
@@ -568,6 +561,7 @@ impl Machine {
                         key: self.reg(key_r.0),
                         getter: self.reg(get_r.0),
                         setter: self.reg(set_r.0),
+                        set_name: self.acc,
                     };
                 }
                 Bytecode::ThrowConstassignment(name_r) => {
@@ -592,14 +586,14 @@ impl Machine {
                 }
                 Bytecode::Createobjectwithexcludedkeys(argc, obj_r, start) => {
                     return Halt::CreateObjectWithExcludedKeys {
-                        argc: argc.0,
+                        argc: argc.0 + 1,
                         obj: self.reg(obj_r.0),
                         start: start.0,
                     };
                 }
                 Bytecode::WideCreateobjectwithexcludedkeys(argc, obj_r, start) => {
                     return Halt::WideCreateObjectWithExcludedKeys {
-                        argc: argc.0,
+                        argc: argc.0 + 1,
                         obj: self.reg(obj_r.0),
                         start: start.0,
                     };

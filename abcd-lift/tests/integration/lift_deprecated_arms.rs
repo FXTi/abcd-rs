@@ -151,12 +151,10 @@ fn deprecated_poplexenv_emits_pop_lex_env() {
     );
 }
 
-// ── deprecated.getiteratornext → GetIterator over the REGISTER ───────
+// ── deprecated.getiteratornext → IteratorNext over the REGISTER ──────
 
 #[test]
 fn deprecated_getiteratornext_reads_the_register_operand() {
-    // v0 = 7 (the iterator), v1 = 9 (the step register — vendor reads
-    // only the FIRST; translate.rs:1936-1942).
     let file = build(
         &[
             Bytecode::Ldai(Imm(7)),
@@ -170,13 +168,14 @@ fn deprecated_getiteratornext_reads_the_register_operand() {
     );
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let Op::GetIterator { obj } = find_op(&m, |op| matches!(op, Op::GetIterator { .. })) else {
+    let Op::IteratorNext { iterator } = find_op(&m, |op| matches!(op, Op::IteratorNext { .. }))
+    else {
         unreachable!()
     };
     assert_eq!(
-        const_of(&m, *obj),
+        const_of(&m, *iterator),
         Const::number(7.0),
-        "the iterable is the FIRST register (v0), not the step register"
+        "the iterator is the FIRST register (v0), not the step register"
     );
 }
 
@@ -710,12 +709,18 @@ fn deprecated_stlexvar_value_is_the_register() {
     );
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let Op::PutLexVar { level, slot, value } = find_op(&m, |o| matches!(o, Op::PutLexVar { .. }))
+    let Op::PutLexVar {
+        level,
+        slot,
+        value,
+        kind,
+    } = find_op(&m, |o| matches!(o, Op::PutLexVar { .. }))
     else {
         unreachable!()
     };
     assert_eq!(*level, 1);
     assert_eq!(*slot, 2);
+    assert_eq!(*kind, abcd_ir::LexEnvKind::Plain);
     assert_eq!(
         const_of(&m, *value),
         Const::number(5.0),
@@ -843,20 +848,21 @@ fn deprecated_ldobjbyname_reads_the_register_object() {
     assert_eq!(const_of(&m, *object), Const::number(42.0), "object = v1");
 }
 
-// ── deprecated.ldsuperbyname → LoadSuper (Name key, frame this) ──────
+// ── deprecated.ldsuperbyname → LoadSuper (Name key, reg receiver) ────
 
 #[test]
-fn deprecated_ldsuperbyname_ignores_the_receiver_register() {
-    // translate.rs:2299-2307: v0.1 does NOT read the receiver register;
-    // the thisValue is the frame's this-role value (N74-W4) — with zero
-    // declared arguments that is the materialized `undefined`.
+fn deprecated_ldsuperbyname_reads_the_receiver_register() {
+    // R3-M4: legacy `deprecated.ldsuperbyname string_id, v` passes the
+    // super receiver in `obj_reg` (`Reg(0)`).
     let file = build_with_string(
         &[
+            Bytecode::Ldai(Imm(55)),
+            Bytecode::Sta(Reg(0)),
             Bytecode::DeprecatedLdsuperbyname(PLACEHOLDER, Reg(0)),
             Bytecode::Return,
         ],
         1,
-        0,
+        2,
         "superProp",
     );
     let mut m = lift_file(&file).expect("lift");
@@ -867,11 +873,7 @@ fn deprecated_ldsuperbyname_ignores_the_receiver_register() {
         unreachable!()
     };
     assert_eq!(*key, SuperKey::Name(name));
-    assert_eq!(
-        const_of(&m, *this_value),
-        Const::Undefined,
-        "no this-role frame slot (num_args = 0) → materialized undefined"
-    );
+    assert_eq!(const_of(&m, *this_value), Const::number(55.0));
 }
 
 // ── deprecated.stconstto/stletto/stclasstoglobalrecord ───────────────
@@ -1010,12 +1012,11 @@ fn deprecated_dynamicimport_reads_the_register() {
     );
 }
 
-// ── deprecated.asyncgeneratorreject → AsyncReject (reg, reg) ─────────
+// ── deprecated.asyncgeneratorreject → AsyncGeneratorReject (reg, reg) ─
 
 #[test]
 fn deprecated_asyncgeneratorreject_register_roles() {
-    // translate.rs:2356-2364: v1 = the async generator object, v2 = the
-    // rejection reason (interpreter-inl.cpp:3240-3254).
+    // R3-M4: v1 = async generator object, v2 = rejection reason.
     let file = build(
         &[
             Bytecode::Ldai(Imm(7)),
@@ -1029,10 +1030,11 @@ fn deprecated_asyncgeneratorreject_register_roles() {
     );
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let Op::AsyncReject { funcobj, value } = find_op(&m, |o| matches!(o, Op::AsyncReject { .. }))
+    let Op::AsyncGeneratorReject { genobj, value } =
+        find_op(&m, |o| matches!(o, Op::AsyncGeneratorReject { .. }))
     else {
         unreachable!()
     };
-    assert_eq!(const_of(&m, *funcobj), Const::number(7.0), "genobj = v1");
+    assert_eq!(const_of(&m, *genobj), Const::number(7.0), "genobj = v1");
     assert_eq!(const_of(&m, *value), Const::number(9.0), "reason = v2");
 }

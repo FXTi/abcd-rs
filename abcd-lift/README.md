@@ -6,20 +6,20 @@ Format-aware lifter converting a decoded [`abcd_file::File`](../abcd-file/README
 
 `abcd-lift` is one of the only two crates in `abcd-rs` (alongside [`abcd-lower`](../abcd-lower/README.md)) permitted to cross the boundary between the `.abc`/ISA container layer (`abcd-file`, `abcd-isa`) and [`abcd-ir`](../abcd-ir/README.md):
 
-- **Container-to-semantic boundary (`ADR-01`)**: resolves raw file offsets, per-method `u16` entity indices, literal-array buffers, register/accumulator bytecodes, and debug line-number programs into arena-indexed [`abcd_ir::Module`] tables with zero container leaks.
-- **Full format span (`ADR-08`)**: lifts modern dynamic/static `.abc` containers (`9.0.0.0`–`24.0.0.0` and ArkTS `0.1.0.7`) as well as legacy OpenHarmony 3.2/4.0 (`0.0.0.2`, `Bytecode::Deprecated*`) modules into one canonical 88-op IR.
-- **Silent, non-panicking library**: enforces `#![deny(missing_docs)]` and `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`, returning typed [`LiftError`] values on malformed inputs or upstream-unimplemented opcodes without writing to `stdout`/`stderr`.
+- **Container-to-semantic boundary (`ADR-01`, `#50`)**: resolves typed `EntityRef` / `MethodIdx` / `FieldIdx` / `LiteralArrayIdx` slots, `CatchBlock::type_class` descriptors, literal-array buffers, register/accumulator bytecodes, and debug line-number programs into arena-indexed [`abcd_ir::Module`] tables with zero container leaks.
+- **Full format span (`ADR-08`, `#55`, `#61`)**: lifts modern dynamic/static `.abc` containers (`9.0.0.0`–`24.0.0.0` and ArkTS `0.1.0.7`) as well as legacy OpenHarmony 3.2/4.0 (`0.0.0.2`, `Bytecode::Deprecated*`) modules into one canonical SSA IR with lossless literal tags (`#57`) and exact raw `JumpEqz`/`JumpNez` branch predicates (`#61`).
+- **Silent, non-panicking Safe Rust library (`#58`)**: enforces `#![forbid(unsafe_code)]`, `#![deny(missing_docs)]`, and `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`, returning typed [`LiftError`] values on malformed bounds or upstream-unimplemented opcodes without writing to `stdout`/`stderr`.
 
 ## Lifting Pipeline
 
 | Stage | Module | Responsibility |
 | :--- | :--- | :--- |
-| Two-pass orchestration & dead-island sweep | [`lib.rs`](src/lib.rs) | Pre-reserves `ClassId` and `FuncId` tables, wires `TryRegion`s and `pre_entry` trampolines, drives Braun SSA sealing, and prunes unreachable blocks (`N18`) |
-| Entity & literal-array resolution | [`resolve.rs`](src/resolve.rs) | Maps method offsets to `FuncId` (`S1`/`N2`), interns lossless MUTF-8 symbols (`ADR-09`), and iteratively converts literal buffers and `MemberAttrs` into flat `ConstId`-linked `ConstPool` entries (`N52`, `ADR-17`) |
-| Metadata, ES modules & debug info | [`metadata.rs`](src/metadata.rs) | Merges 4 annotation buckets, pairs standalone and `--merge-abc` `EsModule` / `ModuleRequestPhase` / `scopeNames` fields while ignoring compile-time `typeSummaryOffset` refs (`ADR-10`), and attaches LNP line/column/scope extents |
-| Leader-partition CFG builder | [`cfg.rs`](src/cfg.rs) | Splits flat `Bytecode` streams at jump targets, fall-throughs, terminators, exact `[try_start, try_end)` boundaries, catch handlers, and before register writes (`sta`/`mov`) following throwing bytecodes in try regions (`R2-D1`) |
-| Iterative Braun SSA builder | [`ssa.rs`](src/ssa.rs) | Unifies virtual registers and `acc` (`RegOrAcc`) into SSA `ValueId`s on an explicit heap workstack with `Edge`-keyed phis, trivial-phi collapse, and lazy `Undefined`/`Hole` frame-init constants |
-| Opcode translation (`88` IR ops) | [`translate.rs`](src/translate.rs) | Translates dynamic, `wide.*`, `callruntime.*`, `throw.*`, and `deprecated.*` bytecodes (including `deprecated.defineclasswithbuffer`) with vendor-grounded operand roles |
+| Two-pass orchestration & dead-island sweep | [`lib.rs`](src/lib.rs) | Pre-reserves dense `ClassId`, `FuncId`, and `FieldId` tables, resolves `Catch::type_class` (`ClassId`), wires `TryRegion`s and `pre_entry` trampolines, drives Braun SSA sealing, and prunes unreachable blocks (`N18`) |
+| Entity & literal-array resolution | [`resolve.rs`](src/resolve.rs) | Maps `EntityRef` (`MethodIdx` → `FuncId`), interns lossless MUTF-8 symbols (`ADR-09`), and iteratively converts literal buffers (`ArrayLiteral`, `LiteralBufferRef`, `TypedArrayLiteral`) and `MemberAttrs` into `ConstPool` entries (`#57`) |
+| Metadata, ES modules & debug info | [`metadata.rs`](src/metadata.rs) | Merges 4 annotation buckets, pairs standalone and `--merge-abc` `EsModule` / `ModuleRequestPhase` / `scopeNames` fields while ignoring compile-time `typeSummaryOffset` refs (`ADR-10`), deduplicates `Arc<str>` debug source code (`#58`), and binary-searches LNP scope extents |
+| Leader-partition CFG builder | [`cfg.rs`](src/cfg.rs) | Validates jump, fall-through, and try/catch bounds (`R3-M3`), and splits `Bytecode` streams at jump targets, terminators, throwing-aware `[try_start, try_end)` boundaries, catch handlers, and handler-live register writes (`R2-D1`) |
+| Iterative Braun SSA builder | [`ssa.rs`](src/ssa.rs) | Unifies virtual registers and `acc` (`RegOrAcc`) into SSA `ValueId`s on an explicit heap workstack with dense sealed-block tracking, `Edge`-keyed phis, trivial-phi collapse, and lazy `Undefined`/`Hole` frame-init constants |
+| Opcode translation | [`translate.rs`](src/translate.rs) | Translates dynamic, `wide.*`, `callruntime.*`, `throw.*`, and `deprecated.*` bytecodes with frame-checked register bounds (`R3-M3`), exact `LexEnvKind`/`OwnStoreKind`/`CallKind` modifiers (`#55`), and `JumpEqz`/`JumpNez` branch predicates (`#61`) |
 
 ## Key Invariants
 

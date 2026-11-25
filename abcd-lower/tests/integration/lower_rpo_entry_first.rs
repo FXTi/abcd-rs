@@ -124,7 +124,7 @@ fn lowered_try_function_executes_entry_code_at_pc0_not_handler() {
             catches: vec![Catch {
                 handler,
                 exception,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }
@@ -165,7 +165,7 @@ fn lowered_try_function_executes_entry_code_at_pc0_not_handler() {
         "try range must cover exactly the try blocks (handler range excluded)"
     );
     assert_eq!(tb.catches.len(), 1, "{:?}", tb.catches);
-    assert_eq!(tb.catches[0].type_idx, u32::MAX);
+    assert_eq!(tb.catches[0].type_class, None);
     assert_eq!(
         tb.catches[0].handler as usize, handler_pc,
         "catch entry must resolve to the handler's flat offset"
@@ -235,12 +235,13 @@ fn reachable_only_diamond_matches_v0_1_byte_shape() {
 
     let result = lower_function(&module, func).expect("diamond must lower");
 
-    // Byte-shape pin (Debug rendering — `Bytecode` has no PartialEq). This
-    // is the exact stream v0.1's pipeline produces for this shape.
+    // Byte-shape pin (Debug rendering — `Bytecode` has no PartialEq).
+    // Untyped `cond` coerces via `istrue` before `jnez` (`R3-X1`), and `a`'s
+    // fallthrough `jmp` into `join` is elided (`R3-A7`).
     let rendered = format!("{:?}", result.bytecodes);
-    let expected = "[Bytecode(mov v0 v1), Bytecode(lda v0), Bytecode(jnez label_6), \
-Bytecode(ldai 9), Bytecode(sta v0), Bytecode(jmp label_9), Bytecode(ldai 7), \
-Bytecode(sta v0), Bytecode(jmp label_9), Bytecode(lda v0), Bytecode(return)]";
+    let expected = "[Bytecode(mov v0 v1), Bytecode(lda v0), Bytecode(istrue), \
+Bytecode(jnez label_7), Bytecode(ldai 9), Bytecode(sta v0), Bytecode(jmp label_9), \
+Bytecode(ldai 7), Bytecode(sta v0), Bytecode(lda v0), Bytecode(return)]";
     assert_eq!(rendered, expected, "reachable-only lowering output drifted");
 
     // This fixture has phi copies on the two join edges but no CondBranch

@@ -8,11 +8,11 @@
 //!
 //! - **Entity resolution → [`abcd_ir::SymbolTable`] + [`FuncId`]** — strings
 //!   intern losslessly as content-keyed [`Sym`]s (UTF-8 or raw MUTF-8 bytes);
-//!   method references resolve via a pre-built file method-offset table into
+//!   method references resolve via dense [`abcd_file::MethodIdx`] slots into
 //!   [`FuncId`] indices (never name-keyed, never raw offsets).
-//! - **Literal arrays → [`abcd_ir::ConstPool`]** — typed [`Const`] trees
-//!   (including nested arrays and typed primitive arrays), with method
-//!   references lifted to [`Const::MethodRef`]`(FuncId)`.
+//! - **Literal arrays → [`abcd_ir::ConstPool`]** — lossless typed [`Const`]
+//!   trees (including nested arrays, literal-buffer refs, and typed primitive
+//!   arrays), with method references lifted to [`Const::MethodRef`].
 //! - **Module records → [`abcd_ir::EsModule`] / [`abcd_ir::ImportDecl`] / [`abcd_ir::ExportDecl`]** —
 //!   standalone `_ESModuleRecord` and `--merge-abc` `moduleRecordIdx`
 //!   field blobs (`FieldValue::ModuleData`) parse into declarations with
@@ -46,6 +46,7 @@
 //! Library rule: no panics on data; every malformed or unsupported input
 //! returns a typed [`LiftError`].
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
@@ -56,11 +57,12 @@ mod ssa;
 mod translate;
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use abcd_file::{File, Method, MethodBody};
 use abcd_ir::{
-    Block, BlockId, Catch, ClassId, Const, ConstId, Edge, EdgeKind, FuncId, FunctionData, Inst,
-    InstId, Module, Sym, TryRegion, Ty, Value, ValueDef, ValueId,
+    Block, BlockId, Catch, ClassId, Const, ConstId, Edge, EdgeKind, FieldId, FuncId, FunctionData,
+    Inst, InstId, Module, Sym, TryRegion, Ty, Value, ValueDef, ValueId,
 };
 
 use cfg::{RawCfg, build_cfg};
@@ -160,6 +162,60 @@ pub enum LiftError {
         /// The record's request count.
         count: usize,
     },
+    /// A bytecode operand references a register outside `num_vregs + num_args`.
+    #[error("register v{reg} exceeds method frame limit {frame_limit}")]
+    InvalidRegister {
+        /// Offending register index.
+        reg: u16,
+        /// Total frame register count (`num_vregs + num_args`).
+        frame_limit: u16,
+    },
+    /// A register-range operand overflows `u16` or carries a negative count.
+    #[error("register range start v{start} + count {count} overflows u16")]
+    RegisterRangeOverflow {
+        /// Window start register.
+        start: u16,
+        /// Encoded register count.
+        count: i64,
+    },
+    /// A jump target points outside `body.bytecodes`.
+    #[error("jump at instruction {pc} targets out-of-bounds instruction {target} (len {len})")]
+    JumpTargetOutOfBounds {
+        /// Instruction index of the jump.
+        pc: usize,
+        /// Target instruction index.
+        target: usize,
+        /// Total instruction count.
+        len: usize,
+    },
+    /// Control falls through past the end of `body.bytecodes`.
+    #[error("instruction {pc} falls through past end of bytecode stream (len {len})")]
+    FallthroughOutOfBounds {
+        /// Instruction index of the falling-through instruction.
+        pc: usize,
+        /// Total instruction count.
+        len: usize,
+    },
+    /// A `TryBlock` covers an empty or out-of-bounds instruction range.
+    #[error("try block [{start}..{start}+{len}) exceeds bytecode length {bytecode_len}")]
+    TryRangeOutOfBounds {
+        /// Start instruction index.
+        start: u32,
+        /// Protected instruction count.
+        len: u32,
+        /// Total instruction count.
+        bytecode_len: usize,
+    },
+    /// A `CatchBlock` handler or length points outside `body.bytecodes`.
+    #[error("catch handler [{handler}..{handler}+{len}) exceeds bytecode length {bytecode_len}")]
+    CatchRangeOutOfBounds {
+        /// Handler entry instruction index.
+        handler: u32,
+        /// Handler instruction count.
+        len: u32,
+        /// Total instruction count.
+        bytecode_len: usize,
+    },
 }
 
 /// The module-level conversion state: the v0.2 module under
@@ -169,25 +225,20 @@ pub(crate) struct Lifter<'f> {
     pub file: &'f File,
     /// The v0.2 module under construction.
     pub module: Module,
-    /// Method source-file offset → function-table index (S1/N2: method
-    /// identity is the offset; references resolve offset → [`FuncId`]).
-    /// First-wins on duplicate offsets (hand-built files use offset 0).
-    method_to_func: HashMap<u32, FuncId>,
+    /// Dense method index (`MethodIdx`) → interned method name [`Sym`] (`#50`).
+    pub(crate) method_names: Vec<Sym>,
     /// Class descriptor (file string id) → class-table index. Grows at
-    /// lift time for annotation-only classes (stub entries, see
-    /// [`Lifter::class_of_descriptor`]).
+    /// lift time for foreign annotation / catch-type classes (stub entries,
+    /// see [`Lifter::class_of_descriptor`]).
     pub(crate) class_to_id: HashMap<abcd_file::StringId, ClassId>,
-    /// Field source-file offset → (owning class, field index) — for
-    /// enum-valued annotation elements (`AnnValue::Field`).
-    pub(crate) field_to_id: HashMap<u32, (ClassId, u32)>,
-    /// Class descriptor (file string id) → its first method's reserved
-    /// [`FuncId`] (method i of the class is `base + i` — exact even for
-    /// hand-built files with duplicate method offsets).
-    pub(crate) func_bases: HashMap<abcd_file::StringId, u32>,
-    /// Literal-array table index → pooled [`ConstId`] (memoized).
-    pub(crate) lit_cache: HashMap<u32, ConstId>,
+    /// Dense field index (`FieldIdx`) → `(owning ClassId, FieldId)` (`#50`).
+    pub(crate) field_ids: Vec<(ClassId, FieldId)>,
+    /// `(literal_array_idx, wrapper_kind)` → pooled [`ConstId`] (memoized).
+    pub(crate) lit_cache: HashMap<(u32, resolve::LitWrap), ConstId>,
     /// Cycle guard for nested literal arrays.
     pub(crate) lit_active: BTreeSet<u32>,
+    /// Deduplicated `Arc<str>` debug source-code payloads keyed by `StringId` (`#58` `R3-A6`).
+    pub(crate) source_code_cache: HashMap<abcd_file::StringId, Arc<str>>,
     /// `_ESModuleRecord` blobs, in class/field iteration order.
     pub(crate) module_datas: Vec<&'f abcd_file::ModuleData>,
     /// `moduleRequestPhaseIdx` blobs, in class/field iteration order.
@@ -202,12 +253,12 @@ impl<'f> Lifter<'f> {
         Self {
             file,
             module: Module::new(),
-            method_to_func: HashMap::new(),
+            method_names: Vec::new(),
             class_to_id: HashMap::new(),
-            field_to_id: HashMap::new(),
-            func_bases: HashMap::new(),
+            field_ids: Vec::new(),
             lit_cache: HashMap::new(),
             lit_active: BTreeSet::new(),
+            source_code_cache: HashMap::new(),
             module_datas: Vec::new(),
             module_phases: Vec::new(),
             scope_name_fields: Vec::new(),
@@ -228,11 +279,6 @@ impl<'f> Lifter<'f> {
     /// Intern a string literal as a symbol.
     pub(crate) fn sym(&mut self, s: &str) -> Sym {
         self.module.sym.intern(s)
-    }
-
-    /// The function-table index of a method offset (pass-1 table).
-    pub(crate) fn func_of_method_offset(&self, offset: u32) -> Option<FuncId> {
-        self.method_to_func.get(&offset).copied()
     }
 
     /// The class-table index of a file descriptor, appending a minimal
@@ -279,6 +325,7 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
 
     let total_classes = file.classes.len();
     let total_methods: usize = file.classes.values().map(|c| c.methods.len()).sum();
+    let total_fields: usize = file.classes.values().map(|c| c.fields.len()).sum();
     let total_bytecodes: usize = file
         .all_methods()
         .filter_map(|(_, m)| m.body.as_ref())
@@ -286,27 +333,23 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
         .sum();
     lf.module.classes.reserve(total_classes);
     lf.module.functions.reserve_exact(total_methods);
-    lf.method_to_func.reserve(total_methods);
+    lf.method_names.reserve_exact(total_methods);
     lf.class_to_id.reserve(total_classes);
-    lf.func_bases.reserve(total_classes);
+    lf.field_ids.reserve_exact(total_fields);
     lf.module.insts.reserve_exact(total_bytecodes);
     lf.module.values.reserve_exact(total_bytecodes);
     lf.module
         .blocks
         .reserve_exact(total_methods.saturating_mul(5));
 
-    // Pass 1 — identity tables: pre-fill the class-table and
-    // function-table slots so every forward reference (DefineFunc,
-    // Const::MethodRef, super_class, Type::Reference) resolves to a
-    // stable index, and pass 2 ASSIGNS by reserved index (stub-append
-    // of foreign descriptors can then never disturb the reservation).
-    // Iteration order is the reservation order: classes in file order,
-    // methods/fields in declaration order.
+    // Pass 1 — dense identity tables (`#50`): pre-fill the class-table and
+    // function-table slots in `file.classes` × declaration order (`== MethodIdx`
+    // and `FieldIdx` order) so every forward reference resolves in O(1) and
+    // pass 2 ASSIGNS by reserved index (stub-append of foreign descriptors can
+    // never disturb the reservation).
     for (class_sid, class) in &file.classes {
         let cid = ClassId::new(lf.module.classes.len() as u32);
         lf.class_to_id.insert(*class_sid, cid);
-        lf.func_bases
-            .insert(*class_sid, lf.module.functions.len() as u32);
         let descriptor = lf
             .sym_of_file_sid(class.descriptor)
             .unwrap_or_else(|| lf.sym("<unnamed-class>"));
@@ -314,24 +357,23 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
             .classes
             .push(abcd_ir::ClassData::new(descriptor, descriptor));
         for method in &class.methods {
-            let fid = FuncId::new(lf.module.functions.len() as u32);
-            lf.method_to_func.entry(method.offset).or_insert(fid);
             let name = lf
                 .sym_of_file_sid(method.name)
                 .unwrap_or_else(|| lf.sym("<unnamed>"));
+            lf.method_names.push(name);
             let kind = metadata::function_kind(method);
             lf.module.functions.push(FunctionData::new(cid, name, kind));
         }
-        for (fi, field) in class.fields.iter().enumerate() {
-            lf.field_to_id
-                .entry(field.offset)
-                .or_insert((cid, fi as u32));
+        for (fi, _field) in class.fields.iter().enumerate() {
+            lf.field_ids.push((cid, FieldId::new(fi as u32)));
         }
     }
 
     // Pass 2 — lift classes (same order as pass 1).
-    for class in file.classes.values() {
-        metadata::lift_class(&mut lf, class)?;
+    let mut func_base = 0u32;
+    for (&class_sid, class) in &file.classes {
+        metadata::lift_class(&mut lf, class_sid, class, func_base)?;
+        func_base += class.methods.len() as u32;
     }
 
     // Module records → imports/exports/module-requests.
@@ -406,21 +448,21 @@ pub(crate) fn lift_method<'f>(
         num_vregs: body.num_vregs,
         num_args: body.num_args,
     })?;
-    if arg_base.checked_add(param_count).is_none() {
-        return Err(LiftError::FrameTooLarge {
+    let frame_limit = arg_base
+        .checked_add(param_count)
+        .ok_or(LiftError::FrameTooLarge {
             num_vregs: body.num_vregs,
             num_args: body.num_args,
-        });
-    }
+        })?;
 
-    let raw_cfg = build_cfg(body).ok_or(LiftError::EmptyBytecode)?;
+    let raw_cfg = build_cfg(body)?;
 
     // #32: If raw block 0 (bytecode offset 0) has any incoming edge — a
     // loop back-edge (`jmp 0` / `jnez 0`), a single-block self-loop at 0,
     // or an exception handler targeting offset 0 — synthesize a pure,
     // zero-predecessor pre-entry trampoline at `fd.blocks[0]` that
-    // unconditionally branches to `header0` (`block_map[&0]`, `fd.blocks[1]`).
-    // When raw block 0 has no incoming edges, `entry_block` IS `block_map[&0]`
+    // unconditionally branches to `header0` (`block_map[0]`, `fd.blocks[1]`).
+    // When raw block 0 has no incoming edges, `entry_block` IS `block_map[0]`
     // so block/inst/value numbering stays 100% unchanged.
     let needs_pre_entry = raw_cfg
         .blocks
@@ -433,27 +475,29 @@ pub(crate) fn lift_method<'f>(
             .any(|c| c.handler == 0);
 
     // Create the function's blocks: optional synthetic pre-entry first,
-    // then raw block index → IR BlockId in leader order.
+    // then dense raw block index → IR BlockId in leader order (`R3-A4`).
     let entry_block = BlockId::new(lf.module.blocks.len() as u32);
+    let block_base = entry_block.index();
     lf.module.blocks.push(Block::default());
     fd.blocks.push(entry_block);
-    let mut block_map: HashMap<usize, BlockId> = HashMap::new();
+    let mut block_map: Vec<BlockId> = Vec::with_capacity(raw_cfg.blocks.len());
     if needs_pre_entry {
-        for bi in 0..raw_cfg.blocks.len() {
+        for _ in 0..raw_cfg.blocks.len() {
             let bb = BlockId::new(lf.module.blocks.len() as u32);
             lf.module.blocks.push(Block::default());
             fd.blocks.push(bb);
-            block_map.insert(bi, bb);
+            block_map.push(bb);
         }
     } else {
-        block_map.insert(0, entry_block);
-        for bi in 1..raw_cfg.blocks.len() {
+        block_map.push(entry_block);
+        for _ in 1..raw_cfg.blocks.len() {
             let bb = BlockId::new(lf.module.blocks.len() as u32);
             lf.module.blocks.push(Block::default());
             fd.blocks.push(bb);
-            block_map.insert(bi, bb);
+            block_map.push(bb);
         }
     }
+    let num_fn_blocks = fd.blocks.len();
 
     // Predecessor edges (both kinds, materialized before SSA — the
     // empty-phi-free construction). Normal edges from terminator
@@ -461,16 +505,16 @@ pub(crate) fn lift_method<'f>(
     // Exceptional edges for every (protected block → handler) pair (the
     // verifier's MissingExceptionalPred rule).
     if needs_pre_entry {
-        let header0 = block_map[&0];
+        let header0 = block_map[0];
         lf.module.blocks[header0.index()].preds.push(Edge {
             from: entry_block,
             kind: EdgeKind::Normal,
         });
     }
     for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
-        let ir_block = block_map[&bi];
+        let ir_block = block_map[bi];
         for &succ_bi in &raw_block.succs {
-            let succ_bb = block_map[&succ_bi];
+            let succ_bb = block_map[succ_bi];
             let edge = Edge {
                 from: ir_block,
                 kind: EdgeKind::Normal,
@@ -480,7 +524,7 @@ pub(crate) fn lift_method<'f>(
             }
         }
         for &catch_bi in &raw_block.catch_succs {
-            let catch_bb = block_map[&catch_bi];
+            let catch_bb = block_map[catch_bi];
             let edge = Edge {
                 from: ir_block,
                 kind: EdgeKind::Exceptional,
@@ -493,11 +537,20 @@ pub(crate) fn lift_method<'f>(
 
     // Try regions (protected ranges + handler blocks) from the original
     // try_blocks.
-    let try_regions = build_try_regions(body, &raw_cfg, &block_map);
-    fd.try_regions = try_regions;
+    fd.try_regions = build_try_regions(lf, body, &raw_cfg, &block_map)?;
 
     // SSA construction context.
-    let mut fx = translate::FnLift::new(lf, method, body, func_id, block_map, raw_cfg);
+    let mut fx = translate::FnLift::new(
+        lf,
+        method,
+        body,
+        func_id,
+        frame_limit,
+        block_base,
+        num_fn_blocks,
+        block_map,
+        raw_cfg,
+    );
 
     // N13 handler seeding: exception dispatch physically delivers the
     // thrown object in the ACCUMULATOR at handler entry (vendor
@@ -561,20 +614,20 @@ pub(crate) fn lift_method<'f>(
     // extents attach exclusively to real bytecode instructions).
     fx.ssa.seal_block(entry_block, &mut fx.lf.module);
     if needs_pre_entry {
-        let header0 = fx.block_map[&0];
+        let header0 = fx.block_map[0];
         fx.emit_void(entry_block, abcd_ir::Op::Branch { dest: header0 }, None);
     }
 
     // Translate bytecodes block by block.
     let bytecodes = &body.bytecodes;
     for bi in 0..fx.raw_cfg.blocks.len() {
-        let ir_block = fx.block_map[&bi];
+        let ir_block = fx.block_map[bi];
         let (start, end) = {
             let raw = &fx.raw_cfg.blocks[bi];
             (raw.start, raw.end)
         };
         for (off, bc) in bytecodes[start..end].iter().enumerate() {
-            translate::translate_bytecode(&mut fx, bc, start + off, ir_block)?;
+            translate::translate_bytecode(&mut fx, bc, start + off, bi, ir_block)?;
         }
 
         // Every block must end in an explicit terminator; bytecode
@@ -590,7 +643,7 @@ pub(crate) fn lift_method<'f>(
             let succs = fx.raw_cfg.blocks[bi].succs.clone();
             match succs.as_slice() {
                 [succ_bi] => {
-                    let dest = fx.block_map[succ_bi];
+                    let dest = fx.block_map[*succ_bi];
                     fx.emit_void(ir_block, abcd_ir::Op::Branch { dest }, None);
                 }
                 [] => {
@@ -603,26 +656,19 @@ pub(crate) fn lift_method<'f>(
         }
 
         // Seal successors whose predecessors have all been processed
-        // (raw-block-order heuristic, v0.1 parity; `entry_block` is
-        // already sealed before `bi = 0`).
+        // (`entry_block` and `block_map[0..=bi]` have monotonically increasing
+        // `BlockId`s <= `ir_block`, giving an O(1) predecessor check).
         let (succs, catch_succs) = {
             let raw = &fx.raw_cfg.blocks[bi];
             (raw.succs.clone(), raw.catch_succs.clone())
         };
-        for succ_bi in succs.iter().chain(catch_succs.iter()) {
+        for &succ_bi in succs.iter().chain(catch_succs.iter()) {
             let succ_bb = fx.block_map[succ_bi];
             if !fx.ssa.is_sealed(succ_bb) {
-                let all_preds_done =
-                    fx.lf.module.blocks[succ_bb.index()]
-                        .preds
-                        .iter()
-                        .all(|edge| {
-                            edge.from == entry_block
-                                || fx
-                                    .block_map
-                                    .iter()
-                                    .any(|(&rbi, &bb)| bb == edge.from && rbi <= bi)
-                        });
+                let all_preds_done = fx.lf.module.blocks[succ_bb.index()]
+                    .preds
+                    .iter()
+                    .all(|edge| edge.from.index() <= ir_block.index());
                 if all_preds_done {
                     fx.ssa.seal_block(succ_bb, &mut fx.lf.module);
                 }
@@ -630,15 +676,12 @@ pub(crate) fn lift_method<'f>(
         }
     }
 
-    // Seal any remaining unsealed blocks (N20: raw-block order, not
-    // HashMap order — deterministic value/inst numbering).
-    let mut remaining: Vec<BlockId> = (0..fx.raw_cfg.blocks.len())
-        .map(|bi| fx.block_map[&bi])
-        .filter(|bb| !fx.ssa.is_sealed(*bb))
-        .collect();
-    remaining.sort_unstable();
-    for bb in remaining {
-        fx.ssa.seal_block(bb, &mut fx.lf.module);
+    // Seal any remaining unsealed blocks in raw-block order (`N20`).
+    for bi in 0..fx.raw_cfg.blocks.len() {
+        let bb = fx.block_map[bi];
+        if !fx.ssa.is_sealed(bb) {
+            fx.ssa.seal_block(bb, &mut fx.lf.module);
+        }
     }
 
     // Record the function's frame-initial constant ValueIds (#30) and
@@ -681,15 +724,16 @@ pub(crate) fn lift_method<'f>(
     Ok(())
 }
 
-/// Build structured try regions from the original bytecode try_blocks.
+/// Build structured try regions from the original bytecode `try_blocks`.
 /// Catch exception values start as a placeholder and are filled by the
 /// N13 handler seeding in [`lift_method`].
 fn build_try_regions(
+    lf: &mut Lifter,
     body: &MethodBody,
     raw_cfg: &RawCfg,
-    block_map: &HashMap<usize, BlockId>,
-) -> Vec<TryRegion> {
-    let mut regions = Vec::new();
+    block_map: &[BlockId],
+) -> Result<Vec<TryRegion>, LiftError> {
+    let mut regions = Vec::with_capacity(body.try_blocks.len());
 
     for try_block in &body.try_blocks {
         let try_start = try_block.start as usize;
@@ -700,35 +744,41 @@ fn build_try_regions(
         for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
             if raw_block.start < try_end
                 && raw_block.end > try_start
-                && let Some(&ir_block) = block_map.get(&bi)
+                && let Some(&ir_block) = block_map.get(bi)
             {
                 protected.push(ir_block);
             }
         }
 
-        let catches = try_block
-            .catches
-            .iter()
-            .filter_map(|c| {
-                let handler_bi = raw_cfg.leader_to_block.get(&(c.handler as usize))?;
-                let &handler = block_map.get(handler_bi)?;
-                Some(Catch {
-                    handler,
-                    // Filled by the N13 handler seeding (the placeholder
-                    // is never observed: every handler block is seeded
-                    // before translation, and the sweep prunes dead
-                    // catches afterwards).
-                    exception: ValueId::new(u32::MAX),
-                    // u32::MAX is the file's catch-all sentinel.
-                    type_idx: (c.type_idx != u32::MAX).then_some(c.type_idx),
-                })
-            })
-            .collect();
+        let mut catches = Vec::with_capacity(try_block.catches.len());
+        for c in &try_block.catches {
+            let Some(&handler_bi) = raw_cfg.leader_to_block.get(&(c.handler as usize)) else {
+                continue;
+            };
+            let Some(&handler) = block_map.get(handler_bi) else {
+                continue;
+            };
+            let type_class = match c.type_class {
+                Some(sid) => Some(
+                    lf.class_of_descriptor(sid)
+                        .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?,
+                ),
+                None => None,
+            };
+            catches.push(Catch {
+                handler,
+                // Filled by the N13 handler seeding (the placeholder is never
+                // observed: every handler block is seeded before translation,
+                // and the sweep prunes dead catches afterwards).
+                exception: ValueId::new(u32::MAX),
+                type_class,
+            });
+        }
 
         regions.push(TryRegion { protected, catches });
     }
 
-    regions
+    Ok(regions)
 }
 
 /// N18 dead-island sweep: remove blocks unreachable over the AUGMENTED

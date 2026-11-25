@@ -2,7 +2,7 @@
 //!
 //! [`lower_function`](crate::lower_function) emits entity operands whose
 //! raw values are module-scoped IR identities (never source-file offsets —
-//! `design/ir.md` §1, `design/decisions.md` `ADR-01`):
+//! `design/ir.md` §1, `design/decisions.md` `ADR-01`, `#50` `R3-D2`):
 //!
 //! - `StringId` operands carry the raw [`Sym`] arena index;
 //! - `MethodId` operands carry the module function-table index
@@ -11,47 +11,44 @@
 //!
 //! `abcd_file::encode` first encodes `MethodBody.bytecodes` via
 //! `abcd_isa::encode` (where every entity operand occupies a 16-bit `id:u16`
-//! slot) and then relocates those slots through `MethodBody.entity_offsets`
-//! (`(kind, local_id) → source-file offset`) and `Builder::relocate_code_id`.
+//! slot) and then relocates those slots through `MethodBody.entities`
+//! (`(kind, local_id) → EntityRef`) and `Builder::relocate_code_id`.
 //! Because module-wide [`Sym`] / [`FuncId`] / [`ConstId`] arenas in large
 //! `--merge-abc` bundles routinely exceed `65,536` entries (#32),
 //! `relocate_and_compact_entities` compacts each method's raw IR entity IDs
 //! into deduplicated method-local `u16` indices (`0, 1, 2, …` per
 //! [`EntityKind`] in first-appearance order) inside `MethodBody.bytecodes`
-//! while keying `MethodBody.entity_offsets` by those same compacted `u16` IDs.
-//! Source-file offsets are resolved by inverting `abcd-lift`'s forward
-//! resolution in `resolve.rs`:
+//! while keying `MethodBody.entities` by those same compacted `u16` IDs:
 //!
-//! - a [`Sym`] resolves by MUTF-8 CONTENT to a string-pool entity of the
-//!   file (`File::entity_map`: offset → interned string). Several offsets
-//!   may share one content; encode resolves string operands
-//!   content-addressed, so any of them produces identical output — the
-//!   smallest offset is chosen for determinism;
-//! - a [`FuncId`] resolves by function-table position to the method's
-//!   source-file offset (`File::all_methods()` order is the lift's
+//! - a [`Sym`] resolves by MUTF-8 CONTENT to an interned [`abcd_file::StringId`]
+//!   of the file (`EntityRef::String`), preserving optional wire
+//!   `source_offset` provenance when present on existing method bodies;
+//! - a [`FuncId`] resolves by function-table position to its dense
+//!   [`abcd_file::MethodIdx`] (`File::all_methods()` order is the lift's
 //!   function-table reservation order by construction);
-//! - a [`ConstId`] literal shape resolves BY CONTENT to a literal-array
-//!   table index (structural match mirroring `abcd-lift`'s
-//!   `const_for_literal_value`), then to the array's source offset by
-//!   inverting [`File::literal_array_offsets`]; the smallest matching
-//!   table index is chosen for determinism.
+//! - a [`ConstId`] literal shape resolves BY TAG-EXACT CONTENT (`#57` `R3-H9`)
+//!   to the smallest matching [`abcd_file::LiteralArrayIdx`] via a flat,
+//!   hash-consed shape interner (`O(N)` time, `O(1)` call stack).
 //!
-//! An entity that cannot be traced this way (a symbol with no
-//! equal-content string in the file, an out-of-range function-table
-//! index, a shape no literal array matches) is a hard
-//! [`LowerError::UntraceableEntity`], and a single method referencing more
-//! than `65,536` distinct entities of one kind is a hard
-//! [`LowerError::EntityIndexOverflow`] — nothing is invented, truncated, or
-//! passed through silently.
+//! An entity that cannot be traced this way (a symbol with no equal-content
+//! string in the file, an out-of-range function-table index, a shape no
+//! literal array matches, or an untraceable catch exception class) is a hard
+//! [`LowerError::UntraceableEntity`], a single method referencing more than
+//! `65,536` distinct entities of one kind is a hard
+//! [`LowerError::EntityIndexOverflow`], and any ISA/visitor operand-count
+//! mismatch is a release-active [`LowerError::EntityOperandMismatch`] (`R3-M9`).
 
 use std::collections::{HashMap, HashSet};
 
-use abcd_file::{File, LiteralValue, MethodBody};
-use abcd_ir::{Const, ConstId, FuncId, Module, Sym};
+use abcd_file::{
+    CatchBlock, EntityRef, File, LiteralArrayIdx, LiteralValue, MethodBody, MethodIdx, StringId,
+    TryBlock,
+};
+use abcd_ir::{Const, ConstId, FuncId, LitMethodKind, Module, Sym, TypedArrayTag};
 use abcd_isa::{Bytecode, EntityId, EntityKind};
 use rayon::prelude::*;
 
-use crate::layout::LayoutResult;
+use crate::layout::{LayoutResult, LoweredTryBlock};
 use crate::{LowerError, LowerOptions, lower_function_with_options};
 
 /// Build an encodable [`MethodBody`] for a lowered function.
@@ -65,8 +62,7 @@ use crate::{LowerError, LowerOptions, lower_function_with_options};
 /// per-function wrapper in a loop (#29).
 ///
 /// Every entity operand of every emitted bytecode must be traceable to a
-/// source-file offset; otherwise [`LowerError::UntraceableEntity`] is
-/// returned. There is no silent pass-through of untraceable operands.
+/// file entity; otherwise [`LowerError::UntraceableEntity`] is returned.
 pub fn to_method_body(
     module: &Module,
     func_id: FuncId,
@@ -106,88 +102,121 @@ pub fn lower_module_bodies(
     results.into_iter().collect()
 }
 
-/// Module-scoped reverse entity resolver: IR identities → source-file
-/// offsets (`design/ir.md` §5, `ADR-10`).
-///
-/// Built once per `(Module, File)` pair and safe to share across threads
-/// (`Sync`). All lookups (`string_offset`, `method_offset`,
-/// `literal_array_offset`) run in `O(1)` amortized time.
-pub struct EntityResolver<'a> {
-    module: &'a Module,
-    /// Canonical MUTF-8 wire bytes → smallest source offset of a string entity
-    /// with those exact bytes (#30).
-    string_offsets: HashMap<Box<[u8]>, u32>,
-    /// Function-table position → method source offset (`all_methods()`
-    /// order = the lift's reservation order).
-    method_offsets: Vec<u32>,
-    /// Literal-array table index → source offset (inverted
-    /// `literal_array_offsets`).
-    literal_index_to_offset: HashMap<u32, u32>,
-    /// Canonical literal-array element sequence → smallest matching
-    /// literal-array table index.
-    shape_to_min_index: HashMap<Vec<CanonicalLitElem>, u32>,
+/// Hash-consed flat shape identifier (eliminates recursive `Drop`, `Hash`, and
+/// `PartialEq` across arbitrarily deep nested literal arrays).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ShapeId(u32);
+
+/// Tag-exact, non-recursive canonical element of a literal-array shape (`#57`
+/// `R3-H9`), keeping `Integer8` / `Integer` / `Float` / `Double` / `Accessor` /
+/// `MethodAffiliate` / `BuiltinTypeIndex` / `EtsImplements` / `LitMethodKind` /
+/// `LiteralBufferIndex` / `TypedArrayTag` distinct.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum FlatLitElem {
+    Bool(bool),
+    Int8(u8),
+    Int32(u32),
+    Float32(u32),
+    Double(u64),
+    String(Sym),
+    EtsImplements(Sym),
+    MethodRef { func: FuncId, kind: LitMethodKind },
+    Accessor(u8),
+    MethodAffiliate(u16),
+    BuiltinTypeIndex(u8),
+    LitNull(u8),
+    Array(ShapeId),
+    LiteralBufferRef(ShapeId),
+    TypedArray { tag: TypedArrayTag, items: ShapeId },
 }
 
-/// Value-canonical element of a literal-array shape (`R2-D3`), decoupling
-/// structural content matching from `ConstPool` `ConstId` allocation order.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum CanonicalLitElem {
-    Bool(bool),
-    Number(u64),
-    String(Sym),
-    MethodRef(FuncId),
-    Null,
-    Array(Vec<CanonicalLitElem>),
+/// Module-scoped reverse entity resolver: IR identities → [`EntityRef`]
+/// handles (`design/ir.md` §5, `ADR-10`, `#50` `R3-D2`).
+///
+/// Built once per `(Module, File)` pair and safe to share across threads
+/// (`Sync`). Lookups run in `O(1)` amortized time for strings and methods and
+/// `O(shape_size)` iterative bottom-up hash-consing for literal shapes.
+pub struct EntityResolver<'a> {
+    module: &'a Module,
+    /// Canonical MUTF-8 wire bytes → first [`StringId`] in `file.strings` (#30).
+    string_ids: HashMap<Box<[u8]>, StringId>,
+    /// Optional wire `source_offset` provenance preserved from existing
+    /// `MethodBody::entities` entries (smallest offset wins deterministically).
+    string_source_offsets: HashMap<StringId, u32>,
+    /// Total method count in `file.all_methods()` (`FuncId` reservation bound).
+    method_count: usize,
+    /// Hash-consed flat element sequence → canonical [`ShapeId`].
+    shape_interner: HashMap<Vec<FlatLitElem>, ShapeId>,
+    /// Canonical [`ShapeId`] → smallest matching [`LiteralArrayIdx`] in `file`.
+    shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx>,
 }
 
 impl<'a> EntityResolver<'a> {
     /// Index `file`'s string, method, and literal-array tables once for
     /// `module`.
     pub fn new(module: &'a Module, file: &File) -> Self {
-        let mut string_offsets: HashMap<Box<[u8]>, u32> =
-            HashMap::with_capacity(file.entity_map.len());
-        // Smallest offset wins on duplicate content (encode resolves
-        // string operands content-addressed, so any valid entry produces
-        // identical output; the choice only needs to be deterministic).
-        let mut entries: Vec<(u32, abcd_file::StringId)> =
-            file.entity_map.iter().map(|(&o, &s)| (o, s)).collect();
-        entries.sort_unstable();
-        for (offset, sid) in entries {
+        let mut string_ids: HashMap<Box<[u8]>, StringId> =
+            HashMap::with_capacity(file.strings.len());
+        for i in 0..file.strings.len() {
+            let sid = StringId::new(i as u32);
             if let Some(bytes) = file.strings.to_mutf8_bytes(sid) {
-                string_offsets
+                string_ids
                     .entry(bytes.into_owned().into_boxed_slice())
-                    .or_insert(offset);
+                    .or_insert(sid);
             }
         }
-        let method_offsets: Vec<u32> = file.all_methods().map(|(_, m)| m.offset).collect();
-        let mut method_offset_to_index: HashMap<u32, u32> =
-            HashMap::with_capacity(method_offsets.len());
-        for (i, &off) in method_offsets.iter().enumerate() {
-            method_offset_to_index.entry(off).or_insert(i as u32);
-        }
-        let literal_index_to_offset: HashMap<u32, u32> = file
-            .literal_array_offsets
-            .iter()
-            .map(|(&offset, &index)| (index, offset))
-            .collect();
 
-        let mut shape_to_min_index: HashMap<Vec<CanonicalLitElem>, u32> =
-            HashMap::with_capacity(file.literal_arrays.len());
-        let mut cache: Vec<Option<Option<Vec<CanonicalLitElem>>>> =
-            vec![None; file.literal_arrays.len()];
-        for idx in 0..file.literal_arrays.len() as u32 {
-            if let Some(shape) =
-                build_literal_array_shape(module, file, &method_offset_to_index, &mut cache, idx)
-            {
-                shape_to_min_index.entry(shape).or_insert(idx);
+        let mut string_source_offsets: HashMap<StringId, u32> = HashMap::new();
+        let mut method_count = 0usize;
+        for (_, method) in file.all_methods() {
+            method_count += 1;
+            if let Some(body) = &method.body {
+                for entity in body.entities.values() {
+                    if let EntityRef::String {
+                        id,
+                        source_offset: Some(off),
+                    } = *entity
+                    {
+                        string_source_offsets
+                            .entry(id)
+                            .and_modify(|cur| *cur = (*cur).min(off))
+                            .or_insert(off);
+                    }
+                }
+            }
+        }
+
+        let num_lits = file.literal_arrays.len();
+        let mut shape_interner: HashMap<Vec<FlatLitElem>, ShapeId> =
+            HashMap::with_capacity(num_lits);
+        let mut shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx> =
+            HashMap::with_capacity(num_lits);
+        // `0` = unvisited, `1` = active on workstack, `2` = finished (`resolved` holds result).
+        let mut state: Vec<u8> = vec![0; num_lits];
+        let mut resolved: Vec<Option<ShapeId>> = vec![None; num_lits];
+
+        for idx in 0..num_lits as u32 {
+            if let Some(shape_id) = intern_file_literal_array(
+                module,
+                file,
+                method_count,
+                &mut state,
+                &mut resolved,
+                &mut shape_interner,
+                idx,
+            ) {
+                shape_to_min_index
+                    .entry(shape_id)
+                    .or_insert(LiteralArrayIdx(idx));
             }
         }
 
         Self {
             module,
-            string_offsets,
-            method_offsets,
-            literal_index_to_offset,
+            string_ids,
+            string_source_offsets,
+            method_count,
+            shape_interner,
             shape_to_min_index,
         }
     }
@@ -205,10 +234,10 @@ impl<'a> EntityResolver<'a> {
             .map(|f| f.params.len())
             .unwrap_or_default();
 
-        let (bytecodes, entity_offsets) =
+        let (bytecodes, entities) =
             relocate_and_compact_entities(func_id, &result.bytecodes, |kind, raw| match kind {
                 EntityKind::StringId => {
-                    self.string_offset(Sym::new(raw))
+                    self.string_ref(Sym::new(raw))
                         .ok_or(LowerError::UntraceableEntity {
                             func: func_id,
                             kind,
@@ -216,51 +245,120 @@ impl<'a> EntityResolver<'a> {
                         })
                 }
                 EntityKind::MethodId => {
-                    self.method_offset(FuncId::new(raw))
+                    self.method_ref(FuncId::new(raw))
                         .ok_or(LowerError::UntraceableEntity {
                             func: func_id,
                             kind,
                             raw,
                         })
                 }
-                EntityKind::LiteralarrayId => self.literal_array_offset(ConstId::new(raw)).ok_or(
-                    LowerError::UntraceableEntity {
-                        func: func_id,
-                        kind,
-                        raw,
-                    },
-                ),
+                EntityKind::LiteralarrayId => {
+                    self.literal_array_ref(ConstId::new(raw))
+                        .ok_or(LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw,
+                        })
+                }
             })?;
+
+        let try_blocks = self.resolve_try_blocks(&result.try_blocks, func_id)?;
 
         Ok(MethodBody {
             num_vregs: u32::from(result.num_regs),
             num_args: param_count as u32,
             bytecodes,
-            entity_offsets,
-            try_blocks: result.try_blocks.clone(),
+            entities,
+            try_blocks,
             ic_size: Some(result.ic_size),
         })
     }
 
-    /// [`Sym`] → source offset of an equal-MUTF-8-content string entity.
-    pub(crate) fn string_offset(&self, sym: Sym) -> Option<u32> {
+    /// [`Sym`] → interned [`StringId`] in `file.strings` matching exact MUTF-8 wire bytes.
+    pub(crate) fn string_id(&self, sym: Sym) -> Option<StringId> {
         let bytes = self.module.sym.to_mutf8_bytes(sym)?;
-        self.string_offsets.get(bytes.as_ref()).copied()
+        self.string_ids.get(bytes.as_ref()).copied()
     }
 
-    /// [`FuncId`] → source offset of the method at that function-table
-    /// position.
-    pub(crate) fn method_offset(&self, func: FuncId) -> Option<u32> {
-        self.method_offsets.get(func.index()).copied()
+    /// [`Sym`] → [`EntityRef::String`] carrying preserved `source_offset` when known.
+    pub(crate) fn string_ref(&self, sym: Sym) -> Option<EntityRef> {
+        let id = self.string_id(sym)?;
+        Some(EntityRef::String {
+            id,
+            source_offset: self.string_source_offsets.get(&id).copied(),
+        })
     }
 
-    /// [`ConstId`] (a literal shape) → source offset of the smallest
-    /// literal-array table entry whose content matches the shape.
-    pub(crate) fn literal_array_offset(&self, shape: ConstId) -> Option<u32> {
-        let canonical = canonicalize_const_shape(self.module, shape)?;
-        let &index = self.shape_to_min_index.get(&canonical)?;
-        self.literal_index_to_offset.get(&index).copied()
+    /// [`FuncId`] → [`EntityRef::Method`] at that dense function-table index.
+    pub(crate) fn method_ref(&self, func: FuncId) -> Option<EntityRef> {
+        (func.index() < self.method_count).then_some(EntityRef::Method(MethodIdx(func.0)))
     }
+
+    /// [`ConstId`] (a literal shape) → smallest matching [`LiteralArrayIdx`] in `file`.
+    pub(crate) fn literal_array_idx(&self, shape: ConstId) -> Option<LiteralArrayIdx> {
+        let shape_id = canonicalize_const_shape(self.module, &self.shape_interner, shape)?;
+        self.shape_to_min_index.get(&shape_id).copied()
+    }
+
+    /// [`ConstId`] (a literal shape) → [`EntityRef::LiteralArray`].
+    pub(crate) fn literal_array_ref(&self, shape: ConstId) -> Option<EntityRef> {
+        self.literal_array_idx(shape).map(EntityRef::LiteralArray)
+    }
+
+    /// Convert [`LoweredTryBlock`]s (`ClassId` catch types) into container
+    /// [`TryBlock`]s (`StringId` class descriptors).
+    pub(crate) fn resolve_try_blocks(
+        &self,
+        lowered: &[LoweredTryBlock],
+        func_id: FuncId,
+    ) -> Result<Vec<TryBlock>, LowerError> {
+        let mut out = Vec::with_capacity(lowered.len());
+        for tb in lowered {
+            let mut catches = Vec::with_capacity(tb.catches.len());
+            for c in &tb.catches {
+                let type_class = match c.type_class {
+                    None => None,
+                    Some(cid) => {
+                        let cls = self
+                            .module
+                            .class(cid)
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind: EntityKind::StringId,
+                                raw: cid.0,
+                            })?;
+                        let sid = self.string_id(cls.descriptor).ok_or(
+                            LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind: EntityKind::StringId,
+                                raw: cls.descriptor.0,
+                            },
+                        )?;
+                        Some(sid)
+                    }
+                };
+                catches.push(CatchBlock {
+                    type_class,
+                    handler: c.handler,
+                    len: c.len,
+                });
+            }
+            out.push(TryBlock {
+                start: tb.start,
+                len: tb.len,
+                catches,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Wrapper kind when pushing a nested shape child onto the explicit workstack.
+#[derive(Clone, Copy)]
+enum NestedShapeWrap {
+    Array,
+    BufferRef { wrapper_cid: ConstId },
+    TypedArray(TypedArrayTag),
 }
 
 enum ConstShapeCursor<'m> {
@@ -278,7 +376,9 @@ enum ConstShapeCursor<'m> {
 impl<'m> ConstShapeCursor<'m> {
     fn from_const(c: &'m Const) -> Option<(Self, usize)> {
         match c {
-            Const::ArrayLiteral(items) => Some((Self::Array { items, next: 0 }, items.len())),
+            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+                Some((Self::Array { items, next: 0 }, items.len()))
+            }
             Const::ObjectLiteral { keys, values } if keys.len() == values.len() => Some((
                 Self::Object {
                     keys,
@@ -314,126 +414,192 @@ impl<'m> ConstShapeCursor<'m> {
 
 struct ConstShapeFrame<'m> {
     cid: ConstId,
+    parent_wrap: Option<NestedShapeWrap>,
     cursor: ConstShapeCursor<'m>,
-    depth: u32,
-    subtree_height: u32,
-    items: Vec<CanonicalLitElem>,
+    items: Vec<FlatLitElem>,
 }
 
-/// Iteratively dereference a pooled [`Const::ArrayLiteral`] /
-/// [`Const::ObjectLiteral`] shape into a value-canonical tree, rejecting
-/// dangling child [`ConstId`]s, non-shape/unsupported elements, `ConstId`
-/// cycles, and nesting depths beyond `64` (`R2-D3`).
-fn canonicalize_const_shape(module: &Module, root: ConstId) -> Option<Vec<CanonicalLitElem>> {
-    let root_const = module.consts.get(root)?;
-    let (root_cursor, root_cap) = ConstShapeCursor::from_const(root_const)?;
+fn wrap_flat_elem(wrap: NestedShapeWrap, id: ShapeId) -> FlatLitElem {
+    match wrap {
+        NestedShapeWrap::Array => FlatLitElem::Array(id),
+        NestedShapeWrap::BufferRef { .. } => FlatLitElem::LiteralBufferRef(id),
+        NestedShapeWrap::TypedArray(tag) => FlatLitElem::TypedArray { tag, items: id },
+    }
+}
+
+/// Iteratively dereference a pooled literal shape into its hash-consed
+/// [`ShapeId`] inside `interner`, rejecting dangling child [`ConstId`]s,
+/// non-shape/unsupported elements, and `ConstId` cycles in `O(1)` call stack.
+fn canonicalize_const_shape(
+    module: &Module,
+    interner: &HashMap<Vec<FlatLitElem>, ShapeId>,
+    root: ConstId,
+) -> Option<ShapeId> {
     let mut active: HashSet<ConstId> = HashSet::new();
-    active.insert(root);
-    let mut memo: HashMap<ConstId, (Vec<CanonicalLitElem>, u32)> = HashMap::new();
+    let mut actual_root = root;
+    let root_const = loop {
+        if !active.insert(actual_root) {
+            return None;
+        }
+        match module.consts.get(actual_root)? {
+            Const::LiteralBufferRef(inner) => actual_root = *inner,
+            other => break other,
+        }
+    };
+    let (root_cursor, root_cap) = ConstShapeCursor::from_const(root_const)?;
+    let mut memo: HashMap<ConstId, ShapeId> = HashMap::new();
     let mut stack = vec![ConstShapeFrame {
-        cid: root,
+        cid: actual_root,
+        parent_wrap: None,
         cursor: root_cursor,
-        depth: 0,
-        subtree_height: 0,
         items: Vec::with_capacity(root_cap),
     }];
 
     'outer: while let Some(mut frame) = stack.pop() {
         while let Some(child_cid) = frame.cursor.next_id() {
             let child_const = module.consts.get(child_cid)?;
-            if matches!(
-                child_const,
-                Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
-            ) {
-                if active.contains(&child_cid) {
-                    return None;
+            let nested = match child_const {
+                Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {
+                    Some((child_cid, child_const, NestedShapeWrap::Array))
                 }
-                let child_depth = frame.depth + 1;
-                if child_depth > 64 {
-                    return None;
+                Const::TypedArrayLiteral { tag, .. } => {
+                    Some((child_cid, child_const, NestedShapeWrap::TypedArray(*tag)))
                 }
-                if let Some((cached_items, cached_height)) = memo.get(&child_cid) {
-                    if child_depth + *cached_height > 64 {
+                Const::LiteralBufferRef(inner_cid) => {
+                    if active.contains(&child_cid) {
                         return None;
                     }
-                    frame.subtree_height = frame.subtree_height.max(*cached_height + 1);
-                    frame
-                        .items
-                        .push(CanonicalLitElem::Array(cached_items.clone()));
+                    let inner_const = module.consts.get(*inner_cid)?;
+                    if !matches!(
+                        inner_const,
+                        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
+                    ) {
+                        return None;
+                    }
+                    Some((
+                        *inner_cid,
+                        inner_const,
+                        NestedShapeWrap::BufferRef {
+                            wrapper_cid: child_cid,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+
+            if let Some((target_cid, target_const, wrap)) = nested {
+                if active.contains(&target_cid) {
+                    return None;
+                }
+                if let Some(&cached_id) = memo.get(&target_cid) {
+                    frame.items.push(wrap_flat_elem(wrap, cached_id));
                     continue;
                 }
-                let (child_cursor, child_cap) = ConstShapeCursor::from_const(child_const)?;
-                active.insert(child_cid);
+                let (child_cursor, child_cap) = ConstShapeCursor::from_const(target_const)?;
+                if let NestedShapeWrap::BufferRef { wrapper_cid } = wrap {
+                    active.insert(wrapper_cid);
+                }
+                active.insert(target_cid);
                 stack.push(frame);
                 stack.push(ConstShapeFrame {
-                    cid: child_cid,
+                    cid: target_cid,
+                    parent_wrap: Some(wrap),
                     cursor: child_cursor,
-                    depth: child_depth,
-                    subtree_height: 0,
                     items: Vec::with_capacity(child_cap),
                 });
                 continue 'outer;
             }
+
             let scalar = match child_const {
-                Const::Bool(b) => CanonicalLitElem::Bool(*b),
-                Const::Number(bits) => CanonicalLitElem::Number(*bits),
-                Const::String(s) => CanonicalLitElem::String(*s),
-                Const::MethodRef(f) => CanonicalLitElem::MethodRef(*f),
-                Const::Null => CanonicalLitElem::Null,
+                Const::Bool(b) => FlatLitElem::Bool(*b),
+                Const::Int8(n) => FlatLitElem::Int8(*n),
+                Const::Int32(n) => FlatLitElem::Int32(*n),
+                Const::Float32(bits) => FlatLitElem::Float32(*bits),
+                Const::Number(bits) => FlatLitElem::Double(*bits),
+                Const::Accessor(n) => FlatLitElem::Accessor(*n),
+                Const::MethodAffiliate(n) => FlatLitElem::MethodAffiliate(*n),
+                Const::BuiltinTypeIndex(n) => FlatLitElem::BuiltinTypeIndex(*n),
+                Const::EtsImplements(s) => FlatLitElem::EtsImplements(*s),
+                Const::String(s) => FlatLitElem::String(*s),
+                Const::MethodRef { func, kind } => FlatLitElem::MethodRef {
+                    func: *func,
+                    kind: *kind,
+                },
+                Const::LitNull(n) => FlatLitElem::LitNull(*n),
+                Const::Null => FlatLitElem::LitNull(0),
                 Const::Undefined
                 | Const::Hole
                 | Const::Int64(_)
                 | Const::UInt64(_)
                 | Const::BigInt(_)
                 | Const::ArrayLiteral(_)
-                | Const::ObjectLiteral { .. } => return None,
+                | Const::TypedArrayLiteral { .. }
+                | Const::ObjectLiteral { .. }
+                | Const::LiteralBufferRef(_) => return None,
             };
             frame.items.push(scalar);
         }
 
         active.remove(&frame.cid);
+        if let Some(NestedShapeWrap::BufferRef { wrapper_cid }) = frame.parent_wrap {
+            active.remove(&wrapper_cid);
+        }
+        let shape_id = *interner.get(&frame.items)?;
+        memo.insert(frame.cid, shape_id);
         if let Some(parent) = stack.last_mut() {
-            memo.insert(frame.cid, (frame.items.clone(), frame.subtree_height));
-            parent.subtree_height = parent.subtree_height.max(frame.subtree_height + 1);
-            parent.items.push(CanonicalLitElem::Array(frame.items));
+            let wrap = frame.parent_wrap.unwrap_or(NestedShapeWrap::Array);
+            parent.items.push(wrap_flat_elem(wrap, shape_id));
         } else {
-            return Some(frame.items);
+            return Some(shape_id);
         }
     }
     None
 }
 
-/// Explicit stack frame for iterative literal-array shape conversion.
-struct LitArrayFrame {
-    idx_usize: usize,
-    depth: u32,
-    next_elem: usize,
-    items: Vec<CanonicalLitElem>,
+#[derive(Clone, Copy)]
+enum FileNestedWrap {
+    Array,
+    BufferRef,
+    TypedArray(TypedArrayTag),
 }
 
-/// Convert `file.literal_arrays[table_idx]` into its canonical
-/// [`CanonicalLitElem`] sequence (the exact structural inverse of `abcd-lift`'s
-/// `const_for_literal_array`) using an explicit stack (zero recursion),
-/// returning `None` if any element uses an uninterned string, unknown method
-/// offset, non-shape literal tag, cycle, or nesting depth > 64.
-fn build_literal_array_shape(
+struct LitArrayFrame {
+    idx_usize: usize,
+    parent_wrap: Option<FileNestedWrap>,
+    next_elem: usize,
+    items: Vec<FlatLitElem>,
+}
+
+fn wrap_file_elem(wrap: FileNestedWrap, id: ShapeId) -> FlatLitElem {
+    match wrap {
+        FileNestedWrap::Array => FlatLitElem::Array(id),
+        FileNestedWrap::BufferRef => FlatLitElem::LiteralBufferRef(id),
+        FileNestedWrap::TypedArray(tag) => FlatLitElem::TypedArray { tag, items: id },
+    }
+}
+
+/// Convert `file.literal_arrays[table_idx]` into its hash-consed [`ShapeId`]
+/// iteratively on an explicit heap stack (`O(1)` call stack, cycle-guarded).
+fn intern_file_literal_array(
     module: &Module,
     file: &File,
-    method_offset_to_index: &HashMap<u32, u32>,
-    cache: &mut [Option<Option<Vec<CanonicalLitElem>>>],
+    method_count: usize,
+    state: &mut [u8],
+    resolved: &mut [Option<ShapeId>],
+    interner: &mut HashMap<Vec<FlatLitElem>, ShapeId>,
     table_idx: u32,
-) -> Option<Vec<CanonicalLitElem>> {
+) -> Option<ShapeId> {
     let root_usize = table_idx as usize;
     let root_la = file.literal_arrays.get(root_usize)?;
-    // Memoize depth-valid conversions (`None` inside `Some(None)` marks
-    // either an active cycle or a permanently non-representable array).
-    if let Some(cached) = &cache[root_usize] {
-        return cached.clone();
+    match state[root_usize] {
+        2 => return resolved[root_usize],
+        1 => return None,
+        _ => {}
     }
-    cache[root_usize] = Some(None);
+    state[root_usize] = 1;
     let mut stack = vec![LitArrayFrame {
         idx_usize: root_usize,
-        depth: 0,
+        parent_wrap: None,
         next_elem: 0,
         items: Vec::with_capacity(root_la.values.len()),
     }];
@@ -442,100 +608,159 @@ fn build_literal_array_shape(
         while frame.next_elem < file.literal_arrays[frame.idx_usize].values.len() {
             let v = &file.literal_arrays[frame.idx_usize].values[frame.next_elem];
             frame.next_elem += 1;
-            let nested_idx = match v {
-                LiteralValue::LiteralArray(idx) => Some(idx.0),
-                LiteralValue::LiteralBufferIndex(raw)
-                | LiteralValue::ArrayU1(raw)
-                | LiteralValue::ArrayU8(raw)
-                | LiteralValue::ArrayI8(raw)
-                | LiteralValue::ArrayU16(raw)
-                | LiteralValue::ArrayI16(raw)
-                | LiteralValue::ArrayU32(raw)
-                | LiteralValue::ArrayI32(raw)
-                | LiteralValue::ArrayU64(raw)
-                | LiteralValue::ArrayI64(raw)
-                | LiteralValue::ArrayF32(raw)
-                | LiteralValue::ArrayF64(raw)
-                | LiteralValue::ArrayString(raw) => Some(typed_array_table_index(file, raw.0)?),
+            let nested = match v {
+                LiteralValue::LiteralArray(idx) => Some((idx.0, FileNestedWrap::Array)),
+                LiteralValue::LiteralBufferIndex(idx) => Some((idx.0, FileNestedWrap::BufferRef)),
+                LiteralValue::ArrayU1(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U1)))
+                }
+                LiteralValue::ArrayU8(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U8)))
+                }
+                LiteralValue::ArrayI8(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I8)))
+                }
+                LiteralValue::ArrayU16(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U16)))
+                }
+                LiteralValue::ArrayI16(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I16)))
+                }
+                LiteralValue::ArrayU32(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U32)))
+                }
+                LiteralValue::ArrayI32(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I32)))
+                }
+                LiteralValue::ArrayU64(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U64)))
+                }
+                LiteralValue::ArrayI64(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I64)))
+                }
+                LiteralValue::ArrayF32(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::F32)))
+                }
+                LiteralValue::ArrayF64(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::F64)))
+                }
+                LiteralValue::ArrayString(idx) => {
+                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::String)))
+                }
                 _ => None,
             };
-            if let Some(child_idx) = nested_idx {
-                let child_depth = frame.depth + 1;
-                if child_depth > 64 {
-                    return None;
-                }
+
+            if let Some((child_idx, wrap)) = nested {
                 let child_usize = child_idx as usize;
-                let child_la = file.literal_arrays.get(child_usize)?;
-                if let Some(cached) = &cache[child_usize] {
-                    frame.items.push(CanonicalLitElem::Array(cached.clone()?));
-                } else {
-                    cache[child_usize] = Some(None);
-                    let child_cap = child_la.values.len();
-                    stack.push(frame);
-                    stack.push(LitArrayFrame {
-                        idx_usize: child_usize,
-                        depth: child_depth,
-                        next_elem: 0,
-                        items: Vec::with_capacity(child_cap),
-                    });
-                    continue 'outer;
+                let Some(child_la) = file.literal_arrays.get(child_usize) else {
+                    abort_lit_stack(state, resolved, frame, stack);
+                    return None;
+                };
+                match state[child_usize] {
+                    2 => {
+                        let Some(child_id) = resolved[child_usize] else {
+                            abort_lit_stack(state, resolved, frame, stack);
+                            return None;
+                        };
+                        frame.items.push(wrap_file_elem(wrap, child_id));
+                    }
+                    1 => {
+                        abort_lit_stack(state, resolved, frame, stack);
+                        return None;
+                    }
+                    _ => {
+                        state[child_usize] = 1;
+                        let child_cap = child_la.values.len();
+                        stack.push(frame);
+                        stack.push(LitArrayFrame {
+                            idx_usize: child_usize,
+                            parent_wrap: Some(wrap),
+                            next_elem: 0,
+                            items: Vec::with_capacity(child_cap),
+                        });
+                        continue 'outer;
+                    }
                 }
             } else {
-                frame.items.push(scalar_literal_value_elem(
-                    module,
-                    file,
-                    method_offset_to_index,
-                    v,
-                )?);
+                let Some(scalar) = scalar_literal_value_elem(module, file, method_count, v) else {
+                    abort_lit_stack(state, resolved, frame, stack);
+                    return None;
+                };
+                frame.items.push(scalar);
             }
         }
 
-        let out = frame.items;
-        cache[frame.idx_usize] = Some(Some(out.clone()));
+        let next_id = ShapeId(interner.len() as u32);
+        let shape_id = *interner.entry(frame.items).or_insert(next_id);
+        state[frame.idx_usize] = 2;
+        resolved[frame.idx_usize] = Some(shape_id);
         if let Some(parent) = stack.last_mut() {
-            parent.items.push(CanonicalLitElem::Array(out));
+            let wrap = frame.parent_wrap.unwrap_or(FileNestedWrap::Array);
+            parent.items.push(wrap_file_elem(wrap, shape_id));
         } else {
-            return Some(out);
+            return Some(shape_id);
         }
     }
     None
 }
 
+fn abort_lit_stack(
+    state: &mut [u8],
+    resolved: &mut [Option<ShapeId>],
+    cur: LitArrayFrame,
+    stack: Vec<LitArrayFrame>,
+) {
+    state[cur.idx_usize] = 2;
+    resolved[cur.idx_usize] = None;
+    for f in stack {
+        state[f.idx_usize] = 2;
+        resolved[f.idx_usize] = None;
+    }
+}
+
+fn lookup_sym_in_module(module: &Module, file: &File, sid: StringId) -> Option<Sym> {
+    if let Some(raw) = file.strings.raw_mutf8(sid) {
+        module.sym.get_raw_mutf8(raw)
+    } else {
+        file.strings.as_str(sid).and_then(|s| module.sym.get(s))
+    }
+}
+
 fn scalar_literal_value_elem(
     module: &Module,
     file: &File,
-    method_offset_to_index: &HashMap<u32, u32>,
+    method_count: usize,
     v: &LiteralValue,
-) -> Option<CanonicalLitElem> {
+) -> Option<FlatLitElem> {
+    let method_elem = |midx: MethodIdx, kind: LitMethodKind| -> Option<FlatLitElem> {
+        (midx.index() < method_count).then_some(FlatLitElem::MethodRef {
+            func: FuncId::new(midx.0),
+            kind,
+        })
+    };
     match v {
-        LiteralValue::Bool(vb) => Some(CanonicalLitElem::Bool(*vb)),
-        LiteralValue::Integer8(n) => Some(CanonicalLitElem::Number((*n as f64).to_bits())),
-        LiteralValue::Integer(n) => Some(CanonicalLitElem::Number((*n as f64).to_bits())),
-        LiteralValue::Float(x) => Some(CanonicalLitElem::Number((*x as f64).to_bits())),
-        LiteralValue::Double(x) => Some(CanonicalLitElem::Number(x.to_bits())),
-        LiteralValue::Accessor(n) => Some(CanonicalLitElem::Number(f64::from(*n).to_bits())),
-        LiteralValue::MethodAffiliate(n) => Some(CanonicalLitElem::Number(f64::from(*n).to_bits())),
-        LiteralValue::BuiltinTypeIndex(n) => {
-            Some(CanonicalLitElem::Number(f64::from(*n).to_bits()))
+        LiteralValue::Bool(vb) => Some(FlatLitElem::Bool(*vb)),
+        LiteralValue::Integer8(n) => Some(FlatLitElem::Int8(*n)),
+        LiteralValue::Integer(n) => Some(FlatLitElem::Int32(*n)),
+        LiteralValue::Float(x) => Some(FlatLitElem::Float32(x.to_bits())),
+        LiteralValue::Double(x) => Some(FlatLitElem::Double(x.to_bits())),
+        LiteralValue::Accessor(n) => Some(FlatLitElem::Accessor(*n)),
+        LiteralValue::MethodAffiliate(n) => Some(FlatLitElem::MethodAffiliate(*n)),
+        LiteralValue::BuiltinTypeIndex(n) => Some(FlatLitElem::BuiltinTypeIndex(*n)),
+        LiteralValue::String(sid) => {
+            lookup_sym_in_module(module, file, *sid).map(FlatLitElem::String)
         }
-        LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
-            if let Some(raw) = file.strings.raw_mutf8(*sid) {
-                module.sym.get_raw_mutf8(raw).map(CanonicalLitElem::String)
-            } else {
-                file.strings
-                    .as_str(*sid)
-                    .and_then(|s| module.sym.get(s))
-                    .map(CanonicalLitElem::String)
-            }
+        LiteralValue::EtsImplements(sid) => {
+            lookup_sym_in_module(module, file, *sid).map(FlatLitElem::EtsImplements)
         }
-        LiteralValue::Method(off)
-        | LiteralValue::GeneratorMethod(off)
-        | LiteralValue::AsyncGeneratorMethod(off)
-        | LiteralValue::Getter(off)
-        | LiteralValue::Setter(off) => method_offset_to_index
-            .get(off)
-            .map(|&idx| CanonicalLitElem::MethodRef(FuncId::new(idx))),
-        LiteralValue::NullValue(_) => Some(CanonicalLitElem::Null),
+        LiteralValue::Method(midx) => method_elem(*midx, LitMethodKind::Method),
+        LiteralValue::GeneratorMethod(midx) => method_elem(*midx, LitMethodKind::GeneratorMethod),
+        LiteralValue::AsyncGeneratorMethod(midx) => {
+            method_elem(*midx, LitMethodKind::AsyncGeneratorMethod)
+        }
+        LiteralValue::Getter(midx) => method_elem(*midx, LitMethodKind::Getter),
+        LiteralValue::Setter(midx) => method_elem(*midx, LitMethodKind::Setter),
+        LiteralValue::NullValue(n) => Some(FlatLitElem::LitNull(*n)),
         LiteralValue::LiteralArray(_)
         | LiteralValue::LiteralBufferIndex(_)
         | LiteralValue::ArrayU1(_)
@@ -553,34 +778,19 @@ fn scalar_literal_value_elem(
     }
 }
 
-fn typed_array_table_index(file: &File, raw: u32) -> Option<u32> {
-    if let Some(&idx) = file.literal_array_offsets.get(&raw) {
-        return Some(idx);
-    }
-    if (raw as usize) < file.literal_arrays.len() {
-        return Some(raw);
-    }
-    None
-}
-
-/// Method-local `(EntityKind, u16_local_id) → source-file offset` relocation map.
-pub(crate) type EntityOffsetMap = HashMap<(EntityKind, u32), u32>;
+/// Method-local `(EntityKind, u16_local_id) → EntityRef` relocation map (`#50`).
+pub(crate) type EntityMap = HashMap<(EntityKind, u32), EntityRef>;
 
 /// Resolve every entity operand in `bytecodes` through `resolve` and compact
 /// module-global `EntityId(u32)` values into method-local `u16` placeholder
 /// indices (`0, 1, 2, …` per [`EntityKind`] in first-appearance order, #32).
-///
-/// `abcd_isa::encode` encodes entity operands into 16-bit `id:u16` fields
-/// before `abcd_file::encode` rewrites them from `MethodBody.entity_offsets`,
-/// so leaving module-global `Sym` / `FuncId` / `ConstId` values (`>= 65,536` on
-/// large merged bundles) in `MethodBody.bytecodes` fails bytecode encoding.
 pub(crate) fn relocate_and_compact_entities(
     func_id: FuncId,
     bytecodes: &[Bytecode],
-    mut resolve: impl FnMut(EntityKind, u32) -> Result<u32, LowerError>,
-) -> Result<(Vec<Bytecode>, EntityOffsetMap), LowerError> {
+    mut resolve: impl FnMut(EntityKind, u32) -> Result<EntityRef, LowerError>,
+) -> Result<(Vec<Bytecode>, EntityMap), LowerError> {
     let mut out_bytecodes = bytecodes.to_vec();
-    let mut entity_offsets: EntityOffsetMap = HashMap::new();
+    let mut entities: EntityMap = HashMap::new();
     let mut local_ids: HashMap<(EntityKind, u32), u16> = HashMap::new();
     let mut next_string: u32 = 0;
     let mut next_method: u32 = 0;
@@ -595,7 +805,7 @@ pub(crate) fn relocate_and_compact_entities(
             let local_id = if let Some(&existing) = local_ids.get(&(kind, raw)) {
                 existing
             } else {
-                let offset = resolve(kind, raw)?;
+                let entity_ref = resolve(kind, raw)?;
                 let counter = match kind {
                     EntityKind::StringId => &mut next_string,
                     EntityKind::MethodId => &mut next_method,
@@ -605,22 +815,23 @@ pub(crate) fn relocate_and_compact_entities(
                     .map_err(|_| LowerError::EntityIndexOverflow(func_id))?;
                 *counter += 1;
                 local_ids.insert((kind, raw), assigned);
-                entity_offsets.insert((kind, u32::from(assigned)), offset);
+                entities.insert((kind, u32::from(assigned)), entity_ref);
                 assigned
             };
             *id_mut = EntityId(u32::from(local_id));
             Ok(())
         })?;
-        debug_assert_eq!(
-            visited,
-            expected_len,
-            "for_each_entity_operand_mut out of sync with Bytecode::entity_operands for {}",
-            bc.mnemonic()
-        );
-        debug_assert_eq!(bc.entity_operands().len(), expected_len);
+        if visited != expected_len || bc.entity_operands().len() != expected_len {
+            return Err(LowerError::EntityOperandMismatch {
+                func: func_id,
+                mnemonic: bc.mnemonic().to_string(),
+                expected: expected_len,
+                visited,
+            });
+        }
     }
 
-    Ok((out_bytecodes, entity_offsets))
+    Ok((out_bytecodes, entities))
 }
 
 /// Visit every [`EntityId`] operand of `bc` mutably in ISA signature order,
@@ -748,13 +959,19 @@ mod tests {
         ];
         assert_eq!(sample.len(), 44);
 
-        let (compacted, offsets) =
-            relocate_and_compact_entities(FuncId::new(0), &sample, |_kind, raw| Ok(raw + 0x1000))
-                .expect("compaction must succeed");
+        let (compacted, entities) =
+            relocate_and_compact_entities(FuncId::new(0), &sample, |kind, raw| {
+                Ok(match kind {
+                    EntityKind::StringId => EntityRef::string(StringId::new(raw)),
+                    EntityKind::MethodId => EntityRef::Method(MethodIdx(raw)),
+                    EntityKind::LiteralarrayId => EntityRef::LiteralArray(LiteralArrayIdx(raw)),
+                })
+            })
+            .expect("compaction must succeed");
         for bc in &compacted {
             for (kind, id) in bc.entity_operands() {
                 assert!(id.0 <= u32::from(u16::MAX), "uncompacted operand in {bc:?}");
-                assert!(offsets.contains_key(&(kind, id.0)));
+                assert!(entities.contains_key(&(kind, id.0)));
             }
         }
         abcd_isa::encode(&compacted).expect("all compacted entity instructions must encode");
@@ -765,8 +982,10 @@ mod tests {
         let bytecodes: Vec<Bytecode> = (0..=u32::from(u16::MAX) + 1)
             .map(|i| Bytecode::LdaStr(EntityId(i)))
             .collect();
-        let err = relocate_and_compact_entities(FuncId::new(7), &bytecodes, |_, raw| Ok(raw + 1))
-            .expect_err("65537 distinct strings in one method must overflow u16");
+        let err = relocate_and_compact_entities(FuncId::new(7), &bytecodes, |_, raw| {
+            Ok(EntityRef::string(StringId::new(raw)))
+        })
+        .expect_err("65537 distinct strings in one method must overflow u16");
         assert!(matches!(err, LowerError::EntityIndexOverflow(f) if f == FuncId::new(7)));
     }
 }

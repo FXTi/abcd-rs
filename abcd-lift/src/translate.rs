@@ -142,8 +142,8 @@ use std::collections::HashMap;
 
 use abcd_file::{Method, MethodBody};
 use abcd_ir::{
-    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Loc, Op, SuperCheck, SuperKey,
-    Sym, Ty, UnOp, ValueDef, ValueId,
+    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, DynPrim, FuncId, InstId, LexEnvKind, Loc, Op,
+    OwnStoreKind, StaticTy, SuperCheck, SuperKey, Sym, Ty, UnOp, ValueDef, ValueId,
 };
 use abcd_isa::{Bytecode, EntityId, EntityKind, Reg};
 
@@ -185,8 +185,10 @@ pub struct FnLift<'l, 'f> {
     pub body: &'f MethodBody,
     /// The reserved function-table slot.
     pub func_id: FuncId,
-    /// Raw block index → IR block.
-    pub block_map: HashMap<usize, BlockId>,
+    /// Total valid register count (`num_vregs + num_args`, `R3-M3`).
+    pub frame_limit: u16,
+    /// Dense raw block index → IR block (`R3-A4`).
+    pub block_map: Vec<BlockId>,
     /// The raw CFG.
     pub raw_cfg: RawCfg,
     /// The Braun construction state.
@@ -211,12 +213,19 @@ pub struct FnLift<'l, 'f> {
 
 impl<'l, 'f> FnLift<'l, 'f> {
     /// Build the translation context.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "lifts all per-function frame/CFG/SSA state into FnLift in one call"
+    )]
     pub fn new(
         lf: &'l mut Lifter<'f>,
         method: &'f Method,
         body: &'f MethodBody,
         func_id: FuncId,
-        block_map: HashMap<usize, BlockId>,
+        frame_limit: u16,
+        block_base: usize,
+        num_fn_blocks: usize,
+        block_map: Vec<BlockId>,
         raw_cfg: RawCfg,
     ) -> Self {
         let undefined_const = lf.const_scalar(Const::Undefined);
@@ -238,9 +247,10 @@ impl<'l, 'f> FnLift<'l, 'f> {
             method,
             body,
             func_id,
+            frame_limit,
             block_map,
             raw_cfg,
-            ssa: SsaBuilder::new(undefined_const, hole_const),
+            ssa: SsaBuilder::with_blocks(undefined_const, hole_const, block_base, num_fn_blocks),
             line_table,
             col_table,
             inst_pc: HashMap::new(),
@@ -300,6 +310,13 @@ impl<'l, 'f> FnLift<'l, 'f> {
             .expect("instruction has no result")
     }
 
+    /// Emit, assign an explicit [`Ty`] to the result value, and return it.
+    pub fn emit_val_typed(&mut self, block: BlockId, op: Op, ty: Ty, pc: Option<u32>) -> ValueId {
+        let val = self.emit_val(block, op, pc);
+        self.lf.module.values[val.index()].ty = ty;
+        val
+    }
+
     /// Emit a void instruction (no result).
     pub fn emit_void(&mut self, block: BlockId, op: Op, pc: Option<u32>) {
         self.emit(block, op, pc);
@@ -316,22 +333,61 @@ impl<'l, 'f> FnLift<'l, 'f> {
         self.ssa.write_variable(RegOrAcc::Acc, block, val);
     }
 
-    /// Read a register SSA value.
-    pub fn read_reg(&mut self, reg: Reg, block: BlockId) -> ValueId {
-        self.ssa
-            .read_variable(RegOrAcc::Reg(reg.0), block, &mut self.lf.module)
+    /// Validate that `reg` lies within `[0, frame_limit)` (`R3-M3`).
+    #[inline]
+    fn check_reg(&self, reg: u16) -> Result<(), LiftError> {
+        if reg >= self.frame_limit {
+            return Err(LiftError::InvalidRegister {
+                reg,
+                frame_limit: self.frame_limit,
+            });
+        }
+        Ok(())
     }
 
-    /// Write a register SSA value.
-    pub fn write_reg(&mut self, reg: Reg, block: BlockId, val: ValueId) {
+    /// Read a register SSA value (`R3-M3` frame-checked).
+    pub fn read_reg(&mut self, reg: Reg, block: BlockId) -> Result<ValueId, LiftError> {
+        self.check_reg(reg.0)?;
+        Ok(self
+            .ssa
+            .read_variable(RegOrAcc::Reg(reg.0), block, &mut self.lf.module))
+    }
+
+    /// Write a register SSA value (`R3-M3` frame-checked).
+    pub fn write_reg(&mut self, reg: Reg, block: BlockId, val: ValueId) -> Result<(), LiftError> {
+        self.check_reg(reg.0)?;
         self.ssa.write_variable(RegOrAcc::Reg(reg.0), block, val);
+        Ok(())
     }
 
-    /// Read a range of consecutive registers.
-    pub fn read_reg_range(&mut self, start: u16, count: u16, block: BlockId) -> Vec<ValueId> {
-        (0..count)
-            .map(|i| self.read_reg(Reg(start + i), block))
-            .collect()
+    /// Read a range of consecutive registers (`R3-M3` overflow- and frame-checked).
+    pub fn read_reg_range(
+        &mut self,
+        start: u16,
+        count: i64,
+        block: BlockId,
+    ) -> Result<Vec<ValueId>, LiftError> {
+        let Ok(count_u16) = u16::try_from(count) else {
+            return Err(LiftError::RegisterRangeOverflow { start, count });
+        };
+        if count_u16 == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(end) = start.checked_add(count_u16) else {
+            return Err(LiftError::RegisterRangeOverflow { start, count });
+        };
+        if end > self.frame_limit {
+            return Err(LiftError::InvalidRegister {
+                reg: end - 1,
+                frame_limit: self.frame_limit,
+            });
+        }
+        Ok((0..count_u16)
+            .map(|i| {
+                self.ssa
+                    .read_variable(RegOrAcc::Reg(start + i), block, &mut self.lf.module)
+            })
+            .collect())
     }
 
     /// The `this` value (N67): the this-role frame slot per the vendored
@@ -380,31 +436,59 @@ impl<'l, 'f> FnLift<'l, 'f> {
 
     /// Emit a `LoadConst` for a scalar constant (deduplicated pool).
     pub fn load_const(&mut self, block: BlockId, c: Const, pc: Option<u32>) -> ValueId {
+        let ty = if matches!(c, Const::Bool(_)) {
+            Ty::DynPrim(DynPrim::Bool)
+        } else {
+            Ty::Any
+        };
         let id = self.lf.const_scalar(c);
-        self.emit_val(block, Op::LoadConst(id), pc)
+        self.emit_val_typed(block, Op::LoadConst(id), ty, pc)
     }
 
-    /// The IR block for a jump target label.
-    pub fn label_block(&self, label: abcd_isa::Label) -> BlockId {
-        let target_idx = label.0 as usize;
-        let raw_bi = self.raw_cfg.leader_to_block[&target_idx];
-        self.block_map[&raw_bi]
+    /// Whether `val` is statically proven to hold an ECMAScript boolean (`R3-X1`).
+    pub fn is_proven_bool(&self, val: ValueId) -> bool {
+        let v = &self.lf.module.values[val.index()];
+        if matches!(v.ty, Ty::DynPrim(DynPrim::Bool) | Ty::Static(StaticTy::U1)) {
+            return true;
+        }
+        match v.def {
+            ValueDef::Const(cid) => matches!(self.lf.module.consts.get(cid), Some(Const::Bool(_))),
+            ValueDef::Inst(iid) => match &self.lf.module.insts[iid.index()].op {
+                Op::LoadConst(cid) => {
+                    matches!(self.lf.module.consts.get(*cid), Some(Const::Bool(_)))
+                }
+                Op::Compare { .. } | Op::TestPrivate { .. } | Op::TestProp { .. } => true,
+                Op::UnaryOp { op, .. } => op.is_boolean_result(),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
-    /// The fall-through block (the block containing the instruction
-    /// after `idx`).
-    pub fn fallthrough_block(&self, idx: usize) -> BlockId {
-        let next_idx = idx + 1;
-        for (bi, rb) in self.raw_cfg.blocks.iter().enumerate() {
-            if next_idx >= rb.start && next_idx < rb.end {
-                return self.block_map[&bi];
-            }
-        }
-        if let Some(&bi) = self.raw_cfg.leader_to_block.get(&next_idx) {
-            return self.block_map[&bi];
-        }
-        let last_bi = self.raw_cfg.blocks.len() - 1;
-        self.block_map[&last_bi]
+    /// The IR block for a jump target label (`R3-M3` bounds-checked).
+    pub fn label_block(&self, pc: usize, label: abcd_isa::Label) -> Result<BlockId, LiftError> {
+        let target = label.0 as usize;
+        let &raw_bi =
+            self.raw_cfg
+                .leader_to_block
+                .get(&target)
+                .ok_or(LiftError::JumpTargetOutOfBounds {
+                    pc,
+                    target,
+                    len: self.body.bytecodes.len(),
+                })?;
+        Ok(self.block_map[raw_bi])
+    }
+
+    /// O(1) fall-through block after raw block `bi` (`R3-A4`, `R3-M3`).
+    pub fn fallthrough_block(&self, bi: usize, pc: usize) -> Result<BlockId, LiftError> {
+        self.block_map
+            .get(bi + 1)
+            .copied()
+            .ok_or(LiftError::FallthroughOutOfBounds {
+                pc,
+                len: self.body.bytecodes.len(),
+            })
     }
 }
 
@@ -413,6 +497,7 @@ pub fn translate_bytecode(
     fx: &mut FnLift,
     bc: &Bytecode,
     idx: usize,
+    bi: usize,
     block: BlockId,
 ) -> Result<(), LiftError> {
     let loc = Some(idx as u32);
@@ -420,16 +505,16 @@ pub fn translate_bytecode(
     match bc {
         // ── Data movement (SSA aliases only) ─────────────────────────
         Bytecode::Lda(r) => {
-            let v = fx.read_reg(*r, block);
+            let v = fx.read_reg(*r, block)?;
             fx.write_acc(block, v);
         }
         Bytecode::Sta(r) => {
             let v = fx.read_acc(block);
-            fx.write_reg(*r, block, v);
+            fx.write_reg(*r, block, v)?;
         }
         Bytecode::Mov(dst, src) => {
-            let v = fx.read_reg(*src, block);
-            fx.write_reg(*dst, block, v);
+            let v = fx.read_reg(*src, block)?;
+            fx.write_reg(*dst, block, v)?;
         }
 
         // ── Literals ─────────────────────────────────────────────────
@@ -483,42 +568,33 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Ldsymbol => {
-            let name = fx.lf.sym("Symbol");
-            let default = fx.load_const(block, Const::Undefined, loc);
-            let v = fx.emit_val(
-                block,
-                Op::TryGetGlobal {
-                    name,
-                    default: Some(default),
-                },
-                loc,
-            );
+            let v = fx.emit_val(block, Op::LoadSymbol, loc);
             fx.write_acc(block, v);
         }
 
         // ── Binary operations (acc = acc OP reg, IC slot discarded) ──
-        Bytecode::Add2(_ic, r) => binary_op(fx, BinOp::Add, r, block, loc),
-        Bytecode::Sub2(_ic, r) => binary_op(fx, BinOp::Sub, r, block, loc),
-        Bytecode::Mul2(_ic, r) => binary_op(fx, BinOp::Mul, r, block, loc),
-        Bytecode::Div2(_ic, r) => binary_op(fx, BinOp::Div, r, block, loc),
-        Bytecode::Mod2(_ic, r) => binary_op(fx, BinOp::Mod, r, block, loc),
-        Bytecode::Exp(_ic, r) => binary_op(fx, BinOp::Exp, r, block, loc),
-        Bytecode::Shl2(_ic, r) => binary_op(fx, BinOp::Shl, r, block, loc),
-        Bytecode::Shr2(_ic, r) => binary_op(fx, BinOp::Shr, r, block, loc),
-        Bytecode::Ashr2(_ic, r) => binary_op(fx, BinOp::Ashr, r, block, loc),
-        Bytecode::And2(_ic, r) => binary_op(fx, BinOp::BitAnd, r, block, loc),
-        Bytecode::Or2(_ic, r) => binary_op(fx, BinOp::BitOr, r, block, loc),
-        Bytecode::Xor2(_ic, r) => binary_op(fx, BinOp::BitXor, r, block, loc),
-        Bytecode::Eq(_ic, r) => compare_op(fx, CmpOp::Eq, r, block, loc),
-        Bytecode::Noteq(_ic, r) => compare_op(fx, CmpOp::NotEq, r, block, loc),
-        Bytecode::Less(_ic, r) => compare_op(fx, CmpOp::Less, r, block, loc),
-        Bytecode::Lesseq(_ic, r) => compare_op(fx, CmpOp::LessEq, r, block, loc),
-        Bytecode::Greater(_ic, r) => compare_op(fx, CmpOp::Greater, r, block, loc),
-        Bytecode::Greatereq(_ic, r) => compare_op(fx, CmpOp::GreaterEq, r, block, loc),
-        Bytecode::Isin(_ic, r) => compare_op(fx, CmpOp::In, r, block, loc),
-        Bytecode::Instanceof(_ic, r) => compare_op(fx, CmpOp::InstanceOf, r, block, loc),
-        Bytecode::Stricteq(_ic, r) => compare_op(fx, CmpOp::StrictEq, r, block, loc),
-        Bytecode::Strictnoteq(_ic, r) => compare_op(fx, CmpOp::StrictNotEq, r, block, loc),
+        Bytecode::Add2(_ic, r) => binary_op(fx, BinOp::Add, r, block, loc)?,
+        Bytecode::Sub2(_ic, r) => binary_op(fx, BinOp::Sub, r, block, loc)?,
+        Bytecode::Mul2(_ic, r) => binary_op(fx, BinOp::Mul, r, block, loc)?,
+        Bytecode::Div2(_ic, r) => binary_op(fx, BinOp::Div, r, block, loc)?,
+        Bytecode::Mod2(_ic, r) => binary_op(fx, BinOp::Mod, r, block, loc)?,
+        Bytecode::Exp(_ic, r) => binary_op(fx, BinOp::Exp, r, block, loc)?,
+        Bytecode::Shl2(_ic, r) => binary_op(fx, BinOp::Shl, r, block, loc)?,
+        Bytecode::Shr2(_ic, r) => binary_op(fx, BinOp::Shr, r, block, loc)?,
+        Bytecode::Ashr2(_ic, r) => binary_op(fx, BinOp::Ashr, r, block, loc)?,
+        Bytecode::And2(_ic, r) => binary_op(fx, BinOp::BitAnd, r, block, loc)?,
+        Bytecode::Or2(_ic, r) => binary_op(fx, BinOp::BitOr, r, block, loc)?,
+        Bytecode::Xor2(_ic, r) => binary_op(fx, BinOp::BitXor, r, block, loc)?,
+        Bytecode::Eq(_ic, r) => compare_op(fx, CmpOp::Eq, r, block, loc)?,
+        Bytecode::Noteq(_ic, r) => compare_op(fx, CmpOp::NotEq, r, block, loc)?,
+        Bytecode::Less(_ic, r) => compare_op(fx, CmpOp::Less, r, block, loc)?,
+        Bytecode::Lesseq(_ic, r) => compare_op(fx, CmpOp::LessEq, r, block, loc)?,
+        Bytecode::Greater(_ic, r) => compare_op(fx, CmpOp::Greater, r, block, loc)?,
+        Bytecode::Greatereq(_ic, r) => compare_op(fx, CmpOp::GreaterEq, r, block, loc)?,
+        Bytecode::Isin(_ic, r) => compare_op(fx, CmpOp::In, r, block, loc)?,
+        Bytecode::Instanceof(_ic, r) => compare_op(fx, CmpOp::InstanceOf, r, block, loc)?,
+        Bytecode::Stricteq(_ic, r) => compare_op(fx, CmpOp::StrictEq, r, block, loc)?,
+        Bytecode::Strictnoteq(_ic, r) => compare_op(fx, CmpOp::StrictNotEq, r, block, loc)?,
 
         // ── Unary operations (acc = OP acc, IC slot discarded) ───────
         Bytecode::Neg(_ic) => unary_op(fx, UnOp::Minus, block, loc),
@@ -570,9 +646,17 @@ pub fn translate_bytecode(
         }
         Bytecode::Createobjectwithexcludedkeys(num, obj_reg, start_reg)
         | Bytecode::WideCreateobjectwithexcludedkeys(num, obj_reg, start_reg) => {
-            let obj = fx.read_reg(*obj_reg, block);
-            let count = num.0 as u16;
-            let keys = fx.read_reg_range(start_reg.0, count, block);
+            // `isa.yaml` `range_1` (`R3-C6`): the immediate encodes `key_count - 1`,
+            // so `imm + 1` consecutive registers starting at `start_reg` are read.
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let count = num
+                .0
+                .checked_add(1)
+                .ok_or(LiftError::RegisterRangeOverflow {
+                    start: start_reg.0,
+                    count: num.0,
+                })?;
+            let keys = fx.read_reg_range(start_reg.0, count, block)?;
             let v = fx.emit_val(block, Op::CreateObjectWithExcludedKeys { obj, keys }, loc);
             fx.write_acc(block, v);
         }
@@ -587,7 +671,7 @@ pub fn translate_bytecode(
         Bytecode::Stobjbyname(_ic, eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StoreProp {
@@ -600,7 +684,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Ldobjbyvalue(_ic, obj_reg) => {
             let key = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let v = fx.emit_val(block, Op::LoadPropDyn { object: obj, key }, loc);
             fx.write_acc(block, v);
         }
@@ -608,8 +692,8 @@ pub fn translate_bytecode(
             // Vendor: v1 = receiver, v2 = propKey, acc = VALUE
             // (isa.yaml:1353-1357, interpreter_assembly.cpp:2306-2335).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StorePropDyn {
@@ -635,7 +719,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Stobjbyindex(_, obj_reg, index) | Bytecode::WideStobjbyindex(obj_reg, index) => {
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             fx.emit_void(
                 block,
@@ -647,48 +731,69 @@ pub fn translate_bytecode(
                 loc,
             );
         }
-        Bytecode::Stownbyname(_ic, eid, obj_reg)
-        | Bytecode::Stownbynamewithnameset(_ic, eid, obj_reg) => {
-            // N60: own-property DEFINITION (v0.1
-            // `InstData::StoreOwnProperty` + PropKind::ByName) — no
-            // setters, no prototype-chain walk; never folds to
-            // StoreProp.
+        Bytecode::Stownbyname(_ic, eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StoreOwnPropName {
                     object: obj,
                     name,
                     value,
+                    kind: OwnStoreKind::OwnProp,
                 },
                 loc,
             );
         }
-        Bytecode::Stownbyvalue(_ic, obj_reg, key_reg)
-        | Bytecode::Stownbyvaluewithnameset(_ic, obj_reg, key_reg) => {
-            // N60: own-property definition with a computed key (v0.1
-            // PropKind::ByValue).
+        Bytecode::Stownbynamewithnameset(_ic, eid, obj_reg) => {
+            let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            fx.emit_void(
+                block,
+                Op::StoreOwnPropName {
+                    object: obj,
+                    name,
+                    value,
+                    kind: OwnStoreKind::OwnPropWithNameSet,
+                },
+                loc,
+            );
+        }
+        Bytecode::Stownbyvalue(_ic, obj_reg, key_reg) => {
+            let value = fx.read_acc(block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StoreOwnPropDyn {
                     object: obj,
                     key,
                     value,
+                    kind: OwnStoreKind::OwnProp,
+                },
+                loc,
+            );
+        }
+        Bytecode::Stownbyvaluewithnameset(_ic, obj_reg, key_reg) => {
+            let value = fx.read_acc(block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
+            fx.emit_void(
+                block,
+                Op::StoreOwnPropDyn {
+                    object: obj,
+                    key,
+                    value,
+                    kind: OwnStoreKind::OwnPropWithNameSet,
                 },
                 loc,
             );
         }
         Bytecode::Stownbyindex(_, obj_reg, index) | Bytecode::WideStownbyindex(obj_reg, index) => {
-            // N60: own-property definition at a constant index (v0.1
-            // PropKind::ByIndex — the index MATERIALIZED as a LoadConst,
-            // §9 resolution 3).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             fx.emit_void(
                 block,
@@ -696,6 +801,7 @@ pub fn translate_bytecode(
                     object: obj,
                     index: konst,
                     value,
+                    kind: OwnStoreKind::OwnProp,
                 },
                 loc,
             );
@@ -722,20 +828,17 @@ pub fn translate_bytecode(
         Bytecode::Ldsuperbyname(_ic, eid) => {
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            // No register operand (isa.yaml: `ldsuperbyname imm,
-            // string_id; acc: inout`) — the thisValue is the frame's
-            // this-role value (N74-W4).
-            let this_value = fx.this_value(block, loc);
+            // Vendor `ldsuperbyname imm, string_id; acc: inout` (`R3-H1`):
+            // the receiver (`thisValue`) rides `acc` in, and the property value
+            // is written back to `acc` out.
+            let this_value = fx.read_acc(block);
             let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Stsuperbyname(_ic, eid, this_reg) => {
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            // Vendor `stsuperbyname imm, string_id, v; acc: in`
-            // (isa.yaml:1545-1548): v = thisValue, acc = the stored
-            // value (N74-W4 — the register was misread as the value).
-            let this_value = fx.read_reg(*this_reg, block);
+            let this_value = fx.read_reg(*this_reg, block)?;
             let value = fx.read_acc(block);
             fx.emit_void(
                 block,
@@ -748,21 +851,15 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::Ldsuperbyvalue(_ic, this_reg) => {
-            // Vendor `ldsuperbyvalue imm, v; acc: inout` (isa.yaml:
-            // 1363-1367): v = thisValue, acc = the KEY (N74-W4 — the
-            // register was misread as the key; test262 super/*
-            // decompiled to `super[this]`).
-            let this_value = fx.read_reg(*this_reg, block);
+            let this_value = fx.read_reg(*this_reg, block)?;
             let k = fx.read_acc(block);
             let key = super_key(SuperKeyForm::Dynamic(k))?;
             let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Stsuperbyvalue(_ic, this_reg, key_reg) => {
-            // Vendor `stsuperbyvalue imm, v1, v2; acc: in` (isa.yaml:
-            // 1373-1377): v1 = thisValue, v2 = key, acc = value.
-            let this_value = fx.read_reg(*this_reg, block);
-            let k = fx.read_reg(*key_reg, block);
+            let this_value = fx.read_reg(*this_reg, block)?;
+            let k = fx.read_reg(*key_reg, block)?;
             let key = super_key(SuperKeyForm::Dynamic(k))?;
             let value = fx.read_acc(block);
             fx.emit_void(
@@ -776,14 +873,7 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::Delobjprop(key_reg) => {
-            // Vendor (isa.yaml:1293-1296; N65): `delobjprop v0` takes
-            // the OBJECT in the register v0 and the KEY in acc
-            // (result → acc). The operand ROLES were inverted here
-            // previously — the lower carried the mirror inversion, so
-            // byte round-trips stayed exact while the IR semantics
-            // flipped (found by the d-P4 decompile dream gate:
-            // local/property-ops deleted the wrong property).
-            let obj = fx.read_reg(*key_reg, block);
+            let obj = fx.read_reg(*key_reg, block)?;
             let key = fx.read_acc(block);
             let v = fx.emit_val(block, Op::DeleteProp { object: obj, key }, loc);
             fx.write_acc(block, v);
@@ -791,9 +881,6 @@ pub fn translate_bytecode(
 
         // ── Private properties ───────────────────────────────────────
         Bytecode::Ldprivateproperty(_ic, level, slot) => {
-            // Vendor: imm2 = level, imm3 = slot; acc in = the OBJECT,
-            // acc out = the private value (isa.yaml:436-440,
-            // interpreter_stub.cpp:853-867). NOT a ByIndex load.
             let obj = fx.read_acc(block);
             let v = fx.emit_val(
                 block,
@@ -807,11 +894,8 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Stprivateproperty(_ic, level, slot, obj_reg) => {
-            // Vendor: the REGISTER operand is the OBJECT, the acc
-            // carries the VALUE (isa.yaml:441-445,
-            // interpreter_stub.cpp:869-879).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StorePrivate {
@@ -824,35 +908,47 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::Testin(_ic, level, slot) => {
-            // Vendor: acc in = the OBJECT, acc out = the boolean result
-            // (isa.yaml:446-450, interpreter_stub.cpp:881-890).
             let obj = fx.read_acc(block);
-            let v = fx.emit_val(
+            let v = fx.emit_val_typed(
                 block,
                 Op::TestPrivate {
                     level: level.0 as u16,
                     slot: slot.0 as u16,
                     obj,
                 },
+                Ty::DynPrim(DynPrim::Bool),
                 loc,
             );
             fx.write_acc(block, v);
         }
 
         // ── Define field/property by name ────────────────────────────
-        Bytecode::Definefieldbyname(_ic, eid, obj_reg)
-        | Bytecode::Definepropertybyname(_ic, eid, obj_reg) => {
-            // N60: own-property DEFINITION (v0.1
-            // `InstData::StoreOwnProperty` + PropKind::ByName).
+        Bytecode::Definefieldbyname(_ic, eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StoreOwnPropName {
                     object: obj,
                     name,
                     value,
+                    kind: OwnStoreKind::ClassField,
+                },
+                loc,
+            );
+        }
+        Bytecode::Definepropertybyname(_ic, eid, obj_reg) => {
+            let name = fx.resolve_str(*eid)?;
+            let value = fx.read_acc(block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            fx.emit_void(
+                block,
+                Op::StoreOwnPropName {
+                    object: obj,
+                    name,
+                    value,
+                    kind: OwnStoreKind::DefineProperty,
                 },
                 loc,
             );
@@ -941,6 +1037,7 @@ pub fn translate_bytecode(
                 Op::GetLexVar {
                     level: level.0 as u16,
                     slot: slot.0 as u16,
+                    kind: LexEnvKind::Plain,
                 },
                 loc,
             );
@@ -954,6 +1051,7 @@ pub fn translate_bytecode(
                     level: level.0 as u16,
                     slot: slot.0 as u16,
                     value,
+                    kind: LexEnvKind::Plain,
                 },
                 loc,
             );
@@ -963,6 +1061,7 @@ pub fn translate_bytecode(
                 block,
                 Op::NewLexEnv {
                     num_vars: num.0 as u16,
+                    kind: LexEnvKind::Plain,
                 },
                 loc,
             );
@@ -1078,7 +1177,7 @@ pub fn translate_bytecode(
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
             let member_attrs = fx.resolve_class_member_attrs(*lit_eid, false)?;
-            let base = fx.read_reg(*base_reg, block);
+            let base = fx.read_reg(*base_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::DefineClass(Box::new(abcd_ir::DefineClassData {
@@ -1093,10 +1192,13 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Definegettersetterbyvalue(obj_reg, key_reg, getter_reg, setter_reg) => {
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
-            let getter = fx.read_reg(*getter_reg, block);
-            let setter = fx.read_reg(*setter_reg, block);
+            // Vendor `definegettersetterbyvalue v1, v2, v3, v4, acc: inout` (`R3-H2`):
+            // `acc` carries the boolean `set_name` flag in and receives `obj` out.
+            let set_name = fx.read_acc(block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
+            let getter = fx.read_reg(*getter_reg, block)?;
+            let setter = fx.read_reg(*setter_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::DefineGetterSetterByValue {
@@ -1104,6 +1206,7 @@ pub fn translate_bytecode(
                     key,
                     getter,
                     setter,
+                    set_name,
                 },
                 loc,
             );
@@ -1127,7 +1230,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Callarg1(_ic, a0) => {
             let callee = fx.read_acc(block);
-            let arg0 = fx.read_reg(*a0, block);
+            let arg0 = fx.read_reg(*a0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1142,8 +1245,8 @@ pub fn translate_bytecode(
         }
         Bytecode::Callargs2(_ic, a0, a1) => {
             let callee = fx.read_acc(block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1158,9 +1261,9 @@ pub fn translate_bytecode(
         }
         Bytecode::Callargs3(_ic, a0, a1, a2) => {
             let callee = fx.read_acc(block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
-            let arg2 = fx.read_reg(*a2, block);
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
+            let arg2 = fx.read_reg(*a2, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1175,7 +1278,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Callrange(_, argc, start) | Bytecode::WideCallrange(argc, start) => {
             let callee = fx.read_acc(block);
-            let args = fx.read_reg_range(start.0, argc.0 as u16, block);
+            let args = fx.read_reg_range(start.0, argc.0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1190,7 +1293,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Callthis0(_, this_reg) | Bytecode::Callthis0withname(_, _, this_reg) => {
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
+            let this = fx.read_reg(*this_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1205,8 +1308,8 @@ pub fn translate_bytecode(
         }
         Bytecode::Callthis1(_, this_reg, a0) | Bytecode::Callthis1withname(_, _, this_reg, a0) => {
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
+            let this = fx.read_reg(*this_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1222,9 +1325,9 @@ pub fn translate_bytecode(
         Bytecode::Callthis2(_, this_reg, a0, a1)
         | Bytecode::Callthis2withname(_, _, this_reg, a0, a1) => {
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
+            let this = fx.read_reg(*this_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1240,10 +1343,10 @@ pub fn translate_bytecode(
         Bytecode::Callthis3(_, this_reg, a0, a1, a2)
         | Bytecode::Callthis3withname(_, _, this_reg, a0, a1, a2) => {
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
-            let arg2 = fx.read_reg(*a2, block);
+            let this = fx.read_reg(*this_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
+            let arg2 = fx.read_reg(*a2, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1258,7 +1361,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Callthisrange(_, argc, start) | Bytecode::WideCallthisrange(argc, start) => {
             let callee = fx.read_acc(block);
-            let args = call_this_args(fx, start.0, argc.0, block);
+            let args = call_this_args(fx, start.0, argc.0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1273,10 +1376,8 @@ pub fn translate_bytecode(
         }
         Bytecode::Callthisrangewithname(_, argc, _, start)
         | Bytecode::WideCallthisrangewithname(argc, _, start) => {
-            // callthis*withname: the method name is only a JIT IC hint;
-            // folds into the plain callthis form (v0.1 parity).
             let callee = fx.read_acc(block);
-            let args = call_this_args(fx, start.0, argc.0, block);
+            let args = call_this_args(fx, start.0, argc.0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1291,8 +1392,11 @@ pub fn translate_bytecode(
         }
         Bytecode::Supercallthisrange(_, argc, start)
         | Bytecode::WideSupercallthisrange(argc, start) => {
-            let callee = fx.read_acc(block);
-            let args = fx.read_reg_range(start.0, argc.0 as u16, block);
+            // Vendor `supercallthisrange` (`R3-C5`, `isa.yaml` `acc: out:top`):
+            // does NOT read `acc`; resolves the super constructor from the
+            // enclosing constructor function (`LoadFunction`).
+            let args = fx.read_reg_range(start.0, argc.0, block)?;
+            let callee = fx.emit_val(block, Op::LoadFunction, loc);
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1307,27 +1411,25 @@ pub fn translate_bytecode(
         }
         Bytecode::Supercallarrowrange(_, argc, start)
         | Bytecode::WideSupercallarrowrange(argc, start) => {
-            // Arrow distinction folds into Super (documented).
+            // Vendor `supercallarrowrange` (`R3-C5`, `isa.yaml` `acc: inout:top`):
+            // explicit super constructor in `acc`, distinct `CallKind::SuperArrow`.
             let callee = fx.read_acc(block);
-            let args = fx.read_reg_range(start.0, argc.0 as u16, block);
+            let args = fx.read_reg_range(start.0, argc.0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
                     callee,
                     this: None,
                     args,
-                    kind: CallKind::Super,
+                    kind: CallKind::SuperArrow,
                 },
                 loc,
             );
             fx.write_acc(block, v);
         }
         Bytecode::Supercallspread(_ic, arg_reg) => {
-            // N58: the spread role is IR-explicit
-            // (`CallKind::SuperSpread`, v0.1 parity) — args[0] is the
-            // argument ARRAY, never a positional argument.
             let callee = fx.read_acc(block);
-            let arg = fx.read_reg(*arg_reg, block);
+            let arg = fx.read_reg(*arg_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1341,12 +1443,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Apply(_ic, this_reg, args_reg) => {
-            // N57: the apply opcode identity is IR-explicit
-            // (`CallKind::Apply`, v0.1 parity) — args[0] is the argument
-            // ARRAY, never a positional argument.
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
-            let args_arr = fx.read_reg(*args_reg, block);
+            let this = fx.read_reg(*this_reg, block)?;
+            let args_arr = fx.read_reg(*args_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1360,15 +1459,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Newobjrange(_, argc, start) | Bytecode::WideNewobjrange(argc, start) => {
-            // Vendor: the constructor is the FIRST register of the
-            // range and argc COUNTS it; the slow path passes the ctor
-            // as both func and newTarget (interpreter-inl.cpp:4205,
-            // wide twin :4476).
-            let range = fx.read_reg_range(start.0, argc.0 as u16, block);
+            let range = fx.read_reg_range(start.0, argc.0, block)?;
             let (callee, args) = match range.split_first() {
                 Some((&ctor, rest)) => (ctor, rest.to_vec()),
-                // Degenerate argc = 0: v0.1's acc fallback (no operand
-                // invented or dropped).
                 None => (fx.read_acc(block), Vec::new()),
             };
             let v = fx.emit_val(
@@ -1384,19 +1477,17 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Newobjapply(_ic, obj_reg) => {
-            // Vendor (interpreter_assembly.cpp:1912-1926): the REGISTER
-            // operand is the constructor, the ACC is the spread array.
-            // v0.2 NORMALIZES to callee=ctor (v0.1's NewObjApply
-            // carried the swapped roles — documented).
+            // Vendor (`R3-C1`, `interpreter_assembly.cpp:1912-1926`): register
+            // `obj_reg` is the constructor, `acc` is the spread array → `NewSpread`.
             let array = fx.read_acc(block);
-            let ctor = fx.read_reg(*obj_reg, block);
+            let ctor = fx.read_reg(*obj_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
                     callee: ctor,
                     this: None,
                     args: vec![array],
-                    kind: CallKind::New,
+                    kind: CallKind::NewSpread,
                 },
                 loc,
             );
@@ -1452,167 +1543,141 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Closeiterator(_ic, iter_reg) => {
-            // `closeiterator` calls the iterator's `return()` —
-            // v0.2's IteratorReturn (documented rename).
-            let iterator = fx.read_reg(*iter_reg, block);
+            let iterator = fx.read_reg(*iter_reg, block)?;
             let v = fx.emit_val(block, Op::IteratorReturn { iterator }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Getnextpropname(iter_reg) => {
-            // Vendor: the register operand is the for-in iterator; the
-            // NEXT PROPERTY NAME goes to acc (isa.yaml:1289-1292).
-            let iterator = fx.read_reg(*iter_reg, block);
+            let iterator = fx.read_reg(*iter_reg, block)?;
             let v = fx.emit_val(block, Op::NextPropName { iterator }, loc);
             fx.write_acc(block, v);
         }
 
         // ── Generator / Async ────────────────────────────────────────
         Bytecode::Creategeneratorobj(func_reg) => {
-            let func = fx.read_reg(*func_reg, block);
+            let func = fx.read_reg(*func_reg, block)?;
             let v = fx.emit_val(block, Op::CreateGenerator { func }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Createasyncgeneratorobj(func_reg) => {
-            // Async-generator fold (documented).
-            let func = fx.read_reg(*func_reg, block);
-            let v = fx.emit_val(block, Op::CreateGenerator { func }, loc);
+            let func = fx.read_reg(*func_reg, block)?;
+            let v = fx.emit_val(block, Op::CreateAsyncGenerator { func }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Suspendgenerator(gen_reg) => {
-            // Vendor: the register operand is the generator object, the
-            // accumulator carries the YIELD VALUE; the resume result
-            // goes back to acc (isa.yaml:1302-1305).
-            let genobj = fx.read_reg(*gen_reg, block);
+            let genobj = fx.read_reg(*gen_reg, block)?;
             let value = fx.read_acc(block);
             let v = fx.emit_val(block, Op::SuspendGenerator { genobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Resumegenerator => {
-            // Vendor `acc: inout:top`, no register operand
-            // (isa.yaml:1261-1264).
             let genobj = fx.read_acc(block);
             let v = fx.emit_val(block, Op::ResumeGenerator { genobj }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Getresumemode => {
-            // Vendor `acc: inout:top`, no register operand
-            // (isa.yaml:1270-1273). Distinct from ResumeGenerator.
             let genobj = fx.read_acc(block);
             let v = fx.emit_val(block, Op::GetResumeMode { genobj }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Setgeneratorstate(_imm) => {
-            // State bookkeeping — no IR side effect needed (v0.1
-            // parity).
+        Bytecode::Setgeneratorstate(imm) => {
+            // Vendor `setgeneratorstate imm:u8, acc: in:top` (`R3-C2`).
+            let genobj = fx.read_acc(block);
+            fx.emit_void(
+                block,
+                Op::SetGeneratorState {
+                    genobj,
+                    state: imm.0 as u8,
+                },
+                loc,
+            );
         }
         Bytecode::Asyncfunctionenter => {
             let v = fx.emit_val(block, Op::AsyncFunctionEnter, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Asyncfunctionawaituncaught(func_reg) => {
-            // Vendor `asyncfunctionawaituncaught v:in:top,
-            // acc: inout:top` (isa.yaml:1311-1314): the register operand
-            // is the async function object, the ACCUMULATOR carries the
-            // awaited value; the result goes back to acc
-            // (interpreter-inl.cpp:5357-5366
-            // HANDLE_OPCODE(ASYNCFUNCTIONAWAITUNCAUGHT_V8):
-            // `value = GET_ACC()`).
-            let funcobj = fx.read_reg(*func_reg, block);
+            let funcobj = fx.read_reg(*func_reg, block)?;
             let value = fx.read_acc(block);
             let v = fx.emit_val(block, Op::AwaitUncaught { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Asyncfunctionresolve(func_reg) => {
-            // Vendor `asyncfunctionresolve v:in:top, acc: inout:top`
-            // (isa.yaml:1413-1416; interpreter-inl.cpp:6577-6589
-            // HANDLE_OPCODE(ASYNCFUNCTIONRESOLVE_V8)): v0 = async
-            // function object, acc = resolution value, result → acc.
-            let funcobj = fx.read_reg(*func_reg, block);
+            let funcobj = fx.read_reg(*func_reg, block)?;
             let value = fx.read_acc(block);
             let v = fx.emit_val(block, Op::AsyncResolve { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Asyncfunctionreject(func_reg) => {
-            // Vendor `asyncfunctionreject v:in:top, acc: inout:top`
-            // (isa.yaml:1422-1425; interpreter-inl.cpp:6605-6617
-            // HANDLE_OPCODE(ASYNCFUNCTIONREJECT_V8)): v0 = async
-            // function object, acc = rejection reason, result → acc.
-            let funcobj = fx.read_reg(*func_reg, block);
+            let funcobj = fx.read_reg(*func_reg, block)?;
             let value = fx.read_acc(block);
             let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Asyncgeneratorresolve(val_reg, done_reg, _next_reg) => {
-            // v0.1 folds to the iter-result object (parity); _next_reg
-            // is not read by v0.1 either.
-            let value = fx.read_reg(*val_reg, block);
-            let done = fx.read_reg(*done_reg, block);
-            let v = fx.emit_val(block, Op::CreateIterResultObj { value, done }, loc);
+        Bytecode::Asyncgeneratorresolve(gen_reg, val_reg, done_reg) => {
+            // Vendor `asyncgeneratorresolve v1, v2, v3` (`R3-C2`):
+            // `v1 = genobj`, `v2 = value`, `v3 = done` (`canSuspend`).
+            let genobj = fx.read_reg(*gen_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
+            let done = fx.read_reg(*done_reg, block)?;
+            let v = fx.emit_val(
+                block,
+                Op::AsyncGeneratorResolve {
+                    genobj,
+                    value,
+                    done,
+                },
+                loc,
+            );
             fx.write_acc(block, v);
         }
         Bytecode::Asyncgeneratorreject(gen_reg) => {
-            // Vendor `asyncgeneratorreject v:in:top, acc: inout:top`
-            // (interpreter-inl.cpp:3226-3239
-            // HANDLE_OPCODE(ASYNCGENERATORREJECT_V8)): v0 = async
-            // GENERATOR object, acc = rejection reason, result → acc —
-            // the same acc-value shape as asyncfunctionreject (v0.1
-            // folds both to AsyncReject; parity kept).
-            let funcobj = fx.read_reg(*gen_reg, block);
+            // Vendor `asyncgeneratorreject v:in:top, acc: inout:top` (`R3-C2`):
+            // `v = genobj`, `acc = rejection reason`.
+            let genobj = fx.read_reg(*gen_reg, block)?;
             let value = fx.read_acc(block);
-            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
+            let v = fx.emit_val(block, Op::AsyncGeneratorReject { genobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Createiterresultobj(val_reg, done_reg) => {
-            let value = fx.read_reg(*val_reg, block);
-            let done = fx.read_reg(*done_reg, block);
+            let value = fx.read_reg(*val_reg, block)?;
+            let done = fx.read_reg(*done_reg, block)?;
             let v = fx.emit_val(block, Op::CreateIterResultObj { value, done }, loc);
             fx.write_acc(block, v);
         }
 
         // ── Misc ─────────────────────────────────────────────────────
         Bytecode::Gettemplateobject(_ic) => {
-            // Vendor `acc: inout:top` (isa.yaml:1279-1283): the acc
-            // carries the template literal, the (cached) template
-            // object goes back to acc. NOT an element read.
             let literal = fx.read_acc(block);
             let v = fx.emit_val(block, Op::GetTemplateObject { literal }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Setobjectwithproto(_ic, proto_reg) => {
-            // Vendor: v is the proto, the OBJECT rides the accumulator;
-            // sets the prototype link directly — NEVER a property copy
-            // (isa.yaml:1333-1337).
             let obj = fx.read_acc(block);
-            let proto = fx.read_reg(*proto_reg, block);
+            let proto = fx.read_reg(*proto_reg, block)?;
             fx.emit_void(block, Op::SetObjectWithProto { proto, obj }, loc);
         }
         Bytecode::Starrayspread(arr_reg, index_reg) => {
-            // Vendor: v1 = destination array, v2 = start index, acc =
-            // source iterable; the NEW INDEX is written back to acc
-            // (isa.yaml:1329-1332, interpreter_assembly.cpp:2876-2894).
             let src = fx.read_acc(block);
-            let dst = fx.read_reg(*arr_reg, block);
-            let index = fx.read_reg(*index_reg, block);
+            let dst = fx.read_reg(*arr_reg, block)?;
+            let index = fx.read_reg(*index_reg, block)?;
             let v = fx.emit_val(block, Op::ArraySpread { dst, index, src }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Copydataproperties(dst_reg) => {
-            // Vendor: the register operand is the TARGET, the acc
-            // carries the SOURCE and receives the result (the target).
             let src = fx.read_acc(block);
-            let dst = fx.read_reg(*dst_reg, block);
+            let dst = fx.read_reg(*dst_reg, block)?;
             fx.emit_void(block, Op::CopyDataProps { dst, src }, loc);
-            // acc: inout — after the instruction acc holds the target.
             fx.write_acc(block, dst);
         }
 
         // ── Control flow — jumps ─────────────────────────────────────
         Bytecode::Jmp(label) => {
-            let dest = fx.label_block(*label);
+            let dest = fx.label_block(idx, *label)?;
             fx.emit_void(block, Op::Branch { dest }, loc);
         }
-        Bytecode::Jeqz(label) => cond_branch_acc(fx, false, *label, idx, block, loc),
-        Bytecode::Jnez(label) => cond_branch_acc(fx, true, *label, idx, block, loc),
+        Bytecode::Jeqz(label) => cond_branch_acc(fx, false, *label, idx, bi, block, loc)?,
+        Bytecode::Jnez(label) => cond_branch_acc(fx, true, *label, idx, bi, block, loc)?,
         // Fused compare-and-branch family (isa.yaml:1700-1796) — HARD
         // ERROR (maintainer ruling 2026-10-04, N51 pattern). isa.yaml
         // documents only `pc += imm` for all 24 variants — NO
@@ -1699,28 +1764,19 @@ pub fn translate_bytecode(
             fx.emit_void(block, Op::ThrowDeleteSuperProperty, loc);
         }
         Bytecode::ThrowConstassignment(name_reg) => {
-            // Vendor: the register operand carries the variable name AS
-            // A RUNTIME STRING VALUE (isa.yaml:987-991).
-            let name = fx.read_reg(*name_reg, block);
+            let name = fx.read_reg(*name_reg, block)?;
             fx.emit_void(block, Op::ThrowConstAssignment { name }, loc);
         }
         Bytecode::ThrowIfnotobject(val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
+            let value = fx.read_reg(*val_reg, block)?;
             fx.emit_void(block, Op::ThrowIfNotObject { value }, loc);
         }
         Bytecode::ThrowUndefinedifhole(name_reg, val_reg) => {
-            // Vendor: v1 carries the variable name AS A RUNTIME STRING
-            // VALUE, v2 the checked value; acc untouched
-            // (isa.yaml:998-1002).
-            let name = fx.read_reg(*name_reg, block);
-            let value = fx.read_reg(*val_reg, block);
+            let name = fx.read_reg(*name_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
             fx.emit_void(block, Op::ThrowUndefinedIfHole { name, value }, loc);
         }
         Bytecode::ThrowUndefinedifholewithname(eid) => {
-            // Vendor: here the name IS a compile-time source string and
-            // the checked value rides the accumulator
-            // (isa.yaml:1010-1015) — a distinct instruction from the
-            // two-register form.
             let name = fx.resolve_str(*eid)?;
             let acc = fx.read_acc(block);
             fx.emit_void(
@@ -1730,10 +1786,6 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::ThrowIfsupernotcorrectcall(imm) => {
-            // Vendor: the imm selects the CHECK KIND (0 = TDZ guard,
-            // 1 = re-bind guard — runtime_stubs-inl.h:2520-2532) and
-            // the acc carries the `this` value being checked
-            // (isa.yaml:1003-1008).
             let value = fx.read_acc(block);
             let kind = match imm.0 as u16 {
                 0 => SuperCheck::NotCalled,
@@ -1750,32 +1802,30 @@ pub fn translate_bytecode(
         Bytecode::Nop => { /* no-op */ }
 
         // ── Callruntime variants ─────────────────────────────────────
-        Bytecode::CallruntimeNotifyconcurrentresult | Bytecode::CallruntimeTopropertykey => {
-            // acc stays unchanged or is a pass-through (v0.1 parity).
-        }
-        Bytecode::CallruntimeDefinefieldbyvalue(_ic, key_reg, obj_reg) => {
-            // Vendor: the FIRST register operand is the propKey, the
-            // SECOND is the obj, the acc carries the value
-            // (isa.yaml:826-831, interpreter_stub.cpp:6031-6043). N60:
-            // own-property definition (v0.1 PropKind::ByValue).
+        Bytecode::CallruntimeNotifyconcurrentresult => {
+            // Vendor `callruntime.notifyconcurrentresult` (`R3-C4`, `acc: in:top`).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
+            fx.emit_void(block, Op::NotifyConcurrentResult { value }, loc);
+        }
+        Bytecode::CallruntimeTopropertykey => unary_op(fx, UnOp::ToPropertyKey, block, loc),
+        Bytecode::CallruntimeDefinefieldbyvalue(_ic, key_reg, obj_reg) => {
+            let value = fx.read_acc(block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
             fx.emit_void(
                 block,
                 Op::StoreOwnPropDyn {
                     object: obj,
                     key,
                     value,
+                    kind: OwnStoreKind::ClassField,
                 },
                 loc,
             );
         }
         Bytecode::CallruntimeDefinefieldbyindex(_ic, index, obj_reg) => {
-            // N60: own-property definition at a constant index (v0.1
-            // PropKind::ByIndex — the index MATERIALIZED as a LoadConst).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             fx.emit_void(
                 block,
@@ -1783,14 +1833,12 @@ pub fn translate_bytecode(
                     object: obj,
                     index: konst,
                     value,
+                    kind: OwnStoreKind::ClassField,
                 },
                 loc,
             );
         }
         Bytecode::CallruntimeCreateprivateproperty(count, eid) => {
-            // Vendor: registers `count` private names from the literal
-            // array in the current environment (isa.yaml:843-848,
-            // interpreter_stub.cpp:6066-6077). VOID, but observable.
             let names = fx.resolve_literal(*eid)?;
             fx.emit_void(
                 block,
@@ -1802,11 +1850,8 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::CallruntimeDefineprivateproperty(_ic, level, slot, obj_reg) => {
-            // Vendor: the REGISTER operand is the OBJECT, the acc
-            // carries the VALUE (isa.yaml:849-854,
-            // interpreter_stub.cpp:6079-6091).
             let value = fx.read_acc(block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(
                 block,
                 Op::DefinePrivate {
@@ -1819,30 +1864,27 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::CallruntimeCallinit(_ic, this_reg) => {
+            // Vendor `callruntime.callinit` (`R3-C7`): class field-initializer
+            // invocation (`CallKind::ClassInit`).
             let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
+            let this = fx.read_reg(*this_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
                     callee,
                     this: Some(this),
                     args: vec![],
-                    kind: CallKind::Dynamic,
+                    kind: CallKind::ClassInit,
                 },
                 loc,
             );
             fx.write_acc(block, v);
         }
         Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, count, base_reg) => {
-            // N53: the sendable form is its OWN op — the vendor runtime
-            // builds the class via SlowRuntimeStub::CreateSharedClass
-            // (interpreter_assembly.cpp:6157-6180), not the contemporary
-            // defineclasswithbuffer's CreateClassWithBuffer. v0.1's fold
-            // into DefineClassWithBuffer corrupted the opcode identity.
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
             let member_attrs = fx.resolve_class_member_attrs(*lit_eid, true)?;
-            let base = fx.read_reg(*base_reg, block);
+            let base = fx.read_reg(*base_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::DefineSendableClass(Box::new(abcd_ir::DefineClassData {
@@ -1920,6 +1962,7 @@ pub fn translate_bytecode(
                 block,
                 Op::NewLexEnv {
                     num_vars: num.0 as u16,
+                    kind: LexEnvKind::Sendable,
                 },
                 loc,
             );
@@ -1934,6 +1977,7 @@ pub fn translate_bytecode(
                     level: level.0 as u16,
                     slot: slot.0 as u16,
                     value,
+                    kind: LexEnvKind::Sendable,
                 },
                 loc,
             );
@@ -1945,6 +1989,7 @@ pub fn translate_bytecode(
                 Op::GetLexVar {
                     level: level.0 as u16,
                     slot: slot.0 as u16,
+                    kind: LexEnvKind::Sendable,
                 },
                 loc,
             );
@@ -1953,20 +1998,17 @@ pub fn translate_bytecode(
         Bytecode::CallruntimeIstrue(_ic) => unary_op(fx, UnOp::IsTrue, block, loc),
         Bytecode::CallruntimeIsfalse(_ic) => unary_op(fx, UnOp::IsFalse, block, loc),
         Bytecode::CallruntimeSupercallforwardallargs(this_reg) => {
-            // N58: the forward-all form keeps its own kind
-            // (`CallKind::SuperForwardAllArgs`) so the lower never
-            // confuses it with supercallspread; v0.1's approximation is
-            // kept verbatim — the enclosing `this` is modeled as the
-            // single forwarded argument (v0.1 `CallKind::SuperCall`,
-            // args [this], lowering to supercallthisrange argc=1).
-            let callee = fx.read_acc(block);
-            let this = fx.read_reg(*this_reg, block);
+            // Vendor `callruntime.supercallforwardallargs v:in:top` (`R3-C5`,
+            // `isa.yaml` `acc: out:top`): `this_reg` (`thisFunc`) is the ONLY
+            // input; `acc` is NOT read. `verify_func` and `abcd-lower` model
+            // `SuperForwardAllArgs` with `this: None` and `args: [this_func]`.
+            let this_func = fx.read_reg(*this_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
-                    callee,
+                    callee: this_func,
                     this: None,
-                    args: vec![this],
+                    args: vec![this_func],
                     kind: CallKind::SuperForwardAllArgs,
                 },
                 loc,
@@ -1981,6 +2023,7 @@ pub fn translate_bytecode(
                 Op::GetLexVar {
                     level: 0,
                     slot: index.0 as u16,
+                    kind: LexEnvKind::Patch,
                 },
                 loc,
             );
@@ -1994,6 +2037,7 @@ pub fn translate_bytecode(
                     level: 0,
                     slot: index.0 as u16,
                     value,
+                    kind: LexEnvKind::Patch,
                 },
                 loc,
             );
@@ -2011,25 +2055,28 @@ pub fn translate_bytecode(
         Bytecode::DeprecatedPoplexenv => {
             fx.emit_void(block, Op::PopLexEnv, loc);
         }
-        Bytecode::DeprecatedGetiteratornext(iter_reg, _step_reg) => {
-            // v0.1's fold kept verbatim (GetIterator over the register
-            // operand).
-            let iterator = fx.read_reg(*iter_reg, block);
-            let v = fx.emit_val(block, Op::GetIterator { obj: iterator }, loc);
+        Bytecode::DeprecatedGetiteratornext(iter_reg, step_reg) => {
+            // Legacy `deprecated.getiteratornext v1, v2` (`R3-M4`): advances
+            // `iterator` (`v1`) using its `next` method (`v2`) → `IteratorNext`.
+            let iterator = fx.read_reg(*iter_reg, block)?;
+            let _step = fx.read_reg(*step_reg, block)?;
+            let v = fx.emit_val(block, Op::IteratorNext { iterator }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedCreatearraywithbuffer(idx)
-        | Bytecode::DeprecatedCreateobjectwithbuffer(idx) => {
-            // v0.1 parity: the deprecated form carries the RAW table
-            // index (no entity-offset indirection), and v0.1 lifts BOTH
-            // deprecated forms to CreateArrayWithBuffer — so both fold
-            // to AllocArray here (the comparator machine-checks it).
+        Bytecode::DeprecatedCreatearraywithbuffer(idx) => {
             let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
             let v = fx.emit_val(block, Op::AllocArray { shape: Some(shape) }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedTonumber(dst) | Bytecode::DeprecatedTonumeric(dst) => {
-            let val = fx.read_reg(*dst, block);
+        Bytecode::DeprecatedCreateobjectwithbuffer(idx) => {
+            // `R3-M4`: `deprecated.createobjectwithbuffer` allocates an OBJECT
+            // literal (`AllocObject`), never an array.
+            let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
+            let v = fx.emit_val(block, Op::AllocObject { shape }, loc);
+            fx.write_acc(block, v);
+        }
+        Bytecode::DeprecatedTonumber(src) => {
+            let val = fx.read_reg(*src, block)?;
             let v = fx.emit_val(
                 block,
                 Op::UnaryOp {
@@ -2040,8 +2087,21 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
+        Bytecode::DeprecatedTonumeric(src) => {
+            // `R3-M4`: preserves BigInt values (`ToNumeric`, not `ToNumber`).
+            let val = fx.read_reg(*src, block)?;
+            let v = fx.emit_val(
+                block,
+                Op::UnaryOp {
+                    op: UnOp::ToNumeric,
+                    operand: val,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
+        }
         Bytecode::DeprecatedNeg(src) => {
-            let val = fx.read_reg(*src, block);
+            let val = fx.read_reg(*src, block)?;
             let v = fx.emit_val(
                 block,
                 Op::UnaryOp {
@@ -2053,9 +2113,7 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedNot(src) => {
-            // N39: `deprecated.not` is the same BITWISE ~ on the
-            // register operand (interpreter_assembly.cpp:4761-4786).
-            let val = fx.read_reg(*src, block);
+            let val = fx.read_reg(*src, block)?;
             let v = fx.emit_val(
                 block,
                 Op::UnaryOp {
@@ -2067,7 +2125,7 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedInc(src) => {
-            let val = fx.read_reg(*src, block);
+            let val = fx.read_reg(*src, block)?;
             let v = fx.emit_val(
                 block,
                 Op::UnaryOp {
@@ -2079,7 +2137,7 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedDec(src) => {
-            let val = fx.read_reg(*src, block);
+            let val = fx.read_reg(*src, block)?;
             let v = fx.emit_val(
                 block,
                 Op::UnaryOp {
@@ -2091,7 +2149,7 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallarg0(callee_reg) => {
-            let callee = fx.read_reg(*callee_reg, block);
+            let callee = fx.read_reg(*callee_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2105,8 +2163,8 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallarg1(callee_reg, a0) => {
-            let callee = fx.read_reg(*callee_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
+            let callee = fx.read_reg(*callee_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2120,9 +2178,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallargs2(callee_reg, a0, a1) => {
-            let callee = fx.read_reg(*callee_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
+            let callee = fx.read_reg(*callee_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2136,10 +2194,10 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallargs3(callee_reg, a0, a1, a2) => {
-            let callee = fx.read_reg(*callee_reg, block);
-            let arg0 = fx.read_reg(*a0, block);
-            let arg1 = fx.read_reg(*a1, block);
-            let arg2 = fx.read_reg(*a2, block);
+            let callee = fx.read_reg(*callee_reg, block)?;
+            let arg0 = fx.read_reg(*a0, block)?;
+            let arg1 = fx.read_reg(*a1, block)?;
+            let arg2 = fx.read_reg(*a2, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2154,7 +2212,7 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedCallrange(argc, start) => {
             let callee = fx.read_acc(block);
-            let args = fx.read_reg_range(start.0, argc.0 as u16, block);
+            let args = fx.read_reg_range(start.0, argc.0, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2168,14 +2226,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallspread(func_reg, this_reg, array_reg) => {
-            // Vendor `deprecated.callspread v1, v2, v3`
-            // (isa.yaml:1109): CallSpread(func=v1, obj=v2, array=v3) —
-            // identical semantics to the modern `apply` with func in
-            // acc; lifts to the 2-role Apply form (N16/N57, v0.1
-            // parity).
-            let func = fx.read_reg(*func_reg, block);
-            let this = fx.read_reg(*this_reg, block);
-            let array = fx.read_reg(*array_reg, block);
+            let func = fx.read_reg(*func_reg, block)?;
+            let this = fx.read_reg(*this_reg, block)?;
+            let array = fx.read_reg(*array_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2189,22 +2242,26 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallthisrange(argc, start) => {
-            // Vendor DEPRECATED_CALLTHISRANGE_PREF_IMM16_V8
-            // (interpreter-inl.cpp:1365-1371): the encoded imm16 is
-            // actualNumArgs + 1 (real args EXCLUDING this), the acc is
-            // OUT-only (`acc: out:top`, isa.yaml:1145) and the FUNC is
-            // the FIRST window slot — DEPRECATED_CALL_INITIALIZE reads
-            // `funcTagged = sp[startReg]`; the window layout is
-            // [func, this, args...] with args pushed from
-            // sp[startReg+2 .. startReg+imm]
-            // (DEPRECATED_CALL_PUSH_ARGS_THISRANGE: `for (i =
-            // actualNumArgs + 1; i > 1; i--) push sp[startReg + i]`).
-            // Zero corpus coverage (no deprecated.callthisrange in any
-            // exported fixture) — vendor-derived.
-            let argc = argc.0 as u16;
-            let callee = fx.read_reg(Reg(start.0), block);
-            let this = fx.read_reg(Reg(start.0.saturating_add(1)), block);
-            let args = fx.read_reg_range(start.0.saturating_add(2), argc.saturating_sub(1), block);
+            if argc.0 < 0 {
+                return Err(LiftError::RegisterRangeOverflow {
+                    start: start.0,
+                    count: argc.0,
+                });
+            }
+            let total = if argc.0 == 0 {
+                2
+            } else {
+                argc.0
+                    .checked_add(1)
+                    .ok_or(LiftError::RegisterRangeOverflow {
+                        start: start.0,
+                        count: argc.0,
+                    })?
+            };
+            let window = fx.read_reg_range(start.0, total, block)?;
+            let callee = window[0];
+            let this = window[1];
+            let args = window[2..].to_vec();
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2224,18 +2281,11 @@ pub fn translate_bytecode(
             lexenv_reg,
             proto_reg,
         ) => {
-            // ADR-08 (#38, overturning N54): vendor
-            // `HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8`
-            // (`ecmascript/interpreter/interpreter_assembly.cpp:4624-4648`)
-            // reads `v1` as `lexenv` and `v2` as `proto` (heritage), resolving
-            // `method_id` to the constructor and `imm1` to the member literal
-            // array (`entity_offsets` on decoded 0.0.0.2 files, with direct
-            // `literal_arrays` table-index fallback for synthetic modern bodies).
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let raw_lit = lit_imm.0 as u32;
             let (members, member_attrs) = if fx
                 .body
-                .entity_offsets
+                .entities
                 .contains_key(&(EntityKind::LiteralarrayId, raw_lit))
             {
                 let lit_eid = EntityId(raw_lit);
@@ -2248,8 +2298,8 @@ pub fn translate_bytecode(
                     resolve::class_member_attrs_for_index(fx.lf.file, raw_lit, false)?;
                 (members, member_attrs)
             };
-            let _lexenv = fx.read_reg(*lexenv_reg, block);
-            let base = fx.read_reg(*proto_reg, block);
+            let _lexenv = fx.read_reg(*lexenv_reg, block)?;
+            let base = fx.read_reg(*proto_reg, block)?;
             let v = fx.emit_val(
                 block,
                 Op::DefineClass(Box::new(abcd_ir::DefineClassData {
@@ -2264,82 +2314,64 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedResumegenerator(gen_reg) => {
-            // Vendor: genobj is the register operand here
-            // (isa.yaml:1265-1269).
-            let genobj = fx.read_reg(*gen_reg, block);
+            let genobj = fx.read_reg(*gen_reg, block)?;
             let v = fx.emit_val(block, Op::ResumeGenerator { genobj }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedGetresumemode(gen_reg) => {
-            // Vendor: genobj is the register operand here
-            // (isa.yaml:1274-1278).
-            let genobj = fx.read_reg(*gen_reg, block);
+            let genobj = fx.read_reg(*gen_reg, block)?;
             let v = fx.emit_val(block, Op::GetResumeMode { genobj }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedGettemplateobject(tpl_reg) => {
-            // Vendor: the template literal comes from the register
-            // operand (isa.yaml:1284-1288); folds into the modern op.
-            let literal = fx.read_reg(*tpl_reg, block);
+            let literal = fx.read_reg(*tpl_reg, block)?;
             let v = fx.emit_val(block, Op::GetTemplateObject { literal }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedDelobjprop(obj_reg, key_reg) => {
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
             let v = fx.emit_val(block, Op::DeleteProp { object: obj, key }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedSuspendgenerator(gen_reg, val_reg) => {
-            // Vendor: v1 is the generator object, v2 the yield value
-            // (isa.yaml:1306-1310).
-            let genobj = fx.read_reg(*gen_reg, block);
-            let value = fx.read_reg(*val_reg, block);
+            let genobj = fx.read_reg(*gen_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
             let v = fx.emit_val(block, Op::SuspendGenerator { genobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedAsyncfunctionawaituncaught(async_reg, val_reg) => {
-            // Vendor: v1 = the async function object, v2 = the awaited
-            // value (interpreter-inl.cpp:5369-5381
-            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONAWAITUNCAUGHT_PREF_V8_V8)).
-            let funcobj = fx.read_reg(*async_reg, block);
-            let value = fx.read_reg(*val_reg, block);
+            let funcobj = fx.read_reg(*async_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
             let v = fx.emit_val(block, Op::AwaitUncaught { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCopydataproperties(dst_reg, src_reg) => {
-            // Vendor: v1 = target, v2 = source; the result (the target)
-            // is written to acc (v0.1 parity).
-            let dst = fx.read_reg(*dst_reg, block);
-            let src = fx.read_reg(*src_reg, block);
+            let dst = fx.read_reg(*dst_reg, block)?;
+            let src = fx.read_reg(*src_reg, block)?;
             fx.emit_void(block, Op::CopyDataProps { dst, src }, loc);
             fx.write_acc(block, dst);
         }
         Bytecode::DeprecatedSetobjectwithproto(proto_reg, obj_reg) => {
-            // Vendor: v1 = proto, v2 = obj (isa.yaml:1338-1342); folds
-            // into the modern op.
-            let proto = fx.read_reg(*proto_reg, block);
-            let obj = fx.read_reg(*obj_reg, block);
+            let proto = fx.read_reg(*proto_reg, block)?;
+            let obj = fx.read_reg(*obj_reg, block)?;
             fx.emit_void(block, Op::SetObjectWithProto { proto, obj }, loc);
         }
         Bytecode::DeprecatedLdobjbyvalue(obj_reg, key_reg) => {
-            let obj = fx.read_reg(*obj_reg, block);
-            let key = fx.read_reg(*key_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
+            let key = fx.read_reg(*key_reg, block)?;
             let v = fx.emit_val(block, Op::LoadPropDyn { object: obj, key }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdsuperbyvalue(obj_reg, key_reg) => {
-            // v0.1 reads (and discards) the receiver register — the
-            // read is preserved (as the super reference's thisValue,
-            // N74-W4).
-            let this_value = fx.read_reg(*obj_reg, block);
-            let k = fx.read_reg(*key_reg, block);
+            let this_value = fx.read_reg(*obj_reg, block)?;
+            let k = fx.read_reg(*key_reg, block)?;
             let key = super_key(SuperKeyForm::Dynamic(k))?;
             let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdobjbyindex(obj_reg, index) => {
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             let v = fx.emit_val(
                 block,
@@ -2351,42 +2383,34 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedAsyncfunctionresolve(async_reg, _mid_reg, val_reg) => {
-            // Vendor: v1 = the async function object, v3 = the
-            // resolution value; the MIDDLE register is read only for
-            // the log line (interpreter-inl.cpp:6590-6603
-            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONRESOLVE_PREF_V8_V8_V8)).
-            let funcobj = fx.read_reg(*async_reg, block);
-            let value = fx.read_reg(*val_reg, block);
+        Bytecode::DeprecatedAsyncfunctionresolve(async_reg, mid_reg, val_reg) => {
+            let funcobj = fx.read_reg(*async_reg, block)?;
+            let _mid = fx.read_reg(*mid_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
             let v = fx.emit_val(block, Op::AsyncResolve { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedAsyncfunctionreject(async_reg, _mid_reg, val_reg) => {
-            // Vendor: v1 = the async function object, v3 = the
-            // rejection reason; the MIDDLE register is read only for
-            // the log line (interpreter-inl.cpp:6618-6631
-            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONREJECT_PREF_V8_V8_V8)).
-            let funcobj = fx.read_reg(*async_reg, block);
-            let value = fx.read_reg(*val_reg, block);
+        Bytecode::DeprecatedAsyncfunctionreject(async_reg, mid_reg, val_reg) => {
+            let funcobj = fx.read_reg(*async_reg, block)?;
+            let _mid = fx.read_reg(*mid_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
             let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStlexvar(level, slot, val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
+            let value = fx.read_reg(*val_reg, block)?;
             fx.emit_void(
                 block,
                 Op::PutLexVar {
                     level: level.0 as u16,
                     slot: slot.0 as u16,
                     value,
+                    kind: LexEnvKind::Plain,
                 },
                 loc,
             );
         }
         Bytecode::DeprecatedGetmodulenamespace(eid) => {
-            // v0.1's raw-symbol-index payload hack kept verbatim
-            // (documented): the deprecated form references the module
-            // by a string id that has no module-slot meaning.
             let name = fx.resolve_str(*eid)?;
             let v = fx.emit_val(block, Op::GetModuleNamespace { index: name.0 }, loc);
             fx.write_acc(block, v);
@@ -2405,17 +2429,16 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedLdobjbyname(eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
-            let obj = fx.read_reg(*obj_reg, block);
+            let obj = fx.read_reg(*obj_reg, block)?;
             let v = fx.emit_val(block, Op::LoadProp { object: obj, name }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedLdsuperbyname(eid, _obj_reg) => {
-            // v0.1 does NOT read the receiver register here (parity);
-            // the thisValue operand is the frame's this-role value
-            // (N74-W4 — the field exists on the op now).
+        Bytecode::DeprecatedLdsuperbyname(eid, obj_reg) => {
+            // `R3-M4`: legacy `deprecated.ldsuperbyname string_id, v` passes
+            // the super receiver (`thisValue`) in `obj_reg`.
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            let this_value = fx.this_value(block, loc);
+            let this_value = fx.read_reg(*obj_reg, block)?;
             let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
@@ -2437,9 +2460,6 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStconsttoglobalrecord(eid) => {
-            // Vendor: `SlowRuntimeStub::StGlobalRecord(..., isConst =
-            // true)` (interpreter-inl.cpp:6260-6345) — the const global
-            // LEXICAL record declaration.
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
             fx.emit_void(
@@ -2454,8 +2474,6 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedStlettoglobalrecord(eid)
         | Bytecode::DeprecatedStclasstoglobalrecord(eid) => {
-            // Vendor: `SlowRuntimeStub::StGlobalRecord(..., isConst =
-            // false)` — the mutable (let/class) record declaration.
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
             fx.emit_void(
@@ -2474,17 +2492,15 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedDynamicimport(spec_reg) => {
-            let specifier = fx.read_reg(*spec_reg, block);
+            let specifier = fx.read_reg(*spec_reg, block)?;
             let v = fx.emit_val(block, Op::DynamicImport { specifier }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedAsyncgeneratorreject(gen_reg, val_reg) => {
-            // Vendor: v1 = the async generator object, v2 = the
-            // rejection reason (interpreter-inl.cpp:3240-3254
-            // HANDLE_OPCODE(DEPRECATED_ASYNCGENERATORREJECT_PREF_V8_V8)).
-            let funcobj = fx.read_reg(*gen_reg, block);
-            let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
+            // `R3-M4`: `v1 = genobj`, `v2 = rejection reason` → `AsyncGeneratorReject`.
+            let genobj = fx.read_reg(*gen_reg, block)?;
+            let value = fx.read_reg(*val_reg, block)?;
+            let v = fx.emit_val(block, Op::AsyncGeneratorReject { genobj, value }, loc);
             fx.write_acc(block, v);
         }
     }
@@ -2495,76 +2511,122 @@ pub fn translate_bytecode(
 // ─── Helper functions ────────────────────────────────────────────────────────
 
 /// Emit a binary operation: acc = acc OP reg.
-fn binary_op(fx: &mut FnLift, op: BinOp, r: &Reg, block: BlockId, loc: Option<u32>) {
+fn binary_op(
+    fx: &mut FnLift,
+    op: BinOp,
+    r: &Reg,
+    block: BlockId,
+    loc: Option<u32>,
+) -> Result<(), LiftError> {
     let left = fx.read_acc(block);
-    let right = fx.read_reg(*r, block);
+    let right = fx.read_reg(*r, block)?;
     let v = fx.emit_val(block, Op::BinaryOp { op, left, right }, loc);
     fx.write_acc(block, v);
+    Ok(())
 }
 
 /// Emit a comparison: acc = acc CMP reg.
-fn compare_op(fx: &mut FnLift, op: CmpOp, r: &Reg, block: BlockId, loc: Option<u32>) {
+fn compare_op(
+    fx: &mut FnLift,
+    op: CmpOp,
+    r: &Reg,
+    block: BlockId,
+    loc: Option<u32>,
+) -> Result<(), LiftError> {
     let left = fx.read_acc(block);
-    let right = fx.read_reg(*r, block);
-    let v = fx.emit_val(block, Op::Compare { op, left, right }, loc);
+    let right = fx.read_reg(*r, block)?;
+    let v = fx.emit_val_typed(
+        block,
+        Op::Compare { op, left, right },
+        Ty::DynPrim(DynPrim::Bool),
+        loc,
+    );
     fx.write_acc(block, v);
+    Ok(())
 }
 
 /// Emit a unary operation: acc = OP acc.
 fn unary_op(fx: &mut FnLift, op: UnOp, block: BlockId, loc: Option<u32>) {
     let operand = fx.read_acc(block);
-    let v = fx.emit_val(block, Op::UnaryOp { op, operand }, loc);
+    let ty = if op.is_boolean_result() {
+        Ty::DynPrim(DynPrim::Bool)
+    } else {
+        Ty::Any
+    };
+    let v = fx.emit_val_typed(block, Op::UnaryOp { op, operand }, ty, loc);
     fx.write_acc(block, v);
 }
 
-/// Read a MODERN callthisrange-family register window. The encoded
-/// `argc` immediate counts the REAL arguments only — `this` rides the
-/// window's FIRST slot on top of that, so the window spans `argc + 1`
-/// registers `[this, args...]` (vendor `CALLTHISRANGE_IMM8_IMM8_V8`:
-/// `actualNumArgs = READ_INST_8_1()` then `CALL_PUSH_ARGS_THISRANGE`
-/// pushes `sp[startReg + i]` for `i = actualNumArgs ..= 1` — "1: skip
-/// this", interpreter-inl.cpp:1349-1356/:375-383; es2panda emits
-/// `actualArgs = argCount - 1`, pandagen.cpp:1357-1366). argc = 0 still
-/// yields a one-slot window (`this` only). `argc` saturates at u16: a
-/// hypothetical 0xFFFF-arg call would need a 65536-register frame,
-/// impossible under the u16 register space.
+/// Read a MODERN callthisrange-family register window `[this, args...]` (`argc + 1` slots).
 fn call_this_args(
     fx: &mut FnLift,
     start: u16,
     argc: i64,
     block: BlockId,
-) -> (Option<ValueId>, Vec<ValueId>) {
-    let count = (argc as u16).saturating_add(1);
-    let range = fx.read_reg_range(start, count, block);
+) -> Result<(Option<ValueId>, Vec<ValueId>), LiftError> {
+    if argc < 0 {
+        return Err(LiftError::RegisterRangeOverflow { start, count: argc });
+    }
+    let count = argc
+        .checked_add(1)
+        .ok_or(LiftError::RegisterRangeOverflow { start, count: argc })?;
+    let range = fx.read_reg_range(start, count, block)?;
     match range.split_first() {
-        Some((&this, rest)) => (Some(this), rest.to_vec()),
-        None => (None, Vec::new()),
+        Some((&this, rest)) => Ok((Some(this), rest.to_vec())),
+        None => Ok((None, Vec::new())),
     }
 }
 
-/// Emit a conditional branch based on the accumulator value. If
-/// `truthy` is true, branch to `label` when acc is truthy (jnez-like);
-/// otherwise branch when acc is falsy (jeqz-like).
+/// Emit a conditional branch on `acc` (`#61` `R3-X1`):
+/// - If `acc` is already proven boolean, emit `Op::CondBranch` directly
+///   (`jnez L` → `true_dest: L, false_dest: fall`; `jeqz L` → `true_dest: fall, false_dest: L`).
+/// - Otherwise, emit `Op::UnaryOp { op: JumpNez | JumpEqz, operand: acc }`
+///   (preserving ArkCompiler's non-`ToBoolean` raw `jeqz`/`jnez` semantics on
+///   `null`, `undefined`, `NaN`, strings, and objects) followed by `Op::CondBranch`.
 fn cond_branch_acc(
     fx: &mut FnLift,
     truthy: bool,
     label: abcd_isa::Label,
     idx: usize,
+    bi: usize,
     block: BlockId,
     loc: Option<u32>,
-) {
-    let acc = fx.read_acc(block);
-    let op = if truthy { UnOp::IsTrue } else { UnOp::IsFalse };
-    let cond = fx.emit_val(block, Op::UnaryOp { op, operand: acc }, loc);
-    let true_dest = fx.label_block(label);
-    let false_dest = fx.fallthrough_block(idx);
-    fx.emit_void(
-        block,
-        Op::CondBranch {
-            cond,
-            true_dest,
-            false_dest,
-        },
-        loc,
-    );
+) -> Result<(), LiftError> {
+    let target_dest = fx.label_block(idx, label)?;
+    let fall_dest = fx.fallthrough_block(bi, idx)?;
+    let val = fx.read_acc(block);
+    if fx.is_proven_bool(val) {
+        let (true_dest, false_dest) = if truthy {
+            (target_dest, fall_dest)
+        } else {
+            (fall_dest, target_dest)
+        };
+        fx.emit_void(
+            block,
+            Op::CondBranch {
+                cond: val,
+                true_dest,
+                false_dest,
+            },
+            loc,
+        );
+    } else {
+        let op = if truthy { UnOp::JumpNez } else { UnOp::JumpEqz };
+        let pred = fx.emit_val_typed(
+            block,
+            Op::UnaryOp { op, operand: val },
+            Ty::DynPrim(DynPrim::Bool),
+            loc,
+        );
+        fx.emit_void(
+            block,
+            Op::CondBranch {
+                cond: pred,
+                true_dest: target_dest,
+                false_dest: fall_dest,
+            },
+            loc,
+        );
+    }
+    Ok(())
 }

@@ -118,12 +118,36 @@ pub enum UnOp {
     ToNumber,
     /// ToNumeric coercion.
     ToNumeric,
+    /// `ToPropertyKey` coercion (`callruntime.topropertykey`, `#55`).
+    ToPropertyKey,
     /// `void x`.
     Void,
     /// ToBoolean truth test.
     IsTrue,
     /// ToBoolean falsity test.
     IsFalse,
+    /// ArkCompiler raw `jeqz` predicate (`interpreter-inl.cpp:1130-1131`):
+    /// evaluates to `true` iff operand is `false` or numeric `±0`
+    /// (`int == 0 || double == 0.0`); evaluates to `false` for `null`,
+    /// `undefined`, `""`, `NaN`, strings, and objects (`#61` `R3-X1`).
+    JumpEqz,
+    /// ArkCompiler raw `jnez` predicate (`interpreter-inl.cpp:1178-1179`):
+    /// evaluates to `true` iff operand is `true` or a non-zero number
+    /// (`int != 0 || double != 0.0`, which is **`true` for `NaN`**); evaluates
+    /// to `false` for `null`, `undefined`, strings, and objects (`#61` `R3-X1`).
+    JumpNez,
+}
+
+impl UnOp {
+    /// `true` when this unary operator always produces a boolean result.
+    #[inline]
+    #[must_use]
+    pub const fn is_boolean_result(self) -> bool {
+        matches!(
+            self,
+            Self::LogicalNot | Self::IsTrue | Self::IsFalse | Self::JumpEqz | Self::JumpNez
+        )
+    }
 }
 
 /// Comparison operator kind.
@@ -204,6 +228,35 @@ impl ModuleVarKind {
     }
 }
 
+/// Lexical environment flavor (`#55` `R3-D1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LexEnvKind {
+    /// Ordinary ECMAScript lexical environment (`newlexenv`, `ldlexvar`, `stlexvar`).
+    #[default]
+    Plain,
+    /// Sendable shared lexical environment (`callruntime.newsendableenv`,
+    /// `callruntime.ldsendablevar`, `callruntime.stsendablevar`).
+    Sendable,
+    /// Hot-reload patch lexical slot (`ldpatchvar`, `stpatchvar`; `level == 0`).
+    Patch,
+}
+
+/// Own-property / field definition flavor (`#55` `R3-D1`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum OwnStoreKind {
+    /// Standard own-property store (`stownbyname` / `stownbyvalue` / `stownbyindex`).
+    #[default]
+    OwnProp,
+    /// Own-property store setting anonymous function `.name`
+    /// (`stownbynamewithnameset` / `stownbyvaluewithnameset`).
+    OwnPropWithNameSet,
+    /// Class public field definition (`definefieldbyname` /
+    /// `callruntime.definefieldbyvalue` / `callruntime.definefieldbyindex`).
+    ClassField,
+    /// `Object.defineProperty`-style own-property definition (`definepropertybyname`).
+    DefineProperty,
+}
+
 /// Call kind — the call-binding table (`design/ir.md`,
 /// [`crate::frame::FrameSlots`], where `H = slots.implicit_count()` is the
 /// callee's leading implicit slot count — `H = 3` under
@@ -217,9 +270,12 @@ impl ModuleVarKind {
 /// | `Dynamic` | `call.this` when `Some` (`callthis*`), else computed at callee entry (`callarg*`/`callrange`) | `undefined` | `args → params[H..]` |
 /// | `Apply` | `call.this` (explicit receiver) | `undefined` | SPREAD of `args[0]` |
 /// | `Super` | inherited from enclosing ctor | inherited | `args → params[H..]` |
+/// | `SuperArrow` | inherited from enclosing ctor | inherited | `args → params[H..]` (`callee` explicit from `acc`) |
 /// | `SuperSpread` | inherited from enclosing ctor | inherited | SPREAD of `args[0]` |
 /// | `SuperForwardAllArgs` | inherited | inherited | ALL own args (forwarded) |
 /// | `New` | fresh object from `callee.prototype` | callee itself | `args → params[H..]` |
+/// | `NewSpread` | fresh object from `callee.prototype` | callee itself | SPREAD of `args[0]` |
+/// | `ClassInit` | `call.this` (explicit receiver) | `undefined` | `[]` (0 args) |
 ///
 /// The result is the callee's return value; a throw inside the callee
 /// flows to the caller's exceptional edges.
@@ -228,37 +284,38 @@ pub enum CallKind {
     /// A statically resolved callee with an explicit `this`.
     Direct,
     /// A dynamically computed callee: when `Call::this` is `Some(receiver)`
-    /// (`callthis*` / `callruntime.callinit`), that explicit receiver is passed
-    /// in the `this` slot; when `Call::this` is `None` (`callarg*` / `callrange`),
-    /// `this` is computed at callee entry (`undefined` in strict mode, global
-    /// object in sloppy mode).
+    /// (`callthis*`), that explicit receiver is passed in the `this` slot;
+    /// when `Call::this` is `None` (`callarg*` / `callrange`), `this` is
+    /// computed at callee entry (`undefined` in strict mode, global object in
+    /// sloppy mode).
     Dynamic,
     /// `func.apply(this, argsArray)` — vendor `apply imm, v_this, v_args`
     /// (`isa.yaml:1104`, the func in the acc): the receiver is explicit and
     /// the single argument is an ARRAY spread over the formal parameters.
-    /// Never an arity overload of [`CallKind::Dynamic`]: `Call::this` is
-    /// `Some(receiver)` and `Call::args` is exactly `[array]`
-    /// (`design/decisions.md` N16/N57; lowers to the `apply` opcode).
     Apply,
-    /// A `super(...)` call in a constructor with EXPLICIT arguments
-    /// (vendor `supercallthisrange`/`supercallarrowrange`).
+    /// A `super(...)` call in a constructor with EXPLICIT arguments and the
+    /// enclosing constructor in `callee` (vendor `supercallthisrange`).
     Super,
+    /// A `super(...)` call inside an arrow function in a constructor where
+    /// `callee` is the explicit super constructor from `acc` and `Call::this`
+    /// is `None` (vendor `supercallarrowrange`, `#55`).
+    SuperArrow,
     /// A `super(...args)` call spreading an argument ARRAY into the super
     /// constructor — vendor `supercallspread imm, v_args` (`isa.yaml`).
-    /// `Call::this` is `None` (inherited) and `Call::args` is exactly
-    /// `[array]` (`design/decisions.md` N58; lowers to `supercallspread`).
-    /// Never a 1-argument [`CallKind::Super`].
+    /// `Call::this` is `None` (inherited) and `Call::args` is `[array]`.
     SuperSpread,
     /// Vendor `callruntime.supercallforwardallargs v_this` (`isa.yaml`): a
     /// default derived constructor forwarding ALL of its own arguments to
-    /// the super constructor. `Call::this` is `None` and `Call::args` is
-    /// `[this]` (the enclosing `this` models the forwarded argument list),
-    /// kept distinct from [`CallKind::Super`] so lowering never confuses the
-    /// forward-all form with an explicit 1-argument super call
-    /// (`design/decisions.md` N58).
+    /// the super constructor (`Call::this` is `None` and `Call::args` is `[this]`).
     SuperForwardAllArgs,
-    /// `new callee(args...)`.
+    /// `new callee(args...)` (`newobjrange` / `wide.newobjrange`).
     New,
+    /// `new callee(...argsArray)` (`newobjapply` / `wide.newobjapply`, `#55`):
+    /// `Call::this` is `None` and `Call::args` is `[array]`.
+    NewSpread,
+    /// Class field-initializer invocation (`callruntime.callinit`, `#55`):
+    /// `Call::this` is `Some(receiver)` and `Call::args` is `[]`.
+    ClassInit,
 }
 
 /// Which `this`-binding check [`Op::ThrowIfSuperNotCalled`] performs.
@@ -433,6 +490,8 @@ pub enum Op {
         name: Sym,
         /// The stored value.
         value: ValueId,
+        /// Own-store opcode flavor (`stownbyname*`, `definefieldbyname`, `definepropertybyname`).
+        kind: OwnStoreKind,
     },
     /// Computed-key own-property store (vendor
     /// `stownbyvalue`(+withnameset)/`callruntime.definefieldbyvalue`;
@@ -444,6 +503,8 @@ pub enum Op {
         key: ValueId,
         /// The stored value.
         value: ValueId,
+        /// Own-store opcode flavor (`stownbyvalue*`, `callruntime.definefieldbyvalue`).
+        kind: OwnStoreKind,
     },
     /// Integer-indexed own-property store (vendor
     /// `stownbyindex`/`wide.stownbyindex`/
@@ -455,6 +516,8 @@ pub enum Op {
         index: ValueId,
         /// The stored value.
         value: ValueId,
+        /// Own-store opcode flavor (`stownbyindex`, `callruntime.definefieldbyindex`).
+        kind: OwnStoreKind,
     },
     /// Define a method on an object (class/object-literal semantics).
     DefineMethod {
@@ -525,8 +588,9 @@ pub enum Op {
         keys: Vec<ValueId>,
     },
     /// Vendor `definegettersetterbyvalue v1, v2, v3, v4, acc: inout:top`
-    /// (isa.yaml:1220): define an accessor property on `obj` under the
-    /// computed `key` with the given `getter`/`setter` closures.
+    /// (`isa.yaml:1220`): define an accessor property on `obj` under the
+    /// computed `key` with the given `getter`/`setter` closures and `set_name`
+    /// boolean flag (`acc` input).
     DefineGetterSetterByValue {
         /// The target object.
         obj: ValueId,
@@ -536,6 +600,8 @@ pub enum Op {
         getter: ValueId,
         /// The setter closure.
         setter: ValueId,
+        /// Boolean flag controlling whether runtime sets accessor `.name` (`acc` input).
+        set_name: ValueId,
     },
     /// Vendor `gettemplateobject imm:u16, acc: inout:top`
     /// (isa.yaml:1279-1283): turn the template `literal` into its
@@ -595,11 +661,13 @@ pub enum Op {
     },
 
     // ── Lexical / global / module ──────────────────────────────────────
-    /// Push a new lexical environment with `num_vars` slots, yielding it
-    /// (vendor `newlexenv` / `wide.newlexenv`, `isa.yaml`).
+    /// Push a new lexical or sendable environment with `num_vars` slots,
+    /// yielding it (`newlexenv` / `callruntime.newsendableenv`).
     NewLexEnv {
         /// Number of variables in the new environment.
         num_vars: u16,
+        /// Environment flavor (`Plain` or `Sendable`; never `Patch`).
+        kind: LexEnvKind,
     },
     /// Push a new NAMED lexical environment, yielding it (vendor
     /// `newlexenvwithname` / `wide.newlexenvwithname`, isa.yaml): the
@@ -617,21 +685,25 @@ pub enum Op {
     /// discipline is part of the program's semantics (round-tripping
     /// and the lexical model depend on it).
     PopLexEnv,
-    /// Load a lexical variable by environment level and slot.
+    /// Load a lexical, sendable, or patch variable by environment level and slot.
     GetLexVar {
-        /// Scope-chain level.
+        /// Scope-chain level (`0` for `LexEnvKind::Patch`).
         level: u16,
         /// Slot within the environment.
         slot: u16,
+        /// Lexical environment flavor.
+        kind: LexEnvKind,
     },
-    /// Store a lexical variable by environment level and slot.
+    /// Store a lexical, sendable, or patch variable by environment level and slot.
     PutLexVar {
-        /// Scope-chain level.
+        /// Scope-chain level (`0` for `LexEnvKind::Patch`).
         level: u16,
         /// Slot within the environment.
         slot: u16,
         /// The stored value.
         value: ValueId,
+        /// Lexical environment flavor.
+        kind: LexEnvKind,
     },
     /// Load a global by name, tolerating absence (`default` when the
     /// global does not exist). Absence-tolerant does NOT mean
@@ -863,6 +935,18 @@ pub enum Op {
         /// The closure value.
         func: ValueId,
     },
+    /// Create an async generator object from a closure (`createasyncgeneratorobj`, `#55`).
+    CreateAsyncGenerator {
+        /// The closure value.
+        func: ValueId,
+    },
+    /// Set a generator or async-generator object's internal state (`setgeneratorstate imm`, `#55`).
+    SetGeneratorState {
+        /// The generator object (`acc` input).
+        genobj: ValueId,
+        /// Target generator state code (`imm:u8`).
+        state: u8,
+    },
     /// `yield`: suspend `genobj`, producing `value`; the result is the
     /// resume value.
     SuspendGenerator {
@@ -927,8 +1011,31 @@ pub enum Op {
         /// The rejection reason (the accumulator input).
         value: ValueId,
     },
+    /// Resolve an async generator step (`asyncgeneratorresolve v1, v2, v3`, `#55`).
+    AsyncGeneratorResolve {
+        /// The async generator object (`v1`).
+        genobj: ValueId,
+        /// The yielded/returned value (`v2`).
+        value: ValueId,
+        /// Boolean `done` flag (`v3`).
+        done: ValueId,
+    },
+    /// Reject an async generator step (`asyncgeneratorreject v`, `#55`).
+    AsyncGeneratorReject {
+        /// The async generator object (`v`).
+        genobj: ValueId,
+        /// The rejection reason (`acc` input).
+        value: ValueId,
+    },
+    /// Notify the concurrent task runtime of `value` (`callruntime.notifyconcurrentresult`, `#55`).
+    NotifyConcurrentResult {
+        /// Result value (`acc` input).
+        value: ValueId,
+    },
 
     // ── Frame / special value loaders ──────────────────────────────────
+    /// Load the global `Symbol` constructor (`ldsymbol`, `#55`).
+    LoadSymbol,
     /// Load `new.target` (vendor `ldnewtarget`, isa.yaml — `acc:
     /// out:top`): a real frame-state value (the construct receiver in a
     /// constructor, `undefined` otherwise), never a constant.
@@ -954,11 +1061,9 @@ pub enum Op {
         /// The property key.
         key: SuperKey,
         /// The `thisValue` of the super reference (`design/decisions.md` N74:
-        /// vendor `ldsuperbyvalue imm, v` carries it in the register operand —
-        /// `es2abc` stages the current `this` there — while the KEY is the
-        /// acc; the `byname` form passes no register, so lift reads the
-        /// frame's `this`-role value). Kept as a real operand so byte
-        /// round-tripping can restore the register.
+        /// `ldsuperbyvalue imm, v` carries it in `v` while the key is in `acc`,
+        /// and `ldsuperbyname imm, string_id` also supplies an explicit
+        /// `this_value` from `acc` per `isa.yaml` `acc: inout:top`).
         this_value: ValueId,
     },
     /// Super-property store.
@@ -1053,11 +1158,13 @@ impl Op {
                 object,
                 key: index,
                 value,
+                ..
             }
             | StoreOwnPropIdx {
                 object,
                 index,
                 value,
+                ..
             } => {
                 f(*object)?;
                 f(*index)?;
@@ -1102,11 +1209,13 @@ impl Op {
                 key,
                 getter,
                 setter,
+                set_name,
             } => {
                 f(*obj)?;
                 f(*key)?;
                 f(*getter)?;
                 f(*setter)?;
+                f(*set_name)?;
             }
             GetTemplateObject { literal } => f(*literal)?,
             CreateIterResultObj { value, done } => {
@@ -1123,6 +1232,7 @@ impl Op {
             | PopLexEnv
             | GetLexVar { .. }
             | CreatePrivateNames { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -1176,23 +1286,39 @@ impl Op {
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value } => f(*value)?,
+            | Await { value }
+            | NotifyConcurrentResult { value } => f(*value)?,
             AwaitUncaught { funcobj, value }
             | AsyncResolve { funcobj, value }
-            | AsyncReject { funcobj, value } => {
+            | AsyncReject { funcobj, value }
+            | AsyncGeneratorReject {
+                genobj: funcobj,
+                value,
+            } => {
                 f(*funcobj)?;
                 f(*value)?;
+            }
+            AsyncGeneratorResolve {
+                genobj,
+                value,
+                done,
+            } => {
+                f(*genobj)?;
+                f(*value)?;
+                f(*done)?;
             }
             ThrowUndefinedIfHole { name, value } => {
                 f(*name)?;
                 f(*value)?;
             }
-            CreateGenerator { func } => f(*func)?,
+            CreateGenerator { func } | CreateAsyncGenerator { func } => f(*func)?,
             SuspendGenerator { genobj, value } => {
                 f(*genobj)?;
                 f(*value)?;
             }
-            ResumeGenerator { genobj } | GetResumeMode { genobj } => f(*genobj)?,
+            ResumeGenerator { genobj }
+            | GetResumeMode { genobj }
+            | SetGeneratorState { genobj, .. } => f(*genobj)?,
             LoadSuper { key, this_value } => match key {
                 SuperKey::Name(_) => f(*this_value)?,
                 SuperKey::Dynamic(k) => {
@@ -1302,11 +1428,13 @@ impl Op {
                 object,
                 key: index,
                 value,
+                ..
             }
             | StoreOwnPropIdx {
                 object,
                 index,
                 value,
+                ..
             } => {
                 f(object);
                 f(index);
@@ -1351,11 +1479,13 @@ impl Op {
                 key,
                 getter,
                 setter,
+                set_name,
             } => {
                 f(obj);
                 f(key);
                 f(getter);
                 f(setter);
+                f(set_name);
             }
             GetTemplateObject { literal } => f(literal),
             CreateIterResultObj { value, done } => {
@@ -1372,6 +1502,7 @@ impl Op {
             | PopLexEnv
             | GetLexVar { .. }
             | CreatePrivateNames { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -1425,23 +1556,39 @@ impl Op {
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value } => f(value),
+            | Await { value }
+            | NotifyConcurrentResult { value } => f(value),
             AwaitUncaught { funcobj, value }
             | AsyncResolve { funcobj, value }
-            | AsyncReject { funcobj, value } => {
+            | AsyncReject { funcobj, value }
+            | AsyncGeneratorReject {
+                genobj: funcobj,
+                value,
+            } => {
                 f(funcobj);
                 f(value);
+            }
+            AsyncGeneratorResolve {
+                genobj,
+                value,
+                done,
+            } => {
+                f(genobj);
+                f(value);
+                f(done);
             }
             ThrowUndefinedIfHole { name, value } => {
                 f(name);
                 f(value);
             }
-            CreateGenerator { func } => f(func),
+            CreateGenerator { func } | CreateAsyncGenerator { func } => f(func),
             SuspendGenerator { genobj, value } => {
                 f(genobj);
                 f(value);
             }
-            ResumeGenerator { genobj } | GetResumeMode { genobj } => f(genobj),
+            ResumeGenerator { genobj }
+            | GetResumeMode { genobj }
+            | SetGeneratorState { genobj, .. } => f(genobj),
             LoadSuper { key, this_value } => match key {
                 SuperKey::Name(_) => f(this_value),
                 SuperKey::Dynamic(k) => {
@@ -1509,6 +1656,8 @@ impl Op {
                 | StoreGlobalRecord { .. }
                 | TryStoreGlobal { .. }
                 | StoreModuleVar { .. }
+                | SetGeneratorState { .. }
+                | NotifyConcurrentResult { .. }
                 | Throw { .. }
                 | ThrowIfSuperNotCalled { .. }
                 | ThrowUndefinedIfHole { .. }
@@ -1571,9 +1720,12 @@ impl Op {
             | ThrowConstAssignment { .. }
             | ThrowIfNotObject { .. }
             | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
             | Await { .. }
+            | NotifyConcurrentResult { .. }
             | GetAsyncIterator { .. }
             | GetTemplateObject { .. }
             | ThrowUndefinedIfHoleWithName { .. } => Arity::Exact(1),
@@ -1588,6 +1740,7 @@ impl Op {
             | LoadModuleVar { .. }
             | GetModuleNamespace { .. }
             | CreatePrivateNames { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -1615,11 +1768,12 @@ impl Op {
             | SuspendGenerator { .. }
             | AwaitUncaught { .. }
             | AsyncResolve { .. }
-            | AsyncReject { .. } => Arity::Exact(2),
+            | AsyncReject { .. }
+            | AsyncGeneratorReject { .. } => Arity::Exact(2),
             StorePropIdx { .. } | StorePropDyn { .. } => Arity::Exact(3),
             StoreOwnPropDyn { .. } | StoreOwnPropIdx { .. } => Arity::Exact(3),
-            ArraySpread { .. } => Arity::Exact(3),
-            DefineGetterSetterByValue { .. } => Arity::Exact(4),
+            ArraySpread { .. } | AsyncGeneratorResolve { .. } => Arity::Exact(3),
+            DefineGetterSetterByValue { .. } => Arity::Exact(5),
             CondBranch { .. } => Arity::Exact(1),
             TestProp { .. }
             | TryGetGlobal { .. }
@@ -1709,6 +1863,8 @@ impl Op {
             | ThrowConstAssignment { .. }
             | ThrowIfNotObject { .. }
             | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
             | SuspendGenerator { .. }
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
@@ -1717,6 +1873,10 @@ impl Op {
             | AsyncFunctionEnter
             | AsyncResolve { .. }
             | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -1803,6 +1963,8 @@ impl Op {
             | ThrowConstAssignment { .. }
             | ThrowIfNotObject { .. }
             | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
             | SuspendGenerator { .. }
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
@@ -1811,6 +1973,10 @@ impl Op {
             | AsyncFunctionEnter
             | AsyncResolve { .. }
             | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -1912,6 +2078,8 @@ impl Op {
             | ThrowConstAssignment { .. }
             | ThrowIfNotObject { .. }
             | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
             | SuspendGenerator { .. }
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
@@ -1920,6 +2088,10 @@ impl Op {
             | AsyncFunctionEnter
             | AsyncResolve { .. }
             | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
             | LoadNewTarget
             | LoadGlobalObject
             | LoadFunction
@@ -2003,7 +2175,10 @@ mod tests {
             Op::Return { value: Some(v()) },
             Op::Unreachable,
             // ── Full ISA coverage ops ──
-            Op::NewLexEnv { num_vars: 3 },
+            Op::NewLexEnv {
+                num_vars: 3,
+                kind: LexEnvKind::Plain,
+            },
             Op::NewLexEnvWithName {
                 num_vars: 3,
                 scope_names: ConstId::new(0),
@@ -2027,6 +2202,7 @@ mod tests {
                 key: v(),
                 getter: v(),
                 setter: v(),
+                set_name: v(),
             },
             Op::GetTemplateObject { literal: v() },
             Op::CreateIterResultObj {
@@ -2164,16 +2340,19 @@ mod tests {
                 object: v(),
                 name: s,
                 value: v(),
+                kind: OwnStoreKind::OwnProp,
             },
             Op::StoreOwnPropDyn {
                 object: v(),
                 key: v(),
                 value: v(),
+                kind: OwnStoreKind::OwnProp,
             },
             Op::StoreOwnPropIdx {
                 object: v(),
                 index: v(),
                 value: v(),
+                kind: OwnStoreKind::OwnProp,
             },
             Op::DefineMethod {
                 object: v(),
@@ -2216,6 +2395,7 @@ mod tests {
                 key: v(),
                 getter: v(),
                 setter: v(),
+                set_name: v(),
             },
             Op::GetTemplateObject { literal: v() },
             Op::CreateIterResultObj {
@@ -2231,17 +2411,25 @@ mod tests {
             Op::GetPropIterator { obj: v() },
             Op::NextPropName { iterator: v() },
             // Lexical / global / module (13)
-            Op::NewLexEnv { num_vars: 2 },
+            Op::NewLexEnv {
+                num_vars: 2,
+                kind: LexEnvKind::Plain,
+            },
             Op::NewLexEnvWithName {
                 num_vars: 2,
                 scope_names: c,
             },
             Op::PopLexEnv,
-            Op::GetLexVar { level: 0, slot: 1 },
+            Op::GetLexVar {
+                level: 0,
+                slot: 1,
+                kind: LexEnvKind::Plain,
+            },
             Op::PutLexVar {
                 level: 0,
                 slot: 1,
                 value: v(),
+                kind: LexEnvKind::Plain,
             },
             Op::TryGetGlobal {
                 name: s,
@@ -2356,8 +2544,13 @@ mod tests {
             Op::ThrowDeleteSuperProperty,
             Op::ThrowConstAssignment { name: v() },
             Op::ThrowIfNotObject { value: v() },
-            // Generator / async (9)
+            // Generator / async / concurrent (14)
             Op::CreateGenerator { func: v() },
+            Op::CreateAsyncGenerator { func: v() },
+            Op::SetGeneratorState {
+                genobj: v(),
+                state: 1,
+            },
             Op::SuspendGenerator {
                 genobj: v(),
                 value: v(),
@@ -2378,7 +2571,18 @@ mod tests {
                 funcobj: v(),
                 value: v(),
             },
-            // Frame / special value loaders (5)
+            Op::AsyncGeneratorResolve {
+                genobj: v(),
+                value: v(),
+                done: v(),
+            },
+            Op::AsyncGeneratorReject {
+                genobj: v(),
+                value: v(),
+            },
+            Op::NotifyConcurrentResult { value: v() },
+            // Frame / special value loaders (6)
+            Op::LoadSymbol,
             Op::LoadNewTarget,
             Op::LoadGlobalObject,
             Op::LoadFunction,
@@ -2446,8 +2650,8 @@ mod tests {
         }
         assert_eq!(
             distinct_discriminants.len(),
-            88,
-            "test must cover all 88 Op variants"
+            94,
+            "test must cover all 94 Op variants"
         );
     }
 }

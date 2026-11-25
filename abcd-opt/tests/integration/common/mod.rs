@@ -6,7 +6,10 @@
 //!
 //! Every test target compiles this shared module separately and uses a
 //! different subset of the helpers — allow dead code module-wide.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared integration test infrastructure compiled across test modules"
+)]
 
 use std::collections::HashMap;
 
@@ -199,7 +202,7 @@ impl<'m> V2Builder<'m> {
                 catches: vec![abcd_ir::Catch {
                     handler,
                     exception: exc,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
         exc
@@ -241,7 +244,6 @@ pub fn empty_phis(module: &Module) -> Vec<String> {
 // ─── Minimal deterministic bytecode interpreter ──────────────────────────────
 
 /// What the machine observed when execution stopped.
-#[allow(dead_code)] // variants are constructed only when a path executes them
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Halt {
     /// `Return`: accumulator value at the point of return.
@@ -324,19 +326,14 @@ pub struct Machine {
 /// so the two VM frame-initial states are modeled as distinct sentinels:
 /// `UNDEFINED` (vreg slots at frame creation) and `HOLE` (acc at frame
 /// creation).
-#[allow(dead_code)] // used by the vreg-hole regressions
 pub const UNDEFINED: i64 = i64::MIN;
-#[allow(dead_code)]
 pub const HOLE: i64 = i64::MIN + 1;
 /// Sentinel for `createemptyobject` — the i64 machine has no objects.
-#[allow(dead_code)]
 pub const EMPTY_OBJECT: i64 = i64::MIN + 2;
 /// Sentinel for `definefunc` — the i64 machine has no function objects;
 /// the closure value only needs to be distinguishable from numbers.
-#[allow(dead_code)]
 pub const FUNCTION: i64 = i64::MIN + 3;
 
-#[allow(dead_code)] // helpers are shared across several test binaries
 impl Machine {
     /// A zeroed machine.
     pub fn new() -> Self {
@@ -447,21 +444,41 @@ impl Machine {
                     self.acc = i64::from(self.acc > self.reg(r.0));
                     pc += 1;
                 }
-                // `eq imm, v0` — acc = (acc == v0) (ic slot ignored).
-                Bytecode::Eq(_, r) => {
+                // `eq` / `stricteq` — acc = (acc == v0) (ic slot ignored).
+                Bytecode::Eq(_, r) | Bytecode::Stricteq(_, r) => {
                     self.acc = i64::from(self.acc == self.reg(r.0));
                     pc += 1;
                 }
-                // `istrue` — acc = ToBoolean(acc) (modeled as != 0).
+                // `noteq` / `strictnoteq` — acc = (acc != v0) (ic slot ignored).
+                Bytecode::Noteq(_, r) | Bytecode::Strictnoteq(_, r) => {
+                    self.acc = i64::from(self.acc != self.reg(r.0));
+                    pc += 1;
+                }
+                // `istrue` / `isfalse` — ToBoolean(acc) (`0`, `UNDEFINED`, and `HOLE` are falsy).
                 Bytecode::Istrue => {
-                    self.acc = i64::from(self.acc != 0);
+                    let falsy = self.acc == 0 || matches!(self.acc, UNDEFINED | HOLE);
+                    self.acc = i64::from(!falsy);
+                    pc += 1;
+                }
+                Bytecode::Isfalse => {
+                    let falsy = self.acc == 0 || matches!(self.acc, UNDEFINED | HOLE);
+                    self.acc = i64::from(falsy);
                     pc += 1;
                 }
                 Bytecode::Jmp(label) => {
                     pc = label.0 as usize;
                 }
+                Bytecode::Jeqz(label) => {
+                    if self.acc == 0 {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
                 Bytecode::Jnez(label) => {
-                    if self.acc != 0 {
+                    if self.acc != 0
+                        && !matches!(self.acc, UNDEFINED | HOLE | EMPTY_OBJECT | FUNCTION)
+                    {
                         pc = label.0 as usize;
                     } else {
                         pc += 1;

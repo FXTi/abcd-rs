@@ -391,7 +391,11 @@ fn adce_still_deletes_pure_reads_and_allocs() {
     let cases: Vec<LoadCase> = vec![
         (
             "GetLexVar",
-            Box::new(|_b, _p0| Op::GetLexVar { level: 0, slot: 0 }),
+            Box::new(|_b, _p0| Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            }),
         ),
         (
             "LoadModuleVar",

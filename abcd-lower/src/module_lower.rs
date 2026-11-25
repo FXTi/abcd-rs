@@ -1,4 +1,5 @@
-//! Whole-module lowering and pool-materializing file rewrite (#30).
+//! Whole-module lowering and pool-materializing file rewrite (#30, `#50`
+//! `R3-D2`, `#57` `R3-H8`/`R3-H9`/`R3-M8`).
 //!
 //! Bridges the gap between pure IR transformations and encodable
 //! [`abcd_file::File`] containers in two modes:
@@ -6,29 +7,32 @@
 //! 1. [`rewrite_file`]: lowers all functions of `module` onto a clone of an
 //!    existing `base_file`, preserving untouched container metadata while
 //!    materializing any newly introduced [`Sym`] strings, [`Const`] literal
-//!    arrays, classes, or helper functions into the output [`File`].
+//!    arrays, classes, helper functions, and reconstructed [`MethodDebugInfo`]
+//!    records into the output [`File`].
 //! 2. [`lower_module`] / [`lower_module_with_options`]: standalone lowering
 //!    from `&abcd_ir::Module` + [`abcd_file::Version`] directly to a complete,
-//!    encodable [`abcd_file::File`] with zero source `File` dependency.
+//!    encodable [`abcd_file::File`] with zero source `File` dependency and zero
+//!    fabricated file offsets (`#50`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_file::{
-    AccessFlags, Annotation, AnnotationElem, AnnotationValue, Annotations, Class, ColumnEntry,
-    Field, FieldValue, File, FileType, FunctionKind as FileFunctionKind, LineEntry, LiteralArray,
-    LiteralArrayIdx, LiteralValue, Method, MethodBody, MethodDebugInfo, ModuleData, ModuleRecord,
-    ModuleRequestPhase, ParamAnnotations, ParamInfo, SourceLang as FileSourceLang, StringId,
-    StringPool, Type, Version,
+    AccessFlags, Annotation, AnnotationElem, AnnotationValue, Annotations, CatchBlock, Class,
+    ColumnEntry, EntityRef, Field, FieldIdx, FieldValue, File, FileType,
+    FunctionKind as FileFunctionKind, LineEntry, LiteralArray, LiteralArrayIdx, LiteralValue,
+    Method, MethodBody, MethodDebugInfo, MethodIdx, ModuleData, ModuleRecord, ModuleRequestPhase,
+    ParamAnnotations, ParamInfo, SourceLang as FileSourceLang, StringId, StringPool, TryBlock,
+    Type, Version,
 };
 use abcd_ir::{
-    AnnValue, ClassData, ClassId, Const, ConstId, ExportDecl, FieldData, FuncId,
-    FunctionKind as IrFunctionKind, ImportDecl, InstId, Modifiers, Module, ModuleRequest,
-    SourceLang as IrSourceLang, StaticTy, Sym, Ty,
+    AnnValue, ClassData, Const, ConstId, ExportDecl, FieldData, FuncId,
+    FunctionKind as IrFunctionKind, ImportDecl, LitMethodKind, Modifiers, Module, ModuleRequest,
+    SourceLang as IrSourceLang, StaticTy, Sym, Ty, TypedArrayTag,
 };
 use abcd_isa::EntityKind;
 use rayon::prelude::*;
 
-use crate::layout::LayoutResult;
+use crate::layout::{LayoutResult, LoweredTryBlock};
 use crate::method_body::{EntityResolver, relocate_and_compact_entities};
 use crate::{LowerError, LowerOptions, lower_function_with_options};
 
@@ -36,12 +40,13 @@ const SLOT_NUMBER_ANN_DESC: &str = "L_ESSlotNumberAnnotation;";
 const SLOT_NUMBER_ELEM: &str = "SlotNumber";
 
 /// Rewrite `base_file` with lowered bodies from `module`, materializing any
-/// IR-synthesized strings, literal arrays, classes, and functions into the
-/// returned [`File`] (#30).
+/// IR-synthesized strings, literal arrays, classes, helper functions, and
+/// reconstructed [`MethodDebugInfo`] tables into the returned [`File`] (#30,
+/// `#50`, `#57`).
 ///
 /// Invalid/dangling entity IDs (`Sym` outside `module.sym`, `FuncId` outside
 /// `module.functions`, `ConstId` outside `module.consts` or non-shape
-/// constants in `LiteralarrayId` slots) still fail loudly with
+/// constants in `LiteralarrayId` slots) fail loudly with
 /// [`LowerError::UntraceableEntity`].
 pub fn rewrite_file(
     module: &Module,
@@ -49,19 +54,17 @@ pub fn rewrite_file(
     options: LowerOptions,
 ) -> Result<File, LowerError> {
     let layouts = lower_all_layouts(module, options)?;
+    // Index `base_file`'s original strings and literal arrays BEFORE mutating
+    // `out.classes` so `FuncId` indices in `base_file.literal_arrays` match
+    // `base_file.all_methods()` verbatim.
+    let base_resolver = EntityResolver::new(module, base_file);
     let mut out = base_file.clone();
-    let mut next_offset = initial_synth_offset(&out);
 
-    // Map existing methods in `all_methods()` order (= lift reservation order).
-    let base_method_locs: Vec<(StringId, usize, u32)> = out
+    // Map existing methods in `base_file.all_methods()` (= lift reservation) order.
+    let base_method_locs: Vec<(StringId, usize)> = out
         .classes
         .iter()
-        .flat_map(|(&desc_sid, cls)| {
-            cls.methods
-                .iter()
-                .enumerate()
-                .map(move |(mi, m)| (desc_sid, mi, m.offset))
-        })
+        .flat_map(|(&desc_sid, cls)| (0..cls.methods.len()).map(move |mi| (desc_sid, mi)))
         .collect();
 
     // Ensure every class in `module.classes` exists in `out.classes`.
@@ -96,22 +99,11 @@ pub fn rewrite_file(
         class_desc_sids.push(desc_sid);
     }
 
-    // Track `(class_desc_sid, method_idx_in_class)` and offset for every `FuncId`.
+    // Place every `FuncId` into `out.classes`, recording `(class_desc_sid, mi)`.
     let mut func_slots: Vec<(StringId, usize)> = Vec::with_capacity(module.functions.len());
-    let mut method_offsets: Vec<u32> = Vec::with_capacity(module.functions.len());
-
     for (fi, func_data) in module.functions.iter().enumerate() {
-        if let Some(&(desc_sid, mi, mut off)) = base_method_locs.get(fi) {
-            if off == 0 {
-                off = alloc_offset(&mut next_offset)?;
-                if let Some(cls) = out.classes.get_mut(&desc_sid)
-                    && let Some(m) = cls.methods.get_mut(mi)
-                {
-                    m.offset = off;
-                }
-            }
+        if let Some(&(desc_sid, mi)) = base_method_locs.get(fi) {
             func_slots.push((desc_sid, mi));
-            method_offsets.push(off);
         } else {
             let desc_sid = match class_desc_sids.get(func_data.class_id.index()).copied() {
                 Some(sid) => sid,
@@ -122,36 +114,50 @@ pub fn rewrite_file(
                     .copied()
                     .unwrap_or_else(|| ensure_global_class(&mut out)),
             };
-            let off = alloc_offset(&mut next_offset)?;
-            let synth_method = build_synthesized_method(module, func_data, &mut out, off)?;
-            out.entity_map.insert(off, synth_method.name);
             let cls_sid = if out.classes.contains_key(&desc_sid) {
                 desc_sid
             } else {
                 ensure_global_class(&mut out)
             };
-            let Some(cls) = out.classes.get_mut(&cls_sid) else {
-                return Err(LowerError::SyntheticOffsetOverflow);
-            };
+            let owner_lang = out
+                .classes
+                .get(&cls_sid)
+                .map_or(FileSourceLang::EcmaScript, |c| c.source_lang);
+            let synth_method = build_synthesized_method(module, func_data, owner_lang, &mut out)?;
+            let cls =
+                out.classes
+                    .get_mut(&cls_sid)
+                    .ok_or_else(|| LowerError::UntraceableEntity {
+                        func: FuncId::new(fi as u32),
+                        kind: EntityKind::StringId,
+                        raw: cls_sid.index() as u32,
+                    })?;
             let mi = cls.methods.len();
             cls.methods.push(synth_method);
             func_slots.push((cls_sid, mi));
-            method_offsets.push(off);
         }
     }
 
-    let base_resolver = EntityResolver::new(module, &out);
-    let mut materializer = Materializer::new(module, &mut out, &method_offsets, next_offset);
+    // Compute exact `FuncId -> MethodIdx` over `out.classes` (`BTreeMap` order)
+    // and remap any pre-existing `MethodIdx` handles in `out` if synthesized
+    // classes/methods shifted dense indices.
+    let func_to_method_idx = compute_func_method_indices(&out.classes, &func_slots);
+    remap_existing_method_indices(&mut out, base_method_locs.len(), &func_to_method_idx);
 
     let mut bodies: Vec<Option<MethodBody>> = Vec::with_capacity(layouts.len());
-    for (fi, layout_opt) in layouts.into_iter().enumerate() {
-        let func_id = FuncId::new(fi as u32);
-        let Some(layout) = layout_opt else {
-            bodies.push(None);
-            continue;
-        };
-        let body = materializer.build_method_body(func_id, &layout, Some(&base_resolver))?;
-        bodies.push(Some(body));
+    {
+        let mut materializer = Materializer::new(module, &mut out, &func_to_method_idx);
+        for (fi, layout_opt) in layouts.iter().enumerate() {
+            let func_id = FuncId::new(fi as u32);
+            match layout_opt {
+                Some(layout) => {
+                    let body =
+                        materializer.build_method_body(func_id, layout, Some(&base_resolver))?;
+                    bodies.push(Some(body));
+                }
+                None => bodies.push(None),
+            }
+        }
     }
 
     let need_slot_ann_record = bodies.iter().flatten().any(|b| b.ic_size.unwrap_or(0) > 0);
@@ -162,19 +168,32 @@ pub fn rewrite_file(
     };
 
     for (fi, body_opt) in bodies.into_iter().enumerate() {
-        let Some(body) = body_opt else {
-            continue;
-        };
+        let func_data = &module.functions[fi];
         let (desc_sid, mi) = func_slots[fi];
+        let debug_rebuilt = if layouts[fi].is_some() || fi >= base_method_locs.len() {
+            Some(rebuild_method_debug(
+                module,
+                func_data,
+                layouts[fi].as_ref(),
+                &mut out.strings,
+            ))
+        } else {
+            None
+        };
         if let Some(cls) = out.classes.get_mut(&desc_sid)
             && let Some(m) = cls.methods.get_mut(mi)
         {
-            if let (Some(ic), Some((ann_desc, elem_name))) = (body.ic_size, slot_ann_sids)
-                && ic > 0
-            {
-                ensure_method_slot_annotation(&mut m.annotations, ann_desc, elem_name, ic);
+            if let Some(dbg) = debug_rebuilt {
+                m.debug = dbg;
             }
-            m.body = Some(body);
+            if let Some(body) = body_opt {
+                if let (Some(ic), Some((ann_desc, elem_name))) = (body.ic_size, slot_ann_sids)
+                    && ic > 0
+                {
+                    ensure_method_slot_annotation(&mut m.annotations, ann_desc, elem_name, ic);
+                }
+                m.body = Some(body);
+            }
         }
     }
 
@@ -188,7 +207,8 @@ pub fn lower_module(module: &Module, version: Version) -> Result<File, LowerErro
     lower_module_with_options(module, version, LowerOptions::default())
 }
 
-/// Standalone whole-module lowering with explicit [`LowerOptions`] (#30).
+/// Standalone whole-module lowering with explicit [`LowerOptions`] (#30, `#50`,
+/// `#57`).
 pub fn lower_module_with_options(
     module: &Module,
     version: Version,
@@ -204,15 +224,12 @@ pub fn lower_module_with_options(
         strings: StringPool::new(),
         classes: BTreeMap::new(),
         literal_arrays: Vec::new(),
-        literal_array_offsets: HashMap::new(),
         literal_array_header_offsets: Vec::new(),
-        entity_map: HashMap::new(),
     };
-    let mut next_offset: u32 = 0x10_0000;
 
-    // 1. Pre-allocate class descriptors and deterministic method/field offsets.
+    // 1. Intern class descriptors.
     let mut class_desc_sids: Vec<StringId> = Vec::with_capacity(module.classes.len());
-    for (ci, cls_data) in module.classes.iter().enumerate() {
+    for cls_data in &module.classes {
         let desc_sid = intern_sym(&module.sym, &mut file.strings, cls_data.descriptor).ok_or(
             LowerError::UntraceableEntity {
                 func: FuncId::new(0),
@@ -220,30 +237,17 @@ pub fn lower_module_with_options(
                 raw: cls_data.descriptor.0,
             },
         )?;
-        let cls_off = alloc_offset(&mut next_offset)?;
-        file.entity_map.insert(cls_off, desc_sid);
         class_desc_sids.push(desc_sid);
-        let _ = ci;
     }
     if class_desc_sids.is_empty() && !module.functions.is_empty() {
         class_desc_sids.push(ensure_global_class(&mut file));
     }
 
-    let mut method_offsets: Vec<u32> = Vec::with_capacity(module.functions.len());
-    for _ in 0..module.functions.len() {
-        method_offsets.push(alloc_offset(&mut next_offset)?);
-    }
+    // 2. Build skeleton classes and fields (tracking `(desc_sid, field_idx_in_cls)`
+    //    for every IR `(ClassId, FieldId)` and `scope_names` slot).
+    let mut field_slots: Vec<Vec<(StringId, usize)>> = Vec::with_capacity(module.classes.len());
+    let mut scope_name_slots: Vec<(StringId, usize, ConstId)> = Vec::new();
 
-    let mut field_offsets: Vec<Vec<u32>> = Vec::with_capacity(module.classes.len());
-    for cls_data in &module.classes {
-        let mut offs = Vec::with_capacity(cls_data.fields.len());
-        for _ in 0..cls_data.fields.len() {
-            offs.push(alloc_offset(&mut next_offset)?);
-        }
-        field_offsets.push(offs);
-    }
-
-    // 2. Build skeleton classes and fields.
     for (ci, cls_data) in module.classes.iter().enumerate() {
         let desc_sid = class_desc_sids[ci];
         let name_sid =
@@ -269,9 +273,10 @@ pub fn lower_module_with_options(
             .source_file
             .and_then(|sf| intern_sym(&module.sym, &mut file.strings, sf));
 
+        let base_field_idx = file.classes.get(&desc_sid).map_or(0, |c| c.fields.len());
         let mut fields = Vec::with_capacity(cls_data.fields.len());
+        let mut cls_field_slots = Vec::with_capacity(cls_data.fields.len());
         for (fi, fdata) in cls_data.fields.iter().enumerate() {
-            let f_off = field_offsets[ci][fi];
             let f_sid = intern_sym(&module.sym, &mut file.strings, fdata.name).ok_or(
                 LowerError::UntraceableEntity {
                     func: FuncId::new(0),
@@ -279,184 +284,90 @@ pub fn lower_module_with_options(
                     raw: fdata.name.0,
                 },
             )?;
-            file.entity_map.insert(f_off, f_sid);
-            fields.push(build_field(
+            fields.push(build_field_shell(
                 module,
                 fdata,
                 f_sid,
-                f_off,
                 &class_desc_sids,
-                &field_offsets,
                 &mut file.strings,
-            )?);
+            ));
+            cls_field_slots.push((desc_sid, base_field_idx + fi));
         }
+        field_slots.push(cls_field_slots);
 
-        let cls_anns = build_annotations(
-            module,
-            &cls_data.annotations,
-            &class_desc_sids,
-            &field_offsets,
-            &mut file.strings,
-        )?;
-
-        file.classes.insert(
-            desc_sid,
-            Class {
-                descriptor: desc_sid,
-                name: name_sid,
-                access_flags: flags,
-                source_lang: source_lang_to_file(cls_data.source_lang),
-                source_file,
-                is_external,
-                super_class,
-                interfaces,
-                methods: Vec::new(),
-                fields,
-                annotations: cls_anns,
-            },
-        );
-    }
-
-    // 3. Materialize lowered bodies and attach methods to their owning classes.
-    // Note: in `File`, `classes` is a `BTreeMap<StringId, Class>`, so `all_methods()`
-    // iterates classes in `StringId` order. To keep `FuncId` indices aligned with
-    // `method_offsets[fi]`, each method stores its exact `method_offsets[fi]`, and
-    // bytecode `MethodId` operands relocate through `method_offsets[target_fid]`.
-    let mut lowered_bodies: Vec<Option<MethodBody>> = Vec::with_capacity(module.functions.len());
-    {
-        let mut materializer = Materializer::new(module, &mut file, &method_offsets, next_offset);
-        for (fi, layout_opt) in layouts.iter().enumerate() {
-            let func_id = FuncId::new(fi as u32);
-            match layout_opt {
-                Some(layout) => {
-                    let body = materializer.build_method_body(func_id, layout, None)?;
-                    lowered_bodies.push(Some(body));
-                }
-                None => lowered_bodies.push(None),
-            }
+        if let Some(sn_cid) = cls_data.scope_names {
+            let sn_name = file.strings.get_or_intern(abcd_file::SCOPE_NAMES_FIELD);
+            let slot_idx = base_field_idx + fields.len();
+            fields.push(Field {
+                name: sn_name,
+                offset: 0,
+                field_type: Type::U32,
+                access_flags: AccessFlags::STATIC,
+                is_external: false,
+                initial_value: None,
+                annotations: Annotations::default(),
+            });
+            scope_name_slots.push((desc_sid, slot_idx, sn_cid));
         }
-        // Materialize per-class `scope_names` and `es_module` fields if present.
-        for (ci, cls_data) in module.classes.iter().enumerate() {
-            let desc_sid = class_desc_sids[ci];
-            if let Some(sn_cid) = cls_data.scope_names {
-                let sn_off = materializer.literal_array_offset(sn_cid).ok_or(
-                    LowerError::UntraceableEntity {
-                        func: FuncId::new(0),
-                        kind: EntityKind::LiteralarrayId,
-                        raw: sn_cid.0,
-                    },
-                )?;
-                let field_off = materializer.alloc_offset()?;
-                let sn_name = materializer
-                    .file
+        if let Some(es_mod) = &cls_data.es_module {
+            let (md, phase_opt) = build_module_data(
+                &module.sym,
+                &mut file.strings,
+                &es_mod.imports,
+                &es_mod.exports,
+                &es_mod.module_requests,
+            )?;
+            let mr_name = file
+                .strings
+                .get_or_intern(abcd_file::MODULE_RECORD_IDX_FIELD);
+            fields.push(Field {
+                name: mr_name,
+                offset: 0,
+                field_type: Type::U32,
+                access_flags: AccessFlags::STATIC,
+                is_external: false,
+                initial_value: Some(FieldValue::ModuleData(md)),
+                annotations: Annotations::default(),
+            });
+            if let Some(ph) = phase_opt {
+                let pname = file
                     .strings
-                    .get_or_intern(abcd_file::SCOPE_NAMES_FIELD);
-                if let Some(cls) = materializer.file.classes.get_mut(&desc_sid) {
-                    cls.fields.push(Field {
-                        name: sn_name,
-                        offset: field_off,
-                        field_type: Type::U32,
-                        access_flags: AccessFlags::STATIC,
-                        is_external: false,
-                        initial_value: Some(FieldValue::LiteralArrayRef(sn_off)),
-                        annotations: Annotations::default(),
-                    });
-                }
-            }
-            if let Some(es_mod) = &cls_data.es_module {
-                let (md, phase_opt) = build_module_data(
-                    &module.sym,
-                    &mut materializer.file.strings,
-                    &es_mod.imports,
-                    &es_mod.exports,
-                    &es_mod.module_requests,
-                )?;
-                let mr_name = materializer
-                    .file
-                    .strings
-                    .get_or_intern(abcd_file::MODULE_RECORD_IDX_FIELD);
-                let mr_off = materializer.alloc_offset()?;
-                let phase_entry = if let Some(ph) = phase_opt {
-                    let pname = materializer
-                        .file
-                        .strings
-                        .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD);
-                    let poff = materializer.alloc_offset()?;
-                    Some((pname, poff, ph))
-                } else {
-                    None
-                };
-                if let Some(cls) = materializer.file.classes.get_mut(&desc_sid) {
-                    cls.fields.push(Field {
-                        name: mr_name,
-                        offset: mr_off,
-                        field_type: Type::U32,
-                        access_flags: AccessFlags::STATIC,
-                        is_external: false,
-                        initial_value: Some(FieldValue::ModuleData(md)),
-                        annotations: Annotations::default(),
-                    });
-                    if let Some((pname, poff, ph)) = phase_entry {
-                        cls.fields.push(Field {
-                            name: pname,
-                            offset: poff,
-                            field_type: Type::U32,
-                            access_flags: AccessFlags::STATIC,
-                            is_external: false,
-                            initial_value: Some(FieldValue::ModuleRequestPhase(ph)),
-                            annotations: Annotations::default(),
-                        });
-                    }
-                }
+                    .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD);
+                fields.push(Field {
+                    name: pname,
+                    offset: 0,
+                    field_type: Type::U32,
+                    access_flags: AccessFlags::STATIC,
+                    is_external: false,
+                    initial_value: Some(FieldValue::ModuleRequestPhase(ph)),
+                    annotations: Annotations::default(),
+                });
             }
         }
-        next_offset = materializer.next_offset;
-    }
 
-    let need_slot_ann = lowered_bodies
-        .iter()
-        .flatten()
-        .any(|b| b.ic_size.unwrap_or(0) > 0);
-    let slot_ann_sids = if need_slot_ann {
-        Some(ensure_slot_number_ann_record(&mut file))
-    } else {
-        None
-    };
-
-    for (fi, func_data) in module.functions.iter().enumerate() {
-        let desc_sid = class_desc_sids
-            .get(func_data.class_id.index())
-            .copied()
-            .ok_or(LowerError::UntraceableEntity {
-                func: FuncId::new(fi as u32),
-                kind: EntityKind::MethodId,
-                raw: func_data.class_id.0,
-            })?;
-        let m_off = method_offsets[fi];
-        let mut method = build_synthesized_method_full(
-            module,
-            func_data,
-            layouts[fi].as_ref(),
-            &class_desc_sids,
-            &field_offsets,
-            &mut file,
-            m_off,
-        )?;
-        let body = lowered_bodies[fi].take();
-        if let (Some(b), Some((ann_desc, elem_name))) = (&body, slot_ann_sids)
-            && let Some(ic) = b.ic_size
-            && ic > 0
-        {
-            ensure_method_slot_annotation(&mut method.annotations, ann_desc, elem_name, ic);
-        }
-        method.body = body;
-        file.entity_map.insert(m_off, method.name);
-        if let Some(cls) = file.classes.get_mut(&desc_sid) {
-            cls.methods.push(method);
+        if let Some(existing) = file.classes.get_mut(&desc_sid) {
+            existing.fields.extend(fields);
+        } else {
+            file.classes.insert(
+                desc_sid,
+                Class {
+                    descriptor: desc_sid,
+                    name: name_sid,
+                    access_flags: flags,
+                    source_lang: source_lang_to_file(cls_data.source_lang),
+                    source_file,
+                    is_external,
+                    super_class,
+                    interfaces,
+                    methods: Vec::new(),
+                    fields,
+                    annotations: Annotations::default(),
+                },
+            );
         }
     }
 
-    // 4. Top-level standalone ES module record (`Module.imports` / `exports` / `module_requests`).
+    // 3. Top-level standalone ES module record (`Module.imports` / `exports` / `module_requests`).
     if !module.imports.is_empty()
         || !module.exports.is_empty()
         || !module.module_requests.is_empty()
@@ -472,10 +383,9 @@ pub fn lower_module_with_options(
             .strings
             .get_or_intern(abcd_file::ES_MODULE_RECORD_DESCRIPTOR);
         let field_name = file.strings.get_or_intern("moduleRecordIdx");
-        let f_off = alloc_offset(&mut next_offset)?;
         let mut fields = vec![Field {
             name: field_name,
-            offset: f_off,
+            offset: 0,
             field_type: Type::U32,
             access_flags: AccessFlags::STATIC,
             is_external: false,
@@ -486,10 +396,9 @@ pub fn lower_module_with_options(
             let ph_name = file
                 .strings
                 .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD);
-            let ph_off = alloc_offset(&mut next_offset)?;
             fields.push(Field {
                 name: ph_name,
-                offset: ph_off,
+                offset: 0,
                 field_type: Type::U32,
                 access_flags: AccessFlags::STATIC,
                 is_external: false,
@@ -515,7 +424,271 @@ pub fn lower_module_with_options(
             });
     }
 
+    // 4. Place method shells into `file.classes` so `FuncId -> MethodIdx` and
+    //    `(ClassId, FieldId) -> FieldIdx` match `file.all_methods()` /
+    //    `file.all_fields()` (`BTreeMap` order) with 100% precision.
+    let mut func_slots: Vec<(StringId, usize)> = Vec::with_capacity(module.functions.len());
+    for (fi, func_data) in module.functions.iter().enumerate() {
+        let desc_sid = class_desc_sids
+            .get(func_data.class_id.index())
+            .copied()
+            .ok_or(LowerError::UntraceableEntity {
+                func: FuncId::new(fi as u32),
+                kind: EntityKind::MethodId,
+                raw: func_data.class_id.0,
+            })?;
+        let owner_lang = module
+            .class(func_data.class_id)
+            .map_or(FileSourceLang::EcmaScript, |c| {
+                source_lang_to_file(c.source_lang)
+            });
+        let method = build_method_shell(
+            module,
+            func_data,
+            layouts[fi].as_ref(),
+            owner_lang,
+            &class_desc_sids,
+            &mut file.strings,
+        )?;
+        let cls = file
+            .classes
+            .get_mut(&desc_sid)
+            .ok_or(LowerError::UntraceableEntity {
+                func: FuncId::new(fi as u32),
+                kind: EntityKind::MethodId,
+                raw: func_data.class_id.0,
+            })?;
+        let mi = cls.methods.len();
+        cls.methods.push(method);
+        func_slots.push((desc_sid, mi));
+    }
+
+    let func_to_method_idx = compute_func_method_indices(&file.classes, &func_slots);
+    let field_to_field_idx = compute_field_indices(&file.classes, &field_slots);
+
+    // 5. Materialize method bodies and literal arrays (`scope_names`, initializers, annotations).
+    let mut lowered_bodies: Vec<Option<MethodBody>> = Vec::with_capacity(module.functions.len());
+    let mut resolved_scope_names: Vec<(StringId, usize, LiteralArrayIdx)> =
+        Vec::with_capacity(scope_name_slots.len());
+    {
+        let mut materializer = Materializer::new(module, &mut file, &func_to_method_idx);
+        for (fi, layout_opt) in layouts.iter().enumerate() {
+            let func_id = FuncId::new(fi as u32);
+            match layout_opt {
+                Some(layout) => {
+                    let body = materializer.build_method_body(func_id, layout, None)?;
+                    lowered_bodies.push(Some(body));
+                }
+                None => lowered_bodies.push(None),
+            }
+        }
+        for &(desc_sid, f_idx, sn_cid) in &scope_name_slots {
+            let sn_idx =
+                materializer
+                    .literal_array_idx(sn_cid)
+                    .ok_or(LowerError::UntraceableEntity {
+                        func: FuncId::new(0),
+                        kind: EntityKind::LiteralarrayId,
+                        raw: sn_cid.0,
+                    })?;
+            resolved_scope_names.push((desc_sid, f_idx, sn_idx));
+        }
+    }
+
+    for (desc_sid, f_idx, sn_idx) in resolved_scope_names {
+        if let Some(cls) = file.classes.get_mut(&desc_sid)
+            && let Some(field) = cls.fields.get_mut(f_idx)
+        {
+            field.initial_value = Some(FieldValue::literal_array_ref(sn_idx));
+        }
+    }
+
+    // 6. Populate class, field, and method annotations + attach bodies & `SlotNumber`.
+    for (ci, cls_data) in module.classes.iter().enumerate() {
+        let desc_sid = class_desc_sids[ci];
+        let cls_anns = build_annotations(
+            module,
+            &cls_data.annotations,
+            &class_desc_sids,
+            &func_to_method_idx,
+            &field_to_field_idx,
+            &mut file.strings,
+        )?;
+        if let Some(cls) = file.classes.get_mut(&desc_sid) {
+            cls.annotations = cls_anns;
+        }
+        for (fi, fdata) in cls_data.fields.iter().enumerate() {
+            let f_anns = build_annotations(
+                module,
+                &fdata.annotations,
+                &class_desc_sids,
+                &func_to_method_idx,
+                &field_to_field_idx,
+                &mut file.strings,
+            )?;
+            let (f_desc, f_pos) = field_slots[ci][fi];
+            if let Some(cls) = file.classes.get_mut(&f_desc)
+                && let Some(field) = cls.fields.get_mut(f_pos)
+            {
+                field.annotations = f_anns;
+            }
+        }
+    }
+
+    let need_slot_ann = lowered_bodies
+        .iter()
+        .flatten()
+        .any(|b| b.ic_size.unwrap_or(0) > 0);
+    let slot_ann_sids = if need_slot_ann {
+        Some(ensure_slot_number_ann_record(&mut file))
+    } else {
+        None
+    };
+
+    for (fi, func_data) in module.functions.iter().enumerate() {
+        let m_anns = build_annotations(
+            module,
+            &func_data.annotations,
+            &class_desc_sids,
+            &func_to_method_idx,
+            &field_to_field_idx,
+            &mut file.strings,
+        )?;
+        let (desc_sid, mi) = func_slots[fi];
+        if let Some(cls) = file.classes.get_mut(&desc_sid)
+            && let Some(method) = cls.methods.get_mut(mi)
+        {
+            method.annotations = m_anns;
+            let body = lowered_bodies[fi].take();
+            if let (Some(b), Some((ann_desc, elem_name))) = (&body, slot_ann_sids)
+                && let Some(ic) = b.ic_size
+                && ic > 0
+            {
+                ensure_method_slot_annotation(&mut method.annotations, ann_desc, elem_name, ic);
+            }
+            method.body = body;
+        }
+    }
+
     Ok(file)
+}
+
+/// Reconstruct [`MethodDebugInfo`] for `func_data` from its IR [`abcd_ir::DebugData`]
+/// and post-layout instruction PCs (`#57` `R3-H8`).
+///
+/// - Returns `None` when `func_data.debug` is `None`.
+/// - Maps `DebugData::line_table` and `DebugData::column_table` `InstId`s
+///   through `LayoutResult::inst_pcs` (falling back to `Inst.loc` when the
+///   explicit table is empty), sorting by bytecode index and deduplicating
+///   same-PC and consecutive-identical-line/column entries.
+/// - Clears `local_vars` (`Vec::new()`) because register numbers and scope PCs
+///   are invalidated by SSA + register allocation + block layout.
+pub fn rebuild_method_debug(
+    module: &Module,
+    func_data: &abcd_ir::FunctionData,
+    layout: Option<&LayoutResult>,
+    strings: &mut StringPool,
+) -> Option<MethodDebugInfo> {
+    let dbg = func_data.debug.as_ref()?;
+
+    let source_file = dbg
+        .source_file
+        .and_then(|sf| intern_sym(&module.sym, strings, sf));
+    let source_code = dbg
+        .source_code
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| strings.get_or_intern(s));
+
+    let mut line_table: Vec<LineEntry> = Vec::new();
+    let mut column_table: Vec<ColumnEntry> = Vec::new();
+
+    if let Some(lay) = layout {
+        if !dbg.line_table.is_empty() {
+            for e in &dbg.line_table {
+                if let Some(&pc) = lay.inst_pcs.get(&e.inst) {
+                    line_table.push(LineEntry {
+                        index: pc,
+                        line: e.line,
+                    });
+                }
+            }
+        }
+        if line_table.is_empty() {
+            for &bb in &func_data.blocks {
+                if let Some(blk) = module.block(bb) {
+                    for &iid in &blk.insts {
+                        if let (Some(loc), Some(&pc)) =
+                            (module.inst(iid).and_then(|i| i.loc), lay.inst_pcs.get(&iid))
+                        {
+                            line_table.push(LineEntry {
+                                index: pc,
+                                line: loc.line,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        line_table.sort_by_key(|e| (e.index, e.line));
+        line_table.dedup_by_key(|e| e.index);
+        line_table.dedup_by(|b, a| a.line == b.line);
+
+        if !dbg.column_table.is_empty() {
+            for e in &dbg.column_table {
+                if let Some(&pc) = lay.inst_pcs.get(&e.inst) {
+                    column_table.push(ColumnEntry {
+                        index: pc,
+                        column: e.column,
+                    });
+                }
+            }
+        } else {
+            for &bb in &func_data.blocks {
+                if let Some(blk) = module.block(bb) {
+                    for &iid in &blk.insts {
+                        if let (Some(col), Some(&pc)) = (
+                            module.inst(iid).and_then(|i| i.loc).and_then(|l| l.column),
+                            lay.inst_pcs.get(&iid),
+                        ) {
+                            column_table.push(ColumnEntry {
+                                index: pc,
+                                column: col,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        column_table.sort_by_key(|e| (e.index, e.column));
+        column_table.dedup_by_key(|e| e.index);
+        column_table.dedup_by(|b, a| a.column == b.column);
+    }
+
+    let params = if dbg.param_names.is_empty() {
+        Vec::new()
+    } else {
+        let empty_sig = strings.get_or_intern("");
+        dbg.param_names
+            .iter()
+            .filter_map(|&p| {
+                let name = intern_sym(&module.sym, strings, p)?;
+                Some(ParamInfo {
+                    name,
+                    signature: empty_sig,
+                })
+            })
+            .collect()
+    };
+
+    Some(MethodDebugInfo {
+        source_file,
+        source_code,
+        line_table,
+        column_table,
+        local_vars: Vec::new(),
+        params,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -542,37 +715,124 @@ fn lower_all_layouts(
     results.into_iter().collect()
 }
 
-fn initial_synth_offset(file: &File) -> u32 {
-    let max_entity = file.entity_map.keys().copied().max().unwrap_or(0);
-    let max_lit = file
-        .literal_array_offsets
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0);
-    let max_method = file.all_methods().map(|(_, m)| m.offset).max().unwrap_or(0);
-    let max_field = file
-        .classes
-        .values()
-        .flat_map(|c| &c.fields)
-        .map(|f| f.offset)
-        .max()
-        .unwrap_or(0);
-    max_entity
-        .max(max_lit)
-        .max(max_method)
-        .max(max_field)
-        .max(0x10_0000)
-        .saturating_add(0x1000)
+fn compute_func_method_indices(
+    classes: &BTreeMap<StringId, Class>,
+    func_slots: &[(StringId, usize)],
+) -> Vec<MethodIdx> {
+    let mut class_base: HashMap<StringId, u32> = HashMap::with_capacity(classes.len());
+    let mut running = 0u32;
+    for (&sid, cls) in classes {
+        class_base.insert(sid, running);
+        running += cls.methods.len() as u32;
+    }
+    func_slots
+        .iter()
+        .map(|&(sid, mi)| MethodIdx(class_base[&sid] + mi as u32))
+        .collect()
 }
 
-#[inline]
-fn alloc_offset(next: &mut u32) -> Result<u32, LowerError> {
-    let off = *next;
-    *next = next
-        .checked_add(4)
-        .ok_or(LowerError::SyntheticOffsetOverflow)?;
-    Ok(off)
+fn compute_field_indices(
+    classes: &BTreeMap<StringId, Class>,
+    field_slots: &[Vec<(StringId, usize)>],
+) -> Vec<Vec<FieldIdx>> {
+    let mut class_base: HashMap<StringId, u32> = HashMap::with_capacity(classes.len());
+    let mut running = 0u32;
+    for (&sid, cls) in classes {
+        class_base.insert(sid, running);
+        running += cls.fields.len() as u32;
+    }
+    field_slots
+        .iter()
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|&(sid, fi)| FieldIdx(class_base[&sid] + fi as u32))
+                .collect()
+        })
+        .collect()
+}
+
+fn remap_existing_method_indices(
+    file: &mut File,
+    base_method_count: usize,
+    func_to_method_idx: &[MethodIdx],
+) {
+    let any_shifted = (0..base_method_count)
+        .any(|old| func_to_method_idx.get(old).copied() != Some(MethodIdx(old as u32)));
+    if !any_shifted {
+        return;
+    }
+    let remap = |midx: &mut MethodIdx| {
+        if let Some(&new_midx) = func_to_method_idx.get(midx.index()) {
+            *midx = new_midx;
+        }
+    };
+    for la in &mut file.literal_arrays {
+        for v in &mut la.values {
+            if let Some(midx) = v.method_idx_mut() {
+                remap(midx);
+            }
+        }
+    }
+    for cls in file.classes.values_mut() {
+        remap_annotations_methods(&mut cls.annotations, &remap);
+        for f in &mut cls.fields {
+            remap_annotations_methods(&mut f.annotations, &remap);
+        }
+        for m in &mut cls.methods {
+            remap_annotations_methods(&mut m.annotations, &remap);
+            if let Some(body) = &mut m.body {
+                for entity in body.entities.values_mut() {
+                    if let EntityRef::Method(midx) = entity {
+                        remap(midx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn remap_annotations_methods(anns: &mut Annotations, remap: &impl Fn(&mut MethodIdx)) {
+    for bucket in [
+        &mut anns.compile_time,
+        &mut anns.runtime,
+        &mut anns.compile_time_type,
+        &mut anns.runtime_type,
+    ] {
+        for ann in bucket {
+            remap_ann_slice(&mut ann.elements, remap);
+        }
+    }
+}
+
+fn remap_ann_slice(elems: &mut [AnnotationElem], remap: &impl Fn(&mut MethodIdx)) {
+    let mut stack: Vec<&mut AnnotationValue> = elems.iter_mut().map(|e| &mut e.value).collect();
+    while let Some(val) = stack.pop() {
+        match val {
+            AnnotationValue::Method {
+                method: Some(midx), ..
+            } => remap(midx),
+            AnnotationValue::MethodHandle(rmh) => {
+                if let Some(midx) = &mut rmh.target_method {
+                    remap(midx);
+                }
+            }
+            AnnotationValue::LiteralArray(vals) => {
+                for v in vals {
+                    if let Some(midx) = v.method_idx_mut() {
+                        remap(midx);
+                    }
+                }
+            }
+            AnnotationValue::Annotation(nested) => {
+                stack.extend(nested.elements.iter_mut().map(|e| &mut e.value));
+            }
+            AnnotationValue::Array { values, .. } => {
+                stack.extend(values.iter_mut());
+            }
+            _ => {}
+        }
+    }
 }
 
 fn intern_sym(
@@ -649,47 +909,47 @@ fn ensure_method_slot_annotation(
     }
 }
 
+#[derive(Clone, Copy)]
+enum MatNestedWrap {
+    Array,
+    BufferRef { wrapper_cid: ConstId },
+    TypedArray(TypedArrayTag),
+}
+
+fn wrap_literal_array_value(wrap: MatNestedWrap, idx: LiteralArrayIdx) -> LiteralValue {
+    match wrap {
+        MatNestedWrap::Array => LiteralValue::LiteralArray(idx),
+        MatNestedWrap::BufferRef { .. } => LiteralValue::LiteralBufferIndex(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::U1) => LiteralValue::ArrayU1(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::U8) => LiteralValue::ArrayU8(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::I8) => LiteralValue::ArrayI8(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::U16) => LiteralValue::ArrayU16(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::I16) => LiteralValue::ArrayI16(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::U32) => LiteralValue::ArrayU32(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::I32) => LiteralValue::ArrayI32(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::U64) => LiteralValue::ArrayU64(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::I64) => LiteralValue::ArrayI64(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::F32) => LiteralValue::ArrayF32(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::F64) => LiteralValue::ArrayF64(idx),
+        MatNestedWrap::TypedArray(TypedArrayTag::String) => LiteralValue::ArrayString(idx),
+    }
+}
+
 struct Materializer<'m, 'f> {
     module: &'m Module,
     file: &'f mut File,
-    method_offsets: &'m [u32],
-    next_offset: u32,
-    string_offsets: HashMap<Box<[u8]>, u32>,
-    /// Materialized shape `(table_idx, file_offset, subtree_height)` per [`ConstId`].
-    synth_shapes: HashMap<ConstId, (u32, u32, u32)>,
+    func_to_method_idx: &'m [MethodIdx],
+    synth_shapes: HashMap<ConstId, LiteralArrayIdx>,
 }
 
 impl<'m, 'f> Materializer<'m, 'f> {
-    fn new(
-        module: &'m Module,
-        file: &'f mut File,
-        method_offsets: &'m [u32],
-        next_offset: u32,
-    ) -> Self {
-        let mut string_offsets: HashMap<Box<[u8]>, u32> =
-            HashMap::with_capacity(file.entity_map.len());
-        let mut entries: Vec<(u32, StringId)> =
-            file.entity_map.iter().map(|(&o, &s)| (o, s)).collect();
-        entries.sort_unstable();
-        for (off, sid) in entries {
-            if let Some(bytes) = file.strings.to_mutf8_bytes(sid) {
-                string_offsets
-                    .entry(bytes.into_owned().into_boxed_slice())
-                    .or_insert(off);
-            }
-        }
+    fn new(module: &'m Module, file: &'f mut File, func_to_method_idx: &'m [MethodIdx]) -> Self {
         Self {
             module,
             file,
-            method_offsets,
-            next_offset,
-            string_offsets,
+            func_to_method_idx,
             synth_shapes: HashMap::new(),
         }
-    }
-
-    fn alloc_offset(&mut self) -> Result<u32, LowerError> {
-        alloc_offset(&mut self.next_offset)
     }
 
     fn build_method_body(
@@ -704,25 +964,24 @@ impl<'m, 'f> Materializer<'m, 'f> {
             .map(|f| f.params.len())
             .unwrap_or_default();
 
-        let (bytecodes, entity_offsets) =
+        let (bytecodes, entities) =
             relocate_and_compact_entities(func_id, &result.bytecodes, |kind, raw| match kind {
                 EntityKind::StringId => {
                     let sym = Sym::new(raw);
                     if let Some(r) = base_resolver
-                        && let Some(off) = r.string_offset(sym)
+                        && let Some(eref) = r.string_ref(sym)
                     {
-                        Ok(off)
+                        Ok(eref)
                     } else {
-                        self.string_offset(sym)
-                            .ok_or(LowerError::UntraceableEntity {
-                                func: func_id,
-                                kind,
-                                raw,
-                            })
+                        self.string_ref(sym).ok_or(LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw,
+                        })
                     }
                 }
                 EntityKind::MethodId => {
-                    self.method_offset(FuncId::new(raw))
+                    self.method_ref(FuncId::new(raw))
                         .ok_or(LowerError::UntraceableEntity {
                             func: func_id,
                             kind,
@@ -732,11 +991,12 @@ impl<'m, 'f> Materializer<'m, 'f> {
                 EntityKind::LiteralarrayId => {
                     let cid = ConstId::new(raw);
                     if let Some(r) = base_resolver
-                        && let Some(off) = r.literal_array_offset(cid)
+                        && let Some(eref) = r.literal_array_ref(cid)
                     {
-                        Ok(off)
+                        Ok(eref)
                     } else {
-                        self.literal_array_offset(cid)
+                        self.literal_array_idx(cid)
+                            .map(EntityRef::LiteralArray)
                             .ok_or(LowerError::UntraceableEntity {
                                 func: func_id,
                                 kind,
@@ -746,85 +1006,158 @@ impl<'m, 'f> Materializer<'m, 'f> {
                 }
             })?;
 
+        let try_blocks = self.materialize_try_blocks(&result.try_blocks, func_id)?;
+
         Ok(MethodBody {
             num_vregs: u32::from(result.num_regs),
             num_args: param_count as u32,
             bytecodes,
-            entity_offsets,
-            try_blocks: result.try_blocks.clone(),
+            entities,
+            try_blocks,
             ic_size: Some(result.ic_size),
         })
     }
 
-    fn string_offset(&mut self, sym: Sym) -> Option<u32> {
-        let bytes = self.module.sym.to_mutf8_bytes(sym)?.into_owned();
-        if let Some(&off) = self.string_offsets.get(bytes.as_slice()) {
-            return Some(off);
+    fn materialize_try_blocks(
+        &mut self,
+        lowered: &[LoweredTryBlock],
+        func_id: FuncId,
+    ) -> Result<Vec<TryBlock>, LowerError> {
+        let mut out = Vec::with_capacity(lowered.len());
+        for tb in lowered {
+            let mut catches = Vec::with_capacity(tb.catches.len());
+            for c in &tb.catches {
+                let type_class = match c.type_class {
+                    None => None,
+                    Some(cid) => {
+                        let cls = self
+                            .module
+                            .class(cid)
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind: EntityKind::StringId,
+                                raw: cid.0,
+                            })?;
+                        let sid =
+                            intern_sym(&self.module.sym, &mut self.file.strings, cls.descriptor)
+                                .ok_or(LowerError::UntraceableEntity {
+                                    func: func_id,
+                                    kind: EntityKind::StringId,
+                                    raw: cls.descriptor.0,
+                                })?;
+                        Some(sid)
+                    }
+                };
+                catches.push(CatchBlock {
+                    type_class,
+                    handler: c.handler,
+                    len: c.len,
+                });
+            }
+            out.push(TryBlock {
+                start: tb.start,
+                len: tb.len,
+                catches,
+            });
         }
+        Ok(out)
+    }
+
+    fn string_ref(&mut self, sym: Sym) -> Option<EntityRef> {
         let sid = intern_sym(&self.module.sym, &mut self.file.strings, sym)?;
-        let off = self.alloc_offset().ok()?;
-        self.file.entity_map.insert(off, sid);
-        self.string_offsets.insert(bytes.into_boxed_slice(), off);
-        Some(off)
+        Some(EntityRef::string(sid))
     }
 
-    fn method_offset(&self, func: FuncId) -> Option<u32> {
-        self.method_offsets.get(func.index()).copied()
+    fn method_idx(&self, func: FuncId) -> Option<MethodIdx> {
+        self.func_to_method_idx.get(func.index()).copied()
     }
 
-    fn literal_array_offset(&mut self, shape: ConstId) -> Option<u32> {
-        if let Some(&(_idx, off, _height)) = self.synth_shapes.get(&shape) {
-            return Some(off);
+    fn method_ref(&self, func: FuncId) -> Option<EntityRef> {
+        self.method_idx(func).map(EntityRef::Method)
+    }
+
+    fn literal_array_idx(&mut self, shape: ConstId) -> Option<LiteralArrayIdx> {
+        if let Some(&idx) = self.synth_shapes.get(&shape) {
+            return Some(idx);
         }
-        let (_idx, off) = self.materialize_shape_tree(shape)?;
-        Some(off)
+        self.materialize_shape_tree(shape)
     }
 
-    fn materialize_shape_tree(&mut self, root_cid: ConstId) -> Option<(u32, u32)> {
+    fn materialize_shape_tree(&mut self, root_cid: ConstId) -> Option<LiteralArrayIdx> {
         let module = self.module;
-        let root_const = module.consts.get(root_cid)?;
-        let (root_cursor, root_cap) = ShapeCursor::from_const(root_const)?;
         let mut active: HashSet<ConstId> = HashSet::new();
-        active.insert(root_cid);
+        let mut actual_root = root_cid;
+        let root_const = loop {
+            if !active.insert(actual_root) {
+                return None;
+            }
+            match module.consts.get(actual_root)? {
+                Const::LiteralBufferRef(inner) => actual_root = *inner,
+                other => break other,
+            }
+        };
+        if let Some(&existing) = self.synth_shapes.get(&actual_root) {
+            self.synth_shapes.insert(root_cid, existing);
+            return Some(existing);
+        }
+        let (root_cursor, root_cap) = ShapeCursor::from_const(root_const)?;
         let mut stack = vec![ShapeFrame {
-            cid: root_cid,
+            cid: actual_root,
+            parent_wrap: None,
             cursor: root_cursor,
-            depth: 0,
-            subtree_height: 0,
             values: Vec::with_capacity(root_cap),
         }];
 
         'outer: while let Some(mut frame) = stack.pop() {
             while let Some(child_cid) = frame.cursor.next_id() {
                 let elem = module.consts.get(child_cid)?;
-                if matches!(elem, Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }) {
-                    if active.contains(&child_cid) {
-                        return None;
+                let nested = match elem {
+                    Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {
+                        Some((child_cid, elem, MatNestedWrap::Array))
                     }
-                    let child_depth = frame.depth + 1;
-                    if child_depth > 64 {
-                        return None;
+                    Const::TypedArrayLiteral { tag, .. } => {
+                        Some((child_cid, elem, MatNestedWrap::TypedArray(*tag)))
                     }
-                    if let Some(&(child_idx, _child_off, child_height)) =
-                        self.synth_shapes.get(&child_cid)
-                    {
-                        if child_depth + child_height > 64 {
+                    Const::LiteralBufferRef(inner_cid) => {
+                        if active.contains(&child_cid) {
                             return None;
                         }
-                        frame.subtree_height = frame.subtree_height.max(child_height + 1);
-                        frame
-                            .values
-                            .push(LiteralValue::LiteralArray(LiteralArrayIdx(child_idx)));
+                        let inner_elem = module.consts.get(*inner_cid)?;
+                        if !matches!(
+                            inner_elem,
+                            Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
+                        ) {
+                            return None;
+                        }
+                        Some((
+                            *inner_cid,
+                            inner_elem,
+                            MatNestedWrap::BufferRef {
+                                wrapper_cid: child_cid,
+                            },
+                        ))
+                    }
+                    _ => None,
+                };
+
+                if let Some((target_cid, target_elem, wrap)) = nested {
+                    if active.contains(&target_cid) {
+                        return None;
+                    }
+                    if let Some(&child_idx) = self.synth_shapes.get(&target_cid) {
+                        frame.values.push(wrap_literal_array_value(wrap, child_idx));
                         continue;
                     }
-                    let (child_cursor, child_cap) = ShapeCursor::from_const(elem)?;
-                    active.insert(child_cid);
+                    let (child_cursor, child_cap) = ShapeCursor::from_const(target_elem)?;
+                    if let MatNestedWrap::BufferRef { wrapper_cid } = wrap {
+                        active.insert(wrapper_cid);
+                    }
+                    active.insert(target_cid);
                     stack.push(frame);
                     stack.push(ShapeFrame {
-                        cid: child_cid,
+                        cid: target_cid,
+                        parent_wrap: Some(wrap),
                         cursor: child_cursor,
-                        depth: child_depth,
-                        subtree_height: 0,
                         values: Vec::with_capacity(child_cap),
                     });
                     continue 'outer;
@@ -833,21 +1166,20 @@ impl<'m, 'f> Materializer<'m, 'f> {
             }
 
             active.remove(&frame.cid);
-            let idx = self.file.literal_arrays.len() as u32;
-            let off = self.alloc_offset().ok()?;
-            self.file.literal_arrays.push(LiteralArray {
-                values: frame.values,
-            });
-            self.file.literal_array_offsets.insert(off, idx);
-            self.synth_shapes
-                .insert(frame.cid, (idx, off, frame.subtree_height));
+            if let Some(MatNestedWrap::BufferRef { wrapper_cid }) = frame.parent_wrap {
+                active.remove(&wrapper_cid);
+            }
+            let idx = LiteralArrayIdx(self.file.literal_arrays.len() as u32);
+            self.file
+                .literal_arrays
+                .push(LiteralArray::new(frame.values));
+            self.synth_shapes.insert(frame.cid, idx);
             if let Some(parent) = stack.last_mut() {
-                parent.subtree_height = parent.subtree_height.max(frame.subtree_height + 1);
-                parent
-                    .values
-                    .push(LiteralValue::LiteralArray(LiteralArrayIdx(idx)));
+                let wrap = frame.parent_wrap.unwrap_or(MatNestedWrap::Array);
+                parent.values.push(wrap_literal_array_value(wrap, idx));
             } else {
-                return Some((idx, off));
+                self.synth_shapes.insert(root_cid, idx);
+                return Some(idx);
             }
         }
         None
@@ -856,37 +1188,39 @@ impl<'m, 'f> Materializer<'m, 'f> {
     fn materialize_scalar_elem(&mut self, c: &Const) -> Option<LiteralValue> {
         Some(match c {
             Const::Bool(b) => LiteralValue::Bool(*b),
+            Const::Int8(n) => LiteralValue::Integer8(*n),
+            Const::Int32(n) => LiteralValue::Integer(*n),
+            Const::Float32(bits) => LiteralValue::Float(f32::from_bits(*bits)),
+            Const::Number(bits) => LiteralValue::Double(f64::from_bits(*bits)),
+            Const::Accessor(n) => LiteralValue::Accessor(*n),
+            Const::MethodAffiliate(n) => LiteralValue::MethodAffiliate(*n),
+            Const::BuiltinTypeIndex(n) => LiteralValue::BuiltinTypeIndex(*n),
+            Const::LitNull(n) => LiteralValue::NullValue(*n),
             Const::Null | Const::Undefined | Const::Hole => LiteralValue::NullValue(0),
-            Const::Number(bits) => {
-                let v = f64::from_bits(*bits);
-                if *bits != (-0.0f64).to_bits()
-                    && v.is_finite()
-                    && (v as i32 as f64).to_bits() == *bits
-                {
-                    LiteralValue::Integer((v as i32) as u32)
-                } else {
-                    LiteralValue::Double(v)
-                }
-            }
             Const::String(sym) | Const::BigInt(sym) => {
                 let sid = intern_sym(&self.module.sym, &mut self.file.strings, *sym)?;
                 LiteralValue::String(sid)
             }
-            Const::MethodRef(fid) => {
-                let off = self.method_offset(*fid)?;
-                let kind = self.module.func(*fid).map(|f| f.kind)?;
+            Const::EtsImplements(sym) => {
+                let sid = intern_sym(&self.module.sym, &mut self.file.strings, *sym)?;
+                LiteralValue::EtsImplements(sid)
+            }
+            Const::MethodRef { func, kind } => {
+                let midx = self.method_idx(*func)?;
                 match kind {
-                    IrFunctionKind::Generator => LiteralValue::GeneratorMethod(off),
-                    IrFunctionKind::AsyncGenerator => LiteralValue::AsyncGeneratorMethod(off),
-                    IrFunctionKind::Getter => LiteralValue::Getter(off),
-                    IrFunctionKind::Setter => LiteralValue::Setter(off),
-                    _ => LiteralValue::Method(off),
+                    LitMethodKind::Method => LiteralValue::Method(midx),
+                    LitMethodKind::GeneratorMethod => LiteralValue::GeneratorMethod(midx),
+                    LitMethodKind::AsyncGeneratorMethod => LiteralValue::AsyncGeneratorMethod(midx),
+                    LitMethodKind::Getter => LiteralValue::Getter(midx),
+                    LitMethodKind::Setter => LiteralValue::Setter(midx),
                 }
             }
             Const::Int64(_)
             | Const::UInt64(_)
             | Const::ArrayLiteral(_)
-            | Const::ObjectLiteral { .. } => return None,
+            | Const::TypedArrayLiteral { .. }
+            | Const::ObjectLiteral { .. }
+            | Const::LiteralBufferRef(_) => return None,
         })
     }
 }
@@ -906,7 +1240,9 @@ enum ShapeCursor<'t> {
 impl<'t> ShapeCursor<'t> {
     fn from_const(tree: &'t Const) -> Option<(Self, usize)> {
         match tree {
-            Const::ArrayLiteral(items) => Some((Self::Array { items, next: 0 }, items.len())),
+            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+                Some((Self::Array { items, next: 0 }, items.len()))
+            }
             Const::ObjectLiteral { keys, values } => {
                 if keys.len() != values.len() {
                     return None;
@@ -947,9 +1283,8 @@ impl<'t> ShapeCursor<'t> {
 
 struct ShapeFrame<'t> {
     cid: ConstId,
+    parent_wrap: Option<MatNestedWrap>,
     cursor: ShapeCursor<'t>,
-    depth: u32,
-    subtree_height: u32,
     values: Vec<LiteralValue>,
 }
 
@@ -985,8 +1320,12 @@ fn modifiers_to_access_flags(m: Modifiers) -> AccessFlags {
     out
 }
 
-fn source_lang_to_file(_lang: IrSourceLang) -> FileSourceLang {
-    FileSourceLang::EcmaScript
+fn source_lang_to_file(lang: IrSourceLang) -> FileSourceLang {
+    match lang {
+        IrSourceLang::EcmaScript => FileSourceLang::EcmaScript,
+        IrSourceLang::TypeScript => FileSourceLang::TypeScript,
+        IrSourceLang::ArkTS => FileSourceLang::ArkTs,
+    }
 }
 
 fn function_kind_to_file(kind: IrFunctionKind) -> FileFunctionKind {
@@ -999,6 +1338,21 @@ fn function_kind_to_file(kind: IrFunctionKind) -> FileFunctionKind {
         IrFunctionKind::Arrow => FileFunctionKind::NcFunction,
         IrFunctionKind::AsyncArrow => FileFunctionKind::AsyncNcFunction,
     }
+}
+
+fn method_access_flags(func_data: &abcd_ir::FunctionData) -> AccessFlags {
+    let mut flags = modifiers_to_access_flags(func_data.modifiers);
+    if flags.is_empty() && !func_data.is_external {
+        flags = if func_data.kind == IrFunctionKind::Constructor {
+            AccessFlags::PUBLIC
+        } else {
+            AccessFlags::PUBLIC | AccessFlags::STATIC
+        };
+    }
+    if func_data.kind == IrFunctionKind::Constructor {
+        flags |= AccessFlags::CONSTRUCTOR;
+    }
+    flags
 }
 
 fn ty_to_file(ty: &Ty, class_desc_sids: &[StringId]) -> Type {
@@ -1044,8 +1398,8 @@ fn is_external_class(cls: &ClassData, module: &Module) -> bool {
 fn build_synthesized_method(
     module: &Module,
     func_data: &abcd_ir::FunctionData,
+    source_lang: FileSourceLang,
     file: &mut File,
-    offset: u32,
 ) -> Result<Method, LowerError> {
     let name = intern_sym(&module.sym, &mut file.strings, func_data.name).ok_or(
         LowerError::UntraceableEntity {
@@ -1054,17 +1408,14 @@ fn build_synthesized_method(
             raw: func_data.name.0,
         },
     )?;
-    let mut flags = modifiers_to_access_flags(func_data.modifiers);
-    if flags.is_empty() {
-        flags = AccessFlags::PUBLIC | AccessFlags::STATIC;
-    }
+    let flags = method_access_flags(func_data);
     let arg_types = vec![Type::Tagged; func_data.params.len()];
     Ok(Method {
         name,
-        offset,
+        offset: 0,
         access_flags: flags,
         function_kind: function_kind_to_file(func_data.kind),
-        source_lang: FileSourceLang::EcmaScript,
+        source_lang,
         is_external: func_data.is_external,
         return_type: Some(Type::Tagged),
         arg_types,
@@ -1075,26 +1426,21 @@ fn build_synthesized_method(
     })
 }
 
-fn build_synthesized_method_full(
+fn build_method_shell(
     module: &Module,
     func_data: &abcd_ir::FunctionData,
-    _layout: Option<&LayoutResult>,
+    layout: Option<&LayoutResult>,
+    source_lang: FileSourceLang,
     class_desc_sids: &[StringId],
-    field_offsets: &[Vec<u32>],
-    file: &mut File,
-    offset: u32,
+    strings: &mut StringPool,
 ) -> Result<Method, LowerError> {
-    let name = intern_sym(&module.sym, &mut file.strings, func_data.name).ok_or(
-        LowerError::UntraceableEntity {
+    let name =
+        intern_sym(&module.sym, strings, func_data.name).ok_or(LowerError::UntraceableEntity {
             func: FuncId::new(0),
             kind: EntityKind::StringId,
             raw: func_data.name.0,
-        },
-    )?;
-    let mut flags = modifiers_to_access_flags(func_data.modifiers);
-    if flags.is_empty() && !func_data.is_external {
-        flags = AccessFlags::PUBLIC | AccessFlags::STATIC;
-    }
+        })?;
+    let flags = method_access_flags(func_data);
     let (return_type, arg_types) = match &func_data.sig {
         Some(sig) => {
             let ret = sig
@@ -1116,104 +1462,37 @@ fn build_synthesized_method_full(
             vec![Type::Tagged; func_data.params.len()],
         ),
     };
-    let annotations = build_annotations(
-        module,
-        &func_data.annotations,
-        class_desc_sids,
-        field_offsets,
-        &mut file.strings,
-    )?;
-    let debug = func_data
-        .debug
-        .as_ref()
-        .map(|dbg| build_debug_info(module, dbg, &mut file.strings));
+    let debug = rebuild_method_debug(module, func_data, layout, strings);
 
     Ok(Method {
         name,
-        offset,
+        offset: 0,
         access_flags: flags,
         function_kind: function_kind_to_file(func_data.kind),
-        source_lang: FileSourceLang::EcmaScript,
+        source_lang,
         is_external: func_data.is_external,
         return_type,
         arg_types,
         body: None,
-        annotations,
+        annotations: Annotations::default(),
         param_annotations: ParamAnnotations::default(),
         debug,
     })
 }
 
-fn build_debug_info(
-    module: &Module,
-    dbg: &abcd_ir::DebugData,
-    strings: &mut StringPool,
-) -> MethodDebugInfo {
-    let source_file = dbg
-        .source_file
-        .and_then(|sf| intern_sym(&module.sym, strings, sf));
-    let source_code = dbg
-        .source_code
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| strings.get_or_intern(s));
-    // Standalone lowering has no bytecode-index map per InstId; preserve line/column
-    // metadata conservatively at instruction index 0 when non-empty, plus exact params.
-    let _ = InstId::new(0);
-    let line_table: Vec<LineEntry> = dbg
-        .line_table
-        .first()
-        .map(|e| {
-            vec![LineEntry {
-                index: 0,
-                line: e.line,
-            }]
-        })
-        .unwrap_or_default();
-    let column_table: Vec<ColumnEntry> = dbg
-        .column_table
-        .first()
-        .map(|e| {
-            vec![ColumnEntry {
-                index: 0,
-                column: e.column,
-            }]
-        })
-        .unwrap_or_default();
-    let empty_sig = strings.get_or_intern("");
-    let params: Vec<ParamInfo> = dbg
-        .param_names
-        .iter()
-        .filter_map(|&p| {
-            let name = intern_sym(&module.sym, strings, p)?;
-            Some(ParamInfo {
-                name,
-                signature: empty_sig,
-            })
-        })
-        .collect();
-    MethodDebugInfo {
-        source_file,
-        source_code,
-        line_table,
-        column_table,
-        local_vars: Vec::new(),
-        params,
-    }
-}
-
-fn build_field(
+fn build_field_shell(
     module: &Module,
     fdata: &FieldData,
     name: StringId,
-    offset: u32,
     class_desc_sids: &[StringId],
-    field_offsets: &[Vec<u32>],
     strings: &mut StringPool,
-) -> Result<Field, LowerError> {
+) -> Field {
     let field_type = ty_to_file(&fdata.ty, class_desc_sids);
     let initial_value = match fdata.initial_value.and_then(|cid| module.consts.get(cid)) {
         Some(Const::Bool(b)) => Some(FieldValue::I32(i32::from(*b))),
+        Some(Const::Int8(n)) => Some(FieldValue::I32(i32::from(*n))),
+        Some(Const::Int32(n)) => Some(FieldValue::I32(*n as i32)),
+        Some(Const::Float32(bits)) => Some(FieldValue::F32(f32::from_bits(*bits))),
         Some(Const::Int64(n)) => Some(FieldValue::I64(*n)),
         Some(Const::UInt64(n)) => Some(FieldValue::I64(*n as i64)),
         Some(Const::Number(bits)) => {
@@ -1235,29 +1514,23 @@ fn build_field(
         }
         _ => None,
     };
-    let annotations = build_annotations(
-        module,
-        &fdata.annotations,
-        class_desc_sids,
-        field_offsets,
-        strings,
-    )?;
-    Ok(Field {
+    Field {
         name,
-        offset,
+        offset: 0,
         field_type,
         access_flags: modifiers_to_access_flags(fdata.modifiers),
         is_external: false,
         initial_value,
-        annotations,
-    })
+        annotations: Annotations::default(),
+    }
 }
 
 fn build_annotations(
     module: &Module,
     anns: &[abcd_ir::Annotation],
     class_desc_sids: &[StringId],
-    field_offsets: &[Vec<u32>],
+    func_to_method_idx: &[MethodIdx],
+    field_to_field_idx: &[Vec<FieldIdx>],
     strings: &mut StringPool,
 ) -> Result<Annotations, LowerError> {
     let mut compile_time = Vec::with_capacity(anns.len());
@@ -1270,9 +1543,14 @@ fn build_annotations(
             let Some(name) = intern_sym(&module.sym, strings, *ename) else {
                 continue;
             };
-            if let Some(value) =
-                ann_value_to_file(module, eval, class_desc_sids, field_offsets, strings)
-            {
+            if let Some(value) = ann_value_to_file(
+                module,
+                eval,
+                class_desc_sids,
+                func_to_method_idx,
+                field_to_field_idx,
+                strings,
+            ) {
                 elements.push(AnnotationElem { name, value });
             }
         }
@@ -1293,13 +1571,17 @@ fn ann_value_to_file(
     module: &Module,
     val: &AnnValue,
     class_desc_sids: &[StringId],
-    field_offsets: &[Vec<u32>],
+    func_to_method_idx: &[MethodIdx],
+    field_to_field_idx: &[Vec<FieldIdx>],
     strings: &mut StringPool,
 ) -> Option<AnnotationValue> {
     match val {
         AnnValue::Const(cid) => {
             match module.consts.get(*cid)? {
                 Const::Bool(b) => Some(AnnotationValue::Bool(*b)),
+                Const::Int8(n) => Some(AnnotationValue::U8(*n)),
+                Const::Int32(n) => Some(AnnotationValue::U32(*n)),
+                Const::Float32(bits) => Some(AnnotationValue::F32(f32::from_bits(*bits))),
                 Const::Int64(n) => Some(AnnotationValue::I64(*n)),
                 Const::UInt64(n) => Some(AnnotationValue::U64(*n)),
                 Const::Number(bits) => {
@@ -1318,7 +1600,18 @@ fn ann_value_to_file(
                 Const::String(sym) | Const::BigInt(sym) => Some(AnnotationValue::String(
                     intern_sym(&module.sym, strings, *sym)?,
                 )),
+                Const::MethodRef { func, .. } => {
+                    let fdata = module.func(*func)?;
+                    let name = intern_sym(&module.sym, strings, fdata.name)?;
+                    let method = func_to_method_idx.get(func.index()).copied();
+                    Some(AnnotationValue::Method {
+                        name,
+                        method,
+                        offset: 0,
+                    })
+                }
                 Const::Null => Some(AnnotationValue::StringNullptr),
+                Const::Undefined => Some(AnnotationValue::Void),
                 _ => None,
             }
         }
@@ -1326,8 +1619,15 @@ fn ann_value_to_file(
         AnnValue::Field(cid, fid) => {
             let fdata = module.classes.get(cid.index())?.fields.get(fid.index())?;
             let name = intern_sym(&module.sym, strings, fdata.name)?;
-            let offset = *field_offsets.get(cid.index())?.get(fid.index())?;
-            Some(AnnotationValue::Enum { name, offset })
+            let field = field_to_field_idx
+                .get(cid.index())
+                .and_then(|fs| fs.get(fid.index()))
+                .copied();
+            Some(AnnotationValue::Enum {
+                name,
+                field,
+                offset: 0,
+            })
         }
         AnnValue::Name(sym) => Some(AnnotationValue::String(intern_sym(
             &module.sym,
@@ -1470,13 +1770,12 @@ fn build_module_data(
     ))
 }
 
-#[allow(dead_code)]
-const _: fn(ClassId) = |_| {};
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abcd_ir::{Block, FunctionData, Inst, Op, Value, ValueDef, ValueId, verify_module};
+    use abcd_ir::{
+        Block, ClassId, FunctionData, Inst, InstId, Op, Value, ValueDef, ValueId, verify_module,
+    };
 
     /// Build a standalone IR module with NO source `File`: two functions
     /// (`func_main_0` defining closure `helper`), new string constants
@@ -1494,21 +1793,18 @@ mod tests {
         cls.methods = vec![FuncId::new(0), FuncId::new(1)];
         m.classes.push(cls);
 
-        // Function 0: func_main_0
         let mut f0 = FunctionData::new(ClassId::new(0), main_name, IrFunctionKind::Function);
         f0.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
         let b0 = abcd_ir::BlockId::new(0);
         m.blocks.push(Block::default());
         f0.blocks.push(b0);
 
-        // Function 1: helper
         let mut f1 = FunctionData::new(ClassId::new(0), helper_name, IrFunctionKind::Function);
         f1.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
         let b1 = abcd_ir::BlockId::new(1);
         m.blocks.push(Block::default());
         f1.blocks.push(b1);
 
-        // helper returns a lone-surrogate string constant!
         let lone_sym = m.sym.intern_raw_mutf8(&[0xED, 0xA0, 0xB4]);
         let lone_cid = m.consts.push(Const::String(lone_sym));
         let v_lone = ValueId::new(m.values.len() as u32);
@@ -1534,9 +1830,8 @@ mod tests {
         });
         m.blocks[b1.index()].insts.extend([i_lone, i_ret1]);
 
-        // func_main_0 allocates an array `[1, "\u{E000}icon"]`, defines `helper`, and returns it.
         let pua_sym = m.sym.intern("\u{E000}icon");
-        let c_one = m.consts.intern(Const::number(1.0));
+        let c_one = m.consts.intern(Const::Int32(1));
         let c_pua = m.consts.intern(Const::String(pua_sym));
         let arr_shape = m.consts.push_array(vec![c_one, c_pua]);
         let v_arr = ValueId::new(m.values.len() as u32);
@@ -1653,7 +1948,6 @@ mod tests {
 
         let mut module = abcd_lift::lift_file(&base_file).unwrap();
 
-        // Append a brand-new synthetic helper function + brand-new string + brand-new literal array!
         let synth_name = module.sym.intern("synth_helper");
         let synth_fid = FuncId::new(module.functions.len() as u32);
         let synth_bb = abcd_ir::BlockId::new(module.blocks.len() as u32);
@@ -1687,10 +1981,9 @@ mod tests {
         module.blocks[synth_bb.index()].insts.extend([i_str, i_ret]);
         module.functions.push(synth_fn);
 
-        // Rewrite `func_main_0` to allocate a brand-new `[42]` literal array and reference `synth_helper`.
         let main_bb = module.functions[0].blocks[0];
         module.blocks[main_bb.index()].insts.clear();
-        let c42 = module.consts.intern(Const::number(42.0));
+        let c42 = module.consts.intern(Const::Int32(42));
         let arr_cid = module.consts.push_array(vec![c42]);
         let v_arr = ValueId::new(module.values.len() as u32);
         let i_arr = InstId::new(module.insts.len() as u32);

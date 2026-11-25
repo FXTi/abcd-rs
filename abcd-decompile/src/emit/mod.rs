@@ -480,10 +480,10 @@ pub(in crate::emit) fn collect_method_refs(
             continue;
         };
         match c {
-            Const::MethodRef(f) => {
-                out.insert(*f);
+            Const::MethodRef { func, .. } => {
+                out.insert(*func);
             }
-            Const::ArrayLiteral(items) => {
+            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
                 for &i in items.iter().rev() {
                     if visited.insert(i) {
                         stack.push(i);
@@ -495,6 +495,11 @@ pub(in crate::emit) fn collect_method_refs(
                     if visited.insert(i) {
                         stack.push(i);
                     }
+                }
+            }
+            Const::LiteralBufferRef(inner) => {
+                if visited.insert(*inner) {
+                    stack.push(*inner);
                 }
             }
             _ => {}

@@ -120,7 +120,7 @@ pub(crate) fn quick_callee_leaf_sym(
         let val = module.value(callee)?;
         match val.def {
             ValueDef::Const(c) => {
-                let Const::MethodRef(body) = module.consts.get(c)? else {
+                let Const::MethodRef { func: body, .. } = module.consts.get(c)? else {
                     return None;
                 };
                 return Some(module.func(*body)?.name);
@@ -137,7 +137,7 @@ pub(crate) fn quick_callee_leaf_sym(
                     return Some(module.func(*body)?.name);
                 }
                 Op::LoadConst(c) => {
-                    let Const::MethodRef(body) = module.consts.get(*c)? else {
+                    let Const::MethodRef { func: body, .. } = module.consts.get(*c)? else {
                         return None;
                     };
                     return Some(module.func(*body)?.name);
@@ -373,7 +373,7 @@ fn resolve_iterative(
                         });
                     }
                     Some(Op::LoadConst(c)) => {
-                        if let Some(Const::MethodRef(f)) = module.consts.get(*c)
+                        if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c)
                             && let Some(fd) = module.func(*f)
                             && let Some(s) = module.sym.resolve(fd.name)
                             && let Some(out) = bufs.last_mut()
@@ -390,7 +390,8 @@ fn resolve_iterative(
                         }
                     }
                     Some(Op::AllocClosure { func: inner })
-                    | Some(Op::CreateGenerator { func: inner }) => {
+                    | Some(Op::CreateGenerator { func: inner })
+                    | Some(Op::CreateAsyncGenerator { func: inner }) => {
                         stack.push(ResolveStep::Enter {
                             func,
                             value: *inner,
@@ -462,7 +463,7 @@ fn resolve_iterative(
             ResolveStep::FinishCall { kind } => {
                 let callee_names = bufs.pop().unwrap_or_default();
                 if let Some(out) = bufs.last_mut() {
-                    if kind == CallKind::New {
+                    if matches!(kind, CallKind::New | CallKind::NewSpread) {
                         for cn in callee_names {
                             if cn.starts_with("@ohos.") || cn.starts_with("@kit.") {
                                 push_unique(out, cn);

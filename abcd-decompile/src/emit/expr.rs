@@ -525,6 +525,18 @@ impl<'m> Emitter<'m> {
                 out.push_str(&format!("/*hard-fallback {name} (async driver, R4)*/ "));
                 self.sub(value, 0, out);
             }
+            Expr::AsyncGeneratorResolve { value, .. } => {
+                *self
+                    .stats
+                    .fallback_comments
+                    .entry("AsyncGeneratorResolve")
+                    .or_insert(0) += 1;
+                self.current_fn_has_fallback = true;
+                out.push_str(
+                    "/*hard-fallback AsyncGeneratorResolve (async-generator driver, R4)*/ ",
+                );
+                self.sub(value, 0, out);
+            }
             Expr::CopyDataProps { dst, src } => {
                 out.push_str("Object.assign(");
                 self.sub(dst, 0, out);
@@ -673,6 +685,18 @@ impl<'m> Emitter<'m> {
                 self.sub(callee, 19, out);
                 self.emit_args(args, out);
             }
+            CallKind::NewSpread => {
+                out.push_str("new ");
+                self.sub(callee, 19, out);
+                out.push_str("(...");
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.sub(a, 0, out);
+                }
+                out.push(')');
+            }
             CallKind::Apply => {
                 self.sub(callee, 19, out);
                 out.push_str(".apply(");
@@ -686,7 +710,20 @@ impl<'m> Emitter<'m> {
                 }
                 out.push(')');
             }
-            CallKind::Super => {
+            CallKind::ClassInit => {
+                self.sub(callee, 19, out);
+                out.push_str(".call(");
+                match this {
+                    Some(t) => self.sub(t, 0, out),
+                    None => out.push_str("this"),
+                }
+                for a in args {
+                    out.push_str(", ");
+                    self.sub(a, 0, out);
+                }
+                out.push(')');
+            }
+            CallKind::Super | CallKind::SuperArrow => {
                 out.push_str("super");
                 self.emit_args(args, out);
             }
@@ -724,13 +761,13 @@ impl<'m> Emitter<'m> {
 
     fn emit_unary(&mut self, op: UnOp, operand: &Expr, out: &mut String) {
         match op {
-            UnOp::IsTrue => {
-                // Truthiness coercion feeding a condition: the bare
-                // operand is equivalent in boolean contexts (printed
-                // at context precedence — no coercion node remains).
+            UnOp::IsTrue | UnOp::JumpNez => {
+                // Truthiness / raw jnez predicate feeding a condition:
+                // the bare operand prints cleanly at context precedence
+                // without noisy helper wrappers (R3-X1).
                 self.sub(operand, 0, out);
             }
-            UnOp::IsFalse => {
+            UnOp::IsFalse | UnOp::JumpEqz => {
                 out.push('!');
                 self.sub(operand, 17, out);
             }
@@ -773,6 +810,11 @@ impl<'m> Emitter<'m> {
                     self.sub(operand, 17, out);
                 }
                 out.push_str(" /*ToNumeric*/");
+            }
+            UnOp::ToPropertyKey => {
+                out.push_str("Reflect.ownKeys({ [");
+                self.sub(operand, 0, out);
+                out.push_str("]: 0 })[0]");
             }
             UnOp::Minus => {
                 out.push('-');

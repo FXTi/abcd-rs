@@ -144,7 +144,10 @@ fn exclusive_summary_kills_call_edge() {
         add_param(&mut m, f, 0);
         let p = add_param(&mut m, f, 1);
         let san_val = {
-            let c = m.consts.push(abcd_ir::Const::MethodRef(san));
+            let c = m.consts.push(abcd_ir::Const::MethodRef {
+                func: san,
+                kind: abcd_ir::LitMethodKind::Method,
+            });
             emit(&mut m, entry, Op::LoadConst(c))
         };
         let r = emit(
@@ -199,7 +202,10 @@ fn fallback_steps_into_body() {
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let id_val = {
-        let c = m.consts.push(abcd_ir::Const::MethodRef(id_fn));
+        let c = m.consts.push(abcd_ir::Const::MethodRef {
+            func: id_fn,
+            kind: abcd_ir::LitMethodKind::Method,
+        });
         emit(&mut m, entry, Op::LoadConst(c))
     };
     let r = emit(
@@ -731,7 +737,10 @@ fn call_and_print(callee: abcd_ir::FuncId, m: &mut abcd_ir::Module) -> abcd_tain
     add_param(m, f, 0);
     let p = add_param(m, f, 1);
     let callee_val = {
-        let c = m.consts.push(abcd_ir::Const::MethodRef(callee));
+        let c = m.consts.push(abcd_ir::Const::MethodRef {
+            func: callee,
+            kind: abcd_ir::LitMethodKind::Method,
+        });
         emit(m, entry, Op::LoadConst(c))
     };
     let r = emit(
@@ -3869,7 +3878,10 @@ fn large_bundle_demand_pta_roots_and_zero_needed_slice_unrelated_subgraphs() {
         }
         let wrap_sym = intern(&mut m, "wrap");
         let wrap_name_cid = m.consts.intern(Const::String(wrap_sym));
-        let wrap_fn_cid = m.consts.intern(Const::MethodRef(wrap_fn));
+        let wrap_fn_cid = m.consts.intern(Const::MethodRef {
+            func: wrap_fn,
+            kind: abcd_ir::LitMethodKind::Method,
+        });
         let members = m.consts.push_array(vec![wrap_name_cid, wrap_fn_cid]);
         let cls_val = emit(
             &mut m,

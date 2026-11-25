@@ -24,7 +24,8 @@
 //!
 //! # Core Types
 //!
-//! - [`File`] / [`Dialect`] — fully-decoded ABC file, container dialect classification (`DynamicModern`, `DynamicLegacy`, `Static`), classes, literal arrays, and entity map
+//! - [`File`] / [`Dialect`] — fully-decoded ABC file, container dialect classification (`DynamicModern`, `DynamicLegacy`, `Static`), classes, and literal arrays
+//! - [`EntityRef`] / [`MethodIdx`] / [`FieldIdx`] / [`LiteralArrayIdx`] — container-independent dense entity handles decoupling model consumers from raw `.abc` file offsets
 //! - [`Class`] / [`Method`] / [`Field`] — class hierarchy with access flags and annotations
 //! - [`MethodBody`] — decoded bytecodes ([`Bytecode`]) and try-catch blocks
 //! - [`Annotations`] / [`AnnotationValue`] — four retention policies, fully-typed values

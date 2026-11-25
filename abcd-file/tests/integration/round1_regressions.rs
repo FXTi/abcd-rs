@@ -610,7 +610,7 @@ fn r1_h6_mid_instruction_and_oob_try_catch_spans_rejected() {
             start: 0,
             len: 99, // past bytecodes.len() == 2
             catches: vec![CatchBlock {
-                type_idx: u32::MAX,
+                type_class: None,
                 handler: 1,
                 len: 1,
             }],
@@ -624,7 +624,7 @@ fn r1_h6_mid_instruction_and_oob_try_catch_spans_rejected() {
         })
     ));
 
-    // Unresolvable typed catch class offset on `encode` must also fail instead of becoming catch-all.
+    // Dangling `StringId` in `CatchBlock::type_class` on `encode` must fail loudly instead of becoming catch-all.
     {
         let body = model.classes.values_mut().next().unwrap().methods[0]
             .body
@@ -634,13 +634,19 @@ fn r1_h6_mid_instruction_and_oob_try_catch_spans_rejected() {
             start: 0,
             len: 1,
             catches: vec![CatchBlock {
-                type_idx: 0xDEAD_BEEF,
+                type_class: Some(abcd_file::StringId::new(0xDEAD_BEEF)),
                 handler: 1,
                 len: 1,
             }],
         };
     }
-    assert!(matches!(encode(&model), Err(Error::CodeRelocation(_))));
+    assert!(matches!(
+        encode(&model),
+        Err(Error::Malformed {
+            field: "string_id",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -706,10 +712,11 @@ fn r1_h6_duplicate_classes_unknown_sourcelang_and_nonzero_offset_miss_rejected()
 
     let mut bad_lit = base.clone();
     let target_name = bad_lit.strings.get("target").unwrap();
-    bad_lit.entity_map.insert(0xCAFE, target_name);
-    bad_lit.literal_arrays.push(LiteralArray {
-        values: vec![LiteralValue::Method(0xCAFE)],
-    });
+    bad_lit
+        .literal_arrays
+        .push(LiteralArray::new(vec![LiteralValue::Method(
+            abcd_file::MethodIdx(0xCAFE),
+        )]));
     assert!(matches!(encode(&bad_lit), Err(Error::CodeRelocation(_))));
 
     let mut bad_ann = base;
@@ -728,6 +735,7 @@ fn r1_h6_duplicate_classes_unknown_sourcelang_and_nonzero_offset_miss_rejected()
                 name: elem_name,
                 value: AnnotationValue::Method {
                     name: target_name,
+                    method: None,
                     offset: 0xCAFE,
                 },
             }],
@@ -865,5 +873,241 @@ fn d4_and_d6_encode_options_and_dialect_gating() {
             field: "file_type",
             ..
         })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 6. R3-D2 (#50): Offsetless semantic handles disambiguate same-named entities
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
+    use abcd_file::{
+        Annotations, Class, EntityRef, Field, FieldIdx, FieldValue, File, LiteralArrayIdx, Method,
+        MethodBody, MethodHandleType, MethodIdx, ParamAnnotations, ResolvedMethodHandle,
+        StringPool,
+    };
+    use abcd_isa::{EntityId, EntityKind, Imm, insn};
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut strings = StringPool::default();
+    let cls_a_desc = strings.get_or_intern("LA;");
+    let cls_b_desc = strings.get_or_intern("LB;");
+    let err_desc = strings.get_or_intern("LError;");
+    let dup_method_name = strings.get_or_intern("dup");
+    let dup_field_name = strings.get_or_intern("val");
+    let scope_field_name = strings.get_or_intern(abcd_file::SCOPE_NAMES_FIELD);
+    let hello_sid = strings.get_or_intern("offsetless_hello");
+    let scope_sid = strings.get_or_intern("Scope0");
+    let ann_desc = strings.get_or_intern("LAnno;");
+    let e_m = strings.get_or_intern("m");
+    let e_f = strings.get_or_intern("f");
+    let e_mh = strings.get_or_intern("mh");
+
+    let mk_method = |name, body| Method {
+        name,
+        offset: 0, // Zero synthetic file offsets!
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: abcd_file::FunctionKind::None,
+        source_lang: SourceLang::EcmaScript,
+        is_external: false,
+        return_type: Some(Type::Tagged),
+        arg_types: Vec::new(),
+        body: Some(body),
+        annotations: Annotations::default(),
+        param_annotations: ParamAnnotations::default(),
+        debug: None,
+    };
+
+    // Class LA; (BTreeMap slot 0 -> MethodIdx(0), FieldIdx(0), FieldIdx(1)):
+    // calls LB;::dup (MethodIdx(1)), loads "offsetless_hello", creates literal array 0,
+    // and catches LError; via `type_class: Some(err_desc)`.
+    let mut entities_a = HashMap::new();
+    entities_a.insert((EntityKind::StringId, 0), EntityRef::string(hello_sid));
+    entities_a.insert(
+        (EntityKind::MethodId, 0),
+        EntityRef::Method(MethodIdx(1)), // Specifically targets LB;::dup despite identical name!
+    );
+    entities_a.insert(
+        (EntityKind::LiteralarrayId, 0),
+        EntityRef::LiteralArray(LiteralArrayIdx(0)),
+    );
+    let body_a = MethodBody {
+        num_vregs: 1,
+        num_args: 0,
+        bytecodes: vec![
+            insn::LdaStr::new(EntityId(0)),
+            insn::Definefunc::new(Imm(0), EntityId(0), Imm(0)),
+            insn::Createarraywithbuffer::new(Imm(1), EntityId(0)),
+            insn::Returnundefined::new(),
+        ],
+        entities: entities_a,
+        try_blocks: vec![abcd_file::TryBlock {
+            start: 0,
+            len: 2,
+            catches: vec![CatchBlock {
+                type_class: Some(err_desc),
+                handler: 2,
+                len: 2,
+            }],
+        }],
+        ic_size: Some(2),
+    };
+
+    // Class LB; (BTreeMap slot 1 -> MethodIdx(1), FieldIdx(2)): distinct body (`ldai 99`).
+    let body_b = MethodBody {
+        num_vregs: 0,
+        num_args: 0,
+        bytecodes: vec![insn::Ldai::new(Imm(99)), insn::Returnundefined::new()],
+        entities: HashMap::new(),
+        try_blocks: Vec::new(),
+        ic_size: None,
+    };
+
+    let mut classes = BTreeMap::new();
+    classes.insert(
+        cls_a_desc,
+        Class {
+            descriptor: cls_a_desc,
+            name: cls_a_desc,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: SourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: vec![mk_method(dup_method_name, body_a)],
+            fields: vec![
+                Field {
+                    name: dup_field_name,
+                    offset: 0,
+                    field_type: Type::I32,
+                    access_flags: AccessFlags::PUBLIC,
+                    is_external: false,
+                    initial_value: Some(FieldValue::I32(1)),
+                    annotations: Annotations::default(),
+                },
+                Field {
+                    name: scope_field_name,
+                    offset: 0,
+                    field_type: Type::U32,
+                    access_flags: AccessFlags::STATIC,
+                    is_external: false,
+                    initial_value: Some(FieldValue::literal_array_ref(LiteralArrayIdx(1))),
+                    annotations: Annotations::default(),
+                },
+            ],
+            annotations: Annotations {
+                compile_time: vec![Annotation {
+                    class_descriptor: ann_desc,
+                    elements: vec![
+                        AnnotationElem {
+                            name: e_m,
+                            value: AnnotationValue::Method {
+                                name: dup_method_name,
+                                method: Some(MethodIdx(1)), // LB;::dup
+                                offset: 0,
+                            },
+                        },
+                        AnnotationElem {
+                            name: e_f,
+                            value: AnnotationValue::Enum {
+                                name: dup_field_name,
+                                field: Some(FieldIdx(2)), // LB;::val
+                                offset: 0,
+                            },
+                        },
+                        AnnotationElem {
+                            name: e_mh,
+                            value: AnnotationValue::MethodHandle(ResolvedMethodHandle {
+                                handle_type: MethodHandleType::InvokeStatic,
+                                entity: dup_method_name,
+                                target_method: Some(MethodIdx(1)),
+                                target_field: None,
+                                entity_offset: 0,
+                            }),
+                        },
+                    ],
+                }],
+                ..Annotations::default()
+            },
+        },
+    );
+    classes.insert(
+        cls_b_desc,
+        Class {
+            descriptor: cls_b_desc,
+            name: cls_b_desc,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: SourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: vec![mk_method(dup_method_name, body_b)],
+            fields: vec![Field {
+                name: dup_field_name,
+                offset: 0,
+                field_type: Type::I32,
+                access_flags: AccessFlags::PUBLIC,
+                is_external: false,
+                initial_value: Some(FieldValue::I32(2)),
+                annotations: Annotations::default(),
+            }],
+            annotations: Annotations::default(),
+        },
+    );
+
+    let file = File {
+        version: Version::new(12, 0, 2, 0),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings,
+        classes,
+        literal_arrays: vec![
+            LiteralArray::new(vec![LiteralValue::Method(MethodIdx(1))]), // LB;::dup
+            LiteralArray::new(vec![LiteralValue::String(scope_sid)]),
+        ],
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    // 1. Offsetless model emits clean pandasm referencing `B.dup:()` and `Error`.
+    let pa = String::from_utf8(abcd_file::pandasm::emit_file(&file, "synth.abc")).unwrap();
+    assert!(pa.contains("definefunc 0x0, B.dup:(), 0x0"), "{pa}");
+    assert!(pa.contains("lda.str \"offsetless_hello\""), "{pa}");
+    assert!(pa.contains(".catch Error,"), "{pa}");
+
+    // 2. Offsetless model encodes and decodes with exact disambiguated targets!
+    let encoded = encode(&file).expect("encode offsetless File");
+    let decoded = decode(&encoded).expect("decode offsetless File");
+    let b_dup_off = decoded.class_by_str("LB;").unwrap().methods[0].offset;
+    let b_val_off = decoded.class_by_str("LB;").unwrap().fields[0].offset;
+
+    let a_cls = decoded.class_by_str("LA;").unwrap();
+    let a_body = a_cls.methods[0].body.as_ref().unwrap();
+    let (_, mid) = a_body.bytecodes[1].entity_operands()[0];
+    let EntityRef::Method(resolved_midx) = a_body.entities[&(EntityKind::MethodId, mid.0)] else {
+        panic!("expected EntityRef::Method");
+    };
+    assert_eq!(
+        decoded.method_by_idx(resolved_midx).unwrap().2.offset,
+        b_dup_off,
+        "MethodIdx(1) must bind to LB;::dup, not LA;::dup"
+    );
+    assert_eq!(
+        a_body.try_blocks[0].catches[0]
+            .type_class
+            .and_then(|s| decoded.strings.resolve(s)),
+        Some("LError;")
+    );
+    let ann_elems = &a_cls.annotations.compile_time[0].elements;
+    assert!(matches!(
+        ann_elems[0].value,
+        AnnotationValue::Method { offset, .. } if offset == b_dup_off
+    ));
+    assert!(matches!(
+        ann_elems[1].value,
+        AnnotationValue::Enum { offset, .. } if offset == b_val_off
     ));
 }

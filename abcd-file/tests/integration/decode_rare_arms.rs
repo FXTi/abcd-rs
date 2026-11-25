@@ -114,9 +114,11 @@ fn foreign_method_operand_resolves_through_fallback() {
     let body = caller.body.as_ref().unwrap();
     let (kind, id) = body.bytecodes[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
-    let off = body.entity_offsets[&(kind, id.0)];
+    let abcd_file::EntityRef::ExternalMethod { name, .. } = body.entities[&(kind, id.0)] else {
+        panic!("expected ExternalMethod");
+    };
     assert_eq!(
-        file.resolve_entity_str(off),
+        file.strings.resolve(name),
         Some("foreign_fn"),
         "the foreign method operand must resolve to the foreign name"
     );
@@ -185,17 +187,24 @@ fn legacy_foreign_method_operand_resolves_through_fallback() {
     // Legacy definefuncdyn maps to modern Definefunc.
     let (kind, id) = body.bytecodes[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
-    let off = body.entity_offsets[&(kind, id.0)];
+    let abcd_file::EntityRef::ExternalMethod { name, .. } = body.entities[&(kind, id.0)] else {
+        panic!("expected ExternalMethod");
+    };
     assert_eq!(
-        file.resolve_entity_str(off),
+        file.strings.resolve(name),
         Some("foreign_fn"),
         "the legacy foreign method operand must resolve to the foreign name"
     );
     // The create*withbuffer imm16 references resolved through the header's
     // global literal-array table (the legacy blob pass).
+    let abcd_file::EntityRef::LiteralArray(la_idx) =
+        body.entities[&(EntityKind::LiteralarrayId, 0)]
+    else {
+        panic!("expected EntityRef::LiteralArray");
+    };
     assert_eq!(
-        body.entity_offsets[&(EntityKind::LiteralarrayId, 0)],
-        literal_offset,
+        file.literal_arrays[la_idx.index()].source_offset,
+        Some(literal_offset),
         "the legacy global literal-table index must resolve to the array"
     );
 }
@@ -450,7 +459,13 @@ fn legacy_foreign_method_name_unreadable_is_hard_error() {
     let body = caller.body.as_ref().unwrap();
     let (kind, id) = body.bytecodes[0].entity_operands()[0];
     let method_index = u16::try_from(id.0).unwrap();
-    let foreign_off = body.entity_offsets[&(kind, id.0)];
+    let abcd_file::EntityRef::ExternalMethod {
+        source_offset: foreign_off,
+        ..
+    } = body.entities[&(kind, id.0)]
+    else {
+        panic!("expected ExternalMethod");
+    };
 
     // Legacy rewrite of caller's stream (definefuncdyn id16).
     let mut legacy = vec![0xff, 0x5f];
@@ -497,7 +512,13 @@ fn foreign_method_name_unreadable_is_hard_error() {
         .1;
     let body = caller.body.as_ref().unwrap();
     let (kind, id) = body.bytecodes[0].entity_operands()[0];
-    let foreign_off = body.entity_offsets[&(kind, id.0)];
+    let abcd_file::EntityRef::ExternalMethod {
+        source_offset: foreign_off,
+        ..
+    } = body.entities[&(kind, id.0)]
+    else {
+        panic!("expected ExternalMethod");
+    };
 
     // Corrupt the foreign method's name field (item+4) to dangle.
     let name_field = foreign_off as usize + 4;

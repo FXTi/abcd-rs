@@ -2,6 +2,7 @@
 name = "abcd-lower"
 description = "IR → ArkCompiler bytecode lowering (abcd_ir::Module → abcd_file::MethodBody)"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
@@ -27,3 +28,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 abcd-lift = { workspace = true }
 abcd-opt = { workspace = true }
+
+[lints]
+workspace = true

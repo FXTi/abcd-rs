@@ -319,6 +319,16 @@ impl PtaOutcome {
     }
 }
 
+fn is_super_call_kind(kind: CallKind) -> bool {
+    matches!(
+        kind,
+        CallKind::Super
+            | CallKind::SuperArrow
+            | CallKind::SuperSpread
+            | CallKind::SuperForwardAllArgs
+    )
+}
+
 /// The function body a closure-creating op wraps, through the
 /// `DefineFunc`/`Mov` def chain (T4) — the call graph's
 /// `trace_alloc_site` discipline as an `Option` query.
@@ -342,8 +352,9 @@ fn closure_body(module: &Module, func: ValueId) -> Option<FuncId> {
 }
 
 /// Resolve any callable `FuncId` wrapped by `val` across `Mov`,
-/// `AllocClosure`, `CreateGenerator`, `DefineMethod`, `DefineFunc`, and
-/// `MethodRef` constants (cycle-guarded).
+/// Resolve any callable `FuncId` wrapped by `val` across `Mov`,
+/// `AllocClosure`, `CreateGenerator`, `CreateAsyncGenerator`,
+/// `DefineMethod`, `DefineFunc`, and `MethodRef` constants (cycle-guarded).
 fn callable_body(module: &Module, mut val: ValueId) -> Option<FuncId> {
     let mut visiting = BTreeSet::new();
     loop {
@@ -354,7 +365,7 @@ fn callable_body(module: &Module, mut val: ValueId) -> Option<FuncId> {
         match v.def {
             ValueDef::Const(c) => {
                 return match module.consts.get(c) {
-                    Some(Const::MethodRef(f)) => Some(*f),
+                    Some(Const::MethodRef { func: f, .. }) => Some(*f),
                     _ => None,
                 };
             }
@@ -362,13 +373,14 @@ fn callable_body(module: &Module, mut val: ValueId) -> Option<FuncId> {
                 Op::Mov { src }
                 | Op::AllocClosure { func: src }
                 | Op::CreateGenerator { func: src }
+                | Op::CreateAsyncGenerator { func: src }
                 | Op::DefineMethod { func: src, .. } => {
                     val = *src;
                 }
                 Op::DefineFunc { body, .. } => return Some(*body),
                 Op::LoadConst(c) => {
                     return match module.consts.get(*c) {
-                        Some(Const::MethodRef(f)) => Some(*f),
+                        Some(Const::MethodRef { func: f, .. }) => Some(*f),
                         _ => None,
                     };
                 }
@@ -409,14 +421,14 @@ fn class_member_funcs(module: &Module, members: ConstId) -> Vec<FuncId> {
     match module.consts.get(members) {
         Some(Const::ArrayLiteral(items)) => {
             for &item_cid in items {
-                if let Some(Const::MethodRef(mfid)) = module.consts.get(item_cid) {
+                if let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(item_cid) {
                     out.push(*mfid);
                 }
             }
         }
         Some(Const::ObjectLiteral { values, .. }) => {
             for &item_cid in values {
-                if let Some(Const::MethodRef(mfid)) = module.consts.get(item_cid) {
+                if let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(item_cid) {
                     out.push(*mfid);
                 }
             }
@@ -641,6 +653,19 @@ fn compute_sliced_bfs(
                             );
                         }
                     }
+                    Op::DefineGetterSetterByValue { getter, setter, .. } => {
+                        for &inner in [getter, setter] {
+                            if let Some(body) = callable_body(module, inner) {
+                                enqueue_extra(
+                                    body,
+                                    next_hop,
+                                    &mut func_hop,
+                                    &mut queue,
+                                    &mut extra_enqueued,
+                                );
+                            }
+                        }
+                    }
                     Op::LoadModuleVar { index, kind } => {
                         if kind.is_local() {
                             let slot_ref = ModuleSlotRef {
@@ -689,7 +714,7 @@ fn compute_sliced_bfs(
                             }
                         }
                     }
-                    Op::GetLexVar { level, .. } => {
+                    Op::GetLexVar { level, kind, .. } if *kind != abcd_ir::LexEnvKind::Patch => {
                         if let Some(stack) = env_stack_at.get(iid.index())
                             && (*level as usize) < stack.len()
                         {
@@ -1023,9 +1048,61 @@ impl<'m> Pta<'m> {
                 }
             }
             Obj::Site {
+                site,
                 callable: Some(body),
                 ..
             } => {
+                let is_super = matches!(
+                    self.module.inst(call).map(|i| &i.op),
+                    Some(Op::Call { kind, .. }) if is_super_call_kind(*kind)
+                );
+                let caller_fn = self
+                    .base
+                    .edge_at(call)
+                    .map(|e| e.caller)
+                    .or_else(|| self.links.inst_func(self.module, call));
+                let is_derived_self = is_super
+                    && (caller_fn == Some(body)
+                        || matches!(
+                            self.module.inst(site).map(|i| &i.op),
+                            Some(Op::LoadFunction)
+                        ));
+                if is_derived_self {
+                    let super_targets: Vec<FuncId> = self
+                        .base
+                        .callees_of_call_at(call)
+                        .iter()
+                        .copied()
+                        .filter(|&t| t != body && Some(t) != caller_fn)
+                        .collect();
+                    if super_targets.is_empty() {
+                        if self.call_unknown.insert((call, caller_ctx)) {
+                            self.stats.call_sites_partial += 1;
+                        }
+                        if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
+                            self.add_fact(Ptr::Local(result, caller_ctx), Obj::Unknown);
+                        }
+                    } else {
+                        let next_hop = caller_fn
+                            .and_then(|f| self.func_hop.get(f.index()).copied())
+                            .unwrap_or(u8::MAX)
+                            .saturating_add(1);
+                        for super_ctor in super_targets {
+                            if self
+                                .call_targets
+                                .entry((call, caller_ctx))
+                                .or_default()
+                                .insert(super_ctor)
+                            {
+                                self.stats.call_edges_resolved += 1;
+                            }
+                            if self.try_record_dyn_hop(super_ctor, next_hop) {
+                                self.wire_call(call, caller_ctx, super_ctor);
+                            }
+                        }
+                    }
+                    return;
+                }
                 if self
                     .call_targets
                     .entry((call, caller_ctx))
@@ -1034,9 +1111,7 @@ impl<'m> Pta<'m> {
                 {
                     self.stats.call_edges_resolved += 1;
                 }
-                let next_hop = self
-                    .links
-                    .inst_func(self.module, call)
+                let next_hop = caller_fn
                     .and_then(|f| self.func_hop.get(f.index()).copied())
                     .unwrap_or(u8::MAX)
                     .saturating_add(1);
@@ -1077,20 +1152,37 @@ impl<'m> Pta<'m> {
         // concrete instance allocation keyed by the `New` call instruction so
         // constructor field writes (`this.f = v`) and caller reads (`inst.f`)
         // meet on a concrete site.
-        let constructed_instance = (kind == CallKind::New).then_some(Obj::Site {
-            site: call,
-            ctx: caller_ctx,
-            callable: None,
-            keyed: true,
-        });
+        let constructed_instance =
+            matches!(kind, CallKind::New | CallKind::NewSpread).then_some(Obj::Site {
+                site: call,
+                ctx: caller_ctx,
+                callable: None,
+                keyed: true,
+            });
+        let inherited_this = (this.is_none()
+            && matches!(
+                kind,
+                CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs
+            ))
+        .then(|| {
+            let caller = self
+                .base
+                .edge_at(call)
+                .map(|e| e.caller)
+                .or_else(|| self.links.inst_func(self.module, call))?;
+            let c_slots = frame_slots_of(self.module, caller)?;
+            let c_this_idx = c_slots.this_index()?;
+            self.module.func(caller)?.params.get(c_this_idx).copied()
+        })
+        .flatten();
         match frame_slots_of(self.module, callee) {
             Some(slots) if fd.params.len() >= slots.implicit_count() => {
                 // Implicit slots, ordered func, newTarget, this (N66).
-                if slots.func {
+                if slots.func && !is_super_call_kind(kind) {
                     self.add_edge(local(callee_val), Ptr::Local(fd.params[0], callee_ctx));
                 }
                 if let Some(this_idx) = slots.this_index() {
-                    if let Some(t) = this {
+                    if let Some(t) = this.or(inherited_this) {
                         self.add_edge(local(t), Ptr::Local(fd.params[this_idx], callee_ctx));
                     } else if let Some(inst_obj) = constructed_instance {
                         self.add_fact(Ptr::Local(fd.params[this_idx], callee_ctx), inst_obj);
@@ -1100,7 +1192,8 @@ impl<'m> Pta<'m> {
                 match kind {
                     abcd_ir::CallKind::Apply
                     | abcd_ir::CallKind::SuperSpread
-                    | abcd_ir::CallKind::SuperForwardAllArgs => {
+                    | abcd_ir::CallKind::SuperForwardAllArgs
+                    | abcd_ir::CallKind::NewSpread => {
                         // Formals come out of an argument array / the
                         // caller's own frame — opaque at this rung (the
                         // rung-1 discipline): unknown, never wrong.
@@ -1136,6 +1229,9 @@ impl<'m> Pta<'m> {
         if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
             if let Some(inst_obj) = constructed_instance {
                 self.add_fact(Ptr::Local(result, caller_ctx), inst_obj);
+            }
+            if let Some(inh_t) = inherited_this {
+                self.add_edge(local(inh_t), Ptr::Local(result, caller_ctx));
             }
             let returns = self.returns_of_func(callee);
             for v in returns {
@@ -1218,7 +1314,7 @@ impl<'m> Pta<'m> {
                             );
                         }
                     }
-                    Op::CreateGenerator { func } => {
+                    Op::CreateGenerator { func } | Op::CreateAsyncGenerator { func } => {
                         // Not one of the four keyed allocs (unreported),
                         // but callable — it resolves like a closure.
                         if let Some(r) = inst.result {
@@ -1258,6 +1354,17 @@ impl<'m> Pta<'m> {
                             self.activate(body_fn, None);
                         }
                     }
+                    Op::DefineGetterSetterByValue { getter, setter, .. } => {
+                        if sliced {
+                            for &inner in [getter, setter] {
+                                if let Some(body_fn) = callable_body(self.module, inner)
+                                    && self.try_record_dyn_hop(body_fn, next_dyn_hop)
+                                {
+                                    self.activate(body_fn, None);
+                                }
+                            }
+                        }
+                    }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         if let Some(r) = inst.result {
                             self.add_fact(
@@ -1272,7 +1379,7 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::LoadConst(c) => {
-                        if let Some(Const::MethodRef(f)) = self.module.consts.get(*c)
+                        if let Some(Const::MethodRef { func: f, .. }) = self.module.consts.get(*c)
                             && let Some(r) = inst.result
                         {
                             self.add_fact(
@@ -1359,6 +1466,7 @@ impl<'m> Pta<'m> {
                         object,
                         name,
                         value,
+                        ..
                     } => {
                         self.register(
                             local(*object),
@@ -1405,24 +1513,32 @@ impl<'m> Pta<'m> {
                             self.add_fact(local(r), Obj::Unknown);
                         }
                     }
-                    Op::PutLexVar { level, slot, value } => {
-                        let env_stack_at = self.env_stack_at;
-                        if let Some(stack) = env_stack_at.get(iid.index())
-                            && (*level as usize) < stack.len()
-                        {
-                            let entry = &stack[stack.len() - 1 - *level as usize];
-                            for &env_site in &entry.sites {
-                                self.add_edge(
-                                    local(*value),
-                                    Ptr::LexVar(env_site, *slot, ctx.is_some()),
-                                );
+                    Op::PutLexVar {
+                        level,
+                        slot,
+                        value,
+                        kind,
+                    } => {
+                        if *kind != abcd_ir::LexEnvKind::Patch {
+                            let env_stack_at = self.env_stack_at;
+                            if let Some(stack) = env_stack_at.get(iid.index())
+                                && (*level as usize) < stack.len()
+                            {
+                                let entry = &stack[stack.len() - 1 - *level as usize];
+                                for &env_site in &entry.sites {
+                                    self.add_edge(
+                                        local(*value),
+                                        Ptr::LexVar(env_site, *slot, ctx.is_some()),
+                                    );
+                                }
                             }
                         }
                     }
-                    Op::GetLexVar { level, slot } => {
+                    Op::GetLexVar { level, slot, kind } => {
                         if let Some(r) = inst.result {
                             let env_stack_at = self.env_stack_at;
-                            if let Some(stack) = env_stack_at.get(iid.index())
+                            if *kind != abcd_ir::LexEnvKind::Patch
+                                && let Some(stack) = env_stack_at.get(iid.index())
                                 && (*level as usize) < stack.len()
                             {
                                 let entry = &stack[stack.len() - 1 - *level as usize];
@@ -1561,7 +1677,10 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::Call {
-                        callee, this, args, ..
+                        callee,
+                        this,
+                        args,
+                        kind,
                     } => {
                         let callee_val = *callee;
                         if is_harness {
@@ -1609,9 +1728,9 @@ impl<'m> Pta<'m> {
                                     caller_ctx: ctx,
                                 },
                             );
-                            if sliced {
+                            if sliced || is_super_call_kind(*kind) {
                                 for &target_callee in base.callees_of_call_at(iid) {
-                                    if self.is_base_slice_allowed(target_callee) {
+                                    if !sliced || self.is_base_slice_allowed(target_callee) {
                                         self.wire_call(iid, ctx, target_callee);
                                     }
                                 }
@@ -1883,7 +2002,8 @@ pub fn analyze_with_links_and_roots(
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
-                if let Op::GetLexVar { level, slot } = &inst.op
+                if let Op::GetLexVar { level, slot, kind } = &inst.op
+                    && *kind != abcd_ir::LexEnvKind::Patch
                     && let Some(res_vid) = inst.result
                     && let Some(stack) = env_stack_at.get(iid.index())
                     && (*level as usize) < stack.len()
@@ -2100,7 +2220,9 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                     Op::PopLexEnv => {
                         has_lex_ops[fi] = true;
                     }
-                    Op::AllocClosure { func } | Op::CreateGenerator { func } => {
+                    Op::AllocClosure { func }
+                    | Op::CreateGenerator { func }
+                    | Op::CreateAsyncGenerator { func } => {
                         if let Some(body) = closure_body(module, *func) {
                             capture_points.entry(body).or_default().insert(iid);
                         }
@@ -2113,6 +2235,13 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                     Op::DefineMethod { func, .. } => {
                         if let Some(body) = callable_body(module, *func) {
                             capture_points.entry(body).or_default().insert(iid);
+                        }
+                    }
+                    Op::DefineGetterSetterByValue { getter, setter, .. } => {
+                        for &inner in [getter, setter] {
+                            if let Some(body) = callable_body(module, inner) {
+                                capture_points.entry(body).or_default().insert(iid);
+                            }
                         }
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
@@ -2394,6 +2523,23 @@ impl<'m> Rung2AliasOracle<'m> {
     /// The lexical environment a `GetLexVar`/`PutLexVar` at `at` with
     /// scope-chain `level` denotes (see module docs).
     pub fn lex_env_at(&self, at: InstId, level: u16) -> EnvAnswer {
+        if matches!(
+            self.module.inst(at).map(|i| &i.op),
+            Some(
+                Op::GetLexVar {
+                    kind: abcd_ir::LexEnvKind::Patch,
+                    ..
+                } | Op::PutLexVar {
+                    kind: abcd_ir::LexEnvKind::Patch,
+                    ..
+                }
+            )
+        ) {
+            return EnvAnswer {
+                has_unknown: true,
+                ..EnvAnswer::default()
+            };
+        }
         let Some(stack) = self.tables.env_stack_at.get(at.index()) else {
             return EnvAnswer {
                 has_unknown: true,

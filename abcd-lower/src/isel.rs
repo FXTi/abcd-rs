@@ -22,17 +22,19 @@
 use std::collections::{HashMap, HashSet};
 
 use abcd_ir::{
-    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, DefineClassData, FuncId, Module, Op,
-    SuperCheck, SuperKey, Sym, UnOp, ValueDef, ValueId,
+    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, DefineClassData, DynPrim, FuncId, InstId,
+    LexEnvKind, Module, Op, OwnStoreKind, StaticTy, SuperCheck, SuperKey, Sym, Ty, UnOp, ValueDef,
+    ValueId,
 };
 use abcd_isa::{Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Reg};
 
 use crate::LowerError;
-use crate::fusion::Suppression;
+use crate::copy_resolve::{emit_copy, resolve_slot_copies};
+use crate::fusion::{Suppression, const_u32_index};
 use crate::regalloc::{self, RegAlloc, RegSlot};
 
 /// Result of instruction selection for one function.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IselResult {
     /// Bytecodes per block (in RPO order).
     pub block_codes: Vec<(BlockId, Vec<Bytecode>)>,
@@ -47,6 +49,14 @@ pub struct IselResult {
     /// compatibility; `select_inst` returns `Result::Err` directly on
     /// unsupported shapes).
     pub unsupported: Option<String>,
+    /// Per-block `(InstId, local_pc)` map for reconstructing `MethodDebugInfo` (`#57` `R3-H8`).
+    pub block_inst_pcs: HashMap<BlockId, Vec<(InstId, usize)>>,
+    /// Intra-block synthetic `(label_id, block, local_pc)` targets for standalone `JumpEqz`/`JumpNez`.
+    pub internal_labels: Vec<(u32, BlockId, usize)>,
+    /// Number of leading `ExceptionParam`-homing instructions per catch handler block (`R3-M2`).
+    pub handler_prologue_len: HashMap<BlockId, usize>,
+    /// `CondBranch` blocks whose `acc` at the branch is guaranteed boolean (`R3-X1`).
+    pub bool_cond_blocks: HashSet<BlockId>,
 }
 
 /// Whether an emitted entity operand value is traceable to a source-file
@@ -103,19 +113,30 @@ impl IcAllocator {
         Self { counter: 0 }
     }
 
-    /// Allocate `slot_count` consecutive IC slots, returning the first slot's Imm.
+    /// Allocate `slot_count` consecutive IC slots, skipping the reserved
+    /// [`IC_SLOT_INVALID`] (`0xFF`) slot and `0xFE..=0xFF` boundary straddle,
+    /// and degrading instructions once `counter > 0xFFFF` to `0xFF` without
+    /// advancing `counter` (`templates/isa.h.erb` `SetIcSlot`, `#61` `R3-X2`).
     fn alloc(&mut self, slot_count: u16) -> Imm {
-        let id = self.counter;
-        self.counter = self.counter.saturating_add(slot_count as u32);
-        Imm(id as i64)
+        let width = u32::from(slot_count);
+        if self.counter <= IC_SLOT_INVALID && self.counter.saturating_add(width) > IC_SLOT_INVALID {
+            self.counter = IC_SLOT_INVALID + 1;
+        }
+        if self.counter <= 0xFFFF {
+            let id = self.counter;
+            self.counter += width;
+            Imm(i64::from(id))
+        } else {
+            Imm(i64::from(IC_SLOT_INVALID))
+        }
     }
 
-    /// Allocate 1 IC slot (arithmetic, globals, object/array creation, function def).
+    /// Allocate 1 IC slot (`ONE_SLOT` instructions).
     fn one(&mut self) -> Imm {
         self.alloc(1)
     }
 
-    /// Allocate 2 IC slots (property access, calls, iterators).
+    /// Allocate 2 IC slots (`two_slot` instructions).
     fn two(&mut self) -> Imm {
         self.alloc(2)
     }
@@ -200,8 +221,14 @@ fn ic_slot_imm_mut(bc: &mut Bytecode) -> Option<&mut Imm> {
         | Stobjbyvalue(i, ..)
         | Stobjbyindex(i, ..)
         | Stownbyname(i, ..)
+        | Stownbynamewithnameset(i, ..)
+        | Definefieldbyname(i, ..)
+        | Definepropertybyname(i, ..)
         | Stownbyvalue(i, ..)
+        | Stownbyvaluewithnameset(i, ..)
+        | CallruntimeDefinefieldbyvalue(i, ..)
         | Stownbyindex(i, ..)
+        | CallruntimeDefinefieldbyindex(i, ..)
         | Stsuperbyname(i, ..)
         | Stsuperbyvalue(i, ..) => i,
         Callarg0(i) => i,
@@ -213,10 +240,13 @@ fn ic_slot_imm_mut(bc: &mut Bytecode) -> Option<&mut Imm> {
         | Callthis2(i, ..)
         | Callthis3(i, ..)
         | Apply(i, ..)
-        | Supercallspread(i, _) => i,
+        | Supercallspread(i, _)
+        | Newobjapply(i, _)
+        | CallruntimeCallinit(i, _) => i,
         Callrange(i, ..)
         | Callthisrange(i, ..)
         | Supercallthisrange(i, ..)
+        | Supercallarrowrange(i, ..)
         | Newobjrange(i, ..) => i,
         _ => return None,
     })
@@ -244,12 +274,12 @@ fn ic_slot_imm_mut(bc: &mut Bytecode) -> Option<&mut Imm> {
 ///   upstream.
 /// - Pass B: every other IC instruction (`sixteen_bit_ic` /
 ///   `eight_sixteen_bit_ic`) continues from where pass A ended; a
-///   two-slot instruction straddling 0xFF skips to 0x100 (upstream's
-///   exact rule). Consumption beyond the u16 slot-immediate space is a
-///   hard error — no vendored encoding exists.
+///   two-slot instruction straddling 0xFF skips to 0x100, and once
+///   `counter > 0xFFFF` instructions degrade to [`IC_SLOT_INVALID`]
+///   (`0xFF`) without advancing `counter` (upstream `SetIcSlot`).
 ///
 /// The rearrangement fires ONLY when the dense assignment actually
-/// overflowed (an `eight_bit_ic` immediate above 0xFF), so every
+/// overflowed (an `eight_bit_ic` immediate outside `0..0xFF`), so every
 /// non-overflowing function keeps its dense assignment byte-for-byte.
 /// Returns the total IC-slot consumption (for `IselResult::ic_size`).
 fn rearrange_ic_slots(
@@ -274,7 +304,9 @@ fn rearrange_ic_slots(
             }
             if vendor_ic && bc.has_flag(BytecodeFlags::EIGHT_BIT_IC) {
                 let imm = ic_slot_imm_mut(bc).expect("cross-checked above");
-                if !(0..=i64::from(IC_SLOT_INVALID)).contains(&imm.0) {
+                if !(0..i64::from(IC_SLOT_INVALID)).contains(&imm.0)
+                    || imm.0 + i64::from(ic_slot_count(bc)) > i64::from(IC_SLOT_INVALID)
+                {
                     overflow = true;
                 }
             }
@@ -324,11 +356,13 @@ fn rearrange_ic_slots(
                 // `imm = 0x100; return ret + (0x100 - slot)` behavior).
                 *imm = Imm(i64::from(IC_SLOT_INVALID + 1));
                 counter = IC_SLOT_INVALID + 1 + slots;
-            } else if counter + slots <= 0x1_0000 {
+            } else if counter <= 0xFFFF {
                 *imm = Imm(i64::from(counter));
                 counter += slots;
             } else {
-                return Err(LowerError::IcSlotOverflow(func_id));
+                // Beyond u16 immediate space (`counter > 0xFFFF`): degrade to
+                // `IC_SLOT_INVALID` (`0xFF`) without advancing `counter`.
+                *imm = Imm(i64::from(IC_SLOT_INVALID));
             }
         }
     }
@@ -453,45 +487,26 @@ pub fn select_with_options(
     // non-back-edge predecessor is emitted before its successors).
     let mut exit_states: HashMap<BlockId, AccContent> = HashMap::new();
 
-    // N13: handler block → its exception value. The exception is delivered
-    // in acc by the dispatch itself; the prologue below materializes it
-    // into its register home.
-    let mut handler_exc: HashMap<BlockId, ValueId> = HashMap::new();
+    // R3-X4: handler block → all of its distinct `ExceptionParam` values across
+    // `TryRegion`s targeting the handler. Each used value receives `acc` at entry.
+    let mut handler_exc: HashMap<BlockId, Vec<ValueId>> = HashMap::new();
     for region in &func.try_regions {
         for catch in &region.catches {
-            handler_exc.entry(catch.handler).or_insert(catch.exception);
+            let list = handler_exc.entry(catch.handler).or_default();
+            if !list.contains(&catch.exception) {
+                list.push(catch.exception);
+            }
         }
     }
-    // EVERY catch-handler block (try-region derived, not just the ones with
-    // a seeded exception value): exception dispatch physically clobbers the
-    // accumulator at handler entry, so a handler's entry acc content is
-    // never the meet of its CFG predecessors — values defined in the try
-    // body are NOT in acc, even when every predecessor agrees.
     let handler_blocks: HashSet<BlockId> = func
         .try_regions
         .iter()
         .flat_map(|region| region.catches.iter().map(|c| c.handler))
         .collect();
 
-    // Frame-initial constants owned by this function (`FunctionData::frame_init_consts`,
-    // swept of dead entries by ADCE when `abcd-opt` runs), materialized at the
-    // entry block top in reverse creation order (descending `ValueId`).
     let mut entry_consts = regalloc::frame_init_consts(module, func_id);
-    entry_consts.sort_unstable_by(|a, b| b.cmp(a)); // descending id = reverse creation
+    entry_consts.sort_unstable_by(|a, b| b.cmp(a));
 
-    // N21 pinned stores for handler-block phis, grouped by emission point.
-    // Deterministic order: sorted by (pred, src, dst) / (src, dst).
-    //
-    // - AfterDef: the source is defined by an instruction inside the pred —
-    //   the store is emitted immediately after that instruction (the
-    //   closest implementable point to the vendored `sta`; the source's
-    //   result homing has just run, so its register home holds it).
-    // - BlockStart(pred): every other source — defined in a dominating
-    //   block, a phi result (materialized by the incoming edge copies), a
-    //   parameter (the entry copy-in prologue has run), or an exception
-    //   value (the handler prologue has run). The store is emitted before
-    //   the pred's first instruction, so an exception at any pred
-    //   instruction observes it.
     let mut after_def_stores: HashMap<ValueId, Vec<(ValueId, ValueId)>> = HashMap::new();
     let mut block_start_stores: HashMap<BlockId, Vec<(ValueId, ValueId)>> = HashMap::new();
     for &(pred, src, dst) in &alloc.handler_phi_stores {
@@ -499,10 +514,6 @@ pub fn select_with_options(
             Some(ValueDef::Inst(i)) => module
                 .inst(i)
                 .is_some_and(|inst| !inst.op.is_phi() && inst.block == pred),
-            // A frame-initial const's definition site is the entry-block
-            // materialization: for an entry-pred handler phi, its pinned
-            // store belongs right after the materialization (after-def),
-            // never at block start (the home is written only there).
             Some(ValueDef::Const(_)) => pred == entry_block,
             _ => false,
         };
@@ -519,17 +530,28 @@ pub fn select_with_options(
         stores.sort_unstable();
     }
 
+    let mut block_inst_pcs: HashMap<BlockId, Vec<(InstId, usize)>> =
+        HashMap::with_capacity(rpo.len());
+    let mut handler_prologue_len: HashMap<BlockId, usize> = HashMap::new();
+    let mut ctx = IselCtx {
+        func_id,
+        module,
+        alloc,
+        used: &used,
+        suppression,
+        tracer: &mut tracer,
+        ic: &mut ic,
+        next_internal_label: 0x8000_0000,
+        internal_labels: Vec::new(),
+        bool_cond_blocks: HashSet::new(),
+    };
+
     for &bb in rpo {
         let mut codes = Vec::new();
         let Some(block) = module.block(bb) else {
             continue;
         };
 
-        // Block-entry acc content (B4): the entry block starts with the
-        // vendor frame-init hole; a catch handler starts with the
-        // dispatched exception object (unknown to the tracker until the
-        // prologue homes it); every other block meets its predecessors'
-        // exit contents.
         let mut tracker = if bb == entry_block {
             AccContent::Hole
         } else if handler_blocks.contains(&bb) {
@@ -538,53 +560,38 @@ pub fn select_with_options(
             meet_acc_content(&block.preds, &exit_states)
         };
 
-        // Copy-in prologue: arguments arrive in the ABI top slots and are
-        // moved into the parameters' vreg homes at the very start of the
-        // entry block. `mov` never touches acc — the tracker stays Hole.
         if bb == entry_block {
             emit_param_copy_in(func_id, module, alloc, &mut codes)?;
         }
 
-        // N13 handler prologue: exception dispatch physically delivers the
-        // thrown object in acc (vendor `SET_ACC(exception)`,
-        // interpreter_assembly.cpp:7860-7863) — materialize it into its
-        // register home as the handler's FIRST bytecode, before anything
-        // can clobber acc. This is exactly the vendored handler-entry
-        // `sta vX`. Skipped when the handler never reads the exception (the
-        // value is then uncolored). After the store the tracker knows the
-        // acc holds the exception value (a `sta` reads but never writes
-        // acc — vendor `acc: in`).
-        if let Some(&exc) = handler_exc.get(&bb)
-            && let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc)
-        {
-            emit_sta_home(func_id, home, alloc, &mut codes)?;
-            tracker = AccContent::Holds(exc);
-        }
-
-        // N21 pinned stores at block start (phi-result / exception /
-        // parameter sources). Runs after the exception prologue so a store
-        // sourcing the exception reads its just-written home. Pure `Mov`s:
-        // the tracker is unaffected.
-        if let Some(stores) = block_start_stores.get(&bb) {
-            for &(src, dst) in stores {
-                let s = home_of(func_id, src, alloc)?;
-                let d = home_of(func_id, dst, alloc)?;
-                if s != d {
-                    codes.push(Bytecode::Mov(Reg(d), Reg(s)));
+        // N13 + R3-X4 + R3-M2: Home `acc` into every used `ExceptionParam` of `bb`
+        // and record the prologue length so normal CFG jumps skip over it.
+        if let Some(excs) = handler_exc.get(&bb) {
+            let prol_start = codes.len();
+            for &exc in excs {
+                if let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc) {
+                    emit_sta_home(func_id, home, alloc, &mut codes)?;
+                    tracker = AccContent::Holds(exc);
                 }
+            }
+            let prol_len = codes.len() - prol_start;
+            if prol_len > 0 {
+                handler_prologue_len.insert(bb, prol_len);
             }
         }
 
-        // Frame-initial constants at the head of the entry block's instruction
-        // stream — after the block-start pinned stores. The constant load is
-        // emitted for every seed in `entry_consts`; the homing `Sta` is
-        // use-gated, and an unused seed's acc write leaves the tracker `Unknown`.
+        // R3-X3: Sequentialize parallel handler-phi stores in slot space so
+        // swaps/WAR chains never overwrite an unread source.
+        if let Some(stores) = block_start_stores.get(&bb) {
+            emit_pinned_stores(func_id, stores, alloc, &mut codes)?;
+        }
+
         if bb == entry_block {
             for &cval in &entry_consts {
                 let Some(ValueDef::Const(cid)) = module.value(cval).map(|v| v.def) else {
                     continue;
                 };
-                let bc = const_load_bytecode(module, cid, func_id, &mut tracer)?;
+                let bc = const_load_bytecode(module, cid, func_id, ctx.tracer)?;
                 codes.push(bc);
                 if used.contains(&cval) {
                     let r = home_of(func_id, cval, alloc)?;
@@ -593,74 +600,50 @@ pub fn select_with_options(
                 } else {
                     tracker = AccContent::Unknown;
                 }
-                // N21 after-def pinned stores keyed by this const value:
-                // the materialization is its definition site, so the store runs
-                // right after its `Sta`.
                 if let Some(stores) = after_def_stores.get(&cval) {
-                    for &(_, dst) in stores {
-                        let d = home_of(func_id, dst, alloc)?;
-                        let s = home_of(func_id, cval, alloc)?;
-                        if s != d {
-                            codes.push(Bytecode::Mov(Reg(d), Reg(s)));
-                        }
-                    }
+                    emit_pinned_stores(func_id, stores, alloc, &mut codes)?;
                 }
             }
         }
 
-        // Phi copies from predecessors are handled in layout (inserted before terminators).
-        // Skip phi instructions — they don't produce bytecodes directly.
-
+        let mut local_pcs: Vec<(InstId, usize)> = Vec::with_capacity(block.insts.len());
         for &inst in &block.insts {
+            local_pcs.push((inst, codes.len()));
             if suppression.insts.contains(&inst) {
-                continue; // folded into its consumer (fusion)
+                continue;
             }
             let Some(node) = module.inst(inst) else {
                 continue;
             };
 
-            select_inst(
-                node,
-                func_id,
-                module,
-                alloc,
-                &used,
-                suppression,
-                &mut tracer,
-                &mut codes,
-                &mut ic,
-                &mut tracker,
-            )?;
+            ctx.select_inst(bb, node, &mut codes, &mut tracker)?;
 
-            // N21 pinned stores right after the defining instruction (see
-            // the ordering argument at `after_def_stores`). Pure `Mov`s.
             if let Some(v) = node.result
                 && let Some(stores) = after_def_stores.get(&v)
             {
-                for &(_, dst) in stores {
-                    let d = home_of(func_id, dst, alloc)?;
-                    let s = home_of(func_id, v, alloc)?;
-                    if s != d {
-                        codes.push(Bytecode::Mov(Reg(d), Reg(s)));
-                    }
-                }
+                emit_pinned_stores(func_id, stores, alloc, &mut codes)?;
             }
         }
 
+        block_inst_pcs.insert(bb, local_pcs);
         exit_states.insert(bb, tracker);
         block_codes.push((bb, codes));
     }
 
-    // N71: an over-256-slot method's `eight_bit_ic` immediates do not fit
-    // their u8 operand — rearrange the slot space one-byte-first, exactly
-    // like upstream's `ReArrangeIc` (no-op for non-overflowing functions).
-    let ic_size = rearrange_ic_slots(func_id, &mut block_codes, ic.counter)?;
+    let internal_labels = ctx.internal_labels;
+    let bool_cond_blocks = ctx.bool_cond_blocks;
+    let dense_ic = ctx.ic.counter;
+    let ic_size = rearrange_ic_slots(func_id, &mut block_codes, dense_ic)?;
 
     Ok(IselResult {
         block_codes,
         entity_traces: tracer.traces,
         ic_size,
         unsupported: None,
+        block_inst_pcs,
+        internal_labels,
+        handler_prologue_len,
+        bool_cond_blocks,
     })
 }
 
@@ -868,15 +851,36 @@ fn home_result(
     Ok(())
 }
 
-/// The bytecode that materializes a constant into the accumulator (shared
-/// by [`Op::LoadConst`] and the entry-top frame-initial materialization).
-///
-/// Constant mapping: `Undefined` → `ldundefined`, `Hole` → `ldhole`, `Null` →
-/// `ldnull`, `Bool` → `ldtrue`/`ldfalse`, canonical-NaN bits → `ldnan`, `+∞`
-/// bits → `ldinfinity`, other numbers → integral (`-0.0` excluded, `N37`) via
-/// `ldai` or raw IEEE-754 bits via `fldai`, `String` → `lda.str`, `BigInt` →
-/// `ldbigint`. A bare shape constant (literal tree / method ref) has no scalar
-/// materialization — shapes only flow through their dedicated ops.
+/// Sequentialize and emit parallel handler-phi stores (`R3-X3`).
+fn emit_pinned_stores(
+    func_id: FuncId,
+    stores: &[(ValueId, ValueId)],
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<(), LowerError> {
+    let mut slot_pairs: Vec<(RegSlot, RegSlot)> = Vec::with_capacity(stores.len());
+    for &(src, dst) in stores {
+        let s = RegSlot::Reg(home_of(func_id, src, alloc)?);
+        let d = RegSlot::Reg(home_of(func_id, dst, alloc)?);
+        if s != d {
+            slot_pairs.push((s, d));
+        }
+    }
+    if slot_pairs.is_empty() {
+        return Ok(());
+    }
+    let resolved = resolve_slot_copies(&slot_pairs, alloc.copy_temp)
+        .map_err(|_| LowerError::MissingCopyTemp(func_id))?;
+    for (s, d) in resolved {
+        codes.push(emit_copy(s, d));
+    }
+    Ok(())
+}
+
+/// Canonical quiet-NaN bit pattern (`0x7ff8_0000_0000_0000`, `#60`).
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
+/// Materialize a scalar constant into `acc` (`#57`, `#60`).
 fn const_load_bytecode(
     module: &Module,
     cid: ConstId,
@@ -892,28 +896,42 @@ fn const_load_bytecode(
     Ok(match c {
         Const::Undefined => Bytecode::Ldundefined,
         Const::Hole => Bytecode::Ldhole,
-        Const::Null => Bytecode::Ldnull,
+        Const::Null | Const::LitNull(_) => Bytecode::Ldnull,
         Const::Bool(true) => Bytecode::Ldtrue,
         Const::Bool(false) => Bytecode::Ldfalse,
+        Const::Int8(n) => Bytecode::Ldai(Imm(i64::from(*n))),
+        Const::Int32(n) => Bytecode::Ldai(Imm(i64::from(*n as i32))),
+        Const::Float32(bits) => {
+            let f = f32::from_bits(*bits);
+            if f.is_nan() {
+                Bytecode::Ldnan
+            } else if f == f32::INFINITY {
+                Bytecode::Ldinfinity
+            } else {
+                let n = f64::from(f);
+                if n == (n as i32) as f64 && !(n == 0.0 && n.is_sign_negative()) {
+                    Bytecode::Ldai(Imm(n as i64))
+                } else {
+                    Bytecode::Fldai(Imm(n.to_bits() as i64))
+                }
+            }
+        }
         Const::Number(bits) => {
-            if *bits == f64::NAN.to_bits() {
+            if *bits == CANONICAL_NAN_BITS {
                 Bytecode::Ldnan
             } else if *bits == f64::INFINITY.to_bits() {
                 Bytecode::Ldinfinity
             } else {
                 let n = f64::from_bits(*bits);
-                // N37: `-0.0 == 0.0` in IEEE, so the plain integer check
-                // took the `ldai 0` path for -0.0 and lost the sign bit
-                // (observable: `1 / -0` is -Infinity, `Object.is(-0, 0)`
-                // is false). Exclude negative zero from the Ldai path.
-                if n == (n as i32) as f64 && !(n == 0.0 && n.is_sign_negative()) {
+                // N37: exclude `-0.0` from `ldai 0` so its sign bit survives.
+                if !n.is_nan() && n == (n as i32) as f64 && !(n == 0.0 && n.is_sign_negative()) {
                     Bytecode::Ldai(Imm(n as i64))
                 } else {
                     Bytecode::Fldai(Imm(*bits as i64))
                 }
             }
         }
-        Const::String(s) => Bytecode::LdaStr(tracer.eid(*s)),
+        Const::String(s) | Const::EtsImplements(s) => Bytecode::LdaStr(tracer.eid(*s)),
         Const::BigInt(s) => Bytecode::Ldbigint(tracer.eid(*s)),
         Const::Int64(_) | Const::UInt64(_) => {
             return Err(LowerError::UnsupportedInstruction {
@@ -924,7 +942,14 @@ fn const_load_bytecode(
                 ),
             });
         }
-        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } | Const::MethodRef(_) => {
+        Const::Accessor(_)
+        | Const::MethodAffiliate(_)
+        | Const::BuiltinTypeIndex(_)
+        | Const::ArrayLiteral(_)
+        | Const::TypedArrayLiteral { .. }
+        | Const::ObjectLiteral { .. }
+        | Const::LiteralBufferRef(_)
+        | Const::MethodRef { .. } => {
             return Err(LowerError::UnsupportedInstruction {
                 func: func_id,
                 message: format!(
@@ -936,10 +961,8 @@ fn const_load_bytecode(
     })
 }
 
-/// Recover the by-index immediate of a fused `LoadPropIdx`/`StorePropIdx`/
-/// `StoreOwnPropIdx`: the value of the suppressed adjacent `LoadConst(number)`,
-/// truncated from the vendor's `i64` immediate to `u32`.
-fn fused_index_imm(module: &Module, index: ValueId, suppression: &Suppression) -> Option<Imm> {
+/// Recover the exact `0..=u32::MAX` immediate of a fused `*PropIdx` (`#61` `R3-X5`).
+fn fused_index_u32(module: &Module, index: ValueId, suppression: &Suppression) -> Option<u32> {
     if !suppression.values.contains(&index) {
         return None;
     }
@@ -949,11 +972,31 @@ fn fused_index_imm(module: &Module, index: ValueId, suppression: &Suppression) -
     let Op::LoadConst(cid) = &module.inst(iid)?.op else {
         return None;
     };
-    let num = module.consts.get(*cid)?.as_f64()?;
-    if num.fract() != 0.0 {
-        return None;
+    const_u32_index(module.consts.get(*cid)?)
+}
+
+/// Whether `cond` is guaranteed to hold a runtime JS `Boolean` (`true`/`false`),
+/// allowing `CondBranch` to omit `Bytecode::Istrue` and invert `jnez`/`jeqz` (`R3-X1`).
+fn is_proven_boolean(module: &Module, cond: ValueId) -> bool {
+    let Some(val) = module.value(cond) else {
+        return false;
+    };
+    if matches!(
+        val.ty,
+        Ty::DynPrim(DynPrim::Bool) | Ty::Static(StaticTy::U1)
+    ) {
+        return true;
     }
-    Some(Imm((num as i64 as u32) as i64))
+    match val.def {
+        ValueDef::Const(cid) => matches!(module.consts.get(cid), Some(Const::Bool(_))),
+        ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+            Some(Op::Compare { .. }) => true,
+            Some(Op::UnaryOp { op, .. }) => op.is_boolean_result(),
+            Some(Op::LoadConst(cid)) => matches!(module.consts.get(*cid), Some(Const::Bool(_))),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The [`FuncId`] of a `DefineFunc` body when `v` is (a possibly
@@ -982,203 +1025,227 @@ fn fused_definefunc_body(module: &Module, v: ValueId, suppression: &Suppression)
     }
 }
 
-/// Select bytecodes for a single IR instruction.
-///
-/// `tracker` is the emission-time acc-content model (B4, acc-as-cache):
-/// every acc load goes through `ensure_acc`/`materialize_operands` (the
-/// only acc writers besides result homing), and every arm whose bytecode
-/// writes the accumulator (vendor `acc: out`/`inout` — exactly the arms
-/// with a result, plus `CopyDataProps`) ends with `home_result` or an
-/// explicit tracker invalidation. Arms whose bytecodes only READ the acc
-/// (`acc: in`, e.g. `stobjbyname`) or ignore it (`acc: none`, e.g. `mov`,
-/// `throw.ifnotobject`) leave the tracker untouched.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn select_inst(
-    node: &abcd_ir::Inst,
+struct IselCtx<'a> {
     func_id: FuncId,
-    module: &Module,
-    alloc: &RegAlloc,
-    used: &HashSet<ValueId>,
-    suppression: &Suppression,
-    tracer: &mut EntityTracer,
-    codes: &mut Vec<Bytecode>,
-    ic: &mut IcAllocator,
-    tracker: &mut AccContent,
-) -> Result<(), LowerError> {
-    let data = &node.op;
-    let result = node.result;
-    match data {
-        // ── Constants ────────────────────────────────────────────────
-        Op::LoadConst(cid) => {
-            let bc = const_load_bytecode(module, *cid, func_id, tracer)?;
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
+    module: &'a Module,
+    alloc: &'a RegAlloc,
+    used: &'a HashSet<ValueId>,
+    suppression: &'a Suppression,
+    tracer: &'a mut EntityTracer,
+    ic: &'a mut IcAllocator,
+    next_internal_label: u32,
+    internal_labels: Vec<(u32, BlockId, usize)>,
+    bool_cond_blocks: HashSet<BlockId>,
+}
 
-        // ── Binary / Compare / Unary ─────────────────────────────────
-        Op::BinaryOp { op, left, right } => {
-            let regs =
-                materialize_operands(tracker, func_id, &[*right], Some(*left), alloc, codes)?;
-            let r = regs[0];
-            let bc = match op {
-                BinOp::Add => Bytecode::Add2(ic.one(), r),
-                BinOp::Sub => Bytecode::Sub2(ic.one(), r),
-                BinOp::Mul => Bytecode::Mul2(ic.one(), r),
-                BinOp::Div => Bytecode::Div2(ic.one(), r),
-                BinOp::Mod => Bytecode::Mod2(ic.one(), r),
-                BinOp::Exp => Bytecode::Exp(ic.one(), r),
-                BinOp::Shl => Bytecode::Shl2(ic.one(), r),
-                BinOp::Shr => Bytecode::Shr2(ic.one(), r),
-                BinOp::Ashr => Bytecode::Ashr2(ic.one(), r),
-                BinOp::BitAnd => Bytecode::And2(ic.one(), r),
-                BinOp::BitOr => Bytecode::Or2(ic.one(), r),
-                BinOp::BitXor => Bytecode::Xor2(ic.one(), r),
-            };
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::Compare { op, left, right } => {
-            let regs =
-                materialize_operands(tracker, func_id, &[*right], Some(*left), alloc, codes)?;
-            let r = regs[0];
-            let bc = match op {
-                CmpOp::Eq => Bytecode::Eq(ic.one(), r),
-                CmpOp::NotEq => Bytecode::Noteq(ic.one(), r),
-                CmpOp::StrictEq => Bytecode::Stricteq(ic.one(), r),
-                CmpOp::StrictNotEq => Bytecode::Strictnoteq(ic.one(), r),
-                CmpOp::Less => Bytecode::Less(ic.one(), r),
-                CmpOp::LessEq => Bytecode::Lesseq(ic.one(), r),
-                CmpOp::Greater => Bytecode::Greater(ic.one(), r),
-                CmpOp::GreaterEq => Bytecode::Greatereq(ic.one(), r),
-                CmpOp::In => Bytecode::Isin(ic.one(), r),
-                CmpOp::InstanceOf => Bytecode::Instanceof(ic.one(), r),
-            };
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::UnaryOp { op, operand } => {
-            ensure_acc(tracker, func_id, *operand, alloc, codes)?;
-            let bc = match op {
-                UnOp::Minus => Bytecode::Neg(ic.one()),
-                UnOp::LogicalNot => Bytecode::Not(ic.one()),
-                UnOp::Inc => Bytecode::Inc(ic.one()),
-                UnOp::Dec => Bytecode::Dec(ic.one()),
-                UnOp::TypeOf => Bytecode::Typeof(ic.one()),
-                UnOp::ToNumber => Bytecode::Tonumber(ic.one()),
-                UnOp::ToNumeric => Bytecode::Tonumeric(ic.one()),
-                UnOp::BitNot => Bytecode::Not(ic.one()), // vendored `not` IS bitwise (N39)
-                UnOp::Void => Bytecode::Ldundefined,     // void x → undefined
-                UnOp::IsTrue => Bytecode::Istrue,
-                UnOp::IsFalse => Bytecode::Isfalse,
-            };
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::Mov { src } => {
-            // Pure register copy: no accumulator involvement (vendor
-            // `mov` is `acc: none`). Never produced by `abcd-lift`, but
-            // lowered for IR completeness.
-            if let Some(v) = result
-                && used.contains(&v)
-            {
-                let d = home_of(func_id, v, alloc)?;
-                let s = home_of(func_id, *src, alloc)?;
-                if s != d {
-                    codes.push(Bytecode::Mov(Reg(d), Reg(s)));
+impl<'a> IselCtx<'a> {
+    fn alloc_label(&mut self) -> u32 {
+        let id = self.next_internal_label;
+        self.next_internal_label += 1;
+        id
+    }
+
+    fn select_inst(
+        &mut self,
+        bb: BlockId,
+        node: &abcd_ir::Inst,
+        codes: &mut Vec<Bytecode>,
+        tracker: &mut AccContent,
+    ) -> Result<(), LowerError> {
+        let func_id = self.func_id;
+        let module = self.module;
+        let alloc = self.alloc;
+        let used = self.used;
+        let suppression = self.suppression;
+        let data = &node.op;
+        let result = node.result;
+        match data {
+            // ── Constants ────────────────────────────────────────────────
+            Op::LoadConst(cid) => {
+                let bc = const_load_bytecode(module, *cid, func_id, self.tracer)?;
+                codes.push(bc);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Binary / Compare / Unary ─────────────────────────────────
+            Op::BinaryOp { op, left, right } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*right], Some(*left), alloc, codes)?;
+                let r = regs[0];
+                let bc = match op {
+                    BinOp::Add => Bytecode::Add2(self.ic.one(), r),
+                    BinOp::Sub => Bytecode::Sub2(self.ic.one(), r),
+                    BinOp::Mul => Bytecode::Mul2(self.ic.one(), r),
+                    BinOp::Div => Bytecode::Div2(self.ic.one(), r),
+                    BinOp::Mod => Bytecode::Mod2(self.ic.one(), r),
+                    BinOp::Exp => Bytecode::Exp(self.ic.one(), r),
+                    BinOp::Shl => Bytecode::Shl2(self.ic.one(), r),
+                    BinOp::Shr => Bytecode::Shr2(self.ic.one(), r),
+                    BinOp::Ashr => Bytecode::Ashr2(self.ic.one(), r),
+                    BinOp::BitAnd => Bytecode::And2(self.ic.one(), r),
+                    BinOp::BitOr => Bytecode::Or2(self.ic.one(), r),
+                    BinOp::BitXor => Bytecode::Xor2(self.ic.one(), r),
+                };
+                codes.push(bc);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::Compare { op, left, right } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*right], Some(*left), alloc, codes)?;
+                let r = regs[0];
+                let bc = match op {
+                    CmpOp::Eq => Bytecode::Eq(self.ic.one(), r),
+                    CmpOp::NotEq => Bytecode::Noteq(self.ic.one(), r),
+                    CmpOp::StrictEq => Bytecode::Stricteq(self.ic.one(), r),
+                    CmpOp::StrictNotEq => Bytecode::Strictnoteq(self.ic.one(), r),
+                    CmpOp::Less => Bytecode::Less(self.ic.one(), r),
+                    CmpOp::LessEq => Bytecode::Lesseq(self.ic.one(), r),
+                    CmpOp::Greater => Bytecode::Greater(self.ic.one(), r),
+                    CmpOp::GreaterEq => Bytecode::Greatereq(self.ic.one(), r),
+                    CmpOp::In => Bytecode::Isin(self.ic.one(), r),
+                    // R3-X2: `instanceof` occupies TWO IC slots in isa.yaml:794.
+                    CmpOp::InstanceOf => Bytecode::Instanceof(self.ic.two(), r),
+                };
+                codes.push(bc);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::UnaryOp { op, operand } => {
+                ensure_acc(tracker, func_id, *operand, alloc, codes)?;
+                match op {
+                    UnOp::JumpEqz | UnOp::JumpNez => {
+                        if let Some(v) = result
+                            && used.contains(&v)
+                        {
+                            let lbl_true = self.alloc_label();
+                            let lbl_done = self.alloc_label();
+                            codes.push(match op {
+                                UnOp::JumpEqz => Bytecode::Jeqz(Label(lbl_true)),
+                                _ => Bytecode::Jnez(Label(lbl_true)),
+                            });
+                            codes.push(Bytecode::Ldfalse);
+                            codes.push(Bytecode::Jmp(Label(lbl_done)));
+                            self.internal_labels.push((lbl_true, bb, codes.len()));
+                            codes.push(Bytecode::Ldtrue);
+                            self.internal_labels.push((lbl_done, bb, codes.len()));
+                            home_result(tracker, result, used, func_id, alloc, codes)?;
+                        } else {
+                            *tracker = AccContent::Unknown;
+                        }
+                    }
+                    _ => {
+                        let bc = match op {
+                            UnOp::Minus => Bytecode::Neg(self.ic.one()),
+                            // R3-M1: JS `!x` is `isfalse` (boolean negation), NEVER bitwise `not`!
+                            UnOp::LogicalNot | UnOp::IsFalse => Bytecode::Isfalse,
+                            UnOp::Inc => Bytecode::Inc(self.ic.one()),
+                            UnOp::Dec => Bytecode::Dec(self.ic.one()),
+                            // R3-X2: `typeof` occupies TWO IC slots in isa.yaml:700.
+                            UnOp::TypeOf => Bytecode::Typeof(self.ic.two()),
+                            UnOp::ToNumber => Bytecode::Tonumber(self.ic.one()),
+                            UnOp::ToNumeric => Bytecode::Tonumeric(self.ic.one()),
+                            UnOp::ToPropertyKey => Bytecode::CallruntimeTopropertykey,
+                            UnOp::BitNot => Bytecode::Not(self.ic.one()),
+                            UnOp::Void => Bytecode::Ldundefined,
+                            UnOp::IsTrue => Bytecode::Istrue,
+                            UnOp::JumpEqz | UnOp::JumpNez => unreachable!("handled above"),
+                        };
+                        codes.push(bc);
+                        home_result(tracker, result, used, func_id, alloc, codes)?;
+                    }
                 }
             }
-        }
-
-        // ── Object / Array creation ──────────────────────────────────
-        Op::AllocObject { shape } => {
-            match module.consts.get(*shape) {
-                Some(Const::ObjectLiteral { keys, values })
-                    if keys.is_empty() && values.is_empty() =>
+            Op::Mov { src } => {
+                // Pure register copy: no accumulator involvement (vendor
+                // `mov` is `acc: none`). Never produced by `abcd-lift`, but
+                // lowered for IR completeness.
+                if let Some(v) = result
+                    && used.contains(&v)
                 {
-                    // The lift's shared empty shape: createemptyobject.
-                    codes.push(Bytecode::Createemptyobject);
-                }
-                Some(Const::ObjectLiteral { .. }) | Some(Const::ArrayLiteral(_)) => {
-                    // Vendor createobjectwithbuffer: the OBJECT tag is
-                    // op-carried (N60) — the shape is the flat literal
-                    // buffer content ([k0, v0, ...] as a Const tree).
-                    codes.push(Bytecode::Createobjectwithbuffer(
-                        ic.one(),
-                        tracer.literal_eid(*shape),
-                    ));
-                }
-                _ => {
-                    return Err(LowerError::UnsupportedInstruction {
-                        func: func_id,
-                        message: format!(
-                            "AllocObject shape {shape} is not a literal object/array shape"
-                        ),
-                    });
+                    let d = home_of(func_id, v, alloc)?;
+                    let s = home_of(func_id, *src, alloc)?;
+                    if s != d {
+                        codes.push(Bytecode::Mov(Reg(d), Reg(s)));
+                    }
                 }
             }
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AllocArray { shape } => {
-            match shape {
-                None => {
-                    codes.push(Bytecode::Createemptyarray(ic.one()));
+
+            // ── Object / Array creation ──────────────────────────────────
+            Op::AllocObject { shape } => {
+                match module.consts.get(*shape) {
+                    Some(Const::ObjectLiteral { keys, values })
+                        if keys.is_empty() && values.is_empty() =>
+                    {
+                        codes.push(Bytecode::Createemptyobject);
+                    }
+                    Some(Const::ObjectLiteral { .. }) | Some(Const::ArrayLiteral(_)) => {
+                        codes.push(Bytecode::Createobjectwithbuffer(
+                            self.ic.one(),
+                            self.tracer.literal_eid(*shape),
+                        ));
+                    }
+                    _ => {
+                        return Err(LowerError::UnsupportedInstruction {
+                            func: func_id,
+                            message: format!(
+                                "AllocObject shape {shape} is not a literal object/array shape"
+                            ),
+                        });
+                    }
                 }
-                Some(shape) => {
-                    // Vendor createarraywithbuffer (N60: the ARRAY tag is
-                    // op-carried).
-                    codes.push(Bytecode::Createarraywithbuffer(
-                        ic.one(),
-                        tracer.literal_eid(*shape),
-                    ));
-                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
             }
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AllocRegExp { pattern, flags } => {
-            codes.push(Bytecode::Createregexpwithliteral(
-                ic.one(),
-                tracer.eid(*pattern),
-                Imm(i64::from(*flags)),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AllocClosure { func } => {
-            // Fusion (`fusion.rs`): an adjacent single-use `DefineFunc` is
-            // suppressed; emit vendor `definefunc` (the closure-creation
-            // bytecode) and home the CLOSURE's value. Non-fused shapes never
-            // come from `abcd-lift`: a standalone `DefineFunc` (result used
-            // elsewhere) already materialized the function object, so the
-            // closure is a register copy.
-            if suppression.values.contains(func) {
-                // Fused: the DefineFunc was suppressed — emit definefunc.
-                let Some(ValueDef::Inst(fiid)) = module.value(*func).map(|v| v.def) else {
-                    return Err(LowerError::UnsupportedInstruction {
-                        func: func_id,
-                        message: "AllocClosure of a non-instruction value".into(),
-                    });
-                };
-                let Some(finst) = module.inst(fiid) else {
-                    return Err(LowerError::UnsupportedInstruction {
-                        func: func_id,
-                        message: "AllocClosure of a dangling DefineFunc".into(),
-                    });
-                };
-                let Op::DefineFunc { body, length, .. } = &finst.op else {
-                    return Err(LowerError::UnsupportedInstruction {
-                        func: func_id,
-                        message: "AllocClosure of a non-DefineFunc value".into(),
-                    });
-                };
-                codes.push(Bytecode::Definefunc(
-                    ic.one(),
-                    tracer.method_eid(*body),
-                    Imm(i64::from(*length)),
+            Op::AllocArray { shape } => {
+                match shape {
+                    None => {
+                        codes.push(Bytecode::Createemptyarray(self.ic.one()));
+                    }
+                    Some(shape) => {
+                        codes.push(Bytecode::Createarraywithbuffer(
+                            self.ic.one(),
+                            self.tracer.literal_eid(*shape),
+                        ));
+                    }
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::AllocRegExp { pattern, flags } => {
+                // R3-X2: `createregexpwithliteral` occupies TWO IC slots in isa.yaml:529.
+                codes.push(Bytecode::Createregexpwithliteral(
+                    self.ic.two(),
+                    self.tracer.eid(*pattern),
+                    Imm(i64::from(*flags)),
                 ));
                 home_result(tracker, result, used, func_id, alloc, codes)?;
-            } else if let Some(v) = result {
-                // Robustness fallback (never from the lift): the
-                // function object already exists; the closure is a copy.
-                if used.contains(&v) {
+            }
+            Op::AllocClosure { func } => {
+                if suppression.values.contains(func) {
+                    let Some(ValueDef::Inst(fiid)) = module.value(*func).map(|v| v.def) else {
+                        return Err(LowerError::UnsupportedInstruction {
+                            func: func_id,
+                            message: "AllocClosure of a non-instruction value".into(),
+                        });
+                    };
+                    let Some(finst) = module.inst(fiid) else {
+                        return Err(LowerError::UnsupportedInstruction {
+                            func: func_id,
+                            message: "AllocClosure of a dangling DefineFunc".into(),
+                        });
+                    };
+                    let Op::DefineFunc { body, length, .. } = &finst.op else {
+                        return Err(LowerError::UnsupportedInstruction {
+                            func: func_id,
+                            message: "AllocClosure of a non-DefineFunc value".into(),
+                        });
+                    };
+                    codes.push(Bytecode::Definefunc(
+                        self.ic.one(),
+                        self.tracer.method_eid(*body),
+                        Imm(i64::from(*length)),
+                    ));
+                    home_result(tracker, result, used, func_id, alloc, codes)?;
+                } else if let Some(v) = result
+                    && used.contains(&v)
+                {
                     let d = home_of(func_id, v, alloc)?;
                     let s = home_of(func_id, *func, alloc)?;
                     if s != d {
@@ -1186,1139 +1253,1330 @@ fn select_inst(
                     }
                 }
             }
-        }
-        Op::CreateObjectWithExcludedKeys { obj, keys } => {
-            // Vendor `createobjectwithexcludedkeys imm:u8, v1:in:top,
-            // v2:in:top, acc: out:top` with `properties: [range_1]`
-            // (isa.yaml:494-498): v2 is the START of a CONSECUTIVE
-            // register range holding the `imm` keys. Regalloc never
-            // guarantees consecutiveness (N4 class), so the keys are
-            // mov-filled into the reserved per-function window — the
-            // SAME window the range calls use (each fill+use sequence
-            // completes within this instruction's selection;
-            // `range_call_window_size` takes the max over both kinds of
-            // site, N9). Width selection follows the S2 rule: ≤ 255 keys
-            // keep the narrow form; 256..=65535 select
-            // `wide.createobjectwithexcludedkeys` (u16 count, isa.yaml
-            // :499-504); above u16::MAX, `fill_call_window` hard-errors
-            // (CallArgcOverflow). The window base fits the u8 start
-            // operand of BOTH forms (CallWindowOverflow otherwise).
-            let regs = materialize_operands(tracker, func_id, &[*obj], None, alloc, codes)?;
-            let obj_r = regs[0];
-            let start_r = fill_call_window(func_id, keys, alloc, codes)?;
-            let count = Imm(keys.len() as i64);
-            let bc = if keys.len() <= 255 {
-                Bytecode::Createobjectwithexcludedkeys(count, obj_r, start_r)
-            } else {
-                Bytecode::WideCreateobjectwithexcludedkeys(count, obj_r, start_r)
-            };
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::SetObjectWithProto { proto, obj } => {
-            // Vendor `setobjectwithproto imm:u16, v:in:top, acc: in:top`
-            // (isa.yaml:1333-1337): proto in the register operand, the
-            // object in the accumulator; two-slot IC. Both the modern
-            // source form and the folded deprecated form emit this
-            // modern opcode.
-            let regs = materialize_operands(tracker, func_id, &[*proto], Some(*obj), alloc, codes)?;
-            codes.push(Bytecode::Setobjectwithproto(ic.two(), regs[0]));
-        }
-
-        // ── Property access ──────────────────────────────────────────
-        Op::LoadProp { object, name } => {
-            ensure_acc(tracker, func_id, *object, alloc, codes)?;
-            codes.push(Bytecode::Ldobjbyname(ic.two(), tracer.eid(*name)));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StoreProp {
-            object,
-            name,
-            value,
-        } => {
-            // Normal property store (`stobjbyname`, invoking prototype setters);
-            // own-property definition uses `Op::StoreOwnPropName` (`N60`).
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Stobjbyname(ic.two(), tracer.eid(*name), regs[0]));
-        }
-        Op::LoadPropDyn { object, key } => {
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*key), alloc, codes)?;
-            codes.push(Bytecode::Ldobjbyvalue(ic.two(), regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StorePropDyn { object, key, value } => {
-            // Vendor `stobjbyvalue imm:u16, v1:in:top, v2:in:top,
-            // acc: in:top` (isa.yaml:1353-1357): v1 = receiver, v2 =
-            // propKey, acc = VALUE. Register operands first, then
-            // the acc operand (B3 ordering).
-            let regs = materialize_operands(
-                tracker,
-                func_id,
-                &[*object, *key],
-                Some(*value),
-                alloc,
-                codes,
-            )?;
-            codes.push(Bytecode::Stobjbyvalue(ic.two(), regs[0], regs[1]));
-        }
-        Op::LoadPropIdx { object, index } => {
-            let Some(imm) = fused_index_imm(module, *index, suppression) else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "LoadPropIdx with a non-constant index has no by-index \
-                         encoding (the ISA's ldobjbyindex takes a compile-time immediate)"
-                        .into(),
-                });
-            };
-            ensure_acc(tracker, func_id, *object, alloc, codes)?;
-            codes.push(Bytecode::Ldobjbyindex(ic.two(), imm));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StorePropIdx {
-            object,
-            index,
-            value,
-        } => {
-            let Some(imm) = fused_index_imm(module, *index, suppression) else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "StorePropIdx with a non-constant index has no by-index \
-                         encoding (the ISA's stobjbyindex takes a compile-time immediate)"
-                        .into(),
-                });
-            };
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Stobjbyindex(ic.two(), regs[0], imm));
-        }
-        Op::StoreOwnPropName {
-            object,
-            name,
-            value,
-        } => {
-            // Own-property DEFINITION (`N60`): vendor `stownbyname` — no
-            // setters, no prototype walk.
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
-        }
-        Op::StoreOwnPropDyn { object, key, value } => {
-            // Vendor `stownbyvalue` (`N60`): v1 = receiver, v2 = propKey,
-            // acc = VALUE.
-            let regs = materialize_operands(
-                tracker,
-                func_id,
-                &[*object, *key],
-                Some(*value),
-                alloc,
-                codes,
-            )?;
-            codes.push(Bytecode::Stownbyvalue(ic.two(), regs[0], regs[1]));
-        }
-        Op::StoreOwnPropIdx {
-            object,
-            index,
-            value,
-        } => {
-            let Some(imm) = fused_index_imm(module, *index, suppression) else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "StoreOwnPropIdx with a non-constant index has no by-index \
-                         encoding (the ISA's stownbyindex takes a compile-time immediate)"
-                        .into(),
-                });
-            };
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Stownbyindex(ic.two(), regs[0], imm));
-        }
-        Op::DeleteProp { object, key } => {
-            // Vendor (N65): `delobjprop v0` takes the OBJECT in the
-            // register operand and the KEY in acc.
-            let regs =
-                materialize_operands(tracker, func_id, &[*object], Some(*key), alloc, codes)?;
-            codes.push(Bytecode::Delobjprop(regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::TestProp { .. } => {
-            return Err(LowerError::UnsupportedInstruction {
-                func: func_id,
-                message: "TestProp has no v0.1 lowering equivalent (never produced by \
-                     the lift; the `in` family lowers through Compare)"
-                    .into(),
-            });
-        }
-        Op::CopyDataProps { dst, src } => {
-            // Vendor `copydataproperties v:in:top, acc: inout:top`: the
-            // register operand is the target, the accumulator carries the
-            // source (and receives the result). dst is resolved to its
-            // home first, then src is brought into acc (tracker-aware).
-            // No entity operands — nothing for the tracer/relocation
-            // channel. The bytecode writes acc but the IR instruction has
-            // no result, so the acc content is afterwards untracked.
-            let regs = materialize_operands(tracker, func_id, &[*dst], Some(*src), alloc, codes)?;
-            codes.push(Bytecode::Copydataproperties(regs[0]));
-            *tracker = AccContent::Unknown;
-        }
-        Op::ArraySpread { dst, index, src } => {
-            // Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
-            // (isa.yaml:1329-1332): v1 = destination array, v2 = start
-            // index, acc = source iterable; acc out = the NEW INDEX (the
-            // IR result). Register operands first, then the acc operand
-            // (B3 ordering); the result is homed per `acc: inout`.
-            let regs =
-                materialize_operands(tracker, func_id, &[*dst, *index], Some(*src), alloc, codes)?;
-            codes.push(Bytecode::Starrayspread(regs[0], regs[1]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Private properties ───────────────────────────────────────
-        Op::LoadPrivate { level, slot, obj } => {
-            // Vendor `ldprivateproperty imm1:u8, imm2:u16, imm3:u16,
-            // acc: inout:top` (isa.yaml:436-440, two_slot): acc in =
-            // the object, acc out = the private value.
-            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
-            codes.push(Bytecode::Ldprivateproperty(
-                ic.two(),
-                Imm(*level as i64),
-                Imm(*slot as i64),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StorePrivate {
-            level,
-            slot,
-            obj,
-            value,
-        } => {
-            // Vendor `stprivateproperty imm1, imm2, imm3, v:in:top,
-            // acc: in:top` (isa.yaml:441-445, two_slot): obj = register
-            // operand, value = acc. The bytecode only READS acc — the
-            // tracker is untouched.
-            let regs = materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Stprivateproperty(
-                ic.two(),
-                Imm(*level as i64),
-                Imm(*slot as i64),
-                regs[0],
-            ));
-        }
-        Op::DefinePrivate {
-            level,
-            slot,
-            obj,
-            value,
-        } => {
-            // Vendor `callruntime.defineprivateproperty imm1, imm2,
-            // imm3, v:in:top, acc: in:top` (isa.yaml:849-854,
-            // two_slot): obj = register operand, value = acc. acc
-            // read-only — the tracker is untouched.
-            let regs = materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::CallruntimeDefineprivateproperty(
-                ic.two(),
-                Imm(*level as i64),
-                Imm(*slot as i64),
-                regs[0],
-            ));
-        }
-        Op::TestPrivate { level, slot, obj } => {
-            // Vendor `testin imm1:u8, imm2:u16, imm3:u16,
-            // acc: inout:top` (isa.yaml:446-450, two_slot): acc in =
-            // the object, acc out = the boolean result.
-            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
-            codes.push(Bytecode::Testin(
-                ic.two(),
-                Imm(*level as i64),
-                Imm(*slot as i64),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::CreatePrivateNames { count, names } => {
-            // Vendor `callruntime.createprivateproperty imm:u16,
-            // literalarray_id, acc: none` (isa.yaml:843-848): no acc
-            // effect — the tracker is untouched.
-            codes.push(Bytecode::CallruntimeCreateprivateproperty(
-                Imm(*count as i64),
-                tracer.literal_eid(*names),
-            ));
-        }
-        Op::LoadSuper { key, this_value } => {
-            match key {
-                SuperKey::Name(name) => {
-                    codes.push(Bytecode::Ldsuperbyname(ic.two(), tracer.eid(*name)));
+            Op::CreateObjectWithExcludedKeys { obj, keys } => {
+                // #55: `createobjectwithexcludedkeys` has `range_1` (`isa.yaml:498`),
+                // reading `imm + 1` consecutive key registers (`imm = keys.len() - 1`).
+                // Empty `keys` (`let { ...rest } = obj`) lowers via `createemptyobject`
+                // + `copydataproperties` using the reserved 1-slot call window.
+                if keys.is_empty() {
+                    let wbase = alloc
+                        .call_window_base
+                        .ok_or(LowerError::MissingCallWindow(func_id))?;
+                    if wbase > 255 {
+                        return Err(LowerError::CallWindowOverflow(func_id));
+                    }
+                    codes.push(Bytecode::Createemptyobject);
+                    codes.push(Bytecode::Sta(Reg(wbase)));
+                    ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                    codes.push(Bytecode::Copydataproperties(Reg(wbase)));
+                    home_result(tracker, result, used, func_id, alloc, codes)?;
+                } else {
+                    let imm_val = keys.len() - 1;
+                    if imm_val > usize::from(u16::MAX) {
+                        return Err(LowerError::CallArgcOverflow {
+                            func: func_id,
+                            argc: keys.len(),
+                        });
+                    }
+                    let regs = materialize_operands(tracker, func_id, &[*obj], None, alloc, codes)?;
+                    let obj_r = regs[0];
+                    let start_r = fill_excluded_keys_window(func_id, keys, alloc, codes)?;
+                    let imm = Imm(imm_val as i64);
+                    let bc = if imm_val <= 255 {
+                        Bytecode::Createobjectwithexcludedkeys(imm, obj_r, start_r)
+                    } else {
+                        Bytecode::WideCreateobjectwithexcludedkeys(imm, obj_r, start_r)
+                    };
+                    codes.push(bc);
+                    home_result(tracker, result, used, func_id, alloc, codes)?;
                 }
-                SuperKey::Dynamic(k) => {
-                    // Vendor `ldsuperbyvalue imm, v; acc: inout`:
-                    // v = thisValue, acc = the KEY (N74-W4).
+            }
+            Op::SetObjectWithProto { proto, obj } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*proto], Some(*obj), alloc, codes)?;
+                codes.push(Bytecode::Setobjectwithproto(self.ic.two(), regs[0]));
+            }
+
+            // ── Property access ──────────────────────────────────────────
+            Op::LoadProp { object, name } => {
+                ensure_acc(tracker, func_id, *object, alloc, codes)?;
+                codes.push(Bytecode::Ldobjbyname(self.ic.two(), self.tracer.eid(*name)));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StoreProp {
+                object,
+                name,
+                value,
+            } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Stobjbyname(
+                    self.ic.two(),
+                    self.tracer.eid(*name),
+                    regs[0],
+                ));
+            }
+            Op::LoadPropDyn { object, key } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*key), alloc, codes)?;
+                codes.push(Bytecode::Ldobjbyvalue(self.ic.two(), regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StorePropDyn { object, key, value } => {
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*object, *key],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Stobjbyvalue(self.ic.two(), regs[0], regs[1]));
+            }
+            Op::LoadPropIdx { object, index } => {
+                // R3-X5 + R3-H7: Exact `0..=u32::MAX` fused index selects narrow/wide
+                // `ldobjbyindex`; any non-constant / out-of-range / `-0.0` / multi-use
+                // index falls back to `ldobjbyvalue`.
+                if let Some(idx) = fused_index_u32(module, *index, suppression) {
+                    ensure_acc(tracker, func_id, *object, alloc, codes)?;
+                    if idx <= u32::from(u16::MAX) {
+                        codes.push(Bytecode::Ldobjbyindex(self.ic.two(), Imm(i64::from(idx))));
+                    } else {
+                        codes.push(Bytecode::WideLdobjbyindex(Imm(i64::from(idx))));
+                    }
+                } else {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*object],
+                        Some(*index),
+                        alloc,
+                        codes,
+                    )?;
+                    codes.push(Bytecode::Ldobjbyvalue(self.ic.two(), regs[0]));
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StorePropIdx {
+                object,
+                index,
+                value,
+            } => {
+                if let Some(idx) = fused_index_u32(module, *index, suppression) {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*object],
+                        Some(*value),
+                        alloc,
+                        codes,
+                    )?;
+                    if idx <= u32::from(u16::MAX) {
+                        codes.push(Bytecode::Stobjbyindex(
+                            self.ic.two(),
+                            regs[0],
+                            Imm(i64::from(idx)),
+                        ));
+                    } else {
+                        codes.push(Bytecode::WideStobjbyindex(regs[0], Imm(i64::from(idx))));
+                    }
+                } else {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*object, *index],
+                        Some(*value),
+                        alloc,
+                        codes,
+                    )?;
+                    codes.push(Bytecode::Stobjbyvalue(self.ic.two(), regs[0], regs[1]));
+                }
+            }
+            Op::StoreOwnPropName {
+                object,
+                name,
+                value,
+                kind,
+            } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
+                let eid = self.tracer.eid(*name);
+                let bc = match kind {
+                    OwnStoreKind::OwnProp => Bytecode::Stownbyname(self.ic.two(), eid, regs[0]),
+                    OwnStoreKind::OwnPropWithNameSet => {
+                        Bytecode::Stownbynamewithnameset(self.ic.two(), eid, regs[0])
+                    }
+                    OwnStoreKind::ClassField => {
+                        Bytecode::Definefieldbyname(self.ic.two(), eid, regs[0])
+                    }
+                    OwnStoreKind::DefineProperty => {
+                        Bytecode::Definepropertybyname(self.ic.two(), eid, regs[0])
+                    }
+                };
+                codes.push(bc);
+            }
+            Op::StoreOwnPropDyn {
+                object,
+                key,
+                value,
+                kind,
+            } => {
+                if matches!(kind, OwnStoreKind::DefineProperty) {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "StoreOwnPropDyn with OwnStoreKind::DefineProperty has no opcode"
+                            .into(),
+                    });
+                }
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*object, *key],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
+                let bc = match kind {
+                    OwnStoreKind::OwnProp => {
+                        Bytecode::Stownbyvalue(self.ic.two(), regs[0], regs[1])
+                    }
+                    OwnStoreKind::OwnPropWithNameSet => {
+                        Bytecode::Stownbyvaluewithnameset(self.ic.two(), regs[0], regs[1])
+                    }
+                    OwnStoreKind::ClassField => {
+                        Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[0], regs[1])
+                    }
+                    OwnStoreKind::DefineProperty => unreachable!("rejected above"),
+                };
+                codes.push(bc);
+            }
+            Op::StoreOwnPropIdx {
+                object,
+                index,
+                value,
+                kind,
+            } => {
+                if !matches!(kind, OwnStoreKind::OwnProp | OwnStoreKind::ClassField) {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!("StoreOwnPropIdx has no encoding for {kind:?}"),
+                    });
+                }
+                if let Some(idx) = fused_index_u32(module, *index, suppression) {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*object],
+                        Some(*value),
+                        alloc,
+                        codes,
+                    )?;
+                    match kind {
+                        OwnStoreKind::OwnProp => {
+                            if idx <= u32::from(u16::MAX) {
+                                codes.push(Bytecode::Stownbyindex(
+                                    self.ic.two(),
+                                    regs[0],
+                                    Imm(i64::from(idx)),
+                                ));
+                            } else {
+                                codes
+                                    .push(Bytecode::WideStownbyindex(regs[0], Imm(i64::from(idx))));
+                            }
+                        }
+                        OwnStoreKind::ClassField => {
+                            codes.push(Bytecode::CallruntimeDefinefieldbyindex(
+                                self.ic.two(),
+                                Imm(i64::from(idx)),
+                                regs[0],
+                            ));
+                        }
+                        _ => unreachable!("checked above"),
+                    }
+                } else {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*object, *index],
+                        Some(*value),
+                        alloc,
+                        codes,
+                    )?;
+                    let bc = match kind {
+                        OwnStoreKind::OwnProp => {
+                            Bytecode::Stownbyvalue(self.ic.two(), regs[0], regs[1])
+                        }
+                        OwnStoreKind::ClassField => {
+                            Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[0], regs[1])
+                        }
+                        _ => unreachable!("checked above"),
+                    };
+                    codes.push(bc);
+                }
+            }
+            Op::DeleteProp { object, key } => {
+                // Vendor (N65): `delobjprop v0` takes the OBJECT in the
+                // register operand and the KEY in acc.
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*key), alloc, codes)?;
+                codes.push(Bytecode::Delobjprop(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::TestProp { .. } => {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: "TestProp has no v0.1 lowering equivalent (never produced by \
+                     the lift; the `in` family lowers through Compare)"
+                        .into(),
+                });
+            }
+            Op::CopyDataProps { dst, src } => {
+                // Vendor `copydataproperties v:in:top, acc: inout:top`: the
+                // register operand is the target, the accumulator carries the
+                // source (and receives the result). dst is resolved to its
+                // home first, then src is brought into acc (tracker-aware).
+                // No entity operands — nothing for the tracer/relocation
+                // channel. The bytecode writes acc but the IR instruction has
+                // no result, so the acc content is afterwards untracked.
+                let regs =
+                    materialize_operands(tracker, func_id, &[*dst], Some(*src), alloc, codes)?;
+                codes.push(Bytecode::Copydataproperties(regs[0]));
+                *tracker = AccContent::Unknown;
+            }
+            Op::ArraySpread { dst, index, src } => {
+                // Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
+                // (isa.yaml:1329-1332): v1 = destination array, v2 = start
+                // index, acc = source iterable; acc out = the NEW INDEX (the
+                // IR result). Register operands first, then the acc operand
+                // (B3 ordering); the result is homed per `acc: inout`.
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*dst, *index],
+                    Some(*src),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Starrayspread(regs[0], regs[1]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Private properties ───────────────────────────────────────
+            Op::LoadPrivate { level, slot, obj } => {
+                ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                codes.push(Bytecode::Ldprivateproperty(
+                    self.ic.two(),
+                    Imm(*level as i64),
+                    Imm(*slot as i64),
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StorePrivate {
+                level,
+                slot,
+                obj,
+                value,
+            } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Stprivateproperty(
+                    self.ic.two(),
+                    Imm(*level as i64),
+                    Imm(*slot as i64),
+                    regs[0],
+                ));
+            }
+            Op::DefinePrivate {
+                level,
+                slot,
+                obj,
+                value,
+            } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::CallruntimeDefineprivateproperty(
+                    self.ic.two(),
+                    Imm(*level as i64),
+                    Imm(*slot as i64),
+                    regs[0],
+                ));
+            }
+            Op::TestPrivate { level, slot, obj } => {
+                ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                codes.push(Bytecode::Testin(
+                    self.ic.two(),
+                    Imm(*level as i64),
+                    Imm(*slot as i64),
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::CreatePrivateNames { count, names } => {
+                codes.push(Bytecode::CallruntimeCreateprivateproperty(
+                    Imm(*count as i64),
+                    self.tracer.literal_eid(*names),
+                ));
+            }
+            Op::LoadSuper { key, this_value } => {
+                match key {
+                    SuperKey::Name(name) => {
+                        // R3-H1: `ldsuperbyname` reads `this_value` from `acc` (`acc: inout:top`).
+                        ensure_acc(tracker, func_id, *this_value, alloc, codes)?;
+                        codes.push(Bytecode::Ldsuperbyname(
+                            self.ic.two(),
+                            self.tracer.eid(*name),
+                        ));
+                    }
+                    SuperKey::Dynamic(k) => {
+                        let regs = materialize_operands(
+                            tracker,
+                            func_id,
+                            &[*this_value],
+                            Some(*k),
+                            alloc,
+                            codes,
+                        )?;
+                        codes.push(Bytecode::Ldsuperbyvalue(self.ic.two(), regs[0]));
+                    }
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StoreSuper {
+                key,
+                this_value,
+                value,
+            } => match key {
+                SuperKey::Name(name) => {
                     let regs = materialize_operands(
                         tracker,
                         func_id,
                         &[*this_value],
-                        Some(*k),
+                        Some(*value),
                         alloc,
                         codes,
                     )?;
-                    codes.push(Bytecode::Ldsuperbyvalue(ic.two(), regs[0]));
+                    codes.push(Bytecode::Stsuperbyname(
+                        self.ic.two(),
+                        self.tracer.eid(*name),
+                        regs[0],
+                    ));
                 }
+                SuperKey::Dynamic(k) => {
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*this_value, *k],
+                        Some(*value),
+                        alloc,
+                        codes,
+                    )?;
+                    codes.push(Bytecode::Stsuperbyvalue(self.ic.two(), regs[0], regs[1]));
+                }
+            },
+
+            // ── Global variables ─────────────────────────────────────────
+            Op::TryGetGlobal { name, default } => {
+                match default {
+                    None => {
+                        codes.push(Bytecode::Ldglobalvar(self.ic.one(), self.tracer.eid(*name)));
+                    }
+                    Some(dflt) => {
+                        let fused = suppression.values.contains(dflt)
+                            || matches!(
+                                module.value(*dflt).map(|v| v.def),
+                                Some(ValueDef::Const(cid))
+                                    if matches!(module.consts.get(cid), Some(Const::Undefined))
+                            );
+                        if !fused {
+                            return Err(LowerError::UnsupportedInstruction {
+                                func: func_id,
+                                message: "TryGetGlobal with a non-undefined default has no \
+                                 vendor encoding (tryldglobalbyname's fallback is undefined)"
+                                    .into(),
+                            });
+                        }
+                        codes.push(Bytecode::Tryldglobalbyname(
+                            self.ic.one(),
+                            self.tracer.eid(*name),
+                        ));
+                    }
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
             }
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StoreSuper {
-            key,
-            this_value,
-            value,
-        } => match key {
-            SuperKey::Name(name) => {
-                // Vendor `stsuperbyname imm, string_id, v; acc: in`:
-                // v = thisValue, acc = the value (N74-W4).
-                let regs = materialize_operands(
-                    tracker,
-                    func_id,
-                    &[*this_value],
-                    Some(*value),
-                    alloc,
-                    codes,
-                )?;
-                codes.push(Bytecode::Stsuperbyname(
-                    ic.two(),
-                    tracer.eid(*name),
-                    regs[0],
+            Op::StoreGlobal { name, value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::Stglobalvar(self.ic.one(), self.tracer.eid(*name)));
+            }
+            Op::StoreGlobalRecord {
+                name,
+                value,
+                is_const,
+            } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                let eid = self.tracer.eid(*name);
+                codes.push(if *is_const {
+                    Bytecode::Stconsttoglobalrecord(self.ic.one(), eid)
+                } else {
+                    Bytecode::Sttoglobalrecord(self.ic.one(), eid)
+                });
+            }
+            Op::TryStoreGlobal { name, value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::Trystglobalbyname(
+                    self.ic.one(),
+                    self.tracer.eid(*name),
                 ));
             }
-            SuperKey::Dynamic(k) => {
-                // Vendor `stsuperbyvalue imm, v1, v2; acc: in`: v1 =
-                // thisValue, v2 = key, acc = value (N74-W4).
+
+            // ── Lexical variables (`#55` `LexEnvKind` + `R3-H7` `wide.*`) ──
+            Op::GetLexVar { level, slot, kind } => {
+                let bc = match kind {
+                    LexEnvKind::Plain => {
+                        if *level <= 255 && *slot <= 255 {
+                            Bytecode::Ldlexvar(Imm(i64::from(*level)), Imm(i64::from(*slot)))
+                        } else {
+                            Bytecode::WideLdlexvar(Imm(i64::from(*level)), Imm(i64::from(*slot)))
+                        }
+                    }
+                    LexEnvKind::Sendable => {
+                        if *level <= 255 && *slot <= 255 {
+                            Bytecode::CallruntimeLdsendablevar(
+                                Imm(i64::from(*level)),
+                                Imm(i64::from(*slot)),
+                            )
+                        } else {
+                            Bytecode::CallruntimeWideldsendablevar(
+                                Imm(i64::from(*level)),
+                                Imm(i64::from(*slot)),
+                            )
+                        }
+                    }
+                    LexEnvKind::Patch => {
+                        if *level != 0 {
+                            return Err(LowerError::UnsupportedInstruction {
+                                func: func_id,
+                                message: format!("GetLexVar Patch requires level 0, got {level}"),
+                            });
+                        }
+                        Bytecode::WideLdpatchvar(Imm(i64::from(*slot)))
+                    }
+                };
+                codes.push(bc);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::PutLexVar {
+                level,
+                slot,
+                value,
+                kind,
+            } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                let bc = match kind {
+                    LexEnvKind::Plain => {
+                        if *level <= 255 && *slot <= 255 {
+                            Bytecode::Stlexvar(Imm(i64::from(*level)), Imm(i64::from(*slot)))
+                        } else {
+                            Bytecode::WideStlexvar(Imm(i64::from(*level)), Imm(i64::from(*slot)))
+                        }
+                    }
+                    LexEnvKind::Sendable => {
+                        if *level <= 255 && *slot <= 255 {
+                            Bytecode::CallruntimeStsendablevar(
+                                Imm(i64::from(*level)),
+                                Imm(i64::from(*slot)),
+                            )
+                        } else {
+                            Bytecode::CallruntimeWidestsendablevar(
+                                Imm(i64::from(*level)),
+                                Imm(i64::from(*slot)),
+                            )
+                        }
+                    }
+                    LexEnvKind::Patch => {
+                        if *level != 0 {
+                            return Err(LowerError::UnsupportedInstruction {
+                                func: func_id,
+                                message: format!("PutLexVar Patch requires level 0, got {level}"),
+                            });
+                        }
+                        Bytecode::WideStpatchvar(Imm(i64::from(*slot)))
+                    }
+                };
+                codes.push(bc);
+            }
+            Op::NewLexEnv { num_vars, kind } => match kind {
+                LexEnvKind::Plain => {
+                    if *num_vars <= 255 {
+                        codes.push(Bytecode::Newlexenv(Imm(i64::from(*num_vars))));
+                    } else {
+                        codes.push(Bytecode::WideNewlexenv(Imm(i64::from(*num_vars))));
+                    }
+                    home_result(tracker, result, used, func_id, alloc, codes)?;
+                }
+                LexEnvKind::Sendable => {
+                    if *num_vars <= 255 {
+                        codes.push(Bytecode::CallruntimeNewsendableenv(Imm(i64::from(
+                            *num_vars,
+                        ))));
+                    } else {
+                        codes.push(Bytecode::CallruntimeWidenewsendableenv(Imm(i64::from(
+                            *num_vars,
+                        ))));
+                    }
+                    if let Some(v) = result
+                        && used.contains(&v)
+                    {
+                        home_result(tracker, result, used, func_id, alloc, codes)?;
+                    }
+                }
+                LexEnvKind::Patch => {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "NewLexEnv cannot use LexEnvKind::Patch".into(),
+                    });
+                }
+            },
+            Op::NewLexEnvWithName {
+                num_vars,
+                scope_names,
+            } => {
+                let eid = self.tracer.literal_eid(*scope_names);
+                if *num_vars <= 255 {
+                    codes.push(Bytecode::Newlexenvwithname(Imm(i64::from(*num_vars)), eid));
+                } else {
+                    codes.push(Bytecode::WideNewlexenvwithname(
+                        Imm(i64::from(*num_vars)),
+                        eid,
+                    ));
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::PopLexEnv => {
+                codes.push(Bytecode::Poplexenv);
+            }
+
+            // ── Module variables ─────────────────────────────────────────
+            Op::LoadModuleVar { index, kind } => {
+                use abcd_ir::ModuleVarKind;
+                let bc = match (*kind, u8::try_from(*index), u16::try_from(*index)) {
+                    (ModuleVarKind::Local, Ok(n), _) => {
+                        Bytecode::Ldlocalmodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::Local, Err(_), Ok(w)) => {
+                        Bytecode::WideLdlocalmodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::External, Ok(n), _) => {
+                        Bytecode::Ldexternalmodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::External, Err(_), Ok(w)) => {
+                        Bytecode::WideLdexternalmodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::Lazy, Ok(n), _) => {
+                        Bytecode::CallruntimeLdlazymodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::Lazy, Err(_), Ok(w)) => {
+                        Bytecode::CallruntimeWideldlazymodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::SendableLocal, Ok(n), _) => {
+                        Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::SendableLocal, Err(_), Ok(w)) => {
+                        Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::SendableExternal, Ok(n), _) => {
+                        Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::SendableExternal, Err(_), Ok(w)) => {
+                        Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::LazySendable, Ok(n), _) => {
+                        Bytecode::CallruntimeLdlazysendablemodulevar(Imm(i64::from(n)))
+                    }
+                    (ModuleVarKind::LazySendable, Err(_), Ok(w)) => {
+                        Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(i64::from(w)))
+                    }
+                    (ModuleVarKind::SendableClass, _, Ok(w)) => {
+                        Bytecode::CallruntimeLdsendableclass(Imm(i64::from(w)))
+                    }
+                    (_, _, Err(_)) => {
+                        return Err(LowerError::UnsupportedInstruction {
+                            func: func_id,
+                            message: format!("LoadModuleVar index {index} exceeds u16::MAX"),
+                        });
+                    }
+                };
+                codes.push(bc);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::StoreModuleVar { index, value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                if let Ok(n) = u8::try_from(*index) {
+                    codes.push(Bytecode::Stmodulevar(Imm(i64::from(n))));
+                } else if let Ok(w) = u16::try_from(*index) {
+                    codes.push(Bytecode::WideStmodulevar(Imm(i64::from(w))));
+                } else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!("StoreModuleVar index {index} exceeds u16::MAX"),
+                    });
+                }
+            }
+            Op::GetModuleNamespace { index } => {
+                if let Ok(n) = u8::try_from(*index) {
+                    codes.push(Bytecode::Getmodulenamespace(Imm(i64::from(n))));
+                } else if let Ok(w) = u16::try_from(*index) {
+                    codes.push(Bytecode::WideGetmodulenamespace(Imm(i64::from(w))));
+                } else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!("GetModuleNamespace index {index} exceeds u16::MAX"),
+                    });
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::DynamicImport { specifier } => {
+                ensure_acc(tracker, func_id, *specifier, alloc, codes)?;
+                codes.push(Bytecode::Dynamicimport);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Function / Class definition ──────────────────────────────
+            Op::DefineFunc {
+                body,
+                captures,
+                length,
+            } => {
+                if !captures.is_empty() {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "DefineFunc with explicit captures has no vendor encoding \
+                         (es2abc closure captures are lexenv-based)"
+                            .into(),
+                    });
+                }
+                codes.push(Bytecode::Definefunc(
+                    self.ic.one(),
+                    self.tracer.method_eid(*body),
+                    Imm(i64::from(*length)),
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::DefineMethod {
+                object,
+                func,
+                length,
+                ..
+            } => {
+                let Some(body) = fused_definefunc_body(module, *func, suppression) else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "DefineMethod of a non-fused closure (expected the lift's \
+                         DefineFunc + AllocClosure chain)"
+                            .into(),
+                    });
+                };
+                ensure_acc(tracker, func_id, *object, alloc, codes)?;
+                codes.push(Bytecode::Definemethod(
+                    self.ic.one(),
+                    self.tracer.method_eid(body),
+                    Imm(i64::from(*length)),
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::DefineClass(cls) => {
+                let DefineClassData {
+                    ctor,
+                    heritage,
+                    members,
+                    member_attrs: _,
+                    count,
+                } = cls.as_ref();
+                let Some(base) = heritage else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "DefineClass without a heritage register has no \
+                         defineclasswithbuffer encoding"
+                            .into(),
+                    });
+                };
+                let base_r = val_reg(func_id, *base, alloc, codes, 0)?;
+                codes.push(Bytecode::Defineclasswithbuffer(
+                    self.ic.one(),
+                    self.tracer.method_eid(*ctor),
+                    self.tracer.literal_eid(*members),
+                    Imm(i64::from(*count)),
+                    base_r,
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::DefineSendableClass(cls) => {
+                let DefineClassData {
+                    ctor,
+                    heritage,
+                    members,
+                    member_attrs: _,
+                    count,
+                } = cls.as_ref();
+                let Some(base) = heritage else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "DefineSendableClass without a heritage register has no \
+                         callruntime.definesendableclass encoding"
+                            .into(),
+                    });
+                };
+                let base_r = val_reg(func_id, *base, alloc, codes, 0)?;
+                codes.push(Bytecode::CallruntimeDefinesendableclass(
+                    self.ic.one(),
+                    self.tracer.method_eid(*ctor),
+                    self.tracer.literal_eid(*members),
+                    Imm(i64::from(*count)),
+                    base_r,
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::DefineGetterSetterByValue {
+                obj,
+                key,
+                getter,
+                setter,
+                set_name,
+            } => {
+                // R3-H2: `definegettersetterbyvalue` takes `set_name` boolean in `acc`!
                 let regs = materialize_operands(
                     tracker,
                     func_id,
-                    &[*this_value, *k],
+                    &[*obj, *key, *getter, *setter],
+                    Some(*set_name),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Definegettersetterbyvalue(
+                    regs[0], regs[1], regs[2], regs[3],
+                ));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Calls ────────────────────────────────────────────────────
+            Op::Call {
+                callee,
+                this,
+                args,
+                kind,
+            } => {
+                self.select_call(*kind, *callee, *this, args, codes, tracker)?;
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Special value loaders ────────────────────────────────────
+            Op::LoadSymbol => {
+                codes.push(Bytecode::Ldsymbol);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::LoadNewTarget => {
+                codes.push(Bytecode::Ldnewtarget);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::LoadGlobalObject => {
+                codes.push(Bytecode::Ldglobal);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::LoadFunction => {
+                codes.push(Bytecode::Ldfunction);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::GetUnmappedArgs => {
+                codes.push(Bytecode::Getunmappedargs);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::CopyRestArgs { start_index } => {
+                if *start_index <= 255 {
+                    codes.push(Bytecode::Copyrestargs(Imm(i64::from(*start_index))));
+                } else {
+                    codes.push(Bytecode::WideCopyrestargs(Imm(i64::from(*start_index))));
+                }
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::GetTemplateObject { literal } => {
+                ensure_acc(tracker, func_id, *literal, alloc, codes)?;
+                codes.push(Bytecode::Gettemplateobject(self.ic.one()));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Iterators ────────────────────────────────────────────────
+            Op::GetIterator { obj } => {
+                ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                codes.push(Bytecode::Getiterator(self.ic.two()));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::GetAsyncIterator { obj } => {
+                ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                codes.push(Bytecode::Getasynciterator(self.ic.two()));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::GetPropIterator { obj } => {
+                ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+                codes.push(Bytecode::Getpropiterator);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::IteratorNext { .. } | Op::IteratorThrow { .. } => {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: "IteratorNext/IteratorThrow has no v0.1 lowering equivalent \
+                     (never produced by the lift)"
+                        .into(),
+                });
+            }
+            Op::IteratorReturn { iterator } => {
+                let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
+                codes.push(Bytecode::Closeiterator(self.ic.two(), iter_r));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::NextPropName { iterator } => {
+                let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
+                codes.push(Bytecode::Getnextpropname(iter_r));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Generator / Async / Concurrent (`#55`) ───────────────────
+            Op::CreateGenerator { func } => {
+                let func_r = val_reg(func_id, *func, alloc, codes, 0)?;
+                codes.push(Bytecode::Creategeneratorobj(func_r));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::CreateAsyncGenerator { func } => {
+                let func_r = val_reg(func_id, *func, alloc, codes, 0)?;
+                codes.push(Bytecode::Createasyncgeneratorobj(func_r));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::SetGeneratorState { genobj, state } => {
+                ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
+                codes.push(Bytecode::Setgeneratorstate(Imm(i64::from(*state))));
+            }
+            Op::SuspendGenerator { genobj, value } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*genobj], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Suspendgenerator(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::ResumeGenerator { genobj } => {
+                ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
+                codes.push(Bytecode::Resumegenerator);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::GetResumeMode { genobj } => {
+                ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
+                codes.push(Bytecode::Getresumemode);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::Await { .. } => {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: "Await has no v0.1 lowering equivalent (es2abc's await form is \
+                     asyncfunctionawaituncaught — Op::AwaitUncaught)"
+                        .into(),
+                });
+            }
+            Op::AwaitUncaught { funcobj, value } => {
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*funcobj],
                     Some(*value),
                     alloc,
                     codes,
                 )?;
-                codes.push(Bytecode::Stsuperbyvalue(ic.two(), regs[0], regs[1]));
+                codes.push(Bytecode::Asyncfunctionawaituncaught(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
             }
-        },
-
-        // ── Global variables ─────────────────────────────────────────
-        Op::TryGetGlobal { name, default } => {
-            match default {
-                None => {
-                    // The THROWING form: ldglobalvar.
-                    codes.push(Bytecode::Ldglobalvar(ic.one(), tracer.eid(*name)));
-                }
-                Some(dflt) => {
-                    // The tolerant form: the default must be the fused
-                    // `LoadConst(undefined)` (suppressed — or the shared
-                    // frame-initial undefined constant), else there is no
-                    // vendor encoding.
-                    let fused = suppression.values.contains(dflt)
-                        || matches!(
-                            module.value(*dflt).map(|v| v.def),
-                            Some(ValueDef::Const(cid))
-                                if matches!(module.consts.get(cid), Some(Const::Undefined))
-                        );
-                    if !fused {
-                        return Err(LowerError::UnsupportedInstruction {
-                            func: func_id,
-                            message: "TryGetGlobal with a non-undefined default has no \
-                                 vendor encoding (tryldglobalbyname's fallback is undefined)"
-                                .into(),
-                        });
-                    }
-                    codes.push(Bytecode::Tryldglobalbyname(ic.one(), tracer.eid(*name)));
-                }
+            Op::AsyncFunctionEnter => {
+                codes.push(Bytecode::Asyncfunctionenter);
+                home_result(tracker, result, used, func_id, alloc, codes)?;
             }
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StoreGlobal { name, value } => {
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Stglobalvar(ic.one(), tracer.eid(*name)));
-        }
-        Op::StoreGlobalRecord {
-            name,
-            value,
-            is_const,
-        } => {
-            // The global LEXICAL record store (N72-C4): vendor
-            // sttoglobalrecord / stconsttoglobalrecord (isa.yaml:1585/
-            // :1574 — same op_imm_16_id_16 / one_slot / sixteen_bit_ic
-            // profile as stglobalvar, so the IC allocation is unchanged).
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            let eid = tracer.eid(*name);
-            codes.push(if *is_const {
-                Bytecode::Stconsttoglobalrecord(ic.one(), eid)
-            } else {
-                Bytecode::Sttoglobalrecord(ic.one(), eid)
-            });
-        }
-        Op::TryStoreGlobal { name, value } => {
-            // The tolerant store (`N61`): acc := value, then `trystglobalbyname`
-            // with ONE IC slot.
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Trystglobalbyname(ic.one(), tracer.eid(*name)));
-        }
-
-        // ── Lexical variables ────────────────────────────────────────
-        Op::GetLexVar { level, slot } => {
-            codes.push(Bytecode::Ldlexvar(Imm(*level as i64), Imm(*slot as i64)));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::PutLexVar { level, slot, value } => {
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Stlexvar(Imm(*level as i64), Imm(*slot as i64)));
-        }
-        Op::NewLexEnv { num_vars } => {
-            codes.push(Bytecode::Newlexenv(Imm(*num_vars as i64)));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::NewLexEnvWithName {
-            num_vars,
-            scope_names,
-        } => {
-            codes.push(Bytecode::Newlexenvwithname(
-                Imm(*num_vars as i64),
-                tracer.literal_eid(*scope_names),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::PopLexEnv => {
-            codes.push(Bytecode::Poplexenv);
-        }
-
-        // ── Module variables ─────────────────────────────────────────
-        Op::LoadModuleVar { index, kind } => {
-            use abcd_ir::ModuleVarKind;
-            let bc = match (*kind, u8::try_from(*index), u16::try_from(*index)) {
-                (ModuleVarKind::Local, Ok(n), _) => Bytecode::Ldlocalmodulevar(Imm(i64::from(n))),
-                (ModuleVarKind::Local, Err(_), Ok(w)) => {
-                    Bytecode::WideLdlocalmodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::External, Ok(n), _) => {
-                    Bytecode::Ldexternalmodulevar(Imm(i64::from(n)))
-                }
-                (ModuleVarKind::External, Err(_), Ok(w)) => {
-                    Bytecode::WideLdexternalmodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::Lazy, Ok(n), _) => {
-                    Bytecode::CallruntimeLdlazymodulevar(Imm(i64::from(n)))
-                }
-                (ModuleVarKind::Lazy, Err(_), Ok(w)) => {
-                    Bytecode::CallruntimeWideldlazymodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::SendableLocal, Ok(n), _) => {
-                    Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(i64::from(n)))
-                }
-                (ModuleVarKind::SendableLocal, Err(_), Ok(w)) => {
-                    Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::SendableExternal, Ok(n), _) => {
-                    Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(i64::from(n)))
-                }
-                (ModuleVarKind::SendableExternal, Err(_), Ok(w)) => {
-                    Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::LazySendable, Ok(n), _) => {
-                    Bytecode::CallruntimeLdlazysendablemodulevar(Imm(i64::from(n)))
-                }
-                (ModuleVarKind::LazySendable, Err(_), Ok(w)) => {
-                    Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(i64::from(w)))
-                }
-                (ModuleVarKind::SendableClass, _, Ok(w)) => {
-                    Bytecode::CallruntimeLdsendableclass(Imm(i64::from(w)))
-                }
-                (_, _, Err(_)) => {
-                    return Err(LowerError::UnsupportedInstruction {
-                        func: func_id,
-                        message: format!("LoadModuleVar index {index} exceeds u16::MAX"),
-                    });
-                }
-            };
-            codes.push(bc);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::StoreModuleVar { index, value } => {
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            if let Ok(n) = u8::try_from(*index) {
-                codes.push(Bytecode::Stmodulevar(Imm(i64::from(n))));
-            } else if let Ok(w) = u16::try_from(*index) {
-                codes.push(Bytecode::WideStmodulevar(Imm(i64::from(w))));
-            } else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: format!("StoreModuleVar index {index} exceeds u16::MAX"),
-                });
-            }
-        }
-        Op::GetModuleNamespace { index } => {
-            if let Ok(n) = u8::try_from(*index) {
-                codes.push(Bytecode::Getmodulenamespace(Imm(i64::from(n))));
-            } else if let Ok(w) = u16::try_from(*index) {
-                codes.push(Bytecode::WideGetmodulenamespace(Imm(i64::from(w))));
-            } else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: format!("GetModuleNamespace index {index} exceeds u16::MAX"),
-                });
-            }
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::DynamicImport { specifier } => {
-            ensure_acc(tracker, func_id, *specifier, alloc, codes)?;
-            codes.push(Bytecode::Dynamicimport);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Function / Class definition ──────────────────────────────
-        Op::DefineFunc {
-            body,
-            captures,
-            length,
-        } => {
-            // A standalone DefineFunc (never produced by the lift except
-            // fused into AllocClosure/DefineMethod — then it is
-            // suppressed): vendor definefunc IS the closure creation.
-            if !captures.is_empty() {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "DefineFunc with explicit captures has no vendor encoding \
-                         (es2abc closure captures are lexenv-based)"
-                        .into(),
-                });
-            }
-            codes.push(Bytecode::Definefunc(
-                ic.one(),
-                tracer.method_eid(*body),
-                Imm(i64::from(*length)),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::DefineMethod {
-            object,
-            func,
-            length,
-            ..
-        } => {
-            // Fusion: the `DefineFunc` + `AllocClosure` chain is suppressed;
-            // emit vendor `definemethod` (define + bind in one). The method's
-            // entity identity is the `DefineFunc` body's function-table index.
-            let Some(body) = fused_definefunc_body(module, *func, suppression) else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "DefineMethod of a non-fused closure (expected the lift's \
-                         DefineFunc + AllocClosure chain)"
-                        .into(),
-                });
-            };
-            ensure_acc(tracker, func_id, *object, alloc, codes)?;
-            codes.push(Bytecode::Definemethod(
-                ic.one(),
-                tracer.method_eid(body),
-                Imm(i64::from(*length)),
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::DefineClass(cls) => {
-            let DefineClassData {
-                ctor,
-                heritage,
-                members,
-                // B2: member_attrs is a lift-time semantic projection of the
-                // buffer — lowering re-emits the RAW buffer (byte fidelity),
-                // so the projection is ignored here by construction.
-                member_attrs: _,
-                count,
-            } = cls.as_ref();
-            let Some(base) = heritage else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "DefineClass without a heritage register has no \
-                         defineclasswithbuffer encoding"
-                        .into(),
-                });
-            };
-            let base_r = val_reg(func_id, *base, alloc, codes, 0)?;
-            codes.push(Bytecode::Defineclasswithbuffer(
-                ic.one(),
-                tracer.method_eid(*ctor),
-                tracer.literal_eid(*members),
-                // Vendor imm2 (_count): consumed by the runtime as the
-                // constructor's .length (RuntimeSetClassConstructorLength).
-                Imm(i64::from(*count)),
-                base_r,
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::DefineSendableClass(cls) => {
-            let DefineClassData {
-                ctor,
-                heritage,
-                members,
-                member_attrs: _,
-                count,
-            } = cls.as_ref();
-            // N53: re-emit the SENDABLE opcode
-            // (`callruntime.definesendableclass`, isa.yaml:861-866 —
-            // vendor `SlowRuntimeStub::CreateSharedClass`), NEVER the
-            // ordinary `defineclasswithbuffer`.
-            let Some(base) = heritage else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: "DefineSendableClass without a heritage register has no \
-                         callruntime.definesendableclass encoding"
-                        .into(),
-                });
-            };
-            let base_r = val_reg(func_id, *base, alloc, codes, 0)?;
-            codes.push(Bytecode::CallruntimeDefinesendableclass(
-                ic.one(),
-                tracer.method_eid(*ctor),
-                tracer.literal_eid(*members),
-                // Vendor imm2 (_count): consumed by CreateSharedClass as
-                // the constructor's .length, like the contemporary
-                // form's RuntimeSetClassConstructorLength (N15).
-                Imm(i64::from(*count)),
-                base_r,
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::DefineGetterSetterByValue {
-            obj,
-            key,
-            getter,
-            setter,
-        } => {
-            let regs = materialize_operands(
-                tracker,
-                func_id,
-                &[*obj, *key, *getter, *setter],
-                None,
-                alloc,
-                codes,
-            )?;
-            codes.push(Bytecode::Definegettersetterbyvalue(
-                regs[0], regs[1], regs[2], regs[3],
-            ));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Calls ────────────────────────────────────────────────────
-        Op::Call {
-            callee,
-            this,
-            args,
-            kind,
-        } => {
-            select_call(
-                *kind, *callee, *this, args, func_id, alloc, codes, ic, tracker,
-            )?;
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Special value loaders ────────────────────────────────────
-        Op::LoadNewTarget => {
-            codes.push(Bytecode::Ldnewtarget);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::LoadGlobalObject => {
-            codes.push(Bytecode::Ldglobal);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::LoadFunction => {
-            codes.push(Bytecode::Ldfunction);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::GetUnmappedArgs => {
-            codes.push(Bytecode::Getunmappedargs);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::CopyRestArgs { start_index } => {
-            codes.push(Bytecode::Copyrestargs(Imm(*start_index as i64)));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::GetTemplateObject { literal } => {
-            // Vendor `gettemplateobject imm:u16, acc: inout:top`
-            // (isa.yaml:1279-1283): ONE IC slot (`one_slot`); acc in =
-            // the template literal, acc out = the cached template
-            // object.
-            ensure_acc(tracker, func_id, *literal, alloc, codes)?;
-            codes.push(Bytecode::Gettemplateobject(ic.one()));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Iterators ────────────────────────────────────────────────
-        Op::GetIterator { obj } => {
-            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
-            codes.push(Bytecode::Getiterator(ic.two()));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::GetAsyncIterator { obj } => {
-            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
-            codes.push(Bytecode::Getasynciterator(ic.two()));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::GetPropIterator { obj } => {
-            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
-            codes.push(Bytecode::Getpropiterator);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::IteratorNext { .. } | Op::IteratorThrow { .. } => {
-            return Err(LowerError::UnsupportedInstruction {
-                func: func_id,
-                message: "IteratorNext/IteratorThrow has no v0.1 lowering equivalent \
-                     (never produced by the lift)"
-                    .into(),
-            });
-        }
-        Op::IteratorReturn { iterator } => {
-            // Emit `closeiterator`.
-            let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
-            codes.push(Bytecode::Closeiterator(ic.two(), iter_r));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::NextPropName { iterator } => {
-            // Vendor `getnextpropname v:in:top, acc: out:top`
-            // (isa.yaml:1289-1292): the iterator is a REGISTER operand
-            // (materialized from its home), the result name goes to acc.
-            let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
-            codes.push(Bytecode::Getnextpropname(iter_r));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Generator / Async ────────────────────────────────────────
-        Op::CreateGenerator { func } => {
-            let func_r = val_reg(func_id, *func, alloc, codes, 0)?;
-            codes.push(Bytecode::Creategeneratorobj(func_r));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::SuspendGenerator { genobj, value } => {
-            // Vendor `suspendgenerator v:in:top, acc: inout:top`
-            // (isa.yaml:1302-1305): the register operand is the generator
-            // object, the acc carries the yield value (and receives the
-            // resume result).
-            let regs =
-                materialize_operands(tracker, func_id, &[*genobj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Suspendgenerator(regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::ResumeGenerator { genobj } => {
-            // Vendor `resumegenerator` (isa.yaml:1261-1264):
-            // `acc: inout:top`, no register operand — genobj in acc,
-            // resume result back to acc.
-            ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
-            codes.push(Bytecode::Resumegenerator);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::GetResumeMode { genobj } => {
-            // Vendor `getresumemode` (isa.yaml:1270-1273):
-            // `acc: inout:top`, no register operand — genobj in acc,
-            // resume mode back to acc.
-            ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
-            codes.push(Bytecode::Getresumemode);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::Await { .. } => {
-            return Err(LowerError::UnsupportedInstruction {
-                func: func_id,
-                message: "Await has no v0.1 lowering equivalent (es2abc's await form is \
-                     asyncfunctionawaituncaught — Op::AwaitUncaught)"
-                    .into(),
-            });
-        }
-        Op::AwaitUncaught { funcobj, value } => {
-            // Vendor `asyncfunctionawaituncaught v:in:top,
-            // acc: inout:top` (isa.yaml:1311-1314): v0 is the async
-            // function object, the acc carries the awaited value (and
-            // receives the result).
-            let regs =
-                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Asyncfunctionawaituncaught(regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AsyncFunctionEnter => {
-            codes.push(Bytecode::Asyncfunctionenter);
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AsyncResolve { funcobj, value } => {
-            // Vendor `asyncfunctionresolve v:in:top, acc: inout:top`
-            // (isa.yaml:1413-1416): v0 = funcobj, acc = resolution value.
-            let regs =
-                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Asyncfunctionresolve(regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::AsyncReject { funcobj, value } => {
-            // Vendor `asyncfunctionreject v:in:top, acc: inout:top`
-            // (isa.yaml:1422-1425): v0 = funcobj, acc = rejection reason.
-            let regs =
-                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
-            codes.push(Bytecode::Asyncfunctionreject(regs[0]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-        Op::CreateIterResultObj { value, done } => {
-            let regs =
-                materialize_operands(tracker, func_id, &[*value, *done], None, alloc, codes)?;
-            codes.push(Bytecode::Createiterresultobj(regs[0], regs[1]));
-            home_result(tracker, result, used, func_id, alloc, codes)?;
-        }
-
-        // ── Exception handling ───────────────────────────────────────
-        Op::Throw { value } => {
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Throw);
-        }
-        Op::ThrowIfNotObject { value } => {
-            let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-            codes.push(Bytecode::ThrowIfnotobject(val_r));
-        }
-        Op::ThrowConstAssignment { name } => {
-            // Vendor `throw.constassignment v:in:top, acc: none`
-            // (isa.yaml:987-991): the register operand carries the name
-            // VALUE. No accumulator traffic.
-            let name_r = val_reg(func_id, *name, alloc, codes, 0)?;
-            codes.push(Bytecode::ThrowConstassignment(name_r));
-        }
-        Op::ThrowUndefinedIfHole { name, value } => {
-            // Vendor `throw.undefinedifhole v1:in:top, v2:in:top,
-            // acc: none` (isa.yaml:998-1002): v1 = name value, v2 =
-            // checked value; no accumulator traffic.
-            let regs =
-                materialize_operands(tracker, func_id, &[*name, *value], None, alloc, codes)?;
-            codes.push(Bytecode::ThrowUndefinedifhole(regs[0], regs[1]));
-        }
-        Op::ThrowUndefinedIfHoleWithName { name, value } => {
-            // Vendor `throw.undefinedifholewithname string_id,
-            // acc: in:top` (isa.yaml:1010-1015): the checked value rides
-            // the accumulator, the name is a compile-time string id.
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::ThrowUndefinedifholewithname(tracer.eid(*name)));
-        }
-        Op::ThrowIfSuperNotCalled { value, kind } => {
-            // Vendor `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
-            // (isa.yaml:1003-1008): the checked `this` value rides the
-            // accumulator; imm is the check kind.
-            let k = match kind {
-                SuperCheck::NotCalled => 0,
-                SuperCheck::Rebind => 1,
-            };
-            ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(k)));
-        }
-        Op::ThrowNotExists => {
-            codes.push(Bytecode::ThrowNotexists);
-        }
-        Op::ThrowPatternNonCoercible => {
-            codes.push(Bytecode::ThrowPatternnoncoercible);
-        }
-        Op::ThrowDeleteSuperProperty => {
-            codes.push(Bytecode::ThrowDeletesuperproperty);
-        }
-
-        // ── Terminators ──────────────────────────────────────────────
-        // Branch/CondBranch are handled in layout.rs (jump target resolution).
-        // We emit placeholder labels here; layout will fix them.
-        Op::Branch { dest } => {
-            codes.push(Bytecode::Jmp(Label(dest.0)));
-        }
-        Op::CondBranch {
-            cond,
-            true_dest,
-            false_dest,
-        } => {
-            // Ruling 2026-10-04 (#32): ArkCompiler's 24 fused compare-and-branch
-            // variants (`jeq*`/`jne*`/`jstricteq*`/`jnstricteq*` and the
-            // strict-zero/null/undefined acc-branch forms) document no
-            // comparison semantics in `isa.yaml`, FATAL in the C++ interpreter,
-            // NOP-skip in the assembly interpreter, and are hard-rejected by
-            // `abcd-lift` (`UnsupportedFusedCompareBranch`). `es2abc` always
-            // emits unfused comparisons (`eq`/`noteq`/`stricteq`/`strictnoteq`)
-            // followed by `jnez`/`jeqz`, and so do we: ensure `cond` is in
-            // `acc` (elided when the preceding instruction left it there) and
-            // emit `Jnez(true_dest)`.
-            ensure_acc(tracker, func_id, *cond, alloc, codes)?;
-            codes.push(Bytecode::Jnez(Label(true_dest.0)));
-            // The fall-through to false_dest is implicit if it's the next block.
-            // Layout will insert a Jmp if needed.
-            let _ = false_dest;
-        }
-        Op::Return { value } => {
-            if let Some(val) = value {
-                ensure_acc(tracker, func_id, *val, alloc, codes)?;
-                codes.push(Bytecode::Return);
-            } else {
-                codes.push(Bytecode::Returnundefined);
-            }
-        }
-        Op::Unreachable => {
-            codes.push(Bytecode::Returnundefined);
-        }
-
-        // ── Phi / Debug ──────────────────────────────────────────────
-        Op::Phi { .. } => {
-            // Handled by phi elimination, not emitted directly.
-        }
-        Op::Debugger => {
-            codes.push(Bytecode::Debugger);
-        }
-    }
-    Ok(())
-}
-
-/// Select call bytecodes based on kind and argument count.
-///
-/// Every arm materializes operands the same way: the argument registers
-/// are resolved to their homes first (pure reads, plus scratch `mov`s for
-/// high homes), then the callee is brought into the acc (tracker-aware).
-///
-/// [`Op::Call`] maps back onto the vendor call families (`design/ir.md` §2):
-/// `Dynamic`/`Direct` with `this: None` → `callarg*`/`callrange`, with
-/// `this: Some` → `callthis*`/`callthisrange`; `Super` → `supercallthisrange`;
-/// `Apply` → `apply`; `SuperSpread` → `supercallspread`;
-/// `SuperForwardAllArgs` → `callruntime.supercallforwardallargs`;
-/// `New` → `newobjrange`.
-#[allow(clippy::too_many_arguments)]
-fn select_call(
-    kind: CallKind,
-    callee: ValueId,
-    this: Option<ValueId>,
-    args: &[ValueId],
-    func_id: FuncId,
-    alloc: &RegAlloc,
-    codes: &mut Vec<Bytecode>,
-    ic: &mut IcAllocator,
-    tracker: &mut AccContent,
-) -> Result<(), LowerError> {
-    match kind {
-        CallKind::Dynamic | CallKind::Direct => match this {
-            None => match args.len() {
-                0 => {
-                    materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
-                    codes.push(Bytecode::Callarg0(ic.two()));
-                }
-                n @ (1..=3) => {
-                    let regs =
-                        materialize_operands(tracker, func_id, args, Some(callee), alloc, codes)?;
-                    let bc = match n {
-                        1 => Bytecode::Callarg1(ic.two(), regs[0]),
-                        2 => Bytecode::Callargs2(ic.two(), regs[0], regs[1]),
-                        _ => Bytecode::Callargs3(ic.two(), regs[0], regs[1], regs[2]),
-                    };
-                    codes.push(bc);
-                }
-                _ => emit_range_call(
-                    RangeForm::Call,
-                    callee,
-                    args,
+            Op::AsyncResolve { funcobj, value } => {
+                let regs = materialize_operands(
+                    tracker,
                     func_id,
+                    &[*funcobj],
+                    Some(*value),
                     alloc,
                     codes,
-                    ic,
+                )?;
+                codes.push(Bytecode::Asyncfunctionresolve(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::AsyncReject { funcobj, value } => {
+                let regs = materialize_operands(
                     tracker,
-                )?,
-            },
-            Some(this_val) => {
-                // Method call with receiver (`callthis*` / `callthisrange`):
-                // the window/operand list is `[this, args...]`; `apply` uses
-                // `CallKind::Apply` (`N57`).
-                let mut values = Vec::with_capacity(args.len() + 1);
-                values.push(this_val);
-                values.extend_from_slice(args);
-                match values.len() {
-                    n @ (1..=4) => {
+                    func_id,
+                    &[*funcobj],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Asyncfunctionreject(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::AsyncGeneratorResolve {
+                genobj,
+                value,
+                done,
+            } => {
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*genobj, *value, *done],
+                    None,
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Asyncgeneratorresolve(regs[0], regs[1], regs[2]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::AsyncGeneratorReject { genobj, value } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*genobj], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Asyncgeneratorreject(regs[0]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+            Op::NotifyConcurrentResult { value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::CallruntimeNotifyconcurrentresult);
+                *tracker = AccContent::Unknown;
+            }
+            Op::CreateIterResultObj { value, done } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*value, *done], None, alloc, codes)?;
+                codes.push(Bytecode::Createiterresultobj(regs[0], regs[1]));
+                home_result(tracker, result, used, func_id, alloc, codes)?;
+            }
+
+            // ── Exception handling ───────────────────────────────────────
+            Op::Throw { value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::Throw);
+            }
+            Op::ThrowIfNotObject { value } => {
+                let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
+                codes.push(Bytecode::ThrowIfnotobject(val_r));
+            }
+            Op::ThrowConstAssignment { name } => {
+                let name_r = val_reg(func_id, *name, alloc, codes, 0)?;
+                codes.push(Bytecode::ThrowConstassignment(name_r));
+            }
+            Op::ThrowUndefinedIfHole { name, value } => {
+                let regs =
+                    materialize_operands(tracker, func_id, &[*name, *value], None, alloc, codes)?;
+                codes.push(Bytecode::ThrowUndefinedifhole(regs[0], regs[1]));
+            }
+            Op::ThrowUndefinedIfHoleWithName { name, value } => {
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::ThrowUndefinedifholewithname(
+                    self.tracer.eid(*name),
+                ));
+            }
+            Op::ThrowIfSuperNotCalled { value, kind } => {
+                let k = match kind {
+                    SuperCheck::NotCalled => 0,
+                    SuperCheck::Rebind => 1,
+                };
+                ensure_acc(tracker, func_id, *value, alloc, codes)?;
+                codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(k)));
+            }
+            Op::ThrowNotExists => {
+                codes.push(Bytecode::ThrowNotexists);
+            }
+            Op::ThrowPatternNonCoercible => {
+                codes.push(Bytecode::ThrowPatternnoncoercible);
+            }
+            Op::ThrowDeleteSuperProperty => {
+                codes.push(Bytecode::ThrowDeletesuperproperty);
+            }
+
+            // ── Terminators (`R3-X1`, `R3-A7`) ───────────────────────────
+            Op::Branch { dest } => {
+                codes.push(Bytecode::Jmp(Label(dest.0)));
+            }
+            Op::CondBranch {
+                cond,
+                true_dest,
+                false_dest,
+            } => {
+                let _ = false_dest;
+                // Case 1 & 2: Fused single-use `UnOp::JumpNez` / `UnOp::JumpEqz`
+                // emits raw `jnez` / `jeqz` directly on the underlying operand
+                // (do NOT mark `bool_cond_blocks`, since `jeqz` and `jnez` are not
+                // complements on `null`/`undefined`/strings/objects).
+                if suppression.values.contains(cond)
+                    && let Some(ValueDef::Inst(piid)) = module.value(*cond).map(|v| v.def)
+                    && let Some(Op::UnaryOp {
+                        op: raw_op @ (UnOp::JumpEqz | UnOp::JumpNez),
+                        operand,
+                    }) = module.inst(piid).map(|i| &i.op)
+                {
+                    ensure_acc(tracker, func_id, *operand, alloc, codes)?;
+                    codes.push(match raw_op {
+                        UnOp::JumpEqz => Bytecode::Jeqz(Label(true_dest.0)),
+                        _ => Bytecode::Jnez(Label(true_dest.0)),
+                    });
+                } else {
+                    // Case 3 & 4: Proven boolean emits `jnez` directly; non-boolean
+                    // first coerces via `Bytecode::Istrue` so strings/objects/`NaN`
+                    // obey ECMA-262 `ToBoolean` (`R3-X1`).
+                    ensure_acc(tracker, func_id, *cond, alloc, codes)?;
+                    if !is_proven_boolean(module, *cond) {
+                        codes.push(Bytecode::Istrue);
+                        *tracker = AccContent::Unknown;
+                    }
+                    self.bool_cond_blocks.insert(bb);
+                    codes.push(Bytecode::Jnez(Label(true_dest.0)));
+                }
+            }
+            Op::Return { value } => {
+                if let Some(val) = value {
+                    ensure_acc(tracker, func_id, *val, alloc, codes)?;
+                    codes.push(Bytecode::Return);
+                } else {
+                    codes.push(Bytecode::Returnundefined);
+                }
+            }
+            Op::Unreachable => {
+                codes.push(Bytecode::Returnundefined);
+            }
+
+            // ── Phi / Debug ──────────────────────────────────────────────
+            Op::Phi { .. } => {}
+            Op::Debugger => {
+                codes.push(Bytecode::Debugger);
+            }
+        }
+        Ok(())
+    }
+
+    fn select_call(
+        &mut self,
+        kind: CallKind,
+        callee: ValueId,
+        this: Option<ValueId>,
+        args: &[ValueId],
+        codes: &mut Vec<Bytecode>,
+        tracker: &mut AccContent,
+    ) -> Result<(), LowerError> {
+        let func_id = self.func_id;
+        let alloc = self.alloc;
+        match kind {
+            CallKind::Dynamic | CallKind::Direct => match this {
+                None => match args.len() {
+                    0 => {
+                        materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
+                        codes.push(Bytecode::Callarg0(self.ic.two()));
+                    }
+                    n @ (1..=3) => {
                         let regs = materialize_operands(
                             tracker,
                             func_id,
-                            &values,
+                            args,
                             Some(callee),
                             alloc,
                             codes,
                         )?;
                         let bc = match n {
-                            1 => Bytecode::Callthis0(ic.two(), regs[0]),
-                            2 => Bytecode::Callthis1(ic.two(), regs[0], regs[1]),
-                            3 => Bytecode::Callthis2(ic.two(), regs[0], regs[1], regs[2]),
-                            _ => Bytecode::Callthis3(ic.two(), regs[0], regs[1], regs[2], regs[3]),
+                            1 => Bytecode::Callarg1(self.ic.two(), regs[0]),
+                            2 => Bytecode::Callargs2(self.ic.two(), regs[0], regs[1]),
+                            _ => Bytecode::Callargs3(self.ic.two(), regs[0], regs[1], regs[2]),
                         };
                         codes.push(bc);
                     }
-                    _ => emit_range_call(
-                        RangeForm::CallThis,
-                        callee,
-                        &values,
-                        func_id,
-                        alloc,
-                        codes,
-                        ic,
-                        tracker,
-                    )?,
+                    _ => self.emit_range_call(RangeForm::Call, callee, args, codes, tracker)?,
+                },
+                Some(this_val) => {
+                    let mut values = Vec::with_capacity(args.len() + 1);
+                    values.push(this_val);
+                    values.extend_from_slice(args);
+                    match values.len() {
+                        n @ (1..=4) => {
+                            let regs = materialize_operands(
+                                tracker,
+                                func_id,
+                                &values,
+                                Some(callee),
+                                alloc,
+                                codes,
+                            )?;
+                            let bc = match n {
+                                1 => Bytecode::Callthis0(self.ic.two(), regs[0]),
+                                2 => Bytecode::Callthis1(self.ic.two(), regs[0], regs[1]),
+                                3 => Bytecode::Callthis2(self.ic.two(), regs[0], regs[1], regs[2]),
+                                _ => Bytecode::Callthis3(
+                                    self.ic.two(),
+                                    regs[0],
+                                    regs[1],
+                                    regs[2],
+                                    regs[3],
+                                ),
+                            };
+                            codes.push(bc);
+                        }
+                        _ => self.emit_range_call(
+                            RangeForm::CallThis,
+                            callee,
+                            &values,
+                            codes,
+                            tracker,
+                        )?,
+                    }
                 }
+            },
+            CallKind::Super => {
+                self.emit_range_call(RangeForm::SuperCallThis, callee, args, codes, tracker)?;
             }
-        },
-        CallKind::Super => {
-            // Explicit-arguments super constructor call → `supercallthisrange`.
-            emit_range_call(
-                RangeForm::SuperCallThis,
-                callee,
-                args,
-                func_id,
-                alloc,
-                codes,
-                ic,
-                tracker,
-            )?;
+            CallKind::SuperArrow => {
+                if this.is_some() {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: "supercallarrowrange requires this=None".into(),
+                    });
+                }
+                self.emit_range_call(RangeForm::SuperCallArrow, callee, args, codes, tracker)?;
+            }
+            CallKind::Apply => {
+                let (Some(this_val), [array]) = (this, args) else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!(
+                            "apply requires exactly (this, args array), got this={} args={}",
+                            this.is_some(),
+                            args.len()
+                        ),
+                    });
+                };
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[this_val, *array],
+                    Some(callee),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Apply(self.ic.two(), regs[0], regs[1]));
+            }
+            CallKind::SuperSpread => {
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &args[..1.min(args.len())],
+                    Some(callee),
+                    alloc,
+                    codes,
+                )?;
+                let arg_r = if args.is_empty() { Reg(0) } else { regs[0] };
+                codes.push(Bytecode::Supercallspread(self.ic.two(), arg_r));
+            }
+            CallKind::SuperForwardAllArgs => {
+                let [this_func] = args else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!(
+                            "supercallforwardallargs requires exactly the lifted register operand \
+                             (thisFunc), got {} args",
+                            args.len()
+                        ),
+                    });
+                };
+                let regs =
+                    materialize_operands(tracker, func_id, &[*this_func], None, alloc, codes)?;
+                codes.push(Bytecode::CallruntimeSupercallforwardallargs(regs[0]));
+            }
+            CallKind::New => {
+                emit_construct(callee, args, func_id, alloc, codes, self.ic)?;
+            }
+            CallKind::NewSpread => {
+                // #55: `newobjapply imm:u16, v:in:top; acc: inout:top` — `v` is the
+                // constructor (`callee`) and `acc` carries the spread array (`args[0]`).
+                let (None, [array]) = (this, args) else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!(
+                            "newobjapply requires this=None and 1 spread array, got this={} args={}",
+                            this.is_some(),
+                            args.len()
+                        ),
+                    });
+                };
+                let regs =
+                    materialize_operands(tracker, func_id, &[callee], Some(*array), alloc, codes)?;
+                codes.push(Bytecode::Newobjapply(self.ic.two(), regs[0]));
+            }
+            CallKind::ClassInit => {
+                // #55: `callruntime.callinit imm:u8, v:in:top; acc: in:top` — `acc`
+                // holds `callee` and `v` holds `this` (`args` is empty).
+                let (Some(this_val), []) = (this, args) else {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!(
+                            "callruntime.callinit requires this=Some and 0 args, got this={} args={}",
+                            this.is_some(),
+                            args.len()
+                        ),
+                    });
+                };
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[this_val],
+                    Some(callee),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::CallruntimeCallinit(self.ic.two(), regs[0]));
+            }
         }
-        CallKind::Apply => {
-            // Vendor `apply imm:u8, v1:in:top, v2:in:top` (isa.yaml:1104):
-            // func = acc, this = v1, args array = v2 — exactly one
-            // receiver and one array (`N16`/`N57`).
-            let (Some(this_val), [array]) = (this, args) else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: format!(
-                        "apply requires exactly (this, args array), got this={} args={}",
-                        this.is_some(),
-                        args.len()
-                    ),
-                });
-            };
-            let regs = materialize_operands(
-                tracker,
-                func_id,
-                &[this_val, *array],
-                Some(callee),
-                alloc,
-                codes,
-            )?;
-            codes.push(Bytecode::Apply(ic.two(), regs[0], regs[1]));
-        }
-        CallKind::SuperSpread => {
-            // Vendor `supercallspread imm:u8, v:in:top` — the spread array
-            // is the register operand, the callee rides the acc.
-            let regs = materialize_operands(
-                tracker,
-                func_id,
-                &args[..1.min(args.len())],
-                Some(callee),
-                alloc,
-                codes,
-            )?;
-            let arg_r = if args.is_empty() { Reg(0) } else { regs[0] };
-            codes.push(Bytecode::Supercallspread(ic.two(), arg_r));
-        }
-        CallKind::SuperForwardAllArgs => {
-            // Vendor `callruntime.supercallforwardallargs v:in:top`
-            // (isa.yaml:944 — `acc: out:top`, the register operand is the
-            // ONLY input; interpreter-inl.cpp:3814-3830): the register
-            // operand holds thisFunc; newTarget and the FULL actual
-            // argument list come from the CURRENT frame
-            // (`GetNewTarget(thread, sp)` / `GetNumArgs(thread, sp, …)`),
-            // forwarded verbatim to the super constructor
-            // (`RuntimeSuperCallForwardAllArgs`, runtime_stubs-inl.h:299).
-            // There is NO explicit argument window. The lift (N58) keeps
-            // the vendor register operand as args[0]. The previous
-            // approximation — supercallthisrange argc=1 with window
-            // [func] — Construct'ed the super constructor with ONE
-            // argument, the function object itself (N72-C2: Error(func)
-            // → message "Cannot get source code", Int8Array(func) →
-            // length 0, WeakSet(func) → "TypeError: Callable is false",
-            // DataView(func, …) → "TypeError: buffer is not
-            // ArrayBuffer").
-            let [this_func] = args else {
-                return Err(LowerError::UnsupportedInstruction {
-                    func: func_id,
-                    message: format!(
-                        "supercallforwardallargs requires exactly the lifted register operand \
-                         (thisFunc), got {} args",
-                        args.len()
-                    ),
-                });
-            };
-            let regs = materialize_operands(tracker, func_id, &[*this_func], None, alloc, codes)?;
-            codes.push(Bytecode::CallruntimeSupercallforwardallargs(regs[0]));
-        }
-        CallKind::New => {
-            emit_construct(callee, args, func_id, alloc, codes, ic)?;
-        }
+        Ok(())
     }
-    Ok(())
+
+    fn emit_range_call(
+        &mut self,
+        form: RangeForm,
+        callee: ValueId,
+        args: &[ValueId],
+        codes: &mut Vec<Bytecode>,
+        tracker: &mut AccContent,
+    ) -> Result<(), LowerError> {
+        let start = fill_call_window(self.func_id, args, self.alloc, codes)?;
+        ensure_acc(tracker, self.func_id, callee, self.alloc, codes)?;
+
+        let window = args.len();
+        let argc = match form {
+            RangeForm::CallThis => window.saturating_sub(1),
+            RangeForm::Call | RangeForm::SuperCallThis | RangeForm::SuperCallArrow => window,
+        };
+        let argc_imm = Imm(argc as i64);
+        let bc = match (form, argc <= 255) {
+            (RangeForm::Call, true) => Bytecode::Callrange(self.ic.two(), argc_imm, start),
+            (RangeForm::Call, false) => Bytecode::WideCallrange(argc_imm, start),
+            (RangeForm::CallThis, true) => Bytecode::Callthisrange(self.ic.two(), argc_imm, start),
+            (RangeForm::CallThis, false) => Bytecode::WideCallthisrange(argc_imm, start),
+            (RangeForm::SuperCallThis, true) => {
+                Bytecode::Supercallthisrange(self.ic.two(), argc_imm, start)
+            }
+            (RangeForm::SuperCallThis, false) => Bytecode::WideSupercallthisrange(argc_imm, start),
+            (RangeForm::SuperCallArrow, true) => {
+                Bytecode::Supercallarrowrange(self.ic.two(), argc_imm, start)
+            }
+            (RangeForm::SuperCallArrow, false) => {
+                Bytecode::WideSupercallarrowrange(argc_imm, start)
+            }
+        };
+        codes.push(bc);
+        Ok(())
+    }
 }
 
-/// The range-call families and their narrow/wide bytecode forms. Vendor
-/// (isa.yaml ~:1082-1167): narrow `*range imm1:u8, imm2:u8, v:in:top`
-/// (imm1 = IC slot, imm2 = argc, v = window start); wide
-/// `wide.*range imm:u16, v:in:top` (imm = argc, v = window start — STILL
-/// u8, and NO IC slot operand on the wide forms).
 #[derive(Clone, Copy)]
 enum RangeForm {
     Call,
     CallThis,
     SuperCallThis,
-}
-
-/// Emit a range-form call: copy the arguments into the reserved consecutive
-/// per-function window (`RegAlloc::call_window_base`) in call order, then
-/// encode the call with the window base as the start register.
-///
-/// This replaces the historical "args are assumed consecutive from
-/// val_reg(args[0])" approximation (N4): regalloc never guaranteed
-/// consecutiveness, so the window copy is the only sound encoding. The
-/// window registers are scratch — dead before and after the fill+call
-/// sequence; sites share one per-function window because each sequence
-/// completes before the next instruction is emitted, including nested
-/// calls (the inner call's fill+call is fully emitted inside its own
-/// instruction's selection before the outer call's fill begins).
-///
-/// Width selection: argc ≤ 255 keeps the narrow form (with IC slot); argc
-/// in 256..=65535 selects the wide form (u16 argc, no IC slot consumed);
-/// argc above u16::MAX is a hard error — nothing is silently truncated.
-/// The window base must fit the u8 start operand of BOTH forms; regalloc
-/// guarantees this for allocations it produced, and hand-crafted
-/// allocations are hard-errored here.
-#[allow(clippy::too_many_arguments)]
-fn emit_range_call(
-    form: RangeForm,
-    callee: ValueId,
-    args: &[ValueId],
-    func_id: FuncId,
-    alloc: &RegAlloc,
-    codes: &mut Vec<Bytecode>,
-    ic: &mut IcAllocator,
-    tracker: &mut AccContent,
-) -> Result<(), LowerError> {
-    let start = fill_call_window(func_id, args, alloc, codes)?;
-
-    ensure_acc(tracker, func_id, callee, alloc, codes)?;
-
-    // Vendor argc-immediate conventions differ per range family
-    // (arkcompiler_ets_runtime interpreter-inl.cpp): callrange and
-    // supercallthisrange encode the FULL window count (`CALL_PUSH_ARGS_RANGE`
-    // pushes `sp[startReg + i]` for `i = actualNumArgs - 1 ..= 0`; the
-    // supercall builtin path copies `range` vregs from v0, :3292-3295).
-    // Modern callthisrange encodes the argument count EXCLUDING this —
-    // `actualNumArgs = READ_INST_8_1()` then `CALL_PUSH_ARGS_THISRANGE`
-    // pushes `sp[startReg + i]` for `i = actualNumArgs ..= 1` ("1: skip
-    // this", :1349-1356/:375-383; es2panda emits `actualArgs =
-    // argCount - 1`, pandagen.cpp:1357-1366). The window fill above
-    // always covers ALL `args` slots — for CallThis that is
-    // [this, args...] (select_call pushes `this` first).
-    let window = args.len();
-    let argc = match form {
-        RangeForm::CallThis => window.saturating_sub(1),
-        RangeForm::Call | RangeForm::SuperCallThis => window,
-    };
-    let argc_imm = Imm(argc as i64);
-    let bc = match (form, argc <= 255) {
-        (RangeForm::Call, true) => Bytecode::Callrange(ic.two(), argc_imm, start),
-        (RangeForm::Call, false) => Bytecode::WideCallrange(argc_imm, start),
-        (RangeForm::CallThis, true) => Bytecode::Callthisrange(ic.two(), argc_imm, start),
-        (RangeForm::CallThis, false) => Bytecode::WideCallthisrange(argc_imm, start),
-        (RangeForm::SuperCallThis, true) => Bytecode::Supercallthisrange(ic.two(), argc_imm, start),
-        (RangeForm::SuperCallThis, false) => Bytecode::WideSupercallthisrange(argc_imm, start),
-    };
-    codes.push(bc);
-    Ok(())
+    SuperCallArrow,
 }
 
 /// Emit a construct call (`new callee(args...)`) — vendor
@@ -2413,6 +2671,31 @@ fn fill_call_window(
     // so both the window slot (which may exceed 255) and the value's
     // colored home are always encodable.
     for (j, &val) in values.iter().enumerate() {
+        let dst = Reg(base + j as u16);
+        let r = home_of(func_id, val, alloc)?;
+        codes.push(Bytecode::Mov(dst, Reg(r)));
+    }
+    Ok(Reg(base))
+}
+
+/// Fill the reserved consecutive window for non-empty `CreateObjectWithExcludedKeys`
+/// (`1..=65536` keys, where `imm = keys.len() - 1` fits `u16`).
+fn fill_excluded_keys_window(
+    func_id: FuncId,
+    keys: &[ValueId],
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<Reg, LowerError> {
+    let base = alloc
+        .call_window_base
+        .ok_or(LowerError::MissingCallWindow(func_id))?;
+    if base > 255 {
+        return Err(LowerError::CallWindowOverflow(func_id));
+    }
+    if u32::from(base) + keys.len() as u32 - 1 > u32::from(u16::MAX) {
+        return Err(LowerError::RegisterOverflow(func_id));
+    }
+    for (j, &val) in keys.iter().enumerate() {
         let dst = Reg(base + j as u16);
         let r = home_of(func_id, val, alloc)?;
         codes.push(Bytecode::Mov(dst, Reg(r)));

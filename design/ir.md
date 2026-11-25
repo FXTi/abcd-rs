@@ -15,7 +15,7 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 | Arena / Table | Purpose |
 | :--- | :--- |
 | `SymbolTable` (`module.sym`) | Content-deduplicated string interner (`Sym`) with a lossless raw-MUTF-8 side table reserved strictly for unpaired UTF-16 surrogates (`ADR-09`) |
-| `ConstPool` (`module.consts`) | Append-only / deduplicable flat constant arena (`Undefined`, `Hole`, `Null`, `Bool`, `Number(u64)`, `Int64(i64)`, `UInt64(u64)`, `String(Sym)`, `BigInt(Sym)`, `ArrayLiteral(Vec<ConstId>)`, `ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }`, `MethodRef(FuncId)`) (`ADR-17`) |
+| `ConstPool` (`module.consts`) | Append-only / deduplicable flat constant arena (`Undefined`, `Hole`, `Null`, `LitNull`, `Bool`, `Int8`, `Int32`, `Float32`, `Number(u64)`, `Int64(i64)`, `UInt64(u64)`, `Accessor`, `MethodAffiliate`, `BuiltinTypeIndex`, `EtsImplements`, `String(Sym)`, `BigInt(Sym)`, `ArrayLiteral(Vec<ConstId>)`, `TypedArrayLiteral`, `ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }`, `LiteralBufferRef`, `MethodRef { func, kind }`) (`ADR-17`, `ADR-18`) |
 | `classes: Vec<ClassData>` | Records/classes with `SourceLang` (`EcmaScript`, `ArkTs`, `PandaAssembly`), fields, methods, annotations, per-record `EsModule` (`--merge-abc`), and `scope_names` |
 | `functions: Vec<FunctionData>` | Functions with `FunctionKind`, `Signature`, `params`, `frame_init_consts`, `blocks`, `try_regions`, annotations, and `DebugData` |
 | `blocks: Vec<Block>` | Basic blocks holding `preds: Vec<Edge>` (`EdgeKind::{Normal, Exceptional}`) and ordered `insts: Vec<InstId>` |
@@ -26,11 +26,11 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 ## 2. Op Taxonomy, Effects, Types, CFG & Verifier
 
-1. **Closed `88`-Variant `Op` Enum (`src/op.rs`)**:
-   - Collapses register-width and call-arity bytecode variants into orthogonal semantic ops: compute (`BinaryOp`, `UnaryOp`, `Compare`, `Mov`, `LoadConst`), allocations (`AllocObject`, `AllocArray`, `AllocRegExp`, `AllocClosure`), property/own-property/super/private accesses, iterators, lexical/global/module bindings (`LoadModuleVar` with `ModuleVarKind`, `StoreGlobal` vs. `TryStoreGlobal` vs. `StoreGlobalRecord`), calls (`Call` with `CallKind`), class/sendable-class definitions (`Box<DefineClassData>`, `MemberAttrs`), generator/async suspension ops, guards, `Phi`, and terminators (`Branch`, `CondBranch`, `Return`, `Throw`, `Unreachable`).
+1. **Closed `94`-Variant `Op` Enum (`src/op.rs`)**:
+   - Collapses register-width and call-arity bytecode variants into orthogonal semantic ops: compute (`BinaryOp`, `UnaryOp`, `Compare`, `Mov`, `LoadConst`), allocations (`AllocObject`, `AllocArray`, `AllocRegExp`, `AllocClosure`), property/own-property/super/private accesses, iterators, lexical/global/module bindings (`LoadModuleVar` with `ModuleVarKind`, `StoreGlobal` vs. `TryStoreGlobal` vs. `StoreGlobalRecord`), calls (`Call` with `CallKind`), class/sendable-class definitions (`Box<DefineClassData>`, `MemberAttrs`), generator/async/async-generator suspension ops, guards, `Phi`, and terminators (`Branch`, `CondBranch`, `Return`, `Throw`, `Unreachable`).
    - All consumers inspect and mutate instructions through single-point visitors and queries: `Op::for_each_operand`, `Op::for_each_operand_mut`, `Op::for_each_const_id`, `Op::for_each_func_id`, `Op::for_each_sym`, `Op::effects`, `Op::effects_in`, `Op::has_result`, `Op::is_terminator`, and `Op::arity` (`ADR-02`).
 2. **Two-Tier First-Class Effects (`src/effects.rs`, `ADR-02`, `ADR-16`)**:
-   - `Op::effects(&self)` provides a sound untyped baseline over-approximation (`reads`, `writes` over `MemClasses`, `allocs`, `may_throw`, `may_call`): only unconditionally pure JS ops (`UnOp::{LogicalNot, IsTrue, IsFalse, TypeOf, Void}`, `CmpOp::{StrictEq, StrictNotEq}`) return `Effects::PURE` without type knowledge, while coercing arithmetic/relational/`in`/`instanceof` ops report `HEAP` (+ `PROTOTYPE`) / `may_throw` / `UnknownCallee`.
+   - `Op::effects(&self)` provides a sound untyped baseline over-approximation (`reads`, `writes` over `MemClasses`, `allocs`, `may_throw`, `may_call`): only unconditionally pure JS ops (`UnOp::{LogicalNot, IsTrue, IsFalse, JumpEqz, JumpNez, TypeOf, Void}`, `CmpOp::{StrictEq, StrictNotEq}`) return `Effects::PURE` without type knowledge, while coercing arithmetic/relational/`in`/`instanceof` ops report `HEAP` (+ `PROTOTYPE`) / `may_throw` / `UnknownCallee`.
    - `Op::effects_in(&self, module: &Module)` refines dynamic `UnaryOp`, `BinaryOp`, and `Compare` back to `Effects::PURE` when operand `Value::ty` or `ConstPool` definitions prove coercion-free primitive types, and `Effects::is_removable_if_unused()` drives `abcd-opt::Adce`.
 3. **Type Lattice (`src/ty.rs`) & Frame-Slot Calling Convention (`src/frame.rs`)**:
    - `Ty` bridges dynamic ECMAScript (`Ty::Any`, `DynPrim`) and statically typed ArkTS (`StaticTy` primitives, `Reference(ClassId)`, `Ty::Union(Box<[Ty]>)` with iterative `O(1)`-stack `Clone`/`Drop`/`Eq`/`Hash`/`Debug`).
@@ -54,11 +54,11 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 ## 4. SSA Optimization (`abcd-opt`: `Module → Module`)
 
-`optimize_func` runs a two-round fixed pipeline (`Peephole → Sccp → Adce → CfgSimplify → CopyProp`, followed by `Peephole → Adce → CfgSimplify`), plus opt-in intra-module inlining (`inline::inline_module`, never run before `abcd-decompile`):
+`optimize_func` runs a fixed multi-pass pipeline (`Peephole → Sccp → Adce → CfgSimplify → CopyProp`, followed by `Peephole → Adce → CfgSimplify → CopyProp`), plus opt-in intra-module inlining (`inline::inline_module`, never run before `abcd-decompile`):
 
-- **`Peephole` & `Sccp`**: Honor vendor `vreg OP acc` evaluation order (`N36`), `-0.0` bit preservation (`N37`), nullish non-coercion (`N38`/`N41`), IEEE-754 `===` (`N40`), and modular `ToInt32`/`ToUint32` wrapping (`N42`). `Sccp` traverses exception-augmented CFG edges and forces multi-input catch-handler phis and `ExceptionParam`s to `Bottom` (`ADR-04`).
-- **`Adce` & `CfgSimplify`**: Marks live roots solely from `Op::effects()`, sweeps dead `frame_init_consts`, and simplifies branches/blocks under exception-neutrality guards (`N11`).
-- **`inline`**: Pre-validates call sites (rejecting block-terminal calls before mutating caller CFG, `N82`), binds `[func][new.target][this]` + formals via `abcd_ir::frame`, and splices callee blocks while preserving enclosing caller `TryRegion` protection.
+- **`Peephole` & `Sccp`**: Honor vendor `vreg OP acc` evaluation order (`N36`), `-0.0` bit preservation (`N37`, including `to_bits()` lattice meet in `Sccp`), canonical `0x7ff8_0000_0000_0000` `NaN` bit patterns across x86 and ARM (`#60`), pure-Rust FDLIBM `libm::pow`-backed ECMA-262 `ecma_pow` (`ADR-19`), nullish non-coercion (`N38`/`N41`), IEEE-754 `===` (`N40`), and modular `ToInt32`/`ToUint32` wrapping (`N42`). `Sccp` traverses exception-augmented CFG edges and forces multi-input catch-handler phis and `ExceptionParam`s to `Bottom` (`ADR-04`).
+- **`Adce` & `CfgSimplify`**: Marks live roots from `Op::effects_in(module).is_removable_if_unused()`, sweeps dead `frame_init_consts` and dead `DebugData` instruction rows, and contracts single-edge block chains in `O(B + I)` via union-find + `ExceptionHandlerMap` (`ADR-19`).
+- **`inline`**: Pre-validates call sites (rejecting block-terminal calls, cross-class module ops, super calls, and concurrent-into-plain calls before mutating caller CFG, `N82`), snapshots pre-call handler-phi values prior to return-value replacement, binds `[func][new.target][this]` + formals via `abcd_ir::frame`, and splices callee blocks while preserving enclosing caller `TryRegion` protection.
 
 ---
 
@@ -66,12 +66,11 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 `abcd-lower` supports both in-place container rewriting (`rewrite_file`) and standalone synthesis (`lower_module`):
 
-1. **Fusion Pre-Pass (`src/fusion.rs`)**: Suppresses single-use expansion intermediates (`DefineFunc`→`AllocClosure`, constant index loads, global-load defaults) before register coloring.
+1. **Fusion Pre-Pass (`src/fusion.rs`)**: Suppresses single-use expansion intermediates (`DefineFunc`→`AllocClosure`, adjacent constant index loads, global-load defaults) before register coloring.
 2. **Chordal Register Allocation & Out-of-SSA (`src/regalloc.rs`, `src/copy_resolve.rs`)**:
-   - Computes backward liveness over Normal + Exceptional edges.
+   - Ranks function-local `ValueId`s densely (`0..V`) and computes backward liveness over `[u64]` bitsets with `ExceptionHandlerMap` and pre-grouped phi incoming lists (`ADR-19`).
    - Runs Maximum Cardinality Search (MCS) + greedy coloring, reserving low scratch registers (`v0..v255`) for `lda`/`sta` and a contiguous low-register window for `*range` calls (`ADR-03`).
    - Schedules parallel phi copies with cycle-breaking temporaries on Normal edges (splitting critical edges via trampolines) while enforcing **zero copies on exception edges** (`N21`).
-3. **Instruction Selection, Layout & Compaction (`src/isel.rs`, `src/layout.rs`, `src/method_body.rs`)**:
-   - Emits instructions using `AccContent` caching and unfused `cmp + jnez`/`jeqz` branches (`ADR-07`).
-   - Assigns 8-bit IC slots before 16-bit slots (`N71`) and stores `MethodBody::ic_size` so `abcd-file::encode` synchronizes `_ESSlotNumberAnnotation` (`N73`).
-   - Compacts module-wide `u32` `Sym`/`FuncId`/`ConstId` references into per-method `u16` entity index slots (`relocate_and_compact_entities`), scaling cleanly to commercial bundles with `90,000+` symbols (`ADR-10`).
+3. **Instruction Selection, Layout, Debug Replay & Compaction (`src/isel.rs`, `src/layout.rs`, `src/method_body.rs`)**:
+   - Emits narrow and `wide.*` instructions using `AccContent` caching, unfused `cmp + jnez`/`jeqz` branches (`ADR-07`), and fallthrough `jmp` elision to the immediately-following RPO block (`ADR-19`).
+   - Assigns 8-bit IC slots before 16-bit slots (`N71`), stores `MethodBody::ic_size` so `abcd-file::encode` synchronizes `_ESSlotNumberAnnotation` (`N73`), reconstructs `MethodDebugInfo` line/column tables from lowered instruction PCs (`ADR-18`), and compacts module-wide `u32` `Sym`/`FuncId`/`ConstId` references into typed per-method `u16` `EntityRef` slots (`ADR-10`, `ADR-18`).

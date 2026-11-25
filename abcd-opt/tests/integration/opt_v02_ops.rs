@@ -181,6 +181,7 @@ fn pipeline_keeps_observable_v02_ops() {
                 object: p0,
                 name: b.sym("x"),
                 value: p0,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             }),
         ),
         (
@@ -189,6 +190,7 @@ fn pipeline_keeps_observable_v02_ops() {
                 object: p0,
                 key: p0,
                 value: p0,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             }),
         ),
         (
@@ -197,6 +199,7 @@ fn pipeline_keeps_observable_v02_ops() {
                 object: p0,
                 index: p0,
                 value: p0,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             }),
         ),
         // N61: the tolerant global store still writes the global record.

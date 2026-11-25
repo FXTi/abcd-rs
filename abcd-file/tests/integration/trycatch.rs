@@ -56,18 +56,17 @@ fn multi_catch_and_catch_all_roundtrip() {
     assert_eq!(tb.catches.len(), 2);
 
     let typed = &tb.catches[0];
-    assert_ne!(
-        typed.type_idx,
-        u32::MAX,
-        "typed catch must reference a class"
+    assert_eq!(
+        typed.type_class.and_then(|sid| file.strings.resolve(sid)),
+        Some("LError;"),
+        "typed catch must reference LError;"
     );
     assert_eq!((typed.handler, typed.len), (2, 1));
 
     let catch_all = &tb.catches[1];
     assert_eq!(
-        catch_all.type_idx,
-        u32::MAX,
-        "catch-all decodes as type index UINT32_MAX (stored 0 minus 1)"
+        catch_all.type_class, None,
+        "catch-all decodes as type_class == None"
     );
     assert_eq!((catch_all.handler, catch_all.len), (3, 1));
 }
@@ -112,8 +111,7 @@ fn nested_try_regions_roundtrip() {
     assert_eq!((inner.start, inner.len), (1, 2));
     assert_eq!(inner.catches.len(), 1);
     assert_eq!(
-        inner.catches[0].type_idx,
-        u32::MAX,
+        inner.catches[0].type_class, None,
         "inner catch is catch-all"
     );
     assert_eq!((inner.catches[0].handler, inner.catches[0].len), (4, 1));
@@ -152,8 +150,13 @@ fn try_blocks_survive_encode_roundtrip() {
     let tb = &body2.try_blocks[0];
     assert_eq!((tb.start, tb.len), (0, 2));
     assert_eq!(tb.catches.len(), 2);
-    assert_ne!(tb.catches[0].type_idx, u32::MAX);
+    assert_eq!(
+        tb.catches[0]
+            .type_class
+            .and_then(|sid| file2.strings.resolve(sid)),
+        Some("LError;")
+    );
     assert_eq!((tb.catches[0].handler, tb.catches[0].len), (2, 1));
-    assert_eq!(tb.catches[1].type_idx, u32::MAX);
+    assert_eq!(tb.catches[1].type_class, None);
     assert_eq!((tb.catches[1].handler, tb.catches[1].len), (3, 1));
 }

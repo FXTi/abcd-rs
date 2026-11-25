@@ -17,7 +17,7 @@
 use abcd_ir::{BinOp, BlockId, CmpOp, Const, FuncId, InstId, Module, Op, UnOp, ValueDef, ValueId};
 
 use crate::FuncPass;
-use crate::{to_int32, to_uint32};
+use crate::{canonical_number_const, ecma_pow, has_static_ty, to_int32, to_uint32};
 
 /// The peephole pass: constant folding over local instruction patterns.
 pub struct Peephole;
@@ -37,7 +37,7 @@ impl FuncPass for Peephole {
             let insts: Vec<InstId> = block.insts.clone();
             for inst_id in insts {
                 if let Some(folded) = try_fold(module, inst_id) {
-                    let cid = module.consts.push(folded);
+                    let cid = module.consts.intern(folded);
                     if let Some(inst) = module.inst_mut(inst_id) {
                         inst.op = Op::LoadConst(cid);
                         changed = true;
@@ -49,10 +49,14 @@ impl FuncPass for Peephole {
     }
 }
 
-/// Try to fold an instruction into a constant. The caller pools the
-/// returned [`Const`] and rewrites the instruction to [`Op::LoadConst`]
-/// (the pool is append-only, so this never disturbs other ids).
+/// Try to fold an instruction into a constant. The caller interns the
+/// returned [`Const`] into [`abcd_ir::ConstPool`] and rewrites the instruction
+/// to [`Op::LoadConst`] (the pool is append-only, so this never disturbs other
+/// ids).
 fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
+    if has_static_ty(module, inst_id) {
+        return None;
+    }
     let inst = module.inst(inst_id)?;
     let op = &inst.op;
     match op {
@@ -68,20 +72,20 @@ fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
             let a = as_number(module, *right)?;
             let b = as_number(module, *left)?;
             let result = eval_binop(*op, a, b)?;
-            Some(Const::number(result))
+            Some(canonical_number_const(result))
         }
 
         // Compare(op, Lit(a), Lit(b)) → Bool constant.
         Op::Compare { op, left, right } => try_fold_comparison(*op, module, *left, *right),
 
-        // UnOp(Minus, Lit(n)) → Lit(-n) — bit-exact: -0.0 folds to -0.0
-        // and NaN payloads propagate (N37; Const::Number stores raw bits).
+        // UnOp(Minus, Lit(n)) → Lit(-n) — -0.0 folds to +0.0, +0.0 folds to
+        // -0.0, and NaN canonicalizes (`N37`, `#60`).
         Op::UnaryOp {
             op: UnOp::Minus,
             operand,
         } => {
             let n = as_number(module, *operand)?;
-            Some(Const::number(-n))
+            Some(canonical_number_const(-n))
         }
 
         // UnOp(BitNot, Lit(n)) → Lit(~ToInt32(n)) — wrap, not saturate (N42).
@@ -90,7 +94,7 @@ fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
             operand,
         } => {
             let n = as_number(module, *operand)?;
-            Some(Const::number(!to_int32(n) as f64))
+            Some(canonical_number_const(!to_int32(n) as f64))
         }
 
         // UnOp(LogicalNot, Lit(b)) → Lit(!b) (the BOOLEAN not — N39:
@@ -120,6 +124,26 @@ fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
             let b = as_bool(module, *operand)?;
             Some(Const::Bool(!b))
         }
+
+        // Raw ArkCompiler `jeqz` / `jnez` predicates (`#61` `R3-X1`).
+        Op::UnaryOp {
+            op: UnOp::JumpEqz,
+            operand,
+        } => eval_jump_eqz(&const_of(module, *operand)?).map(Const::Bool),
+
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand,
+        } => eval_jump_nez(&const_of(module, *operand)?).map(Const::Bool),
+
+        // `ToPropertyKey` on an already-string constant is the identity.
+        Op::UnaryOp {
+            op: UnOp::ToPropertyKey,
+            operand,
+        } => match const_of(module, *operand)? {
+            Const::String(sym) => Some(Const::String(sym)),
+            _ => None,
+        },
 
         _ => None,
     }
@@ -264,6 +288,29 @@ fn as_bool(module: &Module, val: ValueId) -> Option<bool> {
     }
 }
 
+/// ArkCompiler raw `jeqz` predicate (`#61` `R3-X1`): `true` iff `false` or
+/// numeric `±0.0` (`NaN`, nullish, strings, and bigints are `false`).
+fn eval_jump_eqz(c: &Const) -> Option<bool> {
+    match c {
+        Const::Bool(b) => Some(!*b),
+        Const::Number(bits) => Some(f64::from_bits(*bits) == 0.0),
+        Const::Null | Const::Undefined | Const::String(_) | Const::BigInt(_) => Some(false),
+        _ => None,
+    }
+}
+
+/// ArkCompiler raw `jnez` predicate (`#61` `R3-X1`): `true` iff `true` or
+/// numeric `!= 0.0` (**`true` for `NaN`**; nullish, strings, and bigints are
+/// `false`).
+fn eval_jump_nez(c: &Const) -> Option<bool> {
+    match c {
+        Const::Bool(b) => Some(*b),
+        Const::Number(bits) => Some(f64::from_bits(*bits) != 0.0),
+        Const::Null | Const::Undefined | Const::String(_) | Const::BigInt(_) => Some(false),
+        _ => None,
+    }
+}
+
 /// Evaluate a binary operation on two constant numbers.
 fn eval_binop(op: BinOp, a: f64, b: f64) -> Option<f64> {
     Some(match op {
@@ -272,7 +319,7 @@ fn eval_binop(op: BinOp, a: f64, b: f64) -> Option<f64> {
         BinOp::Mul => a * b,
         BinOp::Div => a / b,
         BinOp::Mod => a % b,
-        BinOp::Exp => a.powf(b),
+        BinOp::Exp => ecma_pow(a, b),
         // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
         // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's
         // saturating `as` casts — matches vendored DoubleToInt

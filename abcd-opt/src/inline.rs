@@ -147,8 +147,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use abcd_ir::{
-    BlockId, CallKind, Const, ConstId, Edge, EdgeKind, FuncId, FunctionKind, Inst, InstId,
-    Modifiers, Module, Op, Ty, ValueDef, ValueId,
+    BlockId, CallKind, Const, ConstId, Dialect, Edge, EdgeKind, FuncId, FunctionKind, Inst, InstId,
+    LexEnvKind, Modifiers, Module, Op, Ty, ValueDef, ValueId,
 };
 
 /// Inlining policy knobs. The defaults are deliberately conservative
@@ -302,6 +302,14 @@ impl InlineReport {
     }
 }
 
+/// Module-wide caches shared across one [`inline_module`] run (`R3-M5`):
+/// interns `Const::Undefined` once and memoizes transitive outer-env reads per
+/// nested `FuncId`.
+struct InlineCtx {
+    undef_cid: ConstId,
+    env_reads_cache: HashMap<FuncId, bool>,
+}
+
 /// Run the inliner over a whole module (opt-in; NOT part of
 /// [`crate::optimize_module`]). Functions are processed in table order;
 /// within a function, the call sites present at function-entry are
@@ -311,8 +319,18 @@ impl InlineReport {
 /// remaining (skipped) call sites again.
 pub fn inline_module(module: &mut Module, policy: &InlinePolicy) -> InlineReport {
     let mut report = InlineReport::default();
+    let mut ctx = InlineCtx {
+        undef_cid: module.consts.intern(Const::Undefined),
+        env_reads_cache: HashMap::new(),
+    };
     for fi in 0..module.functions.len() {
-        inline_func(module, FuncId::new(fi as u32), policy, &mut report);
+        inline_func(
+            module,
+            FuncId::new(fi as u32),
+            policy,
+            &mut ctx,
+            &mut report,
+        );
     }
     report
 }
@@ -322,6 +340,7 @@ fn inline_func(
     module: &mut Module,
     caller: FuncId,
     policy: &InlinePolicy,
+    ctx: &mut InlineCtx,
     report: &mut InlineReport,
 ) {
     // Snapshot the call sites present NOW. Cloned call sites are
@@ -363,14 +382,32 @@ fn inline_func(
         let call_block = inst.block;
 
         let reason = match eligibility(
-            module, policy, caller, call_block, iid, callee_val, this, kind,
+            module,
+            policy,
+            &mut ctx.env_reads_cache,
+            caller,
+            call_block,
+            iid,
+            callee_val,
+            this,
+            kind,
         ) {
             Ok(callee) => {
                 let size = callee_inst_count(module, callee);
                 if size > budget {
                     Some(SkipReason::CallerBudgetExhausted)
                 } else {
-                    match inline_site(module, caller, iid, call_block, callee, &this, &args, kind) {
+                    match inline_site(
+                        module,
+                        ctx.undef_cid,
+                        caller,
+                        iid,
+                        call_block,
+                        callee,
+                        &this,
+                        &args,
+                        kind,
+                    ) {
                         Ok(()) => {
                             report.sites_inlined += 1;
                             report.insts_inlined += size;
@@ -497,11 +534,12 @@ impl CallType {
                 let abcd_ir::AnnValue::Const(cid) = value else {
                     continue;
                 };
-                let bits = module
-                    .consts
-                    .get(*cid)
-                    .and_then(Const::as_f64)
-                    .map(|x| x as u32)?;
+                let bits = match module.consts.get(*cid)? {
+                    Const::Int8(v) => *v as u32,
+                    Const::Int32(v) => *v,
+                    Const::Number(raw) => f64::from_bits(*raw) as u32,
+                    _ => return None,
+                };
                 return Some(Self {
                     func: bits & 0b1000 != 0,
                     new_target: bits & 0b0010 != 0,
@@ -550,15 +588,32 @@ fn slot_roles(call_type: CallType, param_count: usize) -> Option<Vec<SlotRole>> 
     Some(roles)
 }
 
+/// Whether `func` carries an annotation marking it as concurrent or sendable
+/// (`R3-M5`).
+fn is_concurrent_or_sendable_func(module: &Module, func: &abcd_ir::FunctionData) -> bool {
+    func.annotations.iter().any(|ann| {
+        matches!(
+            module
+                .class(ann.class)
+                .and_then(|c| module.sym.resolve(c.descriptor)),
+            Some("L_ESConcurrentModuleRequestsAnnotation;" | "L_ESSendableAnnotation;")
+        )
+    })
+}
+
 /// All eligibility checks for one call site. `Ok(callee)` means the
 /// site is inlinable; `Err(reason)` is the skip-histogram entry.
 /// Every check here runs BEFORE any mutation: a site that is refused
 /// leaves the module untouched (the library rule — a recorded skip is
 /// never half-spliced, N82).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "call-site validation inspects caller, block, inst, callee, receiver, kind, policy, and cache"
+)]
 fn eligibility(
     module: &Module,
     policy: &InlinePolicy,
+    env_reads_cache: &mut HashMap<FuncId, bool>,
     caller: FuncId,
     call_block: BlockId,
     call_iid: InstId,
@@ -573,11 +628,16 @@ fn eligibility(
     if callee == caller {
         return Err(SkipReason::SelfRecursive);
     }
+    let caller_func = module.func(caller).ok_or(SkipReason::CalleeNoBody)?;
     let func = module.func(callee).ok_or(SkipReason::CalleeNoBody)?;
     if func.blocks.is_empty() || func.is_external {
         return Err(SkipReason::CalleeNoBody);
     }
-    if func.kind != FunctionKind::Function {
+    if func.kind != FunctionKind::Function
+        || module.func_dialect(func) != Dialect::DynamicEcma
+        || module.func_dialect(caller_func) != Dialect::DynamicEcma
+        || is_concurrent_or_sendable_func(module, func)
+    {
         return Err(SkipReason::CalleeKind);
     }
     if !func.try_regions.is_empty() {
@@ -590,6 +650,8 @@ fn eligibility(
     if callee_inst_count(module, callee) > policy.max_callee_insts {
         return Err(SkipReason::CalleeTooLarge);
     }
+
+    let cross_class = caller_func.class_id != func.class_id;
 
     // Callee body scan: forbidden op classes + value sanity. Nested
     // function/class definitions are collected and checked separately
@@ -612,18 +674,24 @@ fn eligibility(
                 }
                 _ => {}
             }
-            if let Some(reason) = forbidden_op(&inst.op) {
+            if let Some(reason) = forbidden_op(&inst.op, cross_class) {
                 return Err(reason);
             }
             // Every value the callee uses must be re-mappable: a callee
             // param, a callee instruction result, or a pool constant
             // (const-defined values are module-wide and dominate
             // everything, so they transplant verbatim).
-            for v in inst.op.operands() {
-                match module.value(v).map(|val| val.def) {
-                    Some(ValueDef::Param(_) | ValueDef::Inst(_) | ValueDef::Const(_)) => {}
-                    _ => return Err(SkipReason::CalleeForeignValue),
+            let mut foreign_val = false;
+            inst.op.for_each_operand(|v| {
+                if !foreign_val {
+                    match module.value(v).map(|val| val.def) {
+                        Some(ValueDef::Param(_) | ValueDef::Inst(_) | ValueDef::Const(_)) => {}
+                        _ => foreign_val = true,
+                    }
                 }
+            });
+            if foreign_val {
+                return Err(SkipReason::CalleeForeignValue);
             }
             // CFG integrity: every branch target and phi edge source is
             // a callee block, so the clone's remapping is total (the
@@ -652,7 +720,7 @@ fn eligibility(
             }
         }
     }
-    if nested_definitions_read_outer_env(module, &nested_roots) {
+    if nested_definitions_read_outer_env(module, &nested_roots, env_reads_cache) {
         return Err(SkipReason::CalleeDefinesClosure);
     }
 
@@ -718,7 +786,7 @@ fn eligibility(
 /// The forbidden-op classification (the conservative eligibility
 /// exclusions; `LoadNewTarget` is NOT forbidden — it is bound per call
 /// kind, see `bind_new_target`).
-fn forbidden_op(op: &Op) -> Option<SkipReason> {
+fn forbidden_op(op: &Op, cross_class: bool) -> Option<SkipReason> {
     use Op::*;
     match op {
         GetLexVar { .. }
@@ -726,6 +794,14 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
         | NewLexEnv { .. }
         | NewLexEnvWithName { .. }
         | PopLexEnv => Some(SkipReason::CalleeUsesLexEnv),
+        LoadModuleVar { .. }
+        | StoreModuleVar { .. }
+        | GetModuleNamespace { .. }
+        | DynamicImport { .. }
+            if cross_class =>
+        {
+            Some(SkipReason::CalleeForeignValue)
+        }
         LoadPrivate { .. }
         | StorePrivate { .. }
         | DefinePrivate { .. }
@@ -735,6 +811,15 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
         LoadSuper { .. } | StoreSuper { .. } | ThrowIfSuperNotCalled { .. } => {
             Some(SkipReason::CalleeUsesSuper)
         }
+        Call {
+            kind:
+                CallKind::Super
+                | CallKind::SuperArrow
+                | CallKind::SuperSpread
+                | CallKind::SuperForwardAllArgs
+                | CallKind::ClassInit,
+            ..
+        } => Some(SkipReason::CalleeUsesSuper),
         Await { .. }
         | AwaitUncaught { .. }
         | SuspendGenerator { .. }
@@ -743,7 +828,12 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
         | AsyncFunctionEnter
         | AsyncResolve { .. }
         | AsyncReject { .. }
-        | CreateGenerator { .. } => Some(SkipReason::CalleeSuspends),
+        | CreateGenerator { .. }
+        | CreateAsyncGenerator { .. }
+        | AsyncGeneratorResolve { .. }
+        | AsyncGeneratorReject { .. }
+        | SetGeneratorState { .. }
+        | NotifyConcurrentResult { .. } => Some(SkipReason::CalleeSuspends),
         _ => None,
     }
 }
@@ -768,38 +858,82 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
 /// the nested function's OWN env chain without touching the captured
 /// one. Cycles in the DefineFunc graph (mutual recursion) are cut by
 /// the visited set.
-fn nested_definitions_read_outer_env(module: &Module, roots: &[FuncId]) -> bool {
+fn nested_definitions_read_outer_env(
+    module: &Module,
+    roots: &[FuncId],
+    cache: &mut HashMap<FuncId, bool>,
+) -> bool {
     use std::collections::HashSet;
-    let mut visited: HashSet<FuncId> = HashSet::new();
-    let mut stack: Vec<FuncId> = roots.to_vec();
-    while let Some(fid) = stack.pop() {
-        if !visited.insert(fid) {
+    for &root in roots {
+        if let Some(&cached) = cache.get(&root) {
+            if cached {
+                return true;
+            }
             continue;
         }
-        let Some(func) = module.func(fid) else {
-            continue;
-        };
-        for &bb in &func.blocks {
-            let Some(block) = module.block(bb) else {
+        let mut visited: HashSet<FuncId> = HashSet::new();
+        let mut stack: Vec<FuncId> = vec![root];
+        let mut reads = false;
+        while let Some(fid) = stack.pop() {
+            if let Some(&known) = cache.get(&fid) {
+                if known {
+                    reads = true;
+                    break;
+                }
+                continue;
+            }
+            if !visited.insert(fid) {
+                continue;
+            }
+            let Some(func) = module.func(fid) else {
                 continue;
             };
-            for &iid in &block.insts {
-                let Some(inst) = module.inst(iid) else {
+            for &bb in &func.blocks {
+                let Some(block) = module.block(bb) else {
                     continue;
                 };
-                match &inst.op {
-                    Op::GetLexVar { .. }
-                    | Op::PutLexVar { .. }
-                    | Op::LoadPrivate { .. }
-                    | Op::StorePrivate { .. }
-                    | Op::DefinePrivate { .. }
-                    | Op::TestPrivate { .. }
-                    | Op::CreatePrivateNames { .. } => return true,
-                    Op::DefineFunc { body, .. } => stack.push(*body),
-                    Op::DefineClass(data) | Op::DefineSendableClass(data) => stack.push(data.ctor),
-                    _ => {}
+                for &iid in &block.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        Op::GetLexVar { .. }
+                        | Op::PutLexVar { .. }
+                        | Op::NewLexEnv {
+                            kind: LexEnvKind::Sendable | LexEnvKind::Patch,
+                            ..
+                        }
+                        | Op::LoadPrivate { .. }
+                        | Op::StorePrivate { .. }
+                        | Op::DefinePrivate { .. }
+                        | Op::TestPrivate { .. }
+                        | Op::CreatePrivateNames { .. }
+                        | Op::NotifyConcurrentResult { .. } => {
+                            reads = true;
+                            break;
+                        }
+                        Op::DefineFunc { body, .. } => stack.push(*body),
+                        Op::DefineClass(data) | Op::DefineSendableClass(data) => {
+                            stack.push(data.ctor);
+                        }
+                        _ => {}
+                    }
+                }
+                if reads {
+                    break;
                 }
             }
+            if reads {
+                break;
+            }
+        }
+        cache.insert(root, reads);
+        if !reads {
+            for v in visited {
+                cache.insert(v, false);
+            }
+        } else {
+            return true;
         }
     }
     false
@@ -813,31 +947,14 @@ fn nested_definitions_read_outer_env(module: &Module, roots: &[FuncId]) -> bool 
 /// and register allocation never colors it (the typescript-enum corpus
 /// failure). `undefined` is instead materialized as a `LoadConst`
 /// INSTRUCTION — see [`Undef`].
-fn undefined_const(module: &mut Module) -> ConstId {
-    (0..module.consts.len())
-        .map(|i| ConstId::new(i as u32))
-        .find(|&c| matches!(module.consts.get(c), Some(Const::Undefined)))
-        .unwrap_or_else(|| module.consts.push(Const::Undefined))
-}
-
-/// The per-splice `undefined` materialization: ONE `LoadConst` of the
-/// pooled undefined, inserted into the call block immediately before
-/// the call (so it dominates every cloned block and the continuation —
-/// the call block is on every path through the splice). Lazily created
-/// on first use; inst-defined, so register allocation colors it like
-/// any other instruction result. Glue instruction: `loc: None` (never
-/// fabricated).
 struct Undef {
     cid: ConstId,
     value: Option<ValueId>,
 }
 
 impl Undef {
-    fn new(module: &mut Module) -> Self {
-        Self {
-            cid: undefined_const(module),
-            value: None,
-        }
+    fn new(cid: ConstId) -> Self {
+        Self { cid, value: None }
     }
 
     /// The undefined value, materializing the `LoadConst` on first use
@@ -911,9 +1028,13 @@ enum NewTargetBinding {
 ///   completes, and a nonexistent successor has no preds/phis to
 ///   re-key, so skipping the re-key introduces no new corruption (the
 ///   dangling target predates the splice).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "call-site splice requires caller, call_iid, call_block, callee, receiver, args, kind, and cached undef_cid"
+)]
 fn inline_site(
     module: &mut Module,
+    undef_cid: ConstId,
     caller: FuncId,
     call_iid: InstId,
     call_block: BlockId,
@@ -922,7 +1043,7 @@ fn inline_site(
     args: &[ValueId],
     kind: CallKind,
 ) -> Result<(), SkipReason> {
-    let mut undef = Undef::new(module);
+    let mut undef = Undef::new(undef_cid);
     let nt_binding = new_target_binding(kind).ok_or(SkipReason::CalleeKind)?;
     // The call's position in its block: the `undefined` materialization
     // (when needed) is inserted there, before the call, so it dominates
@@ -1045,9 +1166,9 @@ fn inline_site(
                 return Err(SkipReason::CalleeNoBody);
             };
             let mut op = inst.op.clone();
-            for v in op.operands_mut() {
+            op.for_each_operand_mut(|v| {
                 *v = remap(&value_map, *v);
-            }
+            });
             match &mut op {
                 Op::Branch { dest } => *dest = map_block(*dest)?,
                 Op::CondBranch {
@@ -1059,9 +1180,8 @@ fn inline_site(
                     *false_dest = map_block(*false_dest)?;
                 }
                 Op::Phi { entries } => {
-                    for (edge, v) in entries.iter_mut() {
+                    for (edge, _) in entries.iter_mut() {
                         edge.from = map_block(edge.from)?;
-                        *v = remap(&value_map, *v);
                     }
                 }
                 _ => {}
@@ -1305,17 +1425,14 @@ fn inline_site(
             cont_block.preds = preds;
         }
     }
-    if let Some(result) = call_result
-        && result != replacement
-    {
-        crate::analysis::replace_uses_in_func(module, caller, result, replacement);
-    }
-
-    // ── Step H: exception participation (the module-docs rule) ───────
-    // Every region protecting the call block now protects ALL cloned
-    // blocks and the continuation; handlers gain Exceptional preds and
-    // same-value phi entries for each new protected block.
-    let new_protected: Vec<BlockId> = cloned_blocks.iter().copied().chain([cont]).collect();
+    // ── Step H snapshot (`R3-H10`): capture outer handler-phi incoming values
+    // for `call_block` BEFORE `replace_uses_in_func` rewrites `call_result` to
+    // `replacement`, so `call_block` and cloned callee blocks NEVER receive
+    // the call's post-return value on their `Exceptional` edges. ───────────
+    let call_edge = Edge {
+        from: call_block,
+        kind: EdgeKind::Exceptional,
+    };
     let protecting: Vec<usize> = module
         .func(caller)
         .map(|f| {
@@ -1338,22 +1455,9 @@ fn inline_site(
         .unwrap_or_default();
     handlers.sort_by_key(|b| b.index());
     handlers.dedup();
-    for handler in handlers {
-        let call_edge = Edge {
-            from: call_block,
-            kind: EdgeKind::Exceptional,
-        };
-        if let Some(handler_block) = module.block_mut(handler) {
-            for &x in &new_protected {
-                let edge = Edge {
-                    from: x,
-                    kind: EdgeKind::Exceptional,
-                };
-                if !handler_block.preds.contains(&edge) {
-                    handler_block.preds.push(edge);
-                }
-            }
-        }
+
+    let mut handler_phi_snapshots: Vec<(InstId, ValueId)> = Vec::new();
+    for &handler in &handlers {
         let phi_ids: Vec<InstId> = module
             .block(handler)
             .map(|b| {
@@ -1365,29 +1469,99 @@ fn inline_site(
             })
             .unwrap_or_default();
         for phi_id in phi_ids {
-            if let Some(phi) = module.inst_mut(phi_id)
-                && let Op::Phi { entries } = &mut phi.op
-            {
-                // The value the original call-block edge carried — the caller
-                // register state visible at the call. Verified input
-                // guarantees the entry; stay defensive.
-                let Some(v) = entries
+            if let Some(Op::Phi { entries }) = module.inst(phi_id).map(|i| &i.op)
+                && let Some(v) = entries
                     .iter()
                     .find(|(edge, _)| *edge == call_edge)
                     .map(|(_, v)| *v)
-                else {
-                    continue;
+            {
+                handler_phi_snapshots.push((phi_id, v));
+            }
+        }
+    }
+
+    if let Some(result) = call_result
+        && result != replacement
+    {
+        crate::analysis::replace_uses_in_func(module, caller, result, replacement);
+    }
+
+    // ── Step H: exception participation (`R3-H10`) ───────────────────
+    // Every region protecting `call_block` now protects ALL cloned callee
+    // blocks and `cont`. Handler `preds` and `Phi` entries are deduplicated
+    // across shared handlers, and `call_block` + `cloned_blocks` keep the
+    // snapshotted pre-call value (or a pre-throw `ValueDef::Const(Undefined)`
+    // if unverified input referenced `call_result` on `call_edge`).
+    let new_protected: Vec<BlockId> = cloned_blocks.iter().copied().chain([cont]).collect();
+    for &handler in &handlers {
+        if let Some(handler_block) = module.block_mut(handler) {
+            for &x in &new_protected {
+                let edge = Edge {
+                    from: x,
+                    kind: EdgeKind::Exceptional,
                 };
-                for &x in &new_protected {
-                    let edge = Edge {
-                        from: x,
-                        kind: EdgeKind::Exceptional,
-                    };
-                    if !entries.iter().any(|(e, _)| *e == edge) {
-                        entries.push((edge, v));
-                    }
+                if !handler_block.preds.contains(&edge) {
+                    handler_block.preds.push(edge);
                 }
             }
+        }
+    }
+    let mut caller_undef_const_val: Option<ValueId> = None;
+    for (phi_id, snap_val) in handler_phi_snapshots {
+        let (pre_val, cont_val) = if Some(snap_val) == call_result {
+            let uval = *caller_undef_const_val.get_or_insert_with(|| {
+                let existing = module.func(caller).and_then(|f| {
+                    f.frame_init_consts.iter().copied().find(|&v| {
+                        matches!(
+                            module.value(v).map(|val| val.def),
+                            Some(ValueDef::Const(c)) if c == undef.cid
+                        )
+                    })
+                });
+                if let Some(v) = existing {
+                    v
+                } else {
+                    let v = ValueId::new(module.values.len() as u32);
+                    module.values.push(abcd_ir::Value {
+                        def: ValueDef::Const(undef.cid),
+                        ty: Ty::Any,
+                    });
+                    if let Some(f) = module.func_mut(caller) {
+                        f.frame_init_consts.push(v);
+                    }
+                    v
+                }
+            });
+            (uval, replacement)
+        } else {
+            (snap_val, snap_val)
+        };
+        if let Some(phi) = module.inst_mut(phi_id)
+            && let Op::Phi { entries } = &mut phi.op
+        {
+            for (edge, val) in entries.iter_mut() {
+                if *edge == call_edge {
+                    *val = pre_val;
+                }
+            }
+            for &cb in &cloned_blocks {
+                let edge = Edge {
+                    from: cb,
+                    kind: EdgeKind::Exceptional,
+                };
+                if !entries.iter().any(|(e, _)| *e == edge) {
+                    entries.push((edge, pre_val));
+                }
+            }
+            let cont_edge = Edge {
+                from: cont,
+                kind: EdgeKind::Exceptional,
+            };
+            if !entries.iter().any(|(e, _)| *e == cont_edge) {
+                entries.push((cont_edge, cont_val));
+            }
+            let mut seen_edges = std::collections::HashSet::with_capacity(entries.len());
+            entries.retain(|(e, _)| seen_edges.insert(*e));
         }
     }
     if let Some(func) = module.func_mut(caller) {
@@ -1406,7 +1580,7 @@ fn inline_site(
         if let Some(b) = module.block(cb) {
             for &iid in &b.insts {
                 if let Some(inst) = module.inst(iid) {
-                    for v in inst.op.operands() {
+                    inst.op.for_each_operand(|v| {
                         if module
                             .value(v)
                             .is_some_and(|val| matches!(val.def, ValueDef::Const(_)))
@@ -1414,7 +1588,7 @@ fn inline_site(
                         {
                             const_vals.push(v);
                         }
-                    }
+                    });
                 }
             }
         }
@@ -1466,8 +1640,11 @@ mod tests {
         for kind in [
             CallKind::Apply,
             CallKind::Super,
+            CallKind::SuperArrow,
             CallKind::SuperSpread,
             CallKind::SuperForwardAllArgs,
+            CallKind::NewSpread,
+            CallKind::ClassInit,
         ] {
             assert_eq!(new_target_binding(kind), None, "{kind:?} is unbindable");
         }

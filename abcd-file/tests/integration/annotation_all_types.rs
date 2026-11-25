@@ -26,56 +26,34 @@ fn finish(b: &mut Builder, cls: abcd_file::ClassHandle) -> Vec<u8> {
 // Encode round-trip helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve a method item offset to its name (entity identity across a
-/// re-encode: offsets move, names don't — tests here use unique names).
-/// Offset 0 is the hand-built-model sentinel; fall back to entity_map[0],
-/// the same fallback the encoder uses.
-fn method_name_at(file: &abcd_file::File, off: u32) -> String {
-    if let Some((_, m)) = file.all_methods().find(|(_, m)| m.offset == off) {
-        return file.strings.resolve(m.name).unwrap_or("?").to_string();
-    }
-    if off == 0
-        && let Some(sid) = file.entity_map.get(&0)
-    {
-        return file.strings.resolve(*sid).unwrap_or("?").to_string();
-    }
-    "<unresolved>".to_string()
+/// Resolve a dense [`abcd_file::MethodIdx`] to its method name.
+fn method_name_by_idx(file: &abcd_file::File, idx: abcd_file::MethodIdx) -> String {
+    file.method_by_idx(idx)
+        .and_then(|(_, _, m)| file.strings.resolve(m.name))
+        .unwrap_or("<unresolved>")
+        .to_string()
 }
 
 /// Canonical text form of a literal value: StringIds are resolved through
-/// the pool and method offsets through the method table, because both are
-/// pool/file-layout-local and differ between two decodes of one model.
-/// Typed-array (`ArrayXxx`) values compare by discriminant only: their
-/// payload is a file offset that legitimately moves on re-encode.
+/// the pool and method handles through the method table, because both are
+/// pool/table-local across decodes.
+/// Typed-array (`ArrayXxx`) values compare by discriminant only.
 fn canon_literal(file: &abcd_file::File, v: &LiteralValue) -> String {
     let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
     match v {
         LiteralValue::String(sid) => format!("String({})", r(*sid)),
         LiteralValue::EtsImplements(sid) => format!("EtsImplements({})", r(*sid)),
-        LiteralValue::Method(off) => format!("Method({})", method_name_at(file, *off)),
-        LiteralValue::GeneratorMethod(off) => {
-            format!("GeneratorMethod({})", method_name_at(file, *off))
+        LiteralValue::Method(idx) => format!("Method({})", method_name_by_idx(file, *idx)),
+        LiteralValue::GeneratorMethod(idx) => {
+            format!("GeneratorMethod({})", method_name_by_idx(file, *idx))
         }
-        LiteralValue::AsyncGeneratorMethod(off) => {
-            format!("AsyncGeneratorMethod({})", method_name_at(file, *off))
+        LiteralValue::AsyncGeneratorMethod(idx) => {
+            format!("AsyncGeneratorMethod({})", method_name_by_idx(file, *idx))
         }
-        LiteralValue::Getter(off) => format!("Getter({})", method_name_at(file, *off)),
-        LiteralValue::Setter(off) => format!("Setter({})", method_name_at(file, *off)),
-        // Content-based recursion: the literal-array table order is not
-        // guaranteed, so comparing by content is order-independent. The
-        // payload is a table index for model arrays and a RAW FILE OFFSET
-        // for annotation-embedded arrays (never rewritten — literal.rs
-        // LiteralArray doc); resolve both forms.
+        LiteralValue::Getter(idx) => format!("Getter({})", method_name_by_idx(file, *idx)),
+        LiteralValue::Setter(idx) => format!("Setter({})", method_name_by_idx(file, *idx)),
         LiteralValue::LiteralArray(idx) => {
-            let values = if (idx.0 as usize) < file.literal_arrays.len() {
-                &file.literal_arrays[idx.0 as usize].values
-            } else {
-                let table_idx = file
-                    .literal_array_offsets
-                    .get(&idx.0)
-                    .unwrap_or_else(|| panic!("unresolvable literal-array payload {idx:?}"));
-                &file.literal_arrays[*table_idx as usize].values
-            };
+            let values = &file.literal_arrays[idx.index()].values;
             format!("LiteralArray[{}]", canon_literals(file, values))
         }
         LiteralValue::ArrayU1(_) => "ArrayU1".into(),
@@ -838,8 +816,13 @@ fn scalar_method_enum_and_handles_encode_roundtrip() {
     let ann = &g.annotations.compile_time[0];
     assert_eq!(ann.elements.len(), 4);
     match &ann.elements[0].value {
-        AnnotationValue::Method { name, offset } => {
+        AnnotationValue::Method {
+            name,
+            method,
+            offset,
+        } => {
             assert_eq!(file.strings.resolve(*name), Some("target"));
+            assert!(method.is_some());
             assert_ne!(*offset, 0);
         }
         other => panic!("expected Method, got {other:?}"),
@@ -1016,32 +999,22 @@ fn array_void_and_nullptr_elems_encode_as_zero() {
 #[test]
 fn annotation_embedded_literal_array_all_kinds_encode_roundtrip() {
     let mut file = base_model();
-    let target_off = {
-        let cls = file.classes.values().find(|c| !c.is_external).unwrap();
-        cls.methods
-            .iter()
-            .find(|m| file.strings.resolve(m.name) == Some("func_main_0"))
-            .expect("method")
-            .offset
-    };
-    assert_ne!(target_off, 0);
+    let target_idx = abcd_file::MethodIdx(0);
+    assert_eq!(
+        file.method_by_idx(target_idx)
+            .and_then(|(_, _, m)| file.strings.resolve(m.name)),
+        Some("func_main_0")
+    );
 
     let desc = file.strings.get_or_intern("LAnno;");
     let str_sid = file.strings.get_or_intern("embedded_str");
     let impl_sid = file.strings.get_or_intern("LImpl;");
     let name = |file: &mut abcd_file::File, s: &str| file.strings.get_or_intern(s);
 
-    // The offset-0 name fallback: hand-built models carry no source offset;
-    // entity_map[0] supplies the name (same contract as the model path).
-    let target_name = file
-        .strings
-        .get("func_main_0")
-        .expect("method name interned");
-    file.entity_map.insert(0, target_name);
-
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(0x4242), LiteralValue::String(str_sid)],
-    });
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::Integer(0x4242),
+        LiteralValue::String(str_sid),
+    ]));
 
     // Includes a nested `LiteralValue::LiteralArray` in the middle of the
     // matrix followed by trailing items (#32-File: deferred `ann_la_*`
@@ -1055,15 +1028,14 @@ fn annotation_embedded_literal_array_all_kinds_encode_roundtrip() {
         LiteralValue::Double(2.5),
         LiteralValue::String(str_sid),
         LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::Method(target_off),
-        LiteralValue::GeneratorMethod(target_off),
-        LiteralValue::AsyncGeneratorMethod(target_off),
-        LiteralValue::Getter(target_off),
-        LiteralValue::Setter(target_off),
-        LiteralValue::Method(0), // offset-0 name fallback
+        LiteralValue::Method(target_idx),
+        LiteralValue::GeneratorMethod(target_idx),
+        LiteralValue::AsyncGeneratorMethod(target_idx),
+        LiteralValue::Getter(target_idx),
+        LiteralValue::Setter(target_idx),
         LiteralValue::Accessor(1),
         LiteralValue::MethodAffiliate(9),
-        LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(7)),
+        LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(0)),
         LiteralValue::BuiltinTypeIndex(3),
         LiteralValue::EtsImplements(impl_sid),
         LiteralValue::NullValue(0),

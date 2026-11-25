@@ -126,7 +126,12 @@ impl DecompileIndex {
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
-                if let Op::PutLexVar { level, slot, value } = &inst.op
+                if let Op::PutLexVar {
+                    level,
+                    slot,
+                    value,
+                    kind: abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable,
+                } = &inst.op
                     && let Some(body) = crate::classfold::peel_closure_body(module, *value)
                 {
                     lex_closure_stores
@@ -426,8 +431,8 @@ fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
                 continue;
             };
             match c {
-                Const::MethodRef(f) => out.push(*f),
-                Const::ArrayLiteral(items) => {
+                Const::MethodRef { func, .. } => out.push(*func),
+                Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
                     for &item_cid in items.iter().rev() {
                         if visited.insert(item_cid) {
                             stack.push(item_cid);
@@ -439,6 +444,11 @@ fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
                         if visited.insert(child_cid) {
                             stack.push(child_cid);
                         }
+                    }
+                }
+                Const::LiteralBufferRef(inner) => {
+                    if visited.insert(*inner) {
+                        stack.push(*inner);
                     }
                 }
                 _ => {}
@@ -527,7 +537,7 @@ fn step_inst(
         }
     }
     match op {
-        Op::NewLexEnv { num_vars } => {
+        Op::NewLexEnv { num_vars, .. } => {
             *cached_arc = None;
             stack.push(EnvFrame {
                 slots: vec![None; *num_vars as usize],
@@ -559,9 +569,17 @@ fn step_inst(
                 }
             }
         }
-        Op::GetLexVar { level, slot } | Op::PutLexVar { level, slot, .. } => {
-            let name = resolve_slot(stack, *level, *slot)
-                .unwrap_or_else(|| lex_fallback(stack.len(), *level, *slot));
+        Op::GetLexVar { level, slot, kind }
+        | Op::PutLexVar {
+            level, slot, kind, ..
+        } => {
+            let name = match kind {
+                abcd_ir::LexEnvKind::Patch => format!("v999999_{slot}"),
+                abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => {
+                    resolve_slot(stack, *level, *slot)
+                        .unwrap_or_else(|| lex_fallback(stack.len(), *level, *slot))
+                }
+            };
             scopes.resolved.insert(iid, name);
         }
         Op::LoadPrivate { level, slot, .. }
@@ -1147,6 +1165,7 @@ mod tests {
                 object: v,
                 name: s,
                 value: v,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
             Op::TryGetGlobal {
                 name: s,
@@ -1322,7 +1341,15 @@ mod tests {
             push_inst(&mut m, b, Op::Return { value: None });
         }
         let leaf_b = entry_of(&m, fids[0]);
-        let leaf_get = push_inst(&mut m, leaf_b, Op::GetLexVar { level: 0, slot: 0 });
+        let leaf_get = push_inst(
+            &mut m,
+            leaf_b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         push_inst(&mut m, leaf_b, Op::Return { value: None });
 
         // Also add a mutual cycle (`cyc_a <-> cyc_b`) to verify cycle safety.
@@ -1361,5 +1388,85 @@ mod tests {
                 .expect("spawn 256k scoped thread");
             handle.join().expect("256k thread must not stack-overflow");
         });
+    }
+
+    #[test]
+    fn round3_patch_lexenv_and_literal_buffer_ref_children() {
+        use abcd_ir::consts::TypedArrayTag;
+
+        let mut m = mk_module();
+        let child_a = add_fn(&mut m, "child_a");
+        let child_b = add_fn(&mut m, "child_b");
+        let parent = add_fn(&mut m, "parent");
+        let pb = entry_of(&m, parent);
+
+        // Push `NewLexEnvWithName` before defining children so the children
+        // capture `parentNamed` at their definition sites.
+        let named_sym = m.sym.intern("parentNamed");
+        let named_cid = m.consts.intern(Const::String(named_sym));
+        let scope_arr = m.consts.push_array(vec![named_cid]);
+        let _ = emit_val(
+            &mut m,
+            pb,
+            Op::NewLexEnvWithName {
+                num_vars: 1,
+                scope_names: scope_arr,
+            },
+        );
+
+        // `parent` defines `child_a` through `LiteralBufferRef -> TypedArrayLiteral -> MethodRef`
+        // and `child_b` through `DefineClass` members behind `LiteralBufferRef`.
+        let ma = m.consts.intern(Const::method_ref(child_a));
+        let tarr = m.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I32,
+            items: vec![ma],
+        });
+        let bref_a = m.consts.push(Const::LiteralBufferRef(tarr));
+        let _ = emit_val(&mut m, pb, Op::AllocObject { shape: bref_a });
+
+        let mb = m.consts.intern(Const::method_ref(child_b));
+        let arr_b = m.consts.push_array(vec![mb]);
+        let bref_b = m.consts.push(Const::LiteralBufferRef(arr_b));
+        let ctor = add_fn(&mut m, "C");
+        let _ = emit_val(
+            &mut m,
+            pb,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor,
+                heritage: None,
+                members: bref_b,
+                member_attrs: vec![],
+                count: 0,
+            })),
+        );
+        push_inst(&mut m, pb, Op::Return { value: None });
+
+        for child in [child_a, child_b] {
+            let cb = entry_of(&m, child);
+            let get_plain = push_inst(
+                &mut m,
+                cb,
+                Op::GetLexVar {
+                    level: 0,
+                    slot: 0,
+                    kind: abcd_ir::LexEnvKind::Plain,
+                },
+            );
+            let get_patch = push_inst(
+                &mut m,
+                cb,
+                Op::GetLexVar {
+                    level: 0,
+                    slot: 0,
+                    kind: abcd_ir::LexEnvKind::Patch,
+                },
+            );
+            push_inst(&mut m, cb, Op::Return { value: None });
+            let index = DecompileIndex::build(&m);
+            let scopes = NameScopes::build_with_index(&m, child, Some(&index));
+            assert_eq!(scopes.name_of(get_plain), Some("parentNamed"));
+            assert_eq!(scopes.name_of(get_patch), Some("v999999_0"));
+            assert!(scopes.has_fallback_lexenv_name());
+        }
     }
 }

@@ -153,8 +153,8 @@ pub(crate) fn resolve_subst(replacements: &HashMap<ValueId, ValueId>, mut v: Val
 /// Replace all uses of `old` with `new_val` across every instruction in
 /// `func`. Returns the number of
 /// replacements made. Uses are enumerated exclusively through
-/// [`Op::operands_mut`], the single mutation point, so no operand role
-/// can be missed (phi entries, call args, branch conditions, …).
+/// [`Op::for_each_operand_mut`], the single non-allocating mutation point, so
+/// no operand role can be missed (phi entries, call args, branch conditions, …).
 pub fn replace_uses_in_func(
     module: &mut Module,
     func_id: FuncId,
@@ -178,12 +178,12 @@ pub fn replace_uses_in_func(
             let Some(inst) = module.inst_mut(inst_id) else {
                 continue;
             };
-            for v in inst.op.operands_mut() {
+            inst.op.for_each_operand_mut(|v| {
                 if *v == old {
                     *v = new_val;
                     count += 1;
                 }
-            }
+            });
         }
     }
     count
@@ -216,13 +216,13 @@ pub fn replace_uses_map_in_func(
             let Some(inst) = module.inst_mut(inst_id) else {
                 continue;
             };
-            for v in inst.op.operands_mut() {
+            inst.op.for_each_operand_mut(|v| {
                 let target = resolve_subst(replacements, *v);
                 if target != *v {
                     *v = target;
                     count += 1;
                 }
-            }
+            });
         }
     }
     count

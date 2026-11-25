@@ -2,6 +2,7 @@
 name = "abcd-opt"
 description = "Optimization passes for the SSA IR (abcd_ir::Module): peephole, SCCP, ADCE + CFG simplify, copyprop, inline (design/ir.md)"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
@@ -10,16 +11,21 @@ readme = "README.md"
 # same enforcement mechanism as abcd-ir): layering is lift = decode→IR,
 # opt = IR→IR, lower = IR→file. The passes are FORMAT-INDEPENDENT — they
 # see `abcd_ir::Module` and nothing else. This crate's [dependencies]
-# must ONLY ever list `abcd-ir` (the IR) — never abcd-file, abcd-isa,
+# must ONLY ever list `abcd-ir` (the IR) and pure-Rust zero-dep `libm`
+# (deterministic IEEE-754 math) — never abcd-file, abcd-isa,
 # abcd-file-sys, abcd-isa-sys (the container/ISA layer), abcd-lift, or
 # abcd-lower. The format-coupled crates appear exclusively under
 # [dev-dependencies], where the regression tests build bytecode files and
 # drive the decode → lift → optimize → lower pipeline end-to-end.
 [dependencies]
 abcd-ir = { workspace = true }
+libm = { workspace = true }
 
 [dev-dependencies]
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
 abcd-lift = { workspace = true }
 abcd-lower = { workspace = true }
+
+[lints]
+workspace = true

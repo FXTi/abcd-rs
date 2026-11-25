@@ -9,6 +9,7 @@
 //! file rewriting ([`rewrite_file`]), and standalone whole-module lowering
 //! ([`lower_module`]).
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
@@ -23,9 +24,11 @@ pub mod regalloc;
 
 use abcd_ir::{BlockId, FuncId, Module, ValueId};
 
-pub use layout::LayoutResult;
+pub use layout::{LayoutResult, LoweredCatchBlock, LoweredTryBlock};
 pub use method_body::{EntityResolver, lower_module_bodies, to_method_body};
-pub use module_lower::{lower_module, lower_module_with_options, rewrite_file};
+pub use module_lower::{
+    lower_module, lower_module_with_options, rebuild_method_debug, rewrite_file,
+};
 pub use regalloc::RegAlloc;
 
 /// Lowering options.
@@ -159,14 +162,6 @@ pub enum LowerError {
         /// The successor.
         succ: BlockId,
     },
-    /// The method consumes more IC slots than the u16 slot-immediate space
-    /// even after one-byte-slot-first rearrangement (N71) — no vendored
-    /// encoding exists.
-    #[error(
-        "function {0:?}: IC slot consumption exceeds the u16 slot-immediate space even after \
-         ReArrangeIc-style rearrangement — no vendored encoding exists"
-    )]
-    IcSlotOverflow(FuncId),
     /// isel's IC-immediate operand map disagrees with the vendor property
     /// tables (internal invariant: the map must cover exactly the
     /// `ic_slot`/`jit_ic_slot` instructions isel emits — a gap would leave
@@ -208,6 +203,33 @@ pub enum LowerError {
          the u16 entity operand limit"
     )]
     EntityIndexOverflow(FuncId),
+    /// A jump bytecode carries a [`abcd_isa::Label`] that resolves to neither a
+    /// laid-out basic block nor an internal instruction label (`#57` `R3-M3`).
+    #[error(
+        "function {func:?}: branch target label {target} does not resolve to any laid-out block"
+    )]
+    UnresolvedLabel {
+        /// The owning function.
+        func: FuncId,
+        /// The unresolved raw label payload.
+        target: u32,
+    },
+    /// Internal entity-operand visitor count disagreed with
+    /// `abcd_isa::Bytecode::entity_operands` (`#58` `R3-M9`).
+    #[error(
+        "function {func:?}: entity operand visitor mismatch for {mnemonic} \
+         (expected {expected}, visited {visited})"
+    )]
+    EntityOperandMismatch {
+        /// The owning function.
+        func: FuncId,
+        /// Bytecode mnemonic.
+        mnemonic: String,
+        /// Operand count reported by `Bytecode::entity_operands`.
+        expected: usize,
+        /// Operand count visited by `for_each_entity_operand_mut`.
+        visited: usize,
+    },
 }
 
 /// Lower a single IR function back to bytecodes with default [`LowerOptions`].

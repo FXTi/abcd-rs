@@ -368,10 +368,42 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         );
     }
 
-    // Resolve encoded string/method indices while the source file is open.
-    // An index only has meaning in its owning method's index region; it must
-    // never be used directly as a key in the file-wide offset/name map.
-    for method in classes.values_mut().flat_map(|class| &mut class.methods) {
+    // Assign dense 0-based `MethodIdx` / `FieldIdx` tables in `classes` BTreeMap order.
+    let mut method_offset_to_idx: HashMap<u32, MethodIdx> = HashMap::new();
+    for (idx, (_, m)) in classes
+        .iter()
+        .flat_map(|(&d, c)| c.methods.iter().map(move |m| (d, m)))
+        .enumerate()
+    {
+        if m.offset != 0 {
+            method_offset_to_idx
+                .entry(m.offset)
+                .or_insert(MethodIdx(idx as u32));
+        }
+    }
+    let mut field_offset_to_idx: HashMap<u32, FieldIdx> = HashMap::new();
+    for (idx, (_, fl)) in classes
+        .iter()
+        .flat_map(|(&d, c)| c.fields.iter().map(move |fl| (d, fl)))
+        .enumerate()
+    {
+        if fl.offset != 0 {
+            field_offset_to_idx
+                .entry(fl.offset)
+                .or_insert(FieldIdx(idx as u32));
+        }
+    }
+
+    // Resolve encoded string/method/literal-array indices while the source file
+    // is open. Literal-array operands record `(flat_method_idx, raw_id, offset)`
+    // and finalize to `EntityRef::LiteralArray(LiteralArrayIdx)` once
+    // `decode_literal_arrays` builds the complete table.
+    let mut pending_code_lit_refs: Vec<(usize, u32, u32)> = Vec::new();
+    for (flat_idx, method) in classes
+        .values_mut()
+        .flat_map(|class| &mut class.methods)
+        .enumerate()
+    {
         let Some(body) = &mut method.body else {
             continue;
         };
@@ -395,8 +427,8 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         id.0
                     ),
                 };
-                if legacy {
-                    let offset = match kind {
+                let offset = if legacy {
+                    match kind {
                         EntityKind::StringId => {
                             let off = id.0;
                             if off == 0 || off as usize >= data.len() {
@@ -407,13 +439,13 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         EntityKind::MethodId => {
                             let index = u16::try_from(id.0).map_err(|_| invalid())?;
                             // SAFETY: `f` is a live `AbcFileHandle`.
-                            let offset = unsafe {
+                            let off = unsafe {
                                 sys::abc_resolve_offset_by_index(f, method.offset, index)
                             };
-                            if offset == ABSENT {
+                            if off == ABSENT {
                                 return Err(invalid());
                             }
-                            offset
+                            off
                         }
                         EntityKind::LiteralarrayId => {
                             let Some((count, table_off)) = legacy_lit_table else {
@@ -437,68 +469,67 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                             }
                             off
                         }
-                    };
-                    body.entity_offsets.insert((kind, id.0), offset);
-                    if kind == EntityKind::LiteralarrayId || entity_map.contains_key(&offset) {
-                        continue;
                     }
-                    if kind == EntityKind::StringId {
-                        let sid = str_cache
-                            .intern_lossy(offset, &mut strings)
-                            .ok_or_else(invalid)?;
-                        entity_map.insert(offset, sid);
-                        continue;
-                    }
-                    let sid = {
-                        // SAFETY: `f` is live.
-                        let accessor = unsafe { sys::abc_method_open(f, offset) };
-                        if accessor.is_null() {
-                            return Err(invalid());
-                        }
-                        let _guard = HandleGuard(Some(|| {
-                            // SAFETY: `accessor` is non-null and owned by this scope.
-                            unsafe { sys::abc_method_close(accessor) };
-                        }));
-                        str_cache.intern_method_name(offset, accessor, &mut strings)
-                    }
-                    .ok_or_else(invalid)?;
-                    entity_map.insert(offset, sid);
-                    continue;
-                }
-                let index = u16::try_from(id.0).map_err(|_| invalid())?;
-                // SAFETY: `f` is a live `AbcFileHandle`.
-                let offset = unsafe { sys::abc_resolve_offset_by_index(f, method.offset, index) };
-                if offset == ABSENT {
-                    return Err(invalid());
-                }
-                body.entity_offsets.insert((kind, id.0), offset);
-                if kind == EntityKind::LiteralarrayId {
-                    continue;
-                }
-                if entity_map.contains_key(&offset) {
-                    continue;
-                }
-                if kind == EntityKind::StringId {
-                    let sid = str_cache
-                        .intern_lossy(offset, &mut strings)
-                        .ok_or_else(invalid)?;
-                    entity_map.insert(offset, sid);
-                    continue;
-                }
-                let sid = {
-                    // SAFETY: `f` is live.
-                    let accessor = unsafe { sys::abc_method_open(f, offset) };
-                    if accessor.is_null() {
+                } else {
+                    let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                    // SAFETY: `f` is a live `AbcFileHandle`.
+                    let off = unsafe { sys::abc_resolve_offset_by_index(f, method.offset, index) };
+                    if off == ABSENT {
                         return Err(invalid());
                     }
-                    let _guard = HandleGuard(Some(|| {
-                        // SAFETY: `accessor` is non-null and owned by this scope.
-                        unsafe { sys::abc_method_close(accessor) };
-                    }));
-                    str_cache.intern_method_name(offset, accessor, &mut strings)
+                    off
+                };
+
+                match kind {
+                    EntityKind::LiteralarrayId => {
+                        pending_code_lit_refs.push((flat_idx, id.0, offset));
+                    }
+                    EntityKind::StringId => {
+                        let sid = match entity_map.get(&offset).copied() {
+                            Some(sid) => sid,
+                            None => {
+                                let sid = str_cache
+                                    .intern_lossy(offset, &mut strings)
+                                    .ok_or_else(invalid)?;
+                                entity_map.insert(offset, sid);
+                                sid
+                            }
+                        };
+                        body.entities
+                            .insert((kind, id.0), EntityRef::string_with_offset(sid, offset));
+                    }
+                    EntityKind::MethodId => {
+                        let eref = if let Some(&midx) = method_offset_to_idx.get(&offset) {
+                            EntityRef::Method(midx)
+                        } else {
+                            let name = match entity_map.get(&offset).copied() {
+                                Some(sid) => sid,
+                                None => {
+                                    let sid = {
+                                        // SAFETY: `f` is live.
+                                        let accessor = unsafe { sys::abc_method_open(f, offset) };
+                                        if accessor.is_null() {
+                                            return Err(invalid());
+                                        }
+                                        let _guard = HandleGuard(Some(|| {
+                                            // SAFETY: `accessor` is non-null and owned by this scope.
+                                            unsafe { sys::abc_method_close(accessor) };
+                                        }));
+                                        str_cache.intern_method_name(offset, accessor, &mut strings)
+                                    }
+                                    .ok_or_else(invalid)?;
+                                    entity_map.insert(offset, sid);
+                                    sid
+                                }
+                            };
+                            EntityRef::ExternalMethod {
+                                name,
+                                source_offset: offset,
+                            }
+                        };
+                        body.entities.insert((kind, id.0), eref);
+                    }
                 }
-                .ok_or_else(invalid)?;
-                entity_map.insert(offset, sid);
             }
         }
     }
@@ -509,8 +540,12 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     // never sees it. Collect those references here so the literal arrays
     // enter the model exactly like modern ones.
     if legacy {
-        for method in classes.values_mut().flat_map(|class| &mut class.methods) {
-            let Some(body) = &mut method.body else {
+        for (flat_idx, method) in classes
+            .values()
+            .flat_map(|class| &class.methods)
+            .enumerate()
+        {
+            let Some(body) = &method.body else {
                 continue;
             };
             for bytecode in &body.bytecodes {
@@ -550,31 +585,19 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                 if off == 0 || off as usize >= data.len() {
                     return Err(invalid());
                 }
-                body.entity_offsets
-                    .insert((abcd_isa::EntityKind::LiteralarrayId, idx), off);
+                pending_code_lit_refs.push((flat_idx, idx, off));
             }
         }
     }
 
     // --- literal arrays ---
-    // API13/24 no longer expose a usable header count. Collect literal-array
-    // offsets reached through method index regions so they can be decoded on
-    // demand alongside legacy table entries. Scope-names blobs
-    // (`_ESScopeNamesRecord` field values) and nested `LiteralTag::LiteralArray`
-    // targets inside annotation-embedded literal arrays (`L_ESTypeAnnotation;`
-    // `_TypeOfInstruction`, etc.) are ordinary tagged literal arrays that may
-    // be reachable only through those references, so seed them too.
-    let mut referenced_literal_offsets: HashSet<u32> = classes
-        .values()
-        .flat_map(|class| class.methods.iter())
-        .flat_map(|method| method.body.iter())
-        .flat_map(|body| body.entity_offsets.iter())
-        .filter_map(|((kind, _), offset)| {
-            (kind == &abcd_isa::EntityKind::LiteralarrayId).then_some(*offset)
-        })
+    let mut referenced_literal_offsets: HashSet<u32> = pending_code_lit_refs
+        .iter()
+        .map(|&(_, _, off)| off)
         .chain(scope_names_offsets.iter().copied())
         .collect();
     collect_annotation_nested_literal_offsets(
+        f,
         &classes,
         size,
         &module_data_offsets,
@@ -590,11 +613,45 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             &referenced_literal_offsets,
             &module_data_offsets,
             &phase_blob_offsets,
+            &method_offset_to_idx,
         )?;
-    rewrite_annotation_nested_literal_refs(
+
+    // Finalize bytecode literal-array operands, field `LiteralArrayRef`s, and
+    // annotation method/field/literal-array indices.
+    {
+        let mut methods_mut: Vec<&mut Method> = classes
+            .values_mut()
+            .flat_map(|c| c.methods.iter_mut())
+            .collect();
+        for (flat_idx, raw_id, off) in pending_code_lit_refs {
+            let table_idx = literal_array_offsets.get(&off).copied().unwrap_or(ABSENT);
+            if let Some(body) = methods_mut[flat_idx].body.as_mut() {
+                body.entities.insert(
+                    (abcd_isa::EntityKind::LiteralarrayId, raw_id),
+                    EntityRef::LiteralArray(LiteralArrayIdx(table_idx)),
+                );
+            }
+        }
+    }
+    for class in classes.values_mut() {
+        for field in &mut class.fields {
+            if let Some(FieldValue::LiteralArrayRef {
+                index,
+                source_offset: Some(off),
+            }) = &mut field.initial_value
+            {
+                let table_idx = literal_array_offsets.get(off).copied().unwrap_or(ABSENT);
+                *index = LiteralArrayIdx(table_idx);
+            }
+        }
+    }
+    rewrite_annotation_refs(
         &mut classes,
         &literal_array_offsets,
         literal_arrays.len(),
+        &literal_array_header_offsets,
+        &method_offset_to_idx,
+        &field_offset_to_idx,
     );
 
     Ok(File {
@@ -605,9 +662,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         strings,
         classes,
         literal_arrays,
-        literal_array_offsets,
         literal_array_header_offsets,
-        entity_map,
     })
 }
 
@@ -3050,7 +3105,9 @@ fn decode_method_at(
         if code_off == ABSENT {
             (None, Vec::new())
         } else {
-            let (b, bo) = decode_code_at(f, method_off, code_off, dialect)?;
+            let (b, bo) = decode_code_at(
+                f, method_off, code_off, dialect, entity_map, strings, str_cache,
+            )?;
             (Some(b), bo)
         }
     };
@@ -3562,7 +3619,10 @@ fn decode_field_at(
                     return Err(Error::InvalidOffset(offset));
                 }
                 scope_names_offsets.insert(offset);
-                Some(FieldValue::LiteralArrayRef(offset))
+                Some(FieldValue::LiteralArrayRef {
+                    index: LiteralArrayIdx(offset),
+                    source_offset: Some(offset),
+                })
             }
         }
         (_, TypeId::U32, Some(FieldValue::I32(off)))
@@ -3606,7 +3666,10 @@ fn decode_field_at(
                 ))
             })?;
             scope_names_offsets.insert(offset);
-            Some(FieldValue::LiteralArrayRef(offset))
+            Some(FieldValue::LiteralArrayRef {
+                index: LiteralArrayIdx(offset),
+                source_offset: Some(offset),
+            })
         }
         (_, TypeId::U32, Some(FieldValue::I32(off)))
             if strings.resolve(name) == Some(JSON_FILE_CONTENT_FIELD) =>
@@ -3702,6 +3765,9 @@ fn decode_code_at(
     method_off: u32,
     code_off: u32,
     dialect: Dialect,
+    entity_map: &HashMap<u32, StringId>,
+    strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
 ) -> Result<(MethodBody, Vec<u32>), Error> {
     // SAFETY: `f` is a live `AbcFileHandle`.
     let cr = unsafe { sys::abc_code_open(f, code_off) };
@@ -3758,48 +3824,61 @@ fn decode_code_at(
             })
     };
 
-    let try_blocks = collect_try_blocks(f, method_off, cr)?
-        .into_iter()
-        .map(|tb| {
-            let end_pc = tb
-                .start
-                .checked_add(tb.len)
-                .ok_or_else(|| Error::Malformed {
-                    field: "try_block",
-                    context: format!("method at offset {method_off:#x}: try span overflow"),
-                })?;
-            let start = exact_pc_to_index(tb.start, "try_block", "try start")?;
-            let end = exact_pc_to_index(end_pc, "try_block", "try end")?;
-            let catches = tb
-                .catches
-                .into_iter()
-                .map(|cb| {
-                    let handler_end_pc =
-                        cb.handler
-                            .checked_add(cb.len)
-                            .ok_or_else(|| Error::Malformed {
-                                field: "catch_block",
-                                context: format!(
-                                    "method at offset {method_off:#x}: catch span overflow"
-                                ),
-                            })?;
-                    let handler = exact_pc_to_index(cb.handler, "catch_block", "catch handler")?;
-                    let handler_end =
-                        exact_pc_to_index(handler_end_pc, "catch_block", "catch end")?;
-                    Ok(CatchBlock {
-                        type_idx: cb.type_idx,
-                        handler,
-                        len: handler_end.saturating_sub(handler),
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            Ok(TryBlock {
-                start,
-                len: end.saturating_sub(start),
-                catches,
-            })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
+    let raw_try_blocks = collect_try_blocks(f, method_off, cr)?;
+    let mut try_blocks = Vec::with_capacity(raw_try_blocks.len());
+    for tb in raw_try_blocks {
+        let end_pc = tb
+            .start
+            .checked_add(tb.len)
+            .ok_or_else(|| Error::Malformed {
+                field: "try_block",
+                context: format!("method at offset {method_off:#x}: try span overflow"),
+            })?;
+        let start = exact_pc_to_index(tb.start, "try_block", "try start")?;
+        let end = exact_pc_to_index(end_pc, "try_block", "try end")?;
+        let mut catches = Vec::with_capacity(tb.catches.len());
+        for cb in tb.catches {
+            let handler_end_pc =
+                cb.handler
+                    .checked_add(cb.len)
+                    .ok_or_else(|| Error::Malformed {
+                        field: "catch_block",
+                        context: format!("method at offset {method_off:#x}: catch span overflow"),
+                    })?;
+            let handler = exact_pc_to_index(cb.handler, "catch_block", "catch handler")?;
+            let handler_end = exact_pc_to_index(handler_end_pc, "catch_block", "catch end")?;
+            let type_class = match cb.type_class_off {
+                None => None,
+                Some(class_off) => {
+                    let sid = entity_map
+                        .get(&class_off)
+                        .copied()
+                        .or_else(|| {
+                            is_external(f, class_off)
+                                .then(|| str_cache.intern_lossy(class_off, strings))
+                                .flatten()
+                        })
+                        .ok_or_else(|| Error::Malformed {
+                            field: "catch_block",
+                            context: format!(
+                                "method at offset {method_off:#x}: catch type offset {class_off:#x} names no class"
+                            ),
+                        })?;
+                    Some(sid)
+                }
+            };
+            catches.push(CatchBlock {
+                type_class,
+                handler,
+                len: handler_end.saturating_sub(handler),
+            });
+        }
+        try_blocks.push(TryBlock {
+            start,
+            len: end.saturating_sub(start),
+            catches,
+        });
+    }
 
     // SAFETY: `cr` is valid.
     let num_vregs = unsafe { sys::abc_code_num_vregs(cr) };
@@ -3811,7 +3890,7 @@ fn decode_code_at(
             num_vregs,
             num_args,
             bytecodes,
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks,
             ic_size: None,
         },
@@ -4168,6 +4247,7 @@ fn decode_annotation_at(
                         resolve_foreign_entity_name(f, entity_map, strings, str_cache, out.value);
                     AnnotationValue::Method {
                         name: sid,
+                        method: None,
                         offset: out.value,
                     }
                 }
@@ -4176,6 +4256,7 @@ fn decode_annotation_at(
                         resolve_foreign_entity_name(f, entity_map, strings, str_cache, out.value);
                     AnnotationValue::Enum {
                         name: sid,
+                        field: None,
                         offset: out.value,
                     }
                 }
@@ -4217,6 +4298,8 @@ fn decode_annotation_at(
                     AnnotationValue::MethodHandle(ResolvedMethodHandle {
                         handle_type: ht,
                         entity,
+                        target_method: None,
+                        target_field: None,
                         entity_offset: entity_off,
                     })
                 }
@@ -4483,6 +4566,7 @@ fn decode_annotation_array_elements(
                 };
                 AnnotationValue::Method {
                     name: sid,
+                    method: None,
                     offset: raw as u32,
                 }
             }
@@ -4504,6 +4588,7 @@ fn decode_annotation_array_elements(
                 };
                 AnnotationValue::Enum {
                     name: sid,
+                    field: None,
                     offset: raw as u32,
                 }
             }
@@ -4558,6 +4643,8 @@ fn decode_annotation_array_elements(
                 AnnotationValue::MethodHandle(ResolvedMethodHandle {
                     handle_type: ht,
                     entity,
+                    target_method: None,
+                    target_field: None,
                     entity_offset: entity_off,
                 })
             }
@@ -4642,10 +4729,12 @@ fn is_plausible_literal_array_offset<S: U32OffsetSet>(
         && !phase_blob_offsets.contains_offset(off)
 }
 
-/// Seed `out` with plausible nested `LiteralValue::LiteralArray` offsets found
-/// inside any `AnnotationValue::LiteralArray` across the file, using an
-/// explicit iterative workstack.
+/// Seed `out` with plausible nested literal-array offsets found inside any
+/// `AnnotationValue::LiteralArray` across the file (`LiteralArray`,
+/// `LiteralBufferIndex`, and `ArrayU1..ArrayString`), using an explicit
+/// iterative workstack.
 fn collect_annotation_nested_literal_offsets(
+    f: *const sys::AbcFileHandle,
     classes: &BTreeMap<StringId, Class>,
     file_size: u32,
     module_data_offsets: &HashSet<u32>,
@@ -4665,6 +4754,14 @@ fn collect_annotation_nested_literal_offsets(
             }
         }
     }
+
+    let is_valid_lit_array = |cand: u32| -> bool {
+        is_plausible_literal_array_offset(cand, file_size, module_data_offsets, phase_blob_offsets)
+            // SAFETY: `f` is live; null callback performs structural validation only.
+            && unsafe {
+                sys::abc_literal_enumerate_vals_checked(f, cand, None, std::ptr::null_mut())
+            } == 0
+    };
 
     let mut stack: Vec<&AnnotationValue> = Vec::new();
     for class in classes.values() {
@@ -4693,15 +4790,43 @@ fn collect_annotation_nested_literal_offsets(
         match val {
             AnnotationValue::LiteralArray(values) => {
                 for item in values {
-                    if let LiteralValue::LiteralArray(idx) = item
-                        && is_plausible_literal_array_offset(
-                            idx.0,
-                            file_size,
-                            module_data_offsets,
-                            phase_blob_offsets,
-                        )
-                    {
-                        out.insert(idx.0);
+                    match item {
+                        LiteralValue::LiteralArray(idx) => {
+                            if is_plausible_literal_array_offset(
+                                idx.0,
+                                file_size,
+                                module_data_offsets,
+                                phase_blob_offsets,
+                            ) {
+                                out.insert(idx.0);
+                            }
+                        }
+                        LiteralValue::LiteralBufferIndex(idx) => {
+                            if is_valid_lit_array(idx.0) {
+                                out.insert(idx.0);
+                            }
+                        }
+                        LiteralValue::ArrayU1(idx)
+                        | LiteralValue::ArrayU8(idx)
+                        | LiteralValue::ArrayI8(idx)
+                        | LiteralValue::ArrayU16(idx)
+                        | LiteralValue::ArrayI16(idx)
+                        | LiteralValue::ArrayU32(idx)
+                        | LiteralValue::ArrayI32(idx)
+                        | LiteralValue::ArrayU64(idx)
+                        | LiteralValue::ArrayI64(idx)
+                        | LiteralValue::ArrayF32(idx)
+                        | LiteralValue::ArrayF64(idx)
+                        | LiteralValue::ArrayString(idx) => {
+                            if is_valid_lit_array(idx.0) {
+                                out.insert(idx.0);
+                            } else if let Some(parent_off) = idx.0.checked_sub(5)
+                                && is_valid_lit_array(parent_off)
+                            {
+                                out.insert(parent_off);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4720,15 +4845,74 @@ fn collect_annotation_nested_literal_offsets(
     }
 }
 
-/// Rewrite nested `LiteralValue::LiteralArray` offsets inside every
-/// `AnnotationValue::LiteralArray` to `File::literal_arrays` table indices
-/// using an explicit iterative workstack. Unresolvable raw offsets that would
-/// otherwise alias `< literal_array_count` are replaced with `ABSENT` so
-/// relocation fails loudly on `encode`.
-fn rewrite_annotation_nested_literal_refs(
+fn rewrite_literal_item_refs(
+    v: &mut LiteralValue,
+    owning_table_idx: Option<u32>,
+    offset_to_index: &HashMap<u32, u32>,
+    array_count: usize,
+    header_offsets: &[u32],
+    method_offset_to_idx: &HashMap<u32, MethodIdx>,
+) {
+    if let Some(midx) = v.method_idx_mut() {
+        *midx = method_offset_to_idx
+            .get(&midx.0)
+            .copied()
+            .unwrap_or(MethodIdx(ABSENT));
+        return;
+    }
+    match v {
+        LiteralValue::LiteralArray(idx) => {
+            if let Some(&table_idx) = offset_to_index.get(&idx.0) {
+                idx.0 = table_idx;
+            } else if (idx.0 as usize) < array_count {
+                idx.0 = ABSENT;
+            }
+        }
+        LiteralValue::LiteralBufferIndex(idx) => {
+            if let Some(&table_idx) = offset_to_index.get(&idx.0) {
+                idx.0 = table_idx;
+            } else if let Some(&hdr_off) = header_offsets.get(idx.0 as usize)
+                && let Some(&table_idx) = offset_to_index.get(&hdr_off)
+            {
+                idx.0 = table_idx;
+            }
+        }
+        LiteralValue::ArrayU1(idx)
+        | LiteralValue::ArrayU8(idx)
+        | LiteralValue::ArrayI8(idx)
+        | LiteralValue::ArrayU16(idx)
+        | LiteralValue::ArrayI16(idx)
+        | LiteralValue::ArrayU32(idx)
+        | LiteralValue::ArrayI32(idx)
+        | LiteralValue::ArrayU64(idx)
+        | LiteralValue::ArrayI64(idx)
+        | LiteralValue::ArrayF32(idx)
+        | LiteralValue::ArrayF64(idx)
+        | LiteralValue::ArrayString(idx) => {
+            if let Some(&table_idx) = offset_to_index
+                .get(&idx.0)
+                .or_else(|| idx.0.checked_sub(5).and_then(|o| offset_to_index.get(&o)))
+            {
+                idx.0 = table_idx;
+            } else if let Some(own) = owning_table_idx {
+                idx.0 = own;
+            } else if (idx.0 as usize) < array_count {
+                idx.0 = ABSENT;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Populate dense `MethodIdx` / `FieldIdx` / `LiteralArrayIdx` handles across
+/// every `AnnotationValue` in `classes` using an explicit iterative workstack.
+fn rewrite_annotation_refs(
     classes: &mut BTreeMap<StringId, Class>,
     offset_to_index: &HashMap<u32, u32>,
     literal_array_count: usize,
+    header_offsets: &[u32],
+    method_offset_to_idx: &HashMap<u32, MethodIdx>,
+    field_offset_to_idx: &HashMap<u32, FieldIdx>,
 ) {
     fn push_annotations<'a>(anns: &'a mut Annotations, stack: &mut Vec<&'a mut AnnotationValue>) {
         for ann in anns
@@ -4769,15 +4953,29 @@ fn rewrite_annotation_nested_literal_refs(
 
     while let Some(val) = stack.pop() {
         match val {
+            AnnotationValue::Method { method, offset, .. } => {
+                *method = method_offset_to_idx.get(offset).copied();
+            }
+            AnnotationValue::Enum { field, offset, .. } => {
+                *field = field_offset_to_idx.get(offset).copied();
+            }
+            AnnotationValue::MethodHandle(mh) => {
+                if mh.handle_type.is_field_op() {
+                    mh.target_field = field_offset_to_idx.get(&mh.entity_offset).copied();
+                } else {
+                    mh.target_method = method_offset_to_idx.get(&mh.entity_offset).copied();
+                }
+            }
             AnnotationValue::LiteralArray(values) => {
                 for item in values {
-                    if let LiteralValue::LiteralArray(idx) = item {
-                        if let Some(&table_idx) = offset_to_index.get(&idx.0) {
-                            idx.0 = table_idx;
-                        } else if (idx.0 as usize) < literal_array_count {
-                            idx.0 = ABSENT;
-                        }
-                    }
+                    rewrite_literal_item_refs(
+                        item,
+                        None,
+                        offset_to_index,
+                        literal_array_count,
+                        header_offsets,
+                        method_offset_to_idx,
+                    );
                 }
             }
             AnnotationValue::Annotation(inner) => {
@@ -4800,6 +4998,10 @@ fn rewrite_annotation_nested_literal_refs(
 /// the pandasm emitter's byte-identity with upstream ark_disasm).
 type LiteralArrayTable = (Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>);
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "literal-array table builder threads offset sets, string cache, and method index map directly"
+)]
 fn decode_literal_arrays<'a>(
     f: *const sys::AbcFileHandle,
     file_size: u32,
@@ -4808,6 +5010,7 @@ fn decode_literal_arrays<'a>(
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
+    method_offset_to_idx: &HashMap<u32, MethodIdx>,
 ) -> Result<LiteralArrayTable, Error> {
     // SAFETY: `f` is a live `AbcFileHandle`.
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
@@ -4884,20 +5087,44 @@ fn decode_literal_arrays<'a>(
                 return Err(Error::InvalidOffset(off));
             }
             for value in &ctx.values {
-                if let LiteralValue::LiteralArray(idx) = value {
-                    let target = idx.0;
-                    if is_plausible_literal_array_offset(
-                        target,
-                        file_size,
-                        module_data_offsets,
-                        phase_blob_offsets,
-                    ) && !seen.contains(target)
-                    {
-                        nested.push(target);
+                match value {
+                    LiteralValue::LiteralArray(idx) => {
+                        let target = idx.0;
+                        if is_plausible_literal_array_offset(
+                            target,
+                            file_size,
+                            module_data_offsets,
+                            phase_blob_offsets,
+                        ) && !seen.contains(target)
+                        {
+                            nested.push(target);
+                        }
                     }
+                    LiteralValue::LiteralBufferIndex(idx) => {
+                        let target = idx.0;
+                        if is_plausible_literal_array_offset(
+                            target,
+                            file_size,
+                            module_data_offsets,
+                            phase_blob_offsets,
+                        ) && !seen.contains(target)
+                            // SAFETY: `f` is live; null callback validates structural array span.
+                            && unsafe {
+                                sys::abc_literal_enumerate_vals_checked(
+                                    f,
+                                    target,
+                                    None,
+                                    std::ptr::null_mut(),
+                                )
+                            } == 0
+                        {
+                            nested.push(target);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            arrays.push(LiteralArray { values: ctx.values });
+            arrays.push(LiteralArray::with_source_offset(off, ctx.values));
         }
         decoded = offsets.len();
         nested.sort_unstable();
@@ -4911,15 +5138,16 @@ fn decode_literal_arrays<'a>(
     }
 
     let array_count = arrays.len();
-    for arr in &mut arrays {
+    for (arr_idx, arr) in arrays.iter_mut().enumerate() {
         for v in &mut arr.values {
-            if let LiteralValue::LiteralArray(idx) = v {
-                if let Some(&table_idx) = offset_to_index.get(&idx.0) {
-                    idx.0 = table_idx;
-                } else if (idx.0 as usize) < array_count {
-                    idx.0 = ABSENT;
-                }
-            }
+            rewrite_literal_item_refs(
+                v,
+                Some(arr_idx as u32),
+                &offset_to_index,
+                array_count,
+                &header_offsets,
+                method_offset_to_idx,
+            );
         }
     }
     Ok((arrays, offset_to_index, header_offsets))
@@ -4992,17 +5220,29 @@ fn collect_offsets_int<T>(
     result
 }
 
+struct RawCatchBlock {
+    type_class_off: Option<u32>,
+    handler: u32,
+    len: u32,
+}
+
+struct RawTryBlock {
+    start: u32,
+    len: u32,
+    catches: Vec<RawCatchBlock>,
+}
+
 /// Collect try-blocks from a code accessor, strictly resolving typed catch
 /// class indices to entity offsets.
 fn collect_try_blocks(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     cr: *mut sys::AbcCodeAccessor,
-) -> Result<Vec<TryBlock>, Error> {
+) -> Result<Vec<RawTryBlock>, Error> {
     struct Ctx {
         f: *const sys::AbcFileHandle,
         method_off: u32,
-        blocks: Vec<TryBlock>,
+        blocks: Vec<RawTryBlock>,
         err: Option<Error>,
     }
     let mut ctx = Ctx {
@@ -5031,8 +5271,8 @@ fn collect_try_blocks(
         };
         let mut decoded_catches = Vec::with_capacity(catch_slice.len());
         for c in catch_slice {
-            let type_idx = if c.type_idx == u32::MAX {
-                u32::MAX
+            let type_class_off = if c.type_idx == u32::MAX {
+                None
             } else {
                 let Ok(idx) = u16::try_from(c.type_idx) else {
                     ctx.err = Some(Error::InvalidOffset(c.type_idx));
@@ -5044,15 +5284,15 @@ fn collect_try_blocks(
                     ctx.err = Some(Error::InvalidOffset(c.type_idx));
                     return 0;
                 }
-                resolved
+                Some(resolved)
             };
-            decoded_catches.push(CatchBlock {
-                type_idx,
+            decoded_catches.push(RawCatchBlock {
+                type_class_off,
                 handler: c.handler_pc,
                 len: c.code_size,
             });
         }
-        ctx.blocks.push(TryBlock {
+        ctx.blocks.push(RawTryBlock {
             start: info.start_pc,
             len: info.length,
             catches: decoded_catches,
@@ -5166,10 +5406,8 @@ mod tests {
 
         // The literal array's source offset, learned through a decode.
         let file = decode(&data).expect("decode");
-        let la_off = file
-            .literal_array_offsets
-            .iter()
-            .find_map(|(&off, &idx)| (idx == 0).then_some(off))
+        let la_off = file.literal_arrays[0]
+            .source_offset
             .expect("literal array offset");
 
         // Find the annotation array payload: the string item offset of
@@ -5575,7 +5813,10 @@ mod tests {
             assert_eq!(actual.classes, decoded.classes.len());
             assert_eq!(actual.literal_arrays, decoded.literal_arrays.len());
             assert_eq!(actual.strings, decoded.strings.len());
-            assert_eq!(actual.entity_index_entries, decoded.entity_map.len());
+            assert!(
+                actual.entity_index_entries
+                    >= decoded.classes.len() + actual.methods + actual.fields
+            );
         }
 
         // Every non-zero byte in the 16-byte trailing padding must be rejected.

@@ -47,19 +47,21 @@ fn pinned_alloc(
     }
 }
 
-// ── isel: IC slot space (isel.rs:335) ───────────────────────────────────
+// ── isel: IC slot degradation past u16 (`SetIcSlot` + `ReArrangeIc`) ────
 
-/// A method whose dense IC consumption exceeds the u16 slot-immediate
-/// space even after the N71 one-byte-first rearrangement is a hard error.
-///
-/// The rearrangement fires only once an `eight_bit_ic` immediate spills
-/// past 0xFF, so the shape is 257 one-slot `add2`s (dense slots 0..=256 —
-/// the 257th overflows, triggering the rearrange) followed by enough
-/// two-slot sixteen-bit `ldobjbyname`s to push pass B past 0x10000.
+/// Upstream `es2panda` (`templates/isa.h.erb` `SetIcSlot` + `PandaGen::ReArrangeIc`)
+/// degrades 16-bit IC instructions once `counter > 0xFFFF` to `0xFF`
+/// (`IC_SLOT_INVALID`) without advancing `counter`:
+/// - Pass A: 257 one-slot `add2`s assign `0..=0xFE` to the first 255, degrade the
+///   256th (`counter: 0xFF -> 0x100`) and 257th to `0xFF`, leaving `counter = 0x100`.
+/// - Pass B: 32,639 two-slot `ldobjbyname`s fill `0x100..=0xFFFC` (`counter -> 0xFFFE`),
+///   one 1-slot `ldglobalvar` takes `0xFFFE` (`counter -> 0xFFFF`), the next two-slot
+///   `ldobjbyname` takes `0xFFFF` (`counter -> 0x10001`), and the final `ldobjbyname`
+///   (`counter > 0xFFFF`) degrades to `0xFF` while keeping `ic_size == 0x1_0001`.
 #[test]
-fn ic_slot_consumption_beyond_u16_is_a_hard_error() {
+fn ic_slot_consumption_beyond_u16_degrades_to_0xff_after_rearrangement() {
     const ONE_SLOT_IC: usize = 257; // eight_bit_ic overflow trigger
-    const TWO_SLOT_IC: usize = 32_641; // 256 + 2*32640 = 0x10000; one more errors
+    const TWO_SLOT_PREFIX: usize = 32_639; // 0x100..=0xFFFC -> counter = 0xFFFE
 
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
@@ -74,21 +76,38 @@ fn ic_slot_consumption_beyond_u16_is_a_hard_error() {
             });
         }
         let name = b.sym("x");
-        for _ in 0..TWO_SLOT_IC {
+        for _ in 0..TWO_SLOT_PREFIX {
             b.emit_val(Op::LoadProp { object: p, name });
         }
+        b.emit_val(Op::TryGetGlobal {
+            name,
+            default: None,
+        });
+        b.emit_val(Op::LoadProp { object: p, name }); // slot 0xFFFF -> counter 0x10001
+        b.emit_val(Op::LoadProp { object: p, name }); // degraded to 0xFF, counter stays 0x10001
         b.emit_void(Op::Return { value: None });
     }
 
     let param = module.functions[func.index()].params[0];
     let alloc = pinned_alloc(&[(param, 0)], 1, None);
     let rpo = vec![module.functions[func.index()].blocks[0]];
-    let err = isel::select(&module, func, &alloc, &rpo, &Suppression::default())
-        .expect_err("IC consumption past the u16 slot space must be a hard error");
-    assert!(
-        matches!(err, LowerError::IcSlotOverflow(f) if f == func),
-        "expected IcSlotOverflow, got {err:?}"
-    );
+    let res = isel::select(&module, func, &alloc, &rpo, &Suppression::default())
+        .expect("16-bit IC consumption past 0xFFFF must degrade to 0xFF, not error");
+    assert_eq!(res.ic_size, 0x1_0001);
+
+    let prop_slots: Vec<i64> = res.block_codes[0]
+        .1
+        .iter()
+        .filter_map(|bc| match *bc {
+            abcd_isa::Bytecode::Ldobjbyname(abcd_isa::Imm(s), _) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prop_slots.len(), TWO_SLOT_PREFIX + 2);
+    assert_eq!(prop_slots[0], 0x100);
+    assert_eq!(prop_slots[TWO_SLOT_PREFIX - 1], 0xFFFC);
+    assert_eq!(prop_slots[TWO_SLOT_PREFIX], 0xFFFF);
+    assert_eq!(prop_slots[TWO_SLOT_PREFIX + 1], 0xFF);
 }
 
 // ── isel: register overflow in the copy-in prologue (isel.rs:715) ───────
@@ -245,22 +264,36 @@ fn call_window_exceeding_the_frame_is_a_hard_error() {
     );
 }
 
-/// High-register mode reserves LOW_SCRATCH_COUNT (5) low registers right
-/// after the parameter homes; 252 parameters push the scratch block itself
-/// past 256, where `sta`/`lda` cannot address it.
+/// `R3-M7`: 252+ parameters place `low_scratch` (`0..5`) at the bottom of the
+/// frame and parameter homes above them (`5..257`), succeeding cleanly; only
+/// when `LOW_SCRATCH_COUNT + param_count > TEMP_REG_BASE` (`65_516` params)
+/// does reservation reject with `RegAllocError::RegisterOverflow`.
 #[test]
-fn low_scratches_plus_params_beyond_256_is_a_hard_error() {
-    let mut module = Module::new();
-    let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
+fn low_scratches_plus_params_placement_and_frame_ceiling() {
+    let mut ok_module = Module::new();
+    let ok_func = V2Builder::create_function(&mut ok_module, "f252", FunctionKind::Function);
     {
-        let mut b = V2Builder::new(&mut module, func);
+        let mut b = V2Builder::new(&mut ok_module, ok_func);
         for _ in 0..252 {
             b.create_param();
         }
         b.emit_void(Op::Return { value: None });
     }
+    let alloc = regalloc::allocate(&ok_module, ok_func, &Suppression::default())
+        .expect("252 params must succeed with low_scratches placed at 0..5 (R3-M7)");
+    assert_eq!(alloc.low_scratch_base, Some(0));
+
+    let mut module = Module::new();
+    let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
+    {
+        let mut b = V2Builder::new(&mut module, func);
+        for _ in 0..65_516 {
+            b.create_param();
+        }
+        b.emit_void(Op::Return { value: None });
+    }
     let err = regalloc::allocate(&module, func, &Suppression::default())
-        .expect_err("params + scratch block past 256 must be a hard error");
+        .expect_err("low_scratches + params past TEMP_REG_BASE must be a hard error");
     assert!(
         matches!(err, RegAllocError::RegisterOverflow),
         "expected RegisterOverflow, got {err:?}"

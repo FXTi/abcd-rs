@@ -129,6 +129,14 @@ pub fn link_exc(m: &mut Module, from: BlockId, to: BlockId) {
     });
 }
 
+/// Add an empty class record to `m` (e.g. for typed `Catch::type_class`).
+pub fn add_catch_class(m: &mut Module, desc: &str) -> ClassId {
+    let sym = m.sym.intern(desc);
+    let id = ClassId::new(m.classes.len() as u32);
+    m.classes.push(ClassData::new(sym, sym));
+    id
+}
+
 /// Add a try region protecting `protected` with a single catch-all handler.
 pub fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: BlockId, exc: ValueId) {
     for &p in &protected {
@@ -139,7 +147,7 @@ pub fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: Bloc
         catches: vec![Catch {
             handler,
             exception: exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 }

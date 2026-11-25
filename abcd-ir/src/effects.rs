@@ -168,17 +168,26 @@ fn proven_prim(module: &Module, v: ValueId) -> Option<PrimKind> {
     }
     match proven_const(module, v)? {
         Const::Undefined => Some(PrimKind::Dyn(DynPrim::Undefined)),
-        Const::Null => Some(PrimKind::Dyn(DynPrim::Null)),
+        Const::Null | Const::LitNull(_) => Some(PrimKind::Dyn(DynPrim::Null)),
         Const::Bool(_) => Some(PrimKind::Dyn(DynPrim::Bool)),
         Const::Number(_) => Some(PrimKind::Dyn(DynPrim::Number)),
+        Const::Float32(_) => Some(PrimKind::Static(StaticTy::F32)),
+        Const::Int8(_) => Some(PrimKind::Static(StaticTy::U8)),
+        Const::Int32(_) => Some(PrimKind::Static(StaticTy::I32)),
         Const::String(_) => Some(PrimKind::Dyn(DynPrim::String)),
         Const::BigInt(_) => Some(PrimKind::Dyn(DynPrim::BigInt)),
         Const::Int64(_) => Some(PrimKind::Static(StaticTy::I64)),
         Const::UInt64(_) => Some(PrimKind::Static(StaticTy::U64)),
         Const::Hole
+        | Const::Accessor(_)
+        | Const::MethodAffiliate(_)
+        | Const::BuiltinTypeIndex(_)
+        | Const::EtsImplements(_)
         | Const::ArrayLiteral(_)
+        | Const::TypedArrayLiteral { .. }
         | Const::ObjectLiteral { .. }
-        | Const::MethodRef(_) => None,
+        | Const::LiteralBufferRef(_)
+        | Const::MethodRef { .. } => None,
     }
 }
 
@@ -209,6 +218,8 @@ const fn is_static_float_or_bool(s: StaticTy) -> bool {
 
 fn is_nonzero_const(module: &Module, v: ValueId) -> bool {
     match proven_const(module, v) {
+        Some(Const::Int8(n)) => *n != 0,
+        Some(Const::Int32(n)) => *n != 0,
         Some(Const::Int64(n)) => *n != 0,
         Some(Const::UInt64(n)) => *n != 0,
         Some(Const::Number(bits)) => {
@@ -256,15 +267,20 @@ impl Op {
             | LoadFunction => Effects::PURE,
 
             UnaryOp { op, .. } => match op {
-                UnOp::LogicalNot | UnOp::IsTrue | UnOp::IsFalse | UnOp::TypeOf | UnOp::Void => {
-                    Effects::PURE
-                }
+                UnOp::LogicalNot
+                | UnOp::IsTrue
+                | UnOp::IsFalse
+                | UnOp::JumpEqz
+                | UnOp::JumpNez
+                | UnOp::TypeOf
+                | UnOp::Void => Effects::PURE,
                 UnOp::Minus
                 | UnOp::BitNot
                 | UnOp::Inc
                 | UnOp::Dec
                 | UnOp::ToNumber
-                | UnOp::ToNumeric => coercion,
+                | UnOp::ToNumeric
+                | UnOp::ToPropertyKey => coercion,
             },
             BinaryOp { .. } => coercion,
             Compare { op, .. } => match op {
@@ -292,7 +308,10 @@ impl Op {
             },
 
             // Allocation sites (T7).
-            AllocObject { .. } | GetUnmappedArgs | CreateIterResultObj { .. } => Effects {
+            AllocObject { .. }
+            | GetUnmappedArgs
+            | CreateIterResultObj { .. }
+            | CreateAsyncGenerator { .. } => Effects {
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
@@ -533,12 +552,22 @@ impl Op {
                 ..Effects::PURE
             },
             GetResumeMode { .. } => reads(MemClasses::ITERATOR),
+            SetGeneratorState { .. } => writes(MemClasses::HEAP),
+            LoadSymbol => reads(MemClasses::GLOBAL),
+            NotifyConcurrentResult { .. } => writes(MemClasses::GLOBAL),
             Await { .. } | AwaitUncaught { .. } => Effects {
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            AsyncResolve { .. } | AsyncReject { .. } => Effects {
+            AsyncGeneratorResolve { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::GLOBAL,
+                writes: MemClasses::HEAP | MemClasses::GLOBAL,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            AsyncResolve { .. } | AsyncReject { .. } | AsyncGeneratorReject { .. } => Effects {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
@@ -558,12 +587,28 @@ impl Op {
                 if base.is_pure() {
                     return Effects::PURE;
                 }
-                match proven_prim(module, *operand) {
-                    Some(PrimKind::Dyn(p)) if is_js_num_like(p) || p == DynPrim::String => {
-                        let _ = op;
+                match (op, proven_prim(module, *operand)) {
+                    (
+                        UnOp::ToPropertyKey,
+                        Some(PrimKind::Dyn(
+                            DynPrim::String | DynPrim::Symbol | DynPrim::Number | DynPrim::Bool,
+                        )),
+                    ) => Effects::PURE,
+                    (UnOp::ToPropertyKey, Some(PrimKind::Static(s)))
+                        if is_static_float_or_bool(s) || is_static_int(s) =>
+                    {
                         Effects::PURE
                     }
-                    Some(PrimKind::Static(s)) if is_static_float_or_bool(s) || is_static_int(s) => {
+                    (_, Some(PrimKind::Dyn(p)))
+                        if *op != UnOp::ToPropertyKey
+                            && (is_js_num_like(p) || p == DynPrim::String) =>
+                    {
+                        Effects::PURE
+                    }
+                    (_, Some(PrimKind::Static(s)))
+                        if *op != UnOp::ToPropertyKey
+                            && (is_static_float_or_bool(s) || is_static_int(s)) =>
+                    {
                         Effects::PURE
                     }
                     _ => base,
@@ -792,7 +837,12 @@ mod tests {
 
         // Pure reads and non-throwing allocations stay removable when unused.
         for op in [
-            Op::GetLexVar { level: 0, slot: 0 },
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: crate::op::LexEnvKind::Plain,
+            },
+            Op::LoadSymbol,
             Op::LoadModuleVar {
                 index: 0,
                 kind: ModuleVarKind::Local,
@@ -807,6 +857,7 @@ mod tests {
             },
             Op::AllocArray { shape: None },
             Op::AllocClosure { func: v },
+            Op::CreateAsyncGenerator { func: v },
             Op::AsyncFunctionEnter,
         ] {
             assert!(

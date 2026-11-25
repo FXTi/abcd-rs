@@ -1077,7 +1077,7 @@ fn append_module(dst: &mut Module, mod_name: &str, src: &Module) {
                     .map(|c| Catch {
                         handler: map_bid(c.handler),
                         exception: map_vid(c.exception),
-                        type_idx: c.type_idx,
+                        type_class: c.type_class.map(map_cid),
                     })
                     .collect(),
             })
@@ -1216,7 +1216,9 @@ fn remap_consts_into(
     enum ConstVisit {
         Enter(ConstId),
         FinishArray(ConstId, Vec<ConstId>),
+        FinishTypedArray(ConstId, abcd_ir::TypedArrayTag, Vec<ConstId>),
         FinishObject(ConstId, Vec<ConstId>, Vec<ConstId>),
+        FinishBufferRef(ConstId, ConstId),
     }
 
     let len = src.consts.len();
@@ -1245,15 +1247,38 @@ fn remap_consts_into(
                         Some(Const::Hole) => Some(Const::Hole),
                         Some(Const::Null) => Some(Const::Null),
                         Some(Const::Bool(b)) => Some(Const::Bool(*b)),
+                        Some(Const::Int8(v)) => Some(Const::Int8(*v)),
+                        Some(Const::Int32(v)) => Some(Const::Int32(*v)),
+                        Some(Const::Float32(bits)) => Some(Const::Float32(*bits)),
                         Some(Const::Number(bits)) => Some(Const::Number(*bits)),
                         Some(Const::Int64(v)) => Some(Const::Int64(*v)),
                         Some(Const::UInt64(v)) => Some(Const::UInt64(*v)),
+                        Some(Const::Accessor(v)) => Some(Const::Accessor(*v)),
+                        Some(Const::MethodAffiliate(v)) => Some(Const::MethodAffiliate(*v)),
+                        Some(Const::BuiltinTypeIndex(v)) => Some(Const::BuiltinTypeIndex(*v)),
+                        Some(Const::EtsImplements(s)) => {
+                            Some(Const::EtsImplements(map_sym_from(src, dst, *s)))
+                        }
+                        Some(Const::LitNull(v)) => Some(Const::LitNull(*v)),
                         Some(Const::String(s)) => Some(Const::String(map_sym_from(src, dst, *s))),
                         Some(Const::BigInt(s)) => Some(Const::BigInt(map_sym_from(src, dst, *s))),
-                        Some(Const::MethodRef(f)) => Some(Const::MethodRef(map_fid(*f))),
+                        Some(Const::MethodRef { func, kind }) => Some(Const::MethodRef {
+                            func: map_fid(*func),
+                            kind: *kind,
+                        }),
                         Some(Const::ArrayLiteral(items)) => {
                             let items_cloned = items.clone();
                             stack.push(ConstVisit::FinishArray(cid, items.clone()));
+                            for &ch in items_cloned.iter().rev() {
+                                if mapped.get(ch.index()).is_some_and(Option::is_none) {
+                                    stack.push(ConstVisit::Enter(ch));
+                                }
+                            }
+                            None
+                        }
+                        Some(Const::TypedArrayLiteral { tag, items }) => {
+                            let items_cloned = items.clone();
+                            stack.push(ConstVisit::FinishTypedArray(cid, *tag, items.clone()));
                             for &ch in items_cloned.iter().rev() {
                                 if mapped.get(ch.index()).is_some_and(Option::is_none) {
                                     stack.push(ConstVisit::Enter(ch));
@@ -1277,6 +1302,14 @@ fn remap_consts_into(
                             }
                             None
                         }
+                        Some(Const::LiteralBufferRef(inner)) => {
+                            let inner_id = *inner;
+                            stack.push(ConstVisit::FinishBufferRef(cid, inner_id));
+                            if mapped.get(inner_id.index()).is_some_and(Option::is_none) {
+                                stack.push(ConstVisit::Enter(inner_id));
+                            }
+                            None
+                        }
                     };
                     if let Some(c) = leaf {
                         in_progress.remove(&cid);
@@ -1295,6 +1328,22 @@ fn remap_consts_into(
                         out_items.push(m);
                     }
                     mapped[cid.index()] = Some(dst.consts.push(Const::ArrayLiteral(out_items)));
+                }
+                ConstVisit::FinishTypedArray(cid, tag, items) => {
+                    in_progress.remove(&cid);
+                    let mut out_items = Vec::with_capacity(items.len());
+                    for ch in items {
+                        let m = match mapped.get(ch.index()).copied().flatten() {
+                            Some(id) => id,
+                            None => *undef_fallback
+                                .get_or_insert_with(|| dst.consts.push(Const::Undefined)),
+                        };
+                        out_items.push(m);
+                    }
+                    mapped[cid.index()] = Some(dst.consts.push(Const::TypedArrayLiteral {
+                        tag,
+                        items: out_items,
+                    }));
                 }
                 ConstVisit::FinishObject(cid, keys, values) => {
                     in_progress.remove(&cid);
@@ -1320,6 +1369,16 @@ fn remap_consts_into(
                         keys: out_keys,
                         values: out_values,
                     }));
+                }
+                ConstVisit::FinishBufferRef(cid, inner) => {
+                    in_progress.remove(&cid);
+                    let m = match mapped.get(inner.index()).copied().flatten() {
+                        Some(id) => id,
+                        None => {
+                            *undef_fallback.get_or_insert_with(|| dst.consts.push(Const::Undefined))
+                        }
+                    };
+                    mapped[cid.index()] = Some(dst.consts.push(Const::LiteralBufferRef(m)));
                 }
             }
         }
@@ -2183,11 +2242,29 @@ mod tests {
                 }
 
                 // Deeply nested `Ty::Union` and `Const::ArrayLiteral` / `Const::ObjectLiteral`
-                // plus `Int64` / `UInt64` and a cyclic `ConstPool` entry for `remap_consts_into`.
+                // plus `Int64` / `UInt64`, Round 3 literal tags, `TypedArrayLiteral`,
+                // `LiteralBufferRef`, `Catch::type_class`, and a cyclic `ConstPool` entry.
                 let mut deep_ty = Ty::Static(StaticTy::Reference(ClassId::new(0)));
                 let c_key = m1.consts.intern(Const::String(s_val));
+                let _ = m1.consts.push(Const::Int8(7));
+                let c_i32 = m1.consts.push(Const::Int32(42));
+                let _ = m1.consts.push(Const::float32(1.5));
                 let _ = m1.consts.push(Const::Int64(-99));
                 let _ = m1.consts.push(Const::UInt64(99));
+                let _ = m1.consts.push(Const::Accessor(0));
+                let _ = m1.consts.push(Const::MethodAffiliate(2));
+                let _ = m1.consts.push(Const::BuiltinTypeIndex(3));
+                let _ = m1.consts.push(Const::EtsImplements(s_val));
+                let _ = m1.consts.push(Const::LitNull(0));
+                let _ = m1.consts.push(Const::method_ref_with_kind(
+                    FuncId::new(0),
+                    abcd_ir::LitMethodKind::Getter,
+                ));
+                let tarr = m1.consts.push(Const::TypedArrayLiteral {
+                    tag: abcd_ir::TypedArrayTag::I32,
+                    items: vec![c_i32],
+                });
+                let _ = m1.consts.push(Const::LiteralBufferRef(tarr));
                 let mut deep_cid = c_key;
                 for _ in 0..DEPTH {
                     deep_ty = Ty::union(vec![deep_ty]);
@@ -2198,6 +2275,20 @@ mod tests {
                 let cyc_cid = ConstId::new(m1.consts.len() as u32);
                 let _ = m1.consts.push_array(vec![cyc_cid, deep_cid]);
                 m1.values[0].ty = deep_ty;
+                let h_bid = m1.functions[0].blocks[0];
+                let exc_vid = ValueId::new(m1.values.len() as u32);
+                m1.values.push(Value {
+                    def: ValueDef::ExceptionParam(h_bid),
+                    ty: Ty::Any,
+                });
+                m1.functions[0].try_regions.push(TryRegion {
+                    protected: vec![h_bid],
+                    catches: vec![Catch {
+                        handler: h_bid,
+                        exception: exc_vid,
+                        type_class: Some(ClassId::new(1)),
+                    }],
+                });
 
                 let mut m2 = Module::new();
                 let dg = m2.sym.intern("L_GLOBAL;");

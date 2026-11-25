@@ -105,9 +105,9 @@ pub struct Catch {
     /// The exception object value delivered at the handler entry. Its
     /// [`Value::def`] must be [`ValueDef::ExceptionParam`] of `handler`.
     pub exception: ValueId,
-    /// The exception type index of a TYPED catch, when the source
-    /// carried one (`None` = catch-all).
-    pub type_idx: Option<u32>,
+    /// The caught exception class in [`crate::Module::classes`] for a typed
+    /// catch (`None` = catch-all; `#50`).
+    pub type_class: Option<ClassId>,
 }
 
 /// A structured try region (`design/ir.md`): both structure (for lowering) and
@@ -132,9 +132,10 @@ pub struct TryRegion {
 pub struct DebugData {
     /// Source file name, when known.
     pub source_file: Option<Sym>,
-    /// Source code text, when the file carried it (content, not a name —
-    /// deliberately not interned into the [`crate::symbol::SymbolTable`]).
-    pub source_code: Option<String>,
+    /// Shared source code text (`R3-A6`, `#58` — `Arc<str>` avoids duplicating
+    /// whole-file source text across functions in the same compilation unit;
+    /// deliberately not interned into [`crate::symbol::SymbolTable`]).
+    pub source_code: Option<std::sync::Arc<str>>,
     /// Instruction → source line table.
     pub line_table: Vec<LineEntry>,
     /// Instruction → source column table.

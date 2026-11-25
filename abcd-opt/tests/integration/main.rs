@@ -12,6 +12,7 @@ mod opt_inline_e2e;
 mod opt_inline_red;
 mod opt_inline_skip_reasons;
 mod opt_merge_empty_phi;
+mod opt_round3_soundness;
 mod opt_sccp_exception_soundness;
 mod opt_sccp_folds;
 mod opt_try_handler_survives;

@@ -1,36 +1,46 @@
 //! Entity resolution: bytecode `EntityId` → [`Sym`] / [`FuncId`] /
-//! [`ConstId`], and literal arrays → typed [`Const`] trees.
+//! [`ConstId`], and literal arrays → lossless typed [`Const`] trees (`#50`,
+//! `#57` `R3-H9`).
 //!
-//! The S1/N2 lessons, applied: a method reference's identity is its
-//! source-file offset, resolved through the pass-1 method table to a
-//! [`FuncId`] — never name-keyed (two methods can share a name; a name
-//! can collide with a string entity). Strings are content-keyed symbols.
-//! Literal arrays become typed [`Const`] trees (N52: no raw offsets
-//! anywhere — typed `ARRAY_*` payloads, which the v0.1 file model keeps
-//! as raw file offsets, are resolved through
-//! `File::literal_array_offsets` here).
+//! Method references resolve via dense [`MethodIdx`] slots in `MethodBody::entities`
+//! to a [`FuncId`] — never name-keyed, never raw offsets. Strings are
+//! content-keyed symbols, and literal arrays become lossless [`Const`] trees
+//! on an explicit heap workstack.
 
-use abcd_file::{File, LiteralValue, MethodBody};
+use abcd_file::{EntityRef, File, LiteralValue, MethodBody, MethodIdx};
 use abcd_ir::module::FunctionKind;
 use abcd_ir::op::MemberAttrs;
-use abcd_ir::{Const, ConstId, FuncId, Sym};
+use abcd_ir::{Const, ConstId, FuncId, LitMethodKind, Sym, TypedArrayTag};
 use abcd_isa::{EntityId, EntityKind};
 
 use crate::{LiftError, Lifter};
 
-/// Resolve an [`EntityId`] through the owning method's typed index
-/// mapping to a symbol (string-pool entities).
+/// Wrapper shape produced when finishing an expanded literal-array buffer (`#57` `R3-H9`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LitWrap {
+    /// Plain [`Const::ArrayLiteral`] (`LiteralTag::LITERALARRAY` or top-level buffer).
+    PlainArray,
+    /// [`Const::LiteralBufferRef`] wrapping a pooled [`Const::ArrayLiteral`]
+    /// (`LiteralTag::LITERALBUFFERINDEX`).
+    BufferRef,
+    /// [`Const::TypedArrayLiteral`] (`LiteralTag::ARRAY_*`).
+    TypedArray(TypedArrayTag),
+}
+
+/// Resolve an [`EntityId`] through the owning method's typed [`EntityRef`]
+/// table to a symbol (string-pool entities).
 pub fn resolve_sym(
     lf: &mut Lifter,
     body: &MethodBody,
     id: EntityId,
     kind: EntityKind,
 ) -> Result<Sym, LiftError> {
-    let Some(offset) = body.entity_offsets.get(&(kind, id.0)) else {
+    let Some(entity) = body.entities.get(&(kind, id.0)) else {
         return Err(LiftError::UnresolvedEntity(id.0));
     };
-    let Some(file_sid) = lf.file.resolve_entity(*offset) else {
-        return Err(LiftError::UnresolvedEntity(id.0));
+    let file_sid = match *entity {
+        EntityRef::String { id: sid, .. } => sid,
+        _ => return Err(LiftError::UnresolvedEntity(id.0)),
     };
     lf.sym_of_file_sid(file_sid)
         .ok_or(LiftError::UnresolvedEntity(id.0))
@@ -38,48 +48,43 @@ pub fn resolve_sym(
 
 /// Resolve a method-reference [`EntityId`] to its display name and its
 /// function-table index.
-///
-/// `body.entity_offsets[(MethodId, raw)]` gives the exact offset for
-/// THIS use-site (decode records it per operand), so two same-named
-/// methods referenced from one body resolve to their own offsets; the
-/// offset then maps to the pass-1 [`FuncId`].
 pub fn resolve_method(
     lf: &mut Lifter,
     body: &MethodBody,
     id: EntityId,
 ) -> Result<(Sym, FuncId), LiftError> {
-    let Some(&offset) = body.entity_offsets.get(&(EntityKind::MethodId, id.0)) else {
+    let Some(entity) = body.entities.get(&(EntityKind::MethodId, id.0)) else {
         return Err(LiftError::UnresolvedEntity(id.0));
     };
-    let Some(func_id) = lf.func_of_method_offset(offset) else {
-        return Err(LiftError::UnresolvedEntity(id.0));
-    };
-    let Some(file_sid) = lf.file.resolve_entity(offset) else {
-        return Err(LiftError::UnresolvedEntity(id.0));
-    };
-    let name = lf
-        .sym_of_file_sid(file_sid)
-        .ok_or(LiftError::UnresolvedEntity(id.0))?;
-    Ok((name, func_id))
+    match *entity {
+        EntityRef::Method(midx) => {
+            let func_id = func_of_idx(lf, midx).map_err(|_| LiftError::UnresolvedEntity(id.0))?;
+            let name = lf
+                .method_names
+                .get(midx.index())
+                .copied()
+                .ok_or(LiftError::UnresolvedEntity(id.0))?;
+            Ok((name, func_id))
+        }
+        _ => Err(LiftError::UnresolvedEntity(id.0)),
+    }
 }
 
-/// Resolve a method source-file offset to its [`FuncId`] (literal-array
-/// method references — the same identity path as
-/// [`resolve_method`]).
-pub fn func_of_offset(lf: &Lifter, offset: u32) -> Result<FuncId, LiftError> {
-    lf.func_of_method_offset(offset)
-        .ok_or(LiftError::UnresolvedEntity(offset))
+/// Resolve a dense [`MethodIdx`] to its [`FuncId`].
+pub fn func_of_idx(lf: &Lifter, idx: MethodIdx) -> Result<FuncId, LiftError> {
+    if idx.index() < lf.method_names.len() {
+        Ok(FuncId::new(idx.0))
+    } else {
+        Err(LiftError::UnresolvedEntity(idx.0))
+    }
 }
 
 /// Resolve a literal-array [`EntityId`] to its decoded table index.
-fn literal_table_index(file: &File, body: &MethodBody, id: EntityId) -> Result<u32, LiftError> {
-    let Some(&offset) = body.entity_offsets.get(&(EntityKind::LiteralarrayId, id.0)) else {
-        return Err(LiftError::UnresolvedEntity(id.0));
-    };
-    file.literal_array_offsets
-        .get(&offset)
-        .copied()
-        .ok_or(LiftError::UnresolvedEntity(id.0))
+fn literal_table_index(body: &MethodBody, id: EntityId) -> Result<u32, LiftError> {
+    match body.entities.get(&(EntityKind::LiteralarrayId, id.0)) {
+        Some(EntityRef::LiteralArray(idx)) => Ok(idx.0),
+        _ => Err(LiftError::UnresolvedEntity(id.0)),
+    }
 }
 
 /// Resolve a literal-array [`EntityId`] to its pooled shape constant.
@@ -88,7 +93,7 @@ pub fn resolve_literal_const(
     body: &MethodBody,
     id: EntityId,
 ) -> Result<ConstId, LiftError> {
-    let idx = literal_table_index(lf.file, body, id)?;
+    let idx = literal_table_index(body, id)?;
     const_for_literal_array(lf, idx)
 }
 
@@ -120,7 +125,7 @@ pub fn class_member_attrs(
     id: EntityId,
     is_sendable: bool,
 ) -> Result<Vec<MemberAttrs>, LiftError> {
-    let idx = literal_table_index(lf.file, body, id)?;
+    let idx = literal_table_index(body, id)?;
     class_member_attrs_for_index(lf.file, idx, is_sendable)
 }
 
@@ -220,10 +225,21 @@ pub fn class_member_attrs_for_index(
         .collect())
 }
 
-/// Convert the literal array at `table_idx` into a pooled [`ConstId`]
-/// iteratively (memoized, cycle-guarded, O(1) native stack).
+/// Convert the literal array at `table_idx` into a pooled [`Const::ArrayLiteral`]
+/// [`ConstId`] iteratively (memoized, cycle-guarded, O(1) native stack).
 pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstId, LiftError> {
-    let first = match enter_literal_array(lf, table_idx)? {
+    const_for_literal_array_with_wrap(lf, table_idx, LitWrap::PlainArray)
+}
+
+/// Convert the literal array at `table_idx` under `root_wrap` into a pooled
+/// [`ConstId`] iteratively (memoized per `(table_idx, wrap)`, cycle-guarded,
+/// O(1) native stack).
+fn const_for_literal_array_with_wrap(
+    lf: &mut Lifter,
+    table_idx: u32,
+    root_wrap: LitWrap,
+) -> Result<ConstId, LiftError> {
+    let first = match enter_literal_array(lf, table_idx, root_wrap)? {
         Ok(cached) => return Ok(cached),
         Err(frame) => frame,
     };
@@ -251,28 +267,29 @@ pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstI
                         parent.consts.push(cid);
                     }
                 }
-                LitStep::NestedArray(child_idx) => match enter_literal_array(lf, child_idx) {
-                    Ok(Ok(cached)) => {
-                        if let Some(parent) = stack.last_mut() {
-                            parent.consts.push(cached);
+                LitStep::Nested { child_idx, wrap } => {
+                    match enter_literal_array(lf, child_idx, wrap) {
+                        Ok(Ok(cached)) => {
+                            if let Some(parent) = stack.last_mut() {
+                                parent.consts.push(cached);
+                            }
+                        }
+                        Ok(Err(child_frame)) => stack.push(child_frame),
+                        Err(e) => {
+                            for f in &stack {
+                                lf.lit_active.remove(&f.table_idx);
+                            }
+                            return Err(e);
                         }
                     }
-                    Ok(Err(child_frame)) => stack.push(child_frame),
-                    Err(e) => {
-                        for f in &stack {
-                            lf.lit_active.remove(&f.table_idx);
-                        }
-                        return Err(e);
-                    }
-                },
+                }
             }
         } else {
             let Some(finished) = stack.pop() else {
                 break;
             };
             lf.lit_active.remove(&finished.table_idx);
-            let cid = lf.const_shape(Const::ArrayLiteral(finished.consts));
-            lf.lit_cache.insert(finished.table_idx, cid);
+            let cid = finish_literal_frame(lf, finished.table_idx, finished.wrap, finished.consts);
             if let Some(parent) = stack.last_mut() {
                 parent.consts.push(cid);
             } else {
@@ -284,32 +301,65 @@ pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstI
     unreachable!("literal-array stack always returns when popping the root frame")
 }
 
+/// Pool and memoize a finished literal-array frame under its [`LitWrap`] shape,
+/// keeping plain `ArrayLiteral` entries distinct from `LiteralBufferRef` and
+/// `TypedArrayLiteral` wrappers (`#57` `R3-H9`).
+fn finish_literal_frame(
+    lf: &mut Lifter,
+    table_idx: u32,
+    wrap: LitWrap,
+    consts: Vec<ConstId>,
+) -> ConstId {
+    let cid = match wrap {
+        LitWrap::PlainArray => lf.const_shape(Const::ArrayLiteral(consts)),
+        LitWrap::BufferRef => {
+            let arr_cid = lf.const_shape(Const::ArrayLiteral(consts));
+            lf.lit_cache
+                .insert((table_idx, LitWrap::PlainArray), arr_cid);
+            lf.const_shape(Const::LiteralBufferRef(arr_cid))
+        }
+        LitWrap::TypedArray(tag) => lf.const_shape(Const::TypedArrayLiteral { tag, items: consts }),
+    };
+    lf.lit_cache.insert((table_idx, wrap), cid);
+    cid
+}
+
 /// Step outcome when converting one [`LiteralValue`] without native
 /// call-stack recursion.
 enum LitStep {
     /// Immediate scalar, string, or method-ref constant.
     Ready(Const),
-    /// Nested literal-array reference at `table_idx` to expand on the
-    /// explicit work stack.
-    NestedArray(u32),
+    /// Nested literal-array reference at `child_idx` to expand on the
+    /// explicit work stack under `wrap`.
+    Nested { child_idx: u32, wrap: LitWrap },
 }
 
 /// Active frame on the iterative literal-array conversion stack.
 struct LitFrame<'f> {
     table_idx: u32,
+    wrap: LitWrap,
     values: &'f [LiteralValue],
     next_elem: usize,
     consts: Vec<ConstId>,
 }
 
-/// Look up `table_idx` in the memo cache or validate and activate a new
-/// [`LitFrame`] for iterative expansion.
+/// Look up `(table_idx, wrap)` in the memo cache or validate and activate a
+/// new [`LitFrame`] for iterative expansion.
 fn enter_literal_array<'f>(
     lf: &mut Lifter<'f>,
     table_idx: u32,
+    wrap: LitWrap,
 ) -> Result<Result<ConstId, LitFrame<'f>>, LiftError> {
-    if let Some(&cid) = lf.lit_cache.get(&table_idx) {
+    if let Some(&cid) = lf.lit_cache.get(&(table_idx, wrap)) {
         return Ok(Ok(cid));
+    }
+    if matches!(wrap, LitWrap::BufferRef)
+        && let Some(&arr_cid) = lf.lit_cache.get(&(table_idx, LitWrap::PlainArray))
+    {
+        let buf_cid = lf.const_shape(Const::LiteralBufferRef(arr_cid));
+        lf.lit_cache
+            .insert((table_idx, LitWrap::BufferRef), buf_cid);
+        return Ok(Ok(buf_cid));
     }
     let file = lf.file;
     let Some(arr) = file.literal_arrays.get(table_idx as usize) else {
@@ -320,101 +370,126 @@ fn enter_literal_array<'f>(
     }
     Ok(Err(LitFrame {
         table_idx,
+        wrap,
         values: &arr.values,
         next_elem: 0,
         consts: Vec::with_capacity(arr.values.len()),
     }))
 }
 
-/// Convert one literal value to a pooled [`ConstId`] (N52: every reference
-/// is resolved — no raw offsets cross into the IR).
+/// Convert one literal value to a pooled [`ConstId`].
 pub(crate) fn const_for_literal_value(
     lf: &mut Lifter,
     v: &LiteralValue,
 ) -> Result<ConstId, LiftError> {
     match step_literal_value(lf, v)? {
         LitStep::Ready(c) => Ok(lf.module.consts.intern(c)),
-        LitStep::NestedArray(idx) => const_for_literal_array(lf, idx),
+        LitStep::Nested { child_idx, wrap } => {
+            const_for_literal_array_with_wrap(lf, child_idx, wrap)
+        }
     }
 }
 
-/// Classify a single [`LiteralValue`] into an immediate [`Const`] or a
-/// nested literal-array index without recursing.
+/// Classify a single [`LiteralValue`] into its lossless [`Const`] or a nested
+/// literal-array expansion without recursing (`#57` `R3-H9`).
 fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, LiftError> {
     Ok(match v {
         LiteralValue::Bool(b) => LitStep::Ready(Const::Bool(*b)),
-        LiteralValue::Integer8(n) => LitStep::Ready(Const::number(*n as f64)),
-        LiteralValue::Integer(n) => LitStep::Ready(Const::number(*n as f64)),
-        LiteralValue::Float(f) => LitStep::Ready(Const::number(*f as f64)),
+        LiteralValue::Integer8(n) => LitStep::Ready(Const::Int8(*n)),
+        LiteralValue::Integer(n) => LitStep::Ready(Const::Int32(*n)),
+        LiteralValue::Float(f) => LitStep::Ready(Const::float32(*f)),
         LiteralValue::Double(d) => LitStep::Ready(Const::number(*d)),
-        LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
+        LiteralValue::String(sid) => {
             let sym = lf
                 .sym_of_file_sid(*sid)
-                .ok_or(LiftError::UnresolvedEntity(0))?;
+                .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
             LitStep::Ready(Const::String(sym))
         }
-        // Method references resolve offset → FuncId through the pass-1
-        // method table (kind-precise identity, S1/N2).
-        LiteralValue::Method(offset)
-        | LiteralValue::GeneratorMethod(offset)
-        | LiteralValue::AsyncGeneratorMethod(offset)
-        | LiteralValue::Getter(offset)
-        | LiteralValue::Setter(offset) => {
-            LitStep::Ready(Const::MethodRef(func_of_offset(lf, *offset)?))
+        LiteralValue::EtsImplements(sid) => {
+            let sym = lf
+                .sym_of_file_sid(*sid)
+                .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
+            LitStep::Ready(Const::EtsImplements(sym))
         }
-        // Small numeric payloads with no dedicated Const variant
-        // (accessor-kind tag, affiliate index, builtin-type index) —
-        // content preserved as numbers (documented).
-        LiteralValue::Accessor(n) => LitStep::Ready(Const::number(*n as f64)),
-        LiteralValue::MethodAffiliate(n) => LitStep::Ready(Const::number(*n as f64)),
-        LiteralValue::BuiltinTypeIndex(n) => LitStep::Ready(Const::number(*n as f64)),
-        LiteralValue::NullValue(_) => LitStep::Ready(Const::Null),
-        // Nested literal arrays: decode rewrites THIS variant's payload
-        // to a table index (decode.rs "Rewrite nested references").
-        LiteralValue::LiteralArray(idx) => LitStep::NestedArray(idx.0),
-        // LiteralBufferIndex payloads are NOT rewritten by decode —
-        // they are raw file offsets (same N52 class as the typed
-        // arrays; corpus: sendable-class fixtures carry
-        // `lit_offset:0x…` entries).
-        LiteralValue::LiteralBufferIndex(raw) => {
-            let idx = typed_array_table_index(lf.file, raw.0)
-                .ok_or(LiftError::UnresolvedEntity(raw.0))?;
-            LitStep::NestedArray(idx)
-        }
-        // Typed ARRAY_* payloads are RAW FILE OFFSETS in the v0.1 file
-        // model (N52 — decode rewrites only `LiteralArray`); resolve
-        // through the offset→index map. Hand-built models carry direct
-        // indices instead: accept those as a fallback (documented).
-        LiteralValue::ArrayU1(raw)
-        | LiteralValue::ArrayU8(raw)
-        | LiteralValue::ArrayI8(raw)
-        | LiteralValue::ArrayU16(raw)
-        | LiteralValue::ArrayI16(raw)
-        | LiteralValue::ArrayU32(raw)
-        | LiteralValue::ArrayI32(raw)
-        | LiteralValue::ArrayU64(raw)
-        | LiteralValue::ArrayI64(raw)
-        | LiteralValue::ArrayF32(raw)
-        | LiteralValue::ArrayF64(raw)
-        | LiteralValue::ArrayString(raw) => {
-            let idx = typed_array_table_index(lf.file, raw.0)
-                .ok_or(LiftError::UnresolvedEntity(raw.0))?;
-            // Element-type tag (u8/i32/f64/string…) is not part of
-            // v0.2's Const — the elements carry their values; the tag
-            // is a lowering concern (documented divergence).
-            LitStep::NestedArray(idx)
-        }
+        LiteralValue::Method(idx) => LitStep::Ready(Const::method_ref_with_kind(
+            func_of_idx(lf, *idx)?,
+            LitMethodKind::Method,
+        )),
+        LiteralValue::GeneratorMethod(idx) => LitStep::Ready(Const::method_ref_with_kind(
+            func_of_idx(lf, *idx)?,
+            LitMethodKind::GeneratorMethod,
+        )),
+        LiteralValue::AsyncGeneratorMethod(idx) => LitStep::Ready(Const::method_ref_with_kind(
+            func_of_idx(lf, *idx)?,
+            LitMethodKind::AsyncGeneratorMethod,
+        )),
+        LiteralValue::Getter(idx) => LitStep::Ready(Const::method_ref_with_kind(
+            func_of_idx(lf, *idx)?,
+            LitMethodKind::Getter,
+        )),
+        LiteralValue::Setter(idx) => LitStep::Ready(Const::method_ref_with_kind(
+            func_of_idx(lf, *idx)?,
+            LitMethodKind::Setter,
+        )),
+        LiteralValue::Accessor(n) => LitStep::Ready(Const::Accessor(*n)),
+        LiteralValue::MethodAffiliate(n) => LitStep::Ready(Const::MethodAffiliate(*n)),
+        LiteralValue::BuiltinTypeIndex(n) => LitStep::Ready(Const::BuiltinTypeIndex(*n)),
+        LiteralValue::NullValue(n) => LitStep::Ready(Const::LitNull(*n)),
+        LiteralValue::LiteralArray(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::PlainArray,
+        },
+        LiteralValue::LiteralBufferIndex(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::BufferRef,
+        },
+        LiteralValue::ArrayU1(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::U1),
+        },
+        LiteralValue::ArrayU8(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::U8),
+        },
+        LiteralValue::ArrayI8(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::I8),
+        },
+        LiteralValue::ArrayU16(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::U16),
+        },
+        LiteralValue::ArrayI16(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::I16),
+        },
+        LiteralValue::ArrayU32(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::U32),
+        },
+        LiteralValue::ArrayI32(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::I32),
+        },
+        LiteralValue::ArrayU64(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::U64),
+        },
+        LiteralValue::ArrayI64(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::I64),
+        },
+        LiteralValue::ArrayF32(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::F32),
+        },
+        LiteralValue::ArrayF64(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::F64),
+        },
+        LiteralValue::ArrayString(idx) => LitStep::Nested {
+            child_idx: idx.0,
+            wrap: LitWrap::TypedArray(TypedArrayTag::String),
+        },
     })
-}
-
-/// Resolve a typed-array payload: raw file offset → literal-array table
-/// index (N52), with a direct-index fallback for hand-built models.
-fn typed_array_table_index(file: &File, raw: u32) -> Option<u32> {
-    if let Some(&idx) = file.literal_array_offsets.get(&raw) {
-        return Some(idx);
-    }
-    if (raw as usize) < file.literal_arrays.len() {
-        return Some(raw);
-    }
-    None
 }

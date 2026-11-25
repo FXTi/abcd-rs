@@ -70,9 +70,15 @@ fn try_block_added_after_set_code_roundtrip() {
     let tb = &body.try_blocks[0];
     assert_eq!((tb.start, tb.len), (0, 2));
     assert_eq!(tb.catches.len(), 2);
-    assert_ne!(tb.catches[0].type_idx, u32::MAX, "typed catch got an index");
+    assert_eq!(
+        tb.catches[0]
+            .type_class
+            .and_then(|sid| file.strings.resolve(sid)),
+        Some("LError;"),
+        "typed catch got LError;"
+    );
     assert_eq!((tb.catches[0].handler, tb.catches[0].len), (2, 1));
-    assert_eq!(tb.catches[1].type_idx, u32::MAX, "catch-all");
+    assert_eq!(tb.catches[1].type_class, None, "catch-all");
 }
 
 /// The pending-queue skip arm: a try block staged on code item A is NOT

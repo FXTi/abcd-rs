@@ -33,14 +33,14 @@ fn rewrite_with_annotation_method_ref() -> (abcd_file::File, u32) {
     let base = b.finalize().expect("finalize");
     let mut file = decode(&base).expect("decode base");
 
-    let target_off = {
-        let cls = file.classes.values().find(|c| !c.is_external).unwrap();
-        cls.methods
-            .iter()
-            .find(|m| file.strings.resolve(m.name) == Some("target"))
-            .expect("target present")
-            .offset
-    };
+    let (target_idx, target_off) = file
+        .all_methods()
+        .enumerate()
+        .find_map(|(i, (_, m))| {
+            (file.strings.resolve(m.name) == Some("target"))
+                .then_some((abcd_file::MethodIdx(i as u32), m.offset))
+        })
+        .expect("target present");
     assert_ne!(target_off, 0, "decoded methods carry source offsets");
 
     let ann_desc = file.strings.get_or_intern("LAnno;");
@@ -52,7 +52,7 @@ fn rewrite_with_annotation_method_ref() -> (abcd_file::File, u32) {
             name: elem_name,
             value: AnnotationValue::LiteralArray(vec![
                 LiteralValue::Integer(7),
-                LiteralValue::Method(target_off),
+                LiteralValue::Method(target_idx),
             ]),
         }],
     });
@@ -90,7 +90,7 @@ fn annotation_literal_array_method_ref_relocates() {
         );
     };
     let method_ref = values.iter().find_map(|v| match v {
-        LiteralValue::Method(off) => Some(*off),
+        LiteralValue::Method(midx) => Some(file2.method_by_idx(*midx)?.2.offset),
         _ => None,
     });
     assert_eq!(
@@ -128,8 +128,10 @@ fn annotation_literal_array_method_ref_unresolvable_is_error() {
         class_descriptor: ann_desc,
         elements: vec![AnnotationElem {
             name: elem_name,
-            // 0x77777 is not any method's source offset.
-            value: AnnotationValue::LiteralArray(vec![LiteralValue::Method(0x77777)]),
+            // 0x77777 is out of bounds for the file's method table.
+            value: AnnotationValue::LiteralArray(vec![LiteralValue::Method(abcd_file::MethodIdx(
+                0x77777,
+            ))]),
         }],
     });
 

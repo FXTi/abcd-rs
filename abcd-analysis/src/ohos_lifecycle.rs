@@ -205,6 +205,7 @@ pub fn discover_components(
                         object,
                         name,
                         value,
+                        ..
                     } => {
                         let root_obj = peel_mov(module, *object);
                         if let Some(&cls_val) = proto_to_cls.get(&root_obj)
@@ -335,7 +336,7 @@ pub fn synthesize_ohos_harness(
     //    cross-module `StoreModuleVar` exports and prototype methods initialize
     //    before importers and lifecycle hooks execute.
     for &init_fid in init_funcs {
-        let mref = m.consts.push(Const::MethodRef(init_fid));
+        let mref = m.consts.push(Const::method_ref(init_fid));
         let callee = emit_inst_val(&mut m, b, Op::LoadConst(mref));
         let _ = emit_inst_val(
             &mut m,
@@ -482,7 +483,7 @@ fn invoke_method(m: &mut Module, b: BlockId, target: FuncId, this_val: ValueId, 
     if fd.is_external || fd.blocks.is_empty() {
         return;
     }
-    let mref = m.consts.push(Const::MethodRef(target));
+    let mref = m.consts.push(Const::method_ref(target));
     let callee = emit_inst_val(m, b, Op::LoadConst(mref));
     let _ = emit_inst_val(
         m,
@@ -539,7 +540,7 @@ fn collect_member_methods(module: &Module, members: ConstId) -> BTreeMap<String,
             Some(Const::String(s)) => {
                 pending_name = Some(sym_str(module, *s).to_owned());
             }
-            Some(Const::MethodRef(fid)) => {
+            Some(Const::MethodRef { func: fid, .. }) => {
                 if let Some(name) = pending_name.take()
                     && !name.is_empty()
                 {
@@ -708,10 +709,18 @@ fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
         match &module.inst(iid)?.op {
             Op::Mov { src }
             | Op::AllocClosure { func: src }
+            | Op::CreateGenerator { func: src }
+            | Op::CreateAsyncGenerator { func: src }
             | Op::DefineMethod { func: src, .. } => {
                 v = *src;
             }
             Op::DefineFunc { body, .. } => return Some(*body),
+            Op::LoadConst(c) => {
+                return match module.consts.get(*c) {
+                    Some(Const::MethodRef { func: f, .. }) => Some(*f),
+                    _ => None,
+                };
+            }
             _ => return None,
         }
     }
@@ -882,9 +891,9 @@ mod tests {
         let s_hb = m.sym.intern("HeaderBuilder");
 
         let c_s_oc = m.consts.intern(Const::String(s_oc));
-        let c_oc1 = m.consts.intern(Const::MethodRef(on_create1));
+        let c_oc1 = m.consts.intern(Const::method_ref(on_create1));
         let c_s_fg = m.consts.intern(Const::String(s_fg));
-        let c_fg1 = m.consts.intern(Const::MethodRef(on_fg1));
+        let c_fg1 = m.consts.intern(Const::method_ref(on_fg1));
         let mem1 = m.consts.push_array(vec![c_s_oc, c_oc1, c_s_fg, c_fg1]);
         let _ = emit_inst_val(
             &mut m,
@@ -898,7 +907,7 @@ mod tests {
             })),
         );
 
-        let c_fg2 = m.consts.intern(Const::MethodRef(on_fg2));
+        let c_fg2 = m.consts.intern(Const::method_ref(on_fg2));
         let mem2 = m.consts.push_array(vec![c_s_fg, c_fg2]);
         let _ = emit_inst_val(
             &mut m,
@@ -913,7 +922,7 @@ mod tests {
         );
 
         let c_s_af = m.consts.intern(Const::String(s_af));
-        let c_on_add = m.consts.intern(Const::MethodRef(on_add));
+        let c_on_add = m.consts.intern(Const::method_ref(on_add));
         let mem3 = m.consts.push_array(vec![c_s_af, c_on_add]);
         let _ = emit_inst_val(
             &mut m,
@@ -928,9 +937,9 @@ mod tests {
         );
 
         let c_s_ata = m.consts.intern(Const::String(s_ata));
-        let c_about = m.consts.intern(Const::MethodRef(about));
+        let c_about = m.consts.intern(Const::method_ref(about));
         let c_s_ir = m.consts.intern(Const::String(s_ir));
-        let c_render = m.consts.intern(Const::MethodRef(render));
+        let c_render = m.consts.intern(Const::method_ref(render));
         let mem4 = m
             .consts
             .push_array(vec![c_s_ata, c_about, c_s_ir, c_render]);

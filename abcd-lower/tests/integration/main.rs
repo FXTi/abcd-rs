@@ -28,3 +28,4 @@ mod lower_phi_swap_loop;
 mod lower_rpo_entry_first;
 mod lower_try_range_contiguity;
 mod lower_zero_extent_block;
+mod round3_regressions;

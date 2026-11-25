@@ -143,8 +143,6 @@ fn model_with_methods(
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     }
 }
@@ -169,7 +167,7 @@ fn model_method(
             num_vregs: 0,
             num_args: 0,
             bytecodes: vec![Bytecode::Returnundefined],
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -429,7 +427,7 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
             field_type: Type::U32,
             access_flags: AccessFlags::PUBLIC,
             is_external: false,
-            initial_value: Some(FieldValue::LiteralArrayRef(0x40)),
+            initial_value: Some(FieldValue::literal_array_ref(abcd_file::LiteralArrayIdx(1))),
             annotations: Default::default(),
         }],
         annotations: Default::default(),
@@ -454,7 +452,7 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
                 field_type: Type::U32,
                 access_flags: AccessFlags::PUBLIC,
                 is_external: false,
-                initial_value: Some(FieldValue::LiteralArrayRef(0x20)),
+                initial_value: Some(FieldValue::literal_array_ref(abcd_file::LiteralArrayIdx(0))),
                 annotations: Default::default(),
             },
             abcd_file::Field {
@@ -463,7 +461,7 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
                 field_type: Type::U32,
                 access_flags: AccessFlags::PUBLIC,
                 is_external: false,
-                initial_value: Some(FieldValue::LiteralArrayRef(0x40)),
+                initial_value: Some(FieldValue::literal_array_ref(abcd_file::LiteralArrayIdx(1))),
                 annotations: Default::default(),
             },
         ],
@@ -480,15 +478,9 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
             .into_iter()
             .collect(),
         literal_arrays: vec![
-            abcd_file::LiteralArray {
-                values: vec![abcd_file::LiteralValue::String(alpha_sid)],
-            },
-            abcd_file::LiteralArray {
-                values: vec![abcd_file::LiteralValue::Integer(999)],
-            },
+            abcd_file::LiteralArray::new(vec![abcd_file::LiteralValue::String(alpha_sid)]),
+            abcd_file::LiteralArray::new(vec![abcd_file::LiteralValue::Integer(999)]),
         ],
-        entity_map: Default::default(),
-        literal_array_offsets: HashMap::from([(0x20, 0), (0x40, 1)]),
         literal_array_header_offsets: Vec::new(),
     };
     let mut m = lift_file(&file).expect("lift");
@@ -717,7 +709,7 @@ fn annotation_element_kinds_matrix() {
     assert_eq!(by_name["record"], &AnnValue::Class(cid_inner));
     assert_eq!(
         const_of(by_name["method"]),
-        Const::MethodRef(fid_m),
+        Const::method_ref(fid_m),
         "method element → MethodRef constant"
     );
     assert_eq!(
@@ -748,7 +740,7 @@ fn annotation_element_kinds_matrix() {
     };
     assert_eq!(
         arr_elems(by_name["litarray"]),
-        vec![Const::number(42.0)],
+        vec![Const::Int32(42)],
         "literal-array element → pooled ArrayLiteral"
     );
 
@@ -778,7 +770,7 @@ fn annotation_element_kinds_matrix() {
     );
     assert_eq!(
         arr_elems(by_name["arrmeth"]),
-        vec![Const::MethodRef(fid_m)],
+        vec![Const::method_ref(fid_m)],
         "method array elements keep MethodRef identity"
     );
     assert_eq!(
@@ -849,6 +841,7 @@ fn annotation_degrade_arms_for_dangling_identities() {
             name: n_meth,
             value: AnnotationValue::Method {
                 name: zz_m,
+                method: None,
                 offset: 0x777,
             },
         },
@@ -856,6 +849,7 @@ fn annotation_degrade_arms_for_dangling_identities() {
             name: n_enum,
             value: AnnotationValue::Enum {
                 name: zz_e,
+                field: None,
                 offset: 0x888,
             },
         },
@@ -871,6 +865,8 @@ fn annotation_degrade_arms_for_dangling_identities() {
             value: AnnotationValue::MethodHandle(abcd_file::ResolvedMethodHandle {
                 handle_type: abcd_file::MethodHandleType::InvokeStatic,
                 entity: handlee,
+                target_method: None,
+                target_field: None,
                 entity_offset: 0x999,
             }),
         },
@@ -909,8 +905,6 @@ fn annotation_degrade_arms_for_dangling_identities() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
     let mut m = lift_file(&file).expect("lift");
@@ -969,7 +963,7 @@ fn annotation_degrade_arms_for_dangling_identities() {
     };
     assert_eq!(
         lit_elems,
-        vec![Const::number(5.0), Const::Null],
+        vec![Const::Int32(5), Const::Null],
         "failing literal-array elements degrade to null inside the array"
     );
 }
@@ -1008,25 +1002,32 @@ fn annotation_value_as_const_exotic_array_elements() {
                 },
                 AnnotationValue::Method {
                     name: zz_ok,
+                    method: None,
                     offset: 0x777, // unresolvable → String(name)
                 },
                 AnnotationValue::Method {
                     name: ghost, // unresolvable AND dangling → Null
+                    method: None,
                     offset: 0x778,
                 },
                 AnnotationValue::Record(ghost), // dangling → Null
                 AnnotationValue::Enum {
                     name: ghost, // dangling → Null
+                    field: None,
                     offset: 0x779,
                 },
                 AnnotationValue::MethodHandle(abcd_file::ResolvedMethodHandle {
                     handle_type: abcd_file::MethodHandleType::InvokeStatic,
                     entity: zz_ok, // → String("zz_ok")
+                    target_method: None,
+                    target_field: None,
                     entity_offset: 0x999,
                 }),
                 AnnotationValue::MethodHandle(abcd_file::ResolvedMethodHandle {
                     handle_type: abcd_file::MethodHandleType::InvokeStatic,
                     entity: ghost, // dangling → Null
+                    target_method: None,
+                    target_field: None,
                     entity_offset: 0x998,
                 }),
                 AnnotationValue::Annotation(Box::new(FileAnnotation {
@@ -1067,8 +1068,6 @@ fn annotation_value_as_const_exotic_array_elements() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
     let mut m = lift_file(&file).expect("lift");
@@ -1082,7 +1081,7 @@ fn annotation_value_as_const_exotic_array_elements() {
     let c_neg3 = m.consts.intern(Const::number(-3.0));
     let c_nine = m.consts.intern(Const::number(9.0));
     let c_half = m.consts.intern(Const::number(0.5));
-    let c_eight = m.consts.intern(Const::number(8.0));
+    let c_eight = m.consts.intern(Const::Int32(8));
     let c_null = m.consts.intern(Const::Null);
     let c_lit_arr = m.consts.intern(Const::ArrayLiteral(vec![c_eight, c_null]));
     let c_undef = m.consts.intern(Const::Undefined);
@@ -1166,8 +1165,6 @@ fn dangling_annotation_descriptor_and_element_name_are_skipped() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
     let m = lift_file(&file).expect("lift");
@@ -1190,8 +1187,6 @@ fn dangling_annotation_descriptor_and_element_name_are_skipped() {
 
 #[test]
 fn class_descriptor_key_mismatch_is_an_unresolved_entity() {
-    // metadata.rs:168: pass 1 keys class_to_id by the MAP key; a class
-    // whose descriptor FIELD differs never resolves.
     let mut strings = abcd_file::StringPool::default();
     let key = strings.get_or_intern("LKey;");
     let other_desc = strings.get_or_intern("LOther;");
@@ -1216,19 +1211,17 @@ fn class_descriptor_key_mismatch_is_an_unresolved_entity() {
         strings,
         classes: [(key, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
     let err = lift_file(&file).expect_err("descriptor/key mismatch");
-    assert!(matches!(err, LiftError::UnresolvedEntity(0)), "got {err:?}");
+    assert!(
+        matches!(err, LiftError::UnresolvedEntity(id) if id == other_desc.index() as u32),
+        "got {err:?}"
+    );
 }
 
 #[test]
 fn class_stubbed_by_super_reference_has_no_func_base() {
-    // metadata.rs:171: a class whose descriptor was stub-appended via
-    // class_of_descriptor (here: another class's super_class) is in
-    // class_to_id but not in func_bases → UnresolvedEntity.
     let mut strings = abcd_file::StringPool::default();
     // Interning order fixes the BTreeMap iteration order: LA < LB.
     let desc_a = strings.get_or_intern("LA;");
@@ -1257,12 +1250,13 @@ fn class_stubbed_by_super_reference_has_no_func_base() {
         strings,
         classes: [(desc_a, class_a), (desc_b, class_b)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
-    let err = lift_file(&file).expect_err("stubbed class has no func base");
-    assert!(matches!(err, LiftError::UnresolvedEntity(0)), "got {err:?}");
+    let err = lift_file(&file).expect_err("stubbed class has mismatched key");
+    assert!(
+        matches!(err, LiftError::UnresolvedEntity(id) if id == shared.index() as u32),
+        "got {err:?}"
+    );
 }
 
 // ── Debug-record edge guards ─────────────────────────────────────────
@@ -1444,15 +1438,14 @@ fn module_record_file(md: abcd_file::ModuleData) -> abcd_file::File {
         strings,
         classes: [(rec_desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     }
 }
 
 #[test]
-fn dangling_module_request_string_is_skipped() {
-    // metadata.rs:600.
+fn dangling_module_request_string_returns_error() {
+    // R3-M3: dangling module_requests StringIds must never be silently skipped
+    // (skipping would shift subsequent `module_request_idx` entries!).
     let ghost = {
         let mut other = abcd_file::StringPool::default();
         for i in 0..8 {
@@ -1465,17 +1458,15 @@ fn dangling_module_request_string_is_skipped() {
         requests: vec![ghost],
         records: Vec::new(),
     });
-    let m = lift_file(&file).expect("lift");
-    verify_clean(&m);
+    let err = lift_file(&file).expect_err("dangling request sid must error");
     assert!(
-        m.module_requests.is_empty(),
-        "the dangling request sid is skipped"
+        matches!(err, LiftError::UnresolvedEntity(id) if id == ghost.index() as u32),
+        "got {err:?}"
     );
 }
 
 #[test]
 fn out_of_range_module_request_idx_is_malformed() {
-    // metadata.rs:622-625.
     let mut strings = abcd_file::StringPool::default();
     let dep = strings.get_or_intern("dep1");
     let local = strings.get_or_intern("local1");
@@ -1519,8 +1510,6 @@ fn out_of_range_module_request_idx_is_malformed() {
         strings,
         classes: [(rec_desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
     let err = lift_file(&file).expect_err("request idx 7 with one request");
@@ -1577,8 +1566,6 @@ fn deep_nested_annotation_array_lifts_iteratively() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: Vec::new(),
-        entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
     };
 

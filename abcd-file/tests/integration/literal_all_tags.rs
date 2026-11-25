@@ -40,6 +40,14 @@ fn build_one_string_array() -> (Vec<u8>, usize) {
 #[test]
 fn full_literal_tag_matrix_decodes() {
     let (mut data, array_off) = build_one_string_array();
+    let method_off = decode(&data)
+        .expect("decode initial")
+        .all_methods()
+        .next()
+        .expect("func_main_0")
+        .1
+        .offset
+        .to_le_bytes();
     let orig_str_off: [u8; 4] = data[array_off + 5..array_off + 9].try_into().unwrap();
 
     // Rebuild the array: count = 2 * K pairs, first pair is the original
@@ -47,7 +55,8 @@ fn full_literal_tag_matrix_decodes() {
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&[0x05]); // STRING
     body.extend_from_slice(&orig_str_off);
-    body.extend_from_slice(&[0x06, 0x00, 0x00, 0x00, 0x00]); // METHOD off 0
+    body.push(0x06); // METHOD -> MethodIdx(0)
+    body.extend_from_slice(&method_off);
     body.extend_from_slice(&[0x01, 0x01]); // BOOL true
     body.extend_from_slice(&[0x02]); // INTEGER 42
     body.extend_from_slice(&42u32.to_le_bytes());
@@ -55,15 +64,19 @@ fn full_literal_tag_matrix_decodes() {
     body.extend_from_slice(&1.5f32.to_bits().to_le_bytes());
     body.extend_from_slice(&[0x04]); // DOUBLE 2.5
     body.extend_from_slice(&2.5f64.to_bits().to_le_bytes());
-    body.extend_from_slice(&[0x07, 0x00, 0x00, 0x00, 0x00]); // GENERATORMETHOD off 0
+    body.push(0x07); // GENERATORMETHOD -> MethodIdx(0)
+    body.extend_from_slice(&method_off);
     body.extend_from_slice(&[0x08, 0x01]); // ACCESSOR 1
     body.extend_from_slice(&[0x09, 0x01, 0x00]); // METHODAFFILIATE 1
-    body.extend_from_slice(&[0x16, 0x00, 0x00, 0x00, 0x00]); // ASYNCGENERATORMETHOD 0
-    body.extend_from_slice(&[0x17]); // LITERALBUFFERINDEX 7
-    body.extend_from_slice(&7u32.to_le_bytes());
+    body.push(0x16); // ASYNCGENERATORMETHOD -> MethodIdx(0)
+    body.extend_from_slice(&method_off);
+    body.extend_from_slice(&[0x17]); // LITERALBUFFERINDEX header slot 0 -> LiteralArrayIdx(0)
+    body.extend_from_slice(&0u32.to_le_bytes());
     body.extend_from_slice(&[0x19, 0x03]); // BUILTINTYPEINDEX 3
-    body.extend_from_slice(&[0x1a, 0x00, 0x00, 0x00, 0x00]); // GETTER 0
-    body.extend_from_slice(&[0x1b, 0x00, 0x00, 0x00, 0x00]); // SETTER 0
+    body.push(0x1a); // GETTER -> MethodIdx(0)
+    body.extend_from_slice(&method_off);
+    body.push(0x1b); // SETTER -> MethodIdx(0)
+    body.extend_from_slice(&method_off);
     body.extend_from_slice(&[0xff, 0x00]); // NULLVALUE
 
     // Each logical literal is a [tag][value] pair = 2 items; 15 literals.
@@ -85,27 +98,28 @@ fn full_literal_tag_matrix_decodes() {
     let file = decode(&data).expect("decode");
     let la = &file.literal_arrays[0];
     let vals = &la.values;
+    let m0 = abcd_file::MethodIdx(0);
     assert_eq!(vals.len(), 15);
     assert_eq!(
         vals[0],
         LiteralValue::String(file.strings.get("hello").expect("hello string"))
     );
-    assert_eq!(vals[1], LiteralValue::Method(0));
+    assert_eq!(vals[1], LiteralValue::Method(m0));
     assert_eq!(vals[2], LiteralValue::Bool(true));
     assert_eq!(vals[3], LiteralValue::Integer(42));
     assert_eq!(vals[4], LiteralValue::Float(1.5));
     assert_eq!(vals[5], LiteralValue::Double(2.5));
-    assert_eq!(vals[6], LiteralValue::GeneratorMethod(0));
+    assert_eq!(vals[6], LiteralValue::GeneratorMethod(m0));
     assert_eq!(vals[7], LiteralValue::Accessor(1));
     assert_eq!(vals[8], LiteralValue::MethodAffiliate(1));
-    assert_eq!(vals[9], LiteralValue::AsyncGeneratorMethod(0));
+    assert_eq!(vals[9], LiteralValue::AsyncGeneratorMethod(m0));
     assert_eq!(
         vals[10],
-        LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(7))
+        LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(0))
     );
     assert_eq!(vals[11], LiteralValue::BuiltinTypeIndex(3));
-    assert_eq!(vals[12], LiteralValue::Getter(0));
-    assert_eq!(vals[13], LiteralValue::Setter(0));
+    assert_eq!(vals[12], LiteralValue::Getter(m0));
+    assert_eq!(vals[13], LiteralValue::Setter(m0));
     assert_eq!(vals[14], LiteralValue::NullValue(0));
 }
 
@@ -199,7 +213,6 @@ fn typed_array_tags_decode_to_model_values() {
     // payload, not by more [tag][value] pairs — and the delivered value is
     // the payload's file offset, delivered once (vendor
     // `literal_data_accessor-inl.h:94-115`).
-    let payload_off = (array_off + 4 + 1) as u32; // after count + tag byte
     let new_arr: Vec<u8> = [
         &2u32.to_le_bytes()[..], // one literal = one [tag][payload] pair
         &[0x0b],                 // ARRAY_U8
@@ -210,13 +223,12 @@ fn typed_array_tags_decode_to_model_values() {
     data[array_off..array_off + new_arr.len()].copy_from_slice(&new_arr);
 
     let file = decode(&data).expect("decode");
+    assert_eq!(file.literal_arrays[0].source_offset, Some(array_off as u32));
     let vals = &file.literal_arrays[0].values;
     assert_eq!(
         vals.as_slice(),
-        &[LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(
-            payload_off
-        ))],
-        "the typed-array value must be delivered, not silently dropped"
+        &[LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(0))],
+        "the typed-array value must be delivered and normalized to its owning LiteralArrayIdx"
     );
 }
 
@@ -225,37 +237,28 @@ fn typed_array_tags_decode_to_model_values() {
 // ---------------------------------------------------------------------------
 
 /// Canonical text form of a literal value: StringIds are resolved through
-/// the pool and method offsets through the method table (both are
-/// pool/layout-local and differ between two decodes of one model).
-/// Typed-array (`ArrayXxx`) values compare by discriminant only: their
-/// payload is a file offset that legitimately moves on re-encode.
+/// the pool and method handles through the method table.
+/// Typed-array (`ArrayXxx`) values compare by discriminant only.
 fn canon_literal(file: &abcd_file::File, v: &LiteralValue) -> String {
     let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
-    let method_name_at = |off: u32| {
-        if let Some((_, m)) = file.all_methods().find(|(_, m)| m.offset == off) {
-            return file.strings.resolve(m.name).unwrap_or("?").to_string();
-        }
-        // Offset 0 is the hand-built-model sentinel; the encoder falls back
-        // to entity_map[0] for it, so do the same here.
-        if off == 0
-            && let Some(sid) = file.entity_map.get(&0)
-        {
-            return file.strings.resolve(*sid).unwrap_or("?").to_string();
-        }
-        "<unresolved>".to_string()
+    let method_name_by_idx = |idx: abcd_file::MethodIdx| {
+        file.method_by_idx(idx)
+            .and_then(|(_, _, m)| file.strings.resolve(m.name))
+            .unwrap_or("<unresolved>")
+            .to_string()
     };
     match v {
         LiteralValue::String(sid) => format!("String({})", r(*sid)),
         LiteralValue::EtsImplements(sid) => format!("EtsImplements({})", r(*sid)),
-        LiteralValue::Method(off) => format!("Method({})", method_name_at(*off)),
-        LiteralValue::GeneratorMethod(off) => {
-            format!("GeneratorMethod({})", method_name_at(*off))
+        LiteralValue::Method(idx) => format!("Method({})", method_name_by_idx(*idx)),
+        LiteralValue::GeneratorMethod(idx) => {
+            format!("GeneratorMethod({})", method_name_by_idx(*idx))
         }
-        LiteralValue::AsyncGeneratorMethod(off) => {
-            format!("AsyncGeneratorMethod({})", method_name_at(*off))
+        LiteralValue::AsyncGeneratorMethod(idx) => {
+            format!("AsyncGeneratorMethod({})", method_name_by_idx(*idx))
         }
-        LiteralValue::Getter(off) => format!("Getter({})", method_name_at(*off)),
-        LiteralValue::Setter(off) => format!("Setter({})", method_name_at(*off)),
+        LiteralValue::Getter(idx) => format!("Getter({})", method_name_by_idx(*idx)),
+        LiteralValue::Setter(idx) => format!("Setter({})", method_name_by_idx(*idx)),
         // Content-based recursion: the table order is not guaranteed, so
         // comparing by content is order-independent.
         LiteralValue::LiteralArray(idx) => format!(
@@ -326,47 +329,39 @@ fn full_literal_tag_matrix_encodes() {
     let data = b.finalize().expect("finalize");
     let mut file = decode(&data).expect("decode");
 
-    let target_off = file
-        .all_methods()
-        .find(|(_, m)| file.strings.resolve(m.name) == Some("func_main_0"))
-        .map(|(_, m)| m.offset)
-        .expect("method");
-    assert_ne!(target_off, 0);
+    let target_idx = abcd_file::MethodIdx(0);
+    assert_eq!(
+        file.method_by_idx(target_idx)
+            .and_then(|(_, _, m)| file.strings.resolve(m.name)),
+        Some("func_main_0")
+    );
 
     let str_sid = file.strings.get_or_intern("lit_str");
     let impl_sid = file.strings.get_or_intern("LImpl;");
-    // The offset-0 name fallback (hand-built models carry no offsets).
-    let target_name = file.strings.get("func_main_0").expect("interned");
-    file.entity_map.insert(0, target_name);
 
     file.literal_arrays = vec![
-        abcd_file::LiteralArray {
-            values: vec![
-                LiteralValue::Bool(true),
-                LiteralValue::Integer8(5),
-                LiteralValue::Integer(42),
-                LiteralValue::Float(1.5),
-                LiteralValue::Double(2.5),
-                LiteralValue::String(str_sid),
-                LiteralValue::Method(target_off),
-                LiteralValue::GeneratorMethod(target_off),
-                LiteralValue::AsyncGeneratorMethod(target_off),
-                LiteralValue::Getter(target_off),
-                LiteralValue::Setter(target_off),
-                LiteralValue::Method(0), // offset-0 name fallback
-                LiteralValue::Accessor(1),
-                LiteralValue::MethodAffiliate(9),
-                LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
-                LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(7)),
-                LiteralValue::BuiltinTypeIndex(3),
-                LiteralValue::EtsImplements(impl_sid),
-                LiteralValue::NullValue(0),
-            ],
-        },
+        abcd_file::LiteralArray::new(vec![
+            LiteralValue::Bool(true),
+            LiteralValue::Integer8(5),
+            LiteralValue::Integer(42),
+            LiteralValue::Float(1.5),
+            LiteralValue::Double(2.5),
+            LiteralValue::String(str_sid),
+            LiteralValue::Method(target_idx),
+            LiteralValue::GeneratorMethod(target_idx),
+            LiteralValue::AsyncGeneratorMethod(target_idx),
+            LiteralValue::Getter(target_idx),
+            LiteralValue::Setter(target_idx),
+            LiteralValue::Accessor(1),
+            LiteralValue::MethodAffiliate(9),
+            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
+            LiteralValue::LiteralBufferIndex(abcd_file::LiteralArrayIdx(0)),
+            LiteralValue::BuiltinTypeIndex(3),
+            LiteralValue::EtsImplements(impl_sid),
+            LiteralValue::NullValue(0),
+        ]),
         // Nested reference target (referenced by index 1 above).
-        abcd_file::LiteralArray {
-            values: vec![LiteralValue::Integer(99)],
-        },
+        abcd_file::LiteralArray::new(vec![LiteralValue::Integer(99)]),
     ];
     // One single-element array per typed-array kind (ARRAY_* is always the
     // last item of its array upstream). LiteralArrayIdx(0) encodes as an
@@ -386,7 +381,7 @@ fn full_literal_tag_matrix_encodes() {
         LiteralValue::ArrayString(abcd_file::LiteralArrayIdx(0)),
     ] {
         file.literal_arrays
-            .push(abcd_file::LiteralArray { values: vec![v] });
+            .push(abcd_file::LiteralArray::new(vec![v]));
     }
 
     let before = canon_table(&file);

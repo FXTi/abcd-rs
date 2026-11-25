@@ -1,13 +1,13 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-17`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-19`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-17`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-19`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
-- **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; remaining `Catch::type_idx` scheduled for `Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
+- **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; `Catch::type_class: Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-lower`.
 
 ### ADR-02 — Single-Point `Op` Semantics & Two-Tier Derived Effects (`N48`, `N50`, `R2-D2`)
@@ -96,6 +96,20 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   1. `Const::ArrayLiteral(Vec<ConstId>)` and `Const::ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }` reference `ConstPool` entries by `ConstId` (eliminating recursive `Const` trees and enabling structural sub-literal sharing and iterative 3-color `ConstCycle` verification), `Const::{Int64, UInt64}` preserve exact 64-bit integers for `#36`, and `Ty::Union(Box<[Ty]>)` uses iterative heap-workstack trait implementations.
   2. `abcd_ir::cfg` provides the canonical iterative RPO + **Cooper–Harvey–Kennedy** `idom` + Euler `(tin, tout)` `DomTree` (`O(B)` memory, `O(1)` dominance queries), and `Op::DefineClass` / `Op::DefineSendableClass` box `DefineClassData` so `size_of::<Op>() <= 40` bytes across module-wide instruction arenas.
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`.
+
+### ADR-18 — Typed `EntityRef` Decoupling, Lossless `LiteralArray` Tagging & Reconstructed Debug PCs (`R3-D2`, `R3-D3`, `#50`, `#57`)
+- **Ruling**:
+  1. `abcd_file::File` and `MethodBody` decouple model identity from raw `.abc` source offsets via dense `MethodIdx` / `FieldIdx` / `LiteralArrayIdx` handles, `MethodBody::entities: HashMap<(EntityKind, u32), EntityRef>`, `CatchBlock::type_class: Option<StringId>`, and `Catch::type_class: Option<ClassId>`, retaining optional `source_offset` provenance strictly for `ark_disasm` byte-identical `.pa` emission.
+  2. `abcd_ir::Const` preserves exact `LiteralArray` element tags (`Int8`, `Int32`, `Float32`, `Accessor`, `MethodAffiliate`, `BuiltinTypeIndex`, `EtsImplements`, `LitNull`, `MethodRef { func, kind }`, `LiteralBufferRef`, `TypedArrayLiteral`), preventing cross-tag literal deduplication (`R3-H9`).
+  3. On `rewrite_file` / `lower_module`, `abcd-lower` reconstructs `MethodDebugInfo` line/column tables against post-layout instruction PCs from `Inst::loc` (`DebugData`) and clears invalidated register-numbered `local_vars` rather than leaving stale pre-rewrite PCs/vregs (`R3-H8`).
+- **Crates**: `abcd-file`, `abcd-ir`, `abcd-lift`, `abcd-lower`, `abcd-cli`.
+
+### ADR-19 — First-Class Opcode Variant Fidelity, Pure-Rust FDLIBM `ecma_pow`, Canonical `NaN` & Linear/Bitset Lowering (`R3-D1`, `R3-D4`, `R3-D5`, `#55`, `#56`, `#58`, `#60`)
+- **Ruling**:
+  1. Semantically distinct bytecode families carry explicit first-class IR modifiers/ops (`CallKind::{NewSpread, SuperArrow, ClassInit}`, `LexEnvKind::{Plain, Sendable, Patch}`, `OwnStoreKind`, `UnOp::ToPropertyKey`, `Op::{LoadSymbol, NotifyConcurrentResult, CreateAsyncGenerator, AsyncGeneratorResolve, AsyncGeneratorReject, SetGeneratorState}`, `DefineGetterSetterByValue.set_name`), guarded by automated `Bytecode` `lift → lower` round-trip and `acc` parity tests (`R3-A8/A9`) plus full `wide.*` instruction selection (`R3-H7`).
+  2. `abcd-opt` evaluates `BinOp::Exp` (`**`) via `ecma_pow` backed by pure-Rust `libm = { version = "0.2", default-features = false }` (`0` C/transitive deps) + ECMA-262 §6.1.6.1.3 boundary rules, canonicalizes all folded `NaN` bit patterns to `0x7ff8_0000_0000_0000` across x86 and ARM (`#60`), compares `-0.0` via `to_bits()` in `SCCP::meet` (`R3-H5`), and runs `O(B + I)` union-find chain contraction in `CfgSimplify` (`R3-A1`).
+  3. `abcd-lower::regalloc` computes backward liveness over dense `[u64]` bitsets with `ExceptionHandlerMap` and pre-grouped phi lists (`R3-A2`), and `isel` elides fallthrough `jmp`s to the immediately-following RPO block (`R3-A7`).
+- **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`.
 
 ---
 

@@ -840,7 +840,9 @@ impl<'m> Rung1AliasOracle<'m> {
         }
         let formal = pos - implicit;
         match kind {
-            abcd_ir::CallKind::Apply | abcd_ir::CallKind::SuperSpread => {
+            abcd_ir::CallKind::Apply
+            | abcd_ir::CallKind::SuperSpread
+            | abcd_ir::CallKind::NewSpread => {
                 // Formals come out of an argument ARRAY — the element
                 // relation is opaque at rung 1.
                 Bind::Leaf(QueryAnswer::unknown())

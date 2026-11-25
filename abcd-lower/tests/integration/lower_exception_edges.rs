@@ -319,11 +319,19 @@ fn dispatch_handler_sees_prethrow_variable_and_exception() {
         result.bytecodes
     );
 
-    // Simulated dispatch after the a-path try body ran: the handler must
-    // see x = 41 (pre-throw) and the exception sentinel in acc.
-    let handler_pc = result.try_blocks[0].catches[0].handler as usize;
-    machine.acc = EXC_SENTINEL;
-    let halt = machine.run_at(&result.bytecodes, handler_pc);
+    // Simulated dispatch at the end of the protected a-path try body (before
+    // unprotected `join`/`end` runs): the handler must see x = 41 (pre-throw)
+    // and the exception sentinel in acc.
+    let tb = &result.try_blocks[0];
+    let try_end = (tb.start + tb.len) as usize;
+    let handler_pc = tb.catches[0].handler as usize;
+    let mut exc_machine = Machine::new();
+    assert_eq!(
+        exc_machine.run_until(&result.bytecodes, 0, try_end),
+        Halt::Stopped
+    );
+    exc_machine.acc = EXC_SENTINEL;
+    let halt = exc_machine.run_at(&result.bytecodes, handler_pc);
     assert_eq!(
         halt,
         Halt::Return(41 + EXC_SENTINEL),
@@ -405,7 +413,7 @@ fn handler_phi_produces_no_edge_copies() {
             catches: vec![Catch {
                 handler: h,
                 exception,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }
@@ -497,7 +505,7 @@ fn handler_phi_param_incoming_detaches_from_param_home() {
             catches: vec![Catch {
                 handler: h,
                 exception,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }
@@ -668,7 +676,7 @@ fn build_condbranch_try_module() -> (Module, FuncId, BlockId, BlockId, ValueId, 
             catches: vec![Catch {
                 handler: h,
                 exception,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }

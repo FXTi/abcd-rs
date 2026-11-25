@@ -50,6 +50,8 @@ const DOCUMENTED_FALLBACK_OPS: &[&str] = &[
     "GetResumeMode",
     "AsyncResolve",
     "AsyncReject",
+    "AsyncGeneratorResolve",
+    "AsyncGeneratorReject",
     "ThrowDeleteSuperProperty",
 ];
 

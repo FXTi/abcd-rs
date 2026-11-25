@@ -79,16 +79,17 @@ fn decoded_methods_and_fields_carry_unique_offsets() {
         "same-named fields must have distinct offsets"
     );
 
-    // The literal array referenced A.foo; the stored entity offset must be
-    // A's method, not B's same-named one.
+    // The literal array referenced A.foo; the stored MethodIdx must resolve
+    // to A's method, not B's same-named one.
     let la = file.literal_arrays.first().expect("literal array");
     let mut saw_method = false;
     for v in &la.values {
-        if let LiteralValue::Method(off) = v {
+        if let LiteralValue::Method(midx) = v {
             saw_method = true;
+            let (_, _, resolved) = file.method_by_idx(*midx).expect("method idx resolves");
             assert_eq!(
-                *off, a_foo.offset,
-                "literal array must reference the global foo by offset"
+                resolved.offset, a_foo.offset,
+                "literal array must reference the global foo"
             );
         }
     }

@@ -33,8 +33,8 @@ The file-format layer decodes `.abc` binary containers into a self-contained Rus
 - **Two-Pass Nested `LiteralArray` & Full-Width Annotation Encoding**:
   - `decode` traverses method index regions, `scopeNames`, `typeSummaryOffset`, and annotation-embedded literal arrays iteratively (`collect_nested_literal_array_offsets`) with checked literal-tag enumeration (`R1-H6`) to recover every transitive `LiteralValue::LiteralArray` target—essential on `13.0.1.0+` / `24.0.0.0` where the header literal-array table is empty.
   - `encode` pre-allocates `LiteralArrayItem` handles before populating nested `LiteralValue::LiteralArray` elements, indexes `StringId` handles via dense `Vec<Option<StringHandle>>`, and supports all scalar and `8`/`16`/`32`/`64`-bit (`I64`, `U64`, `F64`) annotation array elements.
-- **Code Entity Relocation & IC-Slot Sync**:
-  - Method bytecodes retain `(EntityKind, raw_idx) → source_offset` mappings (`MethodBody::entity_offsets`), registered via `abc_builder_relocate_code_id` (using stack-inline `entity_operands_inline`) and patched after `ItemContainer::ComputeLayout`.
+- **Code Entity Relocation & IC-Slot Sync (`#50`, `ADR-18`)**:
+  - Method bytecodes map `(EntityKind, raw_idx) → EntityRef` (`MethodBody::entities`, resolved at decode time into typed `StringId`, `MethodIdx`, and `LiteralArrayIdx` handles, with optional `source_offset` provenance preserved solely for `ark_disasm` `.pa` emission), while `CatchBlock::type_class` carries `Option<StringId>`. During `encode`, `EntityRef` relocates directly against dense `Builder` handle vectors via `abc_builder_relocate_code_id` without consulting source-offset maps.
   - When `MethodBody::ic_size` is set by `abcd-lower`, `encode` updates `_ESSlotNumberAnnotation` (`N73`) to match the lowered instruction stream's exact IC slot count.
 
 ---

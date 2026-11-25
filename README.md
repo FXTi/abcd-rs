@@ -10,7 +10,7 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
   - Pure-Rust, zero-C reader for `.hap`, `.hsp`, `.app`, and `.hqf` packages (signing-block tolerant, borrowed Stored fast path).
   - Full `.abc` `decode` & `encode` across modern formats (`9.0.0.0`–`24.0.0.0`, including `20+ MB` commercial `--merge-abc` bundles) plus legacy `0.0.0.2` decoding.
   - Byte-identical `.pa` disassembler (`abcd dis`, `5,517/5,517` vs. upstream `ark_disasm`) and semantic `.pa` assembler (`abcd asm`).
-- **Format-Independent `88`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
+- **Format-Independent `94`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
   - Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), chordal MCS register allocation, `acc`-as-cache instruction selection, and per-method `u16` entity compaction.
 - **Interprocedural Static & Taint Analysis (`abcd-analysis`, `abcd-taint`)**:
   - Iterative Cooper–Harvey–Kennedy dominators, pattern-independent region trees, IFDS tabulation solver, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with on-the-fly call-graph co-evolution, cross-module ES linking, Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
@@ -28,7 +28,7 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
 | [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded, span-clamped C99 FFI bridge over vendored `libpandafile` |
 | [`abcd-file`](abcd-file/README.md) | `.abc` `decode` / `encode`, lossless MUTF-8 `StringPool`, and `pandasm` `.pa` text layer |
 | [`abcd-hap`](abcd-hap/README.md) | Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` container reader |
-| [`abcd-ir`](abcd-ir/README.md) | Format-independent `88`-op SSA IR, `Effects`, `Ty`, `frame::FrameSlots`, and verifier |
+| [`abcd-ir`](abcd-ir/README.md) | Format-independent `94`-op SSA IR, `Effects`, `Ty`, `frame::FrameSlots`, and verifier |
 | [`abcd-lift`](abcd-lift/README.md) | `abcd_file::File` → `abcd_ir::Module` lifter |
 | [`abcd-opt`](abcd-opt/README.md) | SSA optimization passes (`Peephole`, `SCCP`, `ADCE`, `CopyProp`, `inline`) |
 | [`abcd-lower`](abcd-lower/README.md) | `abcd_ir::Module` → `abcd_file::File` register allocator & bytecode lowerer |

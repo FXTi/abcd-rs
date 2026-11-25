@@ -93,13 +93,13 @@ fn switch_fallthrough_shared_tail() {
     // The `case '1'` tail (`result += 4`) breaks INTO the shared
     // return tail rather than re-running it unconditionally.
     assert!(
-        text.contains("v568 = v548 + 4.0;\n      break L$140;"),
+        text.contains("v519 = v499 + 4.0;\n      break L$140;"),
         "the case-'1' arm must jump into the shared return tail:\n{}",
         &text[..text.len().min(4000)]
     );
     // The return tail exists exactly once, after the dispatch.
     assert_eq!(
-        text.matches("return v568;").count(),
+        text.matches("return v519;").count(),
         1,
         "exactly one return tail for SwitchTest"
     );
@@ -115,7 +115,7 @@ fn try_nested_finally_phi_temps_declared() {
     let text =
         decompile("24.0.0.0/test262/language/statements/try/S12.14_A7_T1/baseline/input.abc");
     assert!(
-        text.contains("var v384; /* phi */"),
+        text.contains("var v357; /* phi */"),
         "the outer handler's phi declaration must be emitted (its body must exist):\n{}",
         &text[text.len() / 3..2 * text.len() / 3]
     );
@@ -157,7 +157,7 @@ fn try_switch_inside_finally_reconstruction() {
     // the never-taken outer `else` arm).
     let st3 = &text[text.find("___SwitchTest3").expect("SwitchTest3")..];
     assert!(
-        st3.contains("switch (v516) {\n      case undefined: {\n"),
+        st3.contains("switch (v477) {\n      case undefined: {\n"),
         "SwitchTest3's dispatch must fold to a switch over the completion marker:\n{}",
         &st3[..st3.len().min(2500)]
     );
@@ -167,7 +167,7 @@ fn try_switch_inside_finally_reconstruction() {
     // skipped it and SwitchTest1(4) returned `undefined`).
     let st1 = &text[text.find("___SwitchTest1").expect("SwitchTest1")..];
     assert!(
-        st1.contains("            }\n            var v440; /* phi */\n            var v449; /* phi */\n            v439 = v440;"),
+        st1.contains("            }\n            var v408; /* phi */\n            var v416; /* phi */\n            v407 = v408;"),
         "the epilogue must follow the inner dispatch switch, not hide in an arm:\n{}",
         &st1[..st1.len().min(3500)]
     );

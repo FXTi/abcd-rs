@@ -199,11 +199,12 @@ fn window_is_shared_with_range_calls() {
     assert_eq!(window, vec![0xce1, 0xce2, 0xce3]);
 }
 
-/// (c) Width selection: 255 keys keep the narrow form; 256 keys select
-/// `wide.createobjectwithexcludedkeys` (u16 imm) and must still encode.
+/// (c) Width selection (`range_1`: `imm = keys.len() - 1`): 256 keys keep the
+/// narrow form (`imm = 255`); 257 keys select `wide.createobjectwithexcludedkeys`
+/// (`imm = 256`); 0 keys lower via `createemptyobject` + `copydataproperties`.
 #[test]
 fn wide_form_selected_above_u8_key_count() {
-    for (n, expect_wide) in [(255usize, false), (256, true)] {
+    for (n, expect_wide) in [(256usize, false), (257, true)] {
         let (module, func) = build_excluded_keys(n, 0x1000);
         assert!(verify_module(&module).is_ok());
         let lowered =
@@ -245,4 +246,21 @@ fn wide_form_selected_above_u8_key_count() {
             "{n} keys: the LAST window slot must hold the last key"
         );
     }
+
+    // Empty excluded-keys list lowers to createemptyobject + copydataproperties.
+    let (empty_mod, empty_fn) = build_excluded_keys(0, 0x1000);
+    assert!(verify_module(&empty_mod).is_ok());
+    let lowered = lower_function(&empty_mod, empty_fn).expect("0 excluded keys must lower");
+    assert!(
+        lowered
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Createemptyobject))
+            && lowered
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, Bytecode::Copydataproperties(_))),
+        "0 excluded keys must lower via createemptyobject + copydataproperties: {:?}",
+        lowered.bytecodes
+    );
 }

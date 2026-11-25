@@ -97,12 +97,12 @@ fn nested_literal_array_resolves_to_model_table_index() {
     let mut file = decode(&file_bytes).expect("decode base");
 
     // Model literal arrays: [0] references [1]; [1] carries a marker value.
-    file.literal_arrays.push(LiteralArray {
-        values: vec![LiteralValue::LiteralArray(LiteralArrayIdx(1))],
-    });
-    file.literal_arrays.push(LiteralArray {
-        values: vec![LiteralValue::Integer(7)],
-    });
+    file.literal_arrays
+        .push(LiteralArray::new(vec![LiteralValue::LiteralArray(
+            LiteralArrayIdx(1),
+        )]));
+    file.literal_arrays
+        .push(LiteralArray::new(vec![LiteralValue::Integer(7)]));
 
     // Annotation-embedded literal array on the global class: this creates an
     // `ann_la_0` builder array while classes are configured, shifting every

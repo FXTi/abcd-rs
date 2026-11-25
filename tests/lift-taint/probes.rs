@@ -322,7 +322,7 @@ fn probe_interprocedural_call_return() {
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let h = {
-        let c = m.consts.push(abcd_ir::Const::MethodRef(helper));
+        let c = m.consts.push(abcd_ir::Const::method_ref(helper));
         emit(&mut m, entry, Op::LoadConst(c))
     };
     let r = emit(

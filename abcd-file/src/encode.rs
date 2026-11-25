@@ -1376,24 +1376,23 @@ pub struct EncodeOptions {
     pub verify: bool,
 }
 
-/// Handles of encoded methods/fields, resolvable from decoded reference
-/// payloads.
-///
-/// References inside a decoded file carry entity offsets (method/field item
-/// offsets) or interned names. Names are not unique — two classes routinely
-/// define a method of the same name — so a non-zero offset resolves solely
-/// through the offset map, and the name map only serves hand-built models
-/// whose references carry offset `0`.
+/// Handles of encoded methods/fields, resolvable by dense [`MethodIdx`] /
+/// [`FieldIdx`] first, then non-zero source-file offset, and finally by name
+/// when both index and offset are absent (`None` and `offset == 0` on
+/// hand-built models).
 #[derive(Default)]
 struct EntityHandles {
+    methods_by_idx: Vec<MethodHandle>,
     methods_by_offset: HashMap<u32, MethodHandle>,
     methods_by_name: HashMap<StringId, MethodHandle>,
+    fields_by_idx: Vec<FieldHandle>,
     fields_by_offset: HashMap<u32, FieldHandle>,
     fields_by_name: HashMap<StringId, FieldHandle>,
 }
 
 impl EntityHandles {
     fn insert_method(&mut self, m: &Method, h: MethodHandle) {
+        self.methods_by_idx.push(h);
         self.methods_by_name.insert(m.name, h);
         if m.offset != 0 {
             self.methods_by_offset.insert(m.offset, h);
@@ -1401,16 +1400,25 @@ impl EntityHandles {
     }
 
     fn insert_field(&mut self, f: &Field, h: FieldHandle) {
+        self.fields_by_idx.push(h);
         self.fields_by_name.insert(f.name, h);
         if f.offset != 0 {
             self.fields_by_offset.insert(f.offset, h);
         }
     }
 
-    /// Resolve a method reference. A non-zero offset is the entity's unique
-    /// identity; the name map is ONLY consulted when `offset == 0`
-    /// (hand-built models).
-    fn resolve_method(&self, name: StringId, offset: u32) -> Option<MethodHandle> {
+    /// Resolve a method reference: dense [`MethodIdx`] takes precedence; if
+    /// `None`, a non-zero `offset` resolves via `methods_by_offset`, and the
+    /// name map is consulted ONLY when `method.is_none() && offset == 0`.
+    fn resolve_method(
+        &self,
+        name: StringId,
+        method: Option<MethodIdx>,
+        offset: u32,
+    ) -> Option<MethodHandle> {
+        if let Some(idx) = method {
+            return self.methods_by_idx.get(idx.index()).copied();
+        }
         if offset != 0 {
             return self.methods_by_offset.get(&offset).copied();
         }
@@ -1418,7 +1426,15 @@ impl EntityHandles {
     }
 
     /// Resolve a field reference (see [`Self::resolve_method`]).
-    fn resolve_field(&self, name: StringId, offset: u32) -> Option<FieldHandle> {
+    fn resolve_field(
+        &self,
+        name: StringId,
+        field: Option<FieldIdx>,
+        offset: u32,
+    ) -> Option<FieldHandle> {
+        if let Some(idx) = field {
+            return self.fields_by_idx.get(idx.index()).copied();
+        }
         if offset != 0 {
             return self.fields_by_offset.get(&offset).copied();
         }
@@ -1631,23 +1647,14 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                             .catches
                             .iter()
                             .map(|cb| {
-                                let type_class = if cb.type_idx == u32::MAX {
-                                    None
-                                } else {
-                                    let desc_sid = file.resolve_entity(cb.type_idx).ok_or_else(
-                                        || {
-                                            Error::CodeRelocation(format!(
-                                                "method {method_label}: catch type offset {:#x} cannot be resolved",
-                                                cb.type_idx
-                                            ))
-                                        },
-                                    )?;
-                                    Some(resolve_class_id(
+                                let type_class = match cb.type_class {
+                                    None => None,
+                                    Some(desc_sid) => Some(resolve_class_id(
                                         &mut b,
                                         &mut class_handles,
                                         pool,
                                         desc_sid,
-                                    )?)
+                                    )?),
                                 };
                                 let cb_end = cb.handler.checked_add(cb.len).ok_or_else(|| {
                                     Error::Malformed {
@@ -1717,6 +1724,51 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
             b.method_set_function_kind_raw(method_h, raw_kind);
 
             entities.insert_method(method, method_h);
+        }
+
+        // --- Fields ---
+        for field in &cls.fields {
+            let field_name_cstr = rcstr(field.name)?;
+            let ty = field.field_type;
+            let field_h = if field.is_external {
+                b.add_foreign_field_cstr(cls_h, &field_name_cstr, ty)
+            } else if let Type::Reference(d) = ty {
+                let ref_cls = resolve_class_id(&mut b, &mut class_handles, pool, d)?;
+                b.class_add_field_ex_cstr(cls_h, &field_name_cstr, ty, ref_cls, field.access_flags)
+            } else {
+                b.class_add_field_cstr(cls_h, &field_name_cstr, ty, field.access_flags)
+            };
+
+            entities.insert_field(field, field_h);
+
+            match &field.initial_value {
+                Some(FieldValue::I32(v)) => b.field_set_value_i32(field_h, *v),
+                Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
+                Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
+                Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
+                Some(FieldValue::JsonFileContent { content, .. }) => {
+                    let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
+                    b.field_set_value_string(field_h, sh)?;
+                }
+                Some(
+                    fv @ (FieldValue::ModuleData(_)
+                    | FieldValue::LiteralArrayRef { .. }
+                    | FieldValue::ModuleRequestPhase(_)),
+                ) => deferred_field_values.push((field_h, fv)),
+                None => {}
+            }
+        }
+    }
+
+    // --- Attach annotations now that all MethodHandles & FieldHandles exist ---
+    let mut flat_method_idx = 0usize;
+    let mut flat_field_idx = 0usize;
+    for (&desc, cls) in &file.classes {
+        let cls_h = class_handles[&desc];
+
+        for method in &cls.methods {
+            let method_h = entities.methods_by_idx[flat_method_idx];
+            flat_method_idx += 1;
 
             // Method annotations
             {
@@ -1797,55 +1849,24 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
             }
         }
 
-        // --- Fields ---
         for field in &cls.fields {
-            let field_name_cstr = rcstr(field.name)?;
-            let ty = field.field_type;
-            let field_h = if field.is_external {
-                b.add_foreign_field_cstr(cls_h, &field_name_cstr, ty)
-            } else if let Type::Reference(d) = ty {
-                let ref_cls = resolve_class_id(&mut b, &mut class_handles, pool, d)?;
-                b.class_add_field_ex_cstr(cls_h, &field_name_cstr, ty, ref_cls, field.access_flags)
-            } else {
-                b.class_add_field_cstr(cls_h, &field_name_cstr, ty, field.access_flags)
+            let field_h = entities.fields_by_idx[flat_field_idx];
+            flat_field_idx += 1;
+
+            let mut ctx = AnnotationEncodeCtx {
+                string_handles: &mut string_handles,
+                class_handles: &mut class_handles,
+                entities: &entities,
+                ann_la_counter: &mut ann_la_counter,
+                deferred_ann_las: &mut deferred_ann_las,
+                pool,
             };
-
-            entities.insert_field(field, field_h);
-
-            match &field.initial_value {
-                Some(FieldValue::I32(v)) => b.field_set_value_i32(field_h, *v),
-                Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
-                Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
-                Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
-                Some(FieldValue::JsonFileContent { content, .. }) => {
-                    let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
-                    b.field_set_value_string(field_h, sh)?;
-                }
-                Some(
-                    fv @ (FieldValue::ModuleData(_)
-                    | FieldValue::LiteralArrayRef(_)
-                    | FieldValue::ModuleRequestPhase(_)),
-                ) => deferred_field_values.push((field_h, fv)),
-                None => {}
-            }
-
-            // Field annotations
-            {
-                let mut ctx = AnnotationEncodeCtx {
-                    string_handles: &mut string_handles,
-                    class_handles: &mut class_handles,
-                    entities: &entities,
-                    ann_la_counter: &mut ann_la_counter,
-                    deferred_ann_las: &mut deferred_ann_las,
-                    pool,
-                };
-                encode_annotations_on(
-                    &mut b,
-                    &mut ctx,
-                    &field.annotations,
-                    AnnotationTarget::Field(field_h),
-                )?;
-            }
+            encode_annotations_on(
+                &mut b,
+                &mut ctx,
+                &field.annotations,
+                AnnotationTarget::Field(field_h),
+            )?;
         }
 
         // Class annotations
@@ -1875,7 +1896,6 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
         let mut lit_ctx = LiteralEncodeCtx {
             string_handles: &mut string_handles,
             pool,
-            entity_map: &file.entity_map,
             entities: &entities,
             literal_handles: &literal_handles,
         };
@@ -1922,19 +1942,11 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                 b.literal_array_add_module_request_phase(la_h, &phase.flags)?;
                 b.field_set_value_literalarray(field_h, la_h)?;
             }
-            FieldValue::LiteralArrayRef(source_offset) => {
-                let index =
-                    *file
-                        .literal_array_offsets
-                        .get(source_offset)
-                        .ok_or_else(|| {
-                            Error::ModuleData(format!(
-                                "scope-names literal array at source offset {source_offset:#x} was not decoded"
-                            ))
-                        })?;
-                let la_h = *literal_handles.get(index as usize).ok_or_else(|| {
+            FieldValue::LiteralArrayRef { index, .. } => {
+                let la_h = *literal_handles.get(index.index()).ok_or_else(|| {
                     Error::ModuleData(format!(
-                        "scope-names literal array index {index} out of range"
+                        "scope-names literal array index {} out of range",
+                        index.0
                     ))
                 })?;
                 b.field_set_value_literalarray(field_h, la_h)?;
@@ -1955,13 +1967,9 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                         kind, id.0
                     ))
                 };
-                let offset = *body
-                    .entity_offsets
-                    .get(&(kind, id.0))
-                    .ok_or_else(unresolved)?;
-                let target = match kind {
-                    EntityKind::StringId => {
-                        let sid = *file.entity_map.get(&offset).ok_or_else(unresolved)?;
+                let entity_ref = *body.entities.get(&(kind, id.0)).ok_or_else(unresolved)?;
+                let target = match (kind, entity_ref) {
+                    (EntityKind::StringId, EntityRef::String { id: sid, .. }) => {
                         CodeEntity::String(get_or_add_string_id(
                             &mut b,
                             &mut string_handles,
@@ -1969,21 +1977,18 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                             sid,
                         )?)
                     }
-                    EntityKind::MethodId => CodeEntity::Method(
+                    (EntityKind::MethodId, EntityRef::Method(midx)) => CodeEntity::Method(
                         *entities
-                            .methods_by_offset
-                            .get(&offset)
+                            .methods_by_idx
+                            .get(midx.index())
                             .ok_or_else(unresolved)?,
                     ),
-                    EntityKind::LiteralarrayId => {
-                        let index = *file
-                            .literal_array_offsets
-                            .get(&offset)
-                            .ok_or_else(unresolved)?;
+                    (EntityKind::LiteralarrayId, EntityRef::LiteralArray(la_idx)) => {
                         CodeEntity::LiteralArray(
-                            *literal_handles.get(index as usize).ok_or_else(unresolved)?,
+                            *literal_handles.get(la_idx.index()).ok_or_else(unresolved)?,
                         )
                     }
+                    _ => return Err(unresolved()),
                 };
                 b.relocate_code_id(owner, byte_offset, ordinal as u32, target)?;
             }
@@ -2075,8 +2080,8 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
                 }
                 AnnotationValue::LiteralArray(values) => {
                     for (item_index, item) in values.iter().enumerate() {
-                        if let LiteralValue::LiteralArray(idx) = item
-                            && (idx.0 as usize) >= literal_array_count
+                        if let Some(idx) = item.literal_array_idx()
+                            && idx.index() >= literal_array_count
                         {
                             return Err(Error::CodeRelocation(format!(
                                 "annotation {} element '{}' on {}: nested literal array index {} at item {} out of bounds (table len {})",
@@ -2180,8 +2185,8 @@ fn validate_literal_array_graph(literal_arrays: &[LiteralArray]) -> Result<(), E
     let len = literal_arrays.len();
     for la in literal_arrays {
         for item in &la.values {
-            if let LiteralValue::LiteralArray(idx) = item
-                && (idx.0 as usize) >= len
+            if let Some(idx) = item.literal_array_idx()
+                && idx.index() >= len
             {
                 return Err(Error::CodeRelocation(format!(
                     "nested literal array index {} out of bounds",
@@ -2579,28 +2584,36 @@ fn annotation_scalar_value_to_raw(
             let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
             (AVT::Record as u8, AnnotationElemValue::EntityRef(h.0))
         }
-        AnnotationValue::Method { name, offset } => {
+        AnnotationValue::Method {
+            name,
+            method,
+            offset,
+        } => {
             let mh = ctx
                 .entities
-                .resolve_method(*name, *offset)
+                .resolve_method(*name, *method, *offset)
                 .ok_or_else(|| unresolved("method", *name, *offset))?;
             (AVT::Method as u8, AnnotationElemValue::EntityRef(mh.0))
         }
-        AnnotationValue::Enum { name, offset } => {
+        AnnotationValue::Enum {
+            name,
+            field,
+            offset,
+        } => {
             let fh = ctx
                 .entities
-                .resolve_field(*name, *offset)
+                .resolve_field(*name, *field, *offset)
                 .ok_or_else(|| unresolved("enum", *name, *offset))?;
             (AVT::Enum as u8, AnnotationElemValue::EntityRef(fh.0))
         }
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
                 ctx.entities
-                    .resolve_field(mh.entity, mh.entity_offset)
+                    .resolve_field(mh.entity, mh.target_field, mh.entity_offset)
                     .map(|h| h.0)
             } else {
                 ctx.entities
-                    .resolve_method(mh.entity, mh.entity_offset)
+                    .resolve_method(mh.entity, mh.target_method, mh.entity_offset)
                     .map(|h| h.0)
             }
             .ok_or_else(|| unresolved("method-handle", mh.entity, mh.entity_offset))?;
@@ -2670,9 +2683,13 @@ fn annotation_array_leaf_to_handle(
             let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
             u64::from(h.0)
         }
-        AnnotationValue::Method { name, offset } => u64::from(
+        AnnotationValue::Method {
+            name,
+            method,
+            offset,
+        } => u64::from(
             ctx.entities
-                .resolve_method(*name, *offset)
+                .resolve_method(*name, *method, *offset)
                 .ok_or_else(|| {
                     Error::CodeRelocation(format!(
                         "annotation array method reference '{}' at offset {offset:#x} cannot be resolved",
@@ -2681,9 +2698,13 @@ fn annotation_array_leaf_to_handle(
                 })?
                 .0,
         ),
-        AnnotationValue::Enum { name, offset } => u64::from(
+        AnnotationValue::Enum {
+            name,
+            field,
+            offset,
+        } => u64::from(
             ctx.entities
-                .resolve_field(*name, *offset)
+                .resolve_field(*name, *field, *offset)
                 .ok_or_else(|| {
                     Error::CodeRelocation(format!(
                         "annotation array enum reference '{}' at offset {offset:#x} cannot be resolved",
@@ -2695,11 +2716,11 @@ fn annotation_array_leaf_to_handle(
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
                 ctx.entities
-                    .resolve_field(mh.entity, mh.entity_offset)
+                    .resolve_field(mh.entity, mh.target_field, mh.entity_offset)
                     .map(|h| h.0)
             } else {
                 ctx.entities
-                    .resolve_method(mh.entity, mh.entity_offset)
+                    .resolve_method(mh.entity, mh.target_method, mh.entity_offset)
                     .map(|h| h.0)
             }
             .ok_or_else(|| {
@@ -3051,7 +3072,6 @@ fn encode_debug_info(
 struct LiteralEncodeCtx<'a> {
     string_handles: &'a mut [Option<StringHandle>],
     pool: &'a StringPool,
-    entity_map: &'a HashMap<u32, StringId>,
     entities: &'a EntityHandles,
     literal_handles: &'a [LiteralArrayHandle],
 }
@@ -3062,14 +3082,17 @@ fn encode_literal_value(
     la: LiteralArrayHandle,
     val: &LiteralValue,
 ) -> Result<(), Error> {
-    // A non-zero offset is the unique entity identity; the name lookup via
-    // `entity_map` at offset `0` only serves hand-built offsetless models.
-    let resolve_method = |off: u32| -> Option<MethodHandle> {
-        if off != 0 {
-            return ctx.entities.methods_by_offset.get(&off).copied();
+    let resolve_method = |idx: MethodIdx| -> Option<MethodHandle> {
+        ctx.entities.methods_by_idx.get(idx.index()).copied()
+    };
+    let check_la_idx = |idx: LiteralArrayIdx| -> Result<(), Error> {
+        if idx.index() >= ctx.literal_handles.len() {
+            return Err(Error::CodeRelocation(format!(
+                "nested literal array index {} out of bounds",
+                idx.0
+            )));
         }
-        let sid = ctx.entity_map.get(&0)?;
-        ctx.entities.methods_by_name.get(sid).copied()
+        Ok(())
     };
 
     match val {
@@ -3098,46 +3121,51 @@ fn encode_literal_value(
             let sh = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
-        LiteralValue::Method(off) => {
-            let mh = resolve_method(*off).ok_or_else(|| {
+        LiteralValue::Method(idx) => {
+            let mh = resolve_method(*idx).ok_or_else(|| {
                 Error::CodeRelocation(format!(
-                    "literal array method reference at offset {off:#x} cannot be resolved"
+                    "literal array method reference MethodIdx({}) cannot be resolved",
+                    idx.0
                 ))
             })?;
             b.literal_array_add_u8(la, LiteralTag::Method as u8);
             b.literal_array_add_raw_method(la, mh);
         }
-        LiteralValue::GeneratorMethod(off) => {
-            let mh = resolve_method(*off).ok_or_else(|| {
+        LiteralValue::GeneratorMethod(idx) => {
+            let mh = resolve_method(*idx).ok_or_else(|| {
                 Error::CodeRelocation(format!(
-                    "literal array generator-method reference at offset {off:#x} cannot be resolved"
+                    "literal array generator-method reference MethodIdx({}) cannot be resolved",
+                    idx.0
                 ))
             })?;
             b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
             b.literal_array_add_raw_method(la, mh);
         }
-        LiteralValue::AsyncGeneratorMethod(off) => {
-            let mh = resolve_method(*off).ok_or_else(|| {
+        LiteralValue::AsyncGeneratorMethod(idx) => {
+            let mh = resolve_method(*idx).ok_or_else(|| {
                 Error::CodeRelocation(format!(
-                    "literal array async-generator-method reference at offset {off:#x} cannot be resolved"
+                    "literal array async-generator-method reference MethodIdx({}) cannot be resolved",
+                    idx.0
                 ))
             })?;
             b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
             b.literal_array_add_raw_method(la, mh);
         }
-        LiteralValue::Getter(off) => {
-            let mh = resolve_method(*off).ok_or_else(|| {
+        LiteralValue::Getter(idx) => {
+            let mh = resolve_method(*idx).ok_or_else(|| {
                 Error::CodeRelocation(format!(
-                    "literal array getter reference at offset {off:#x} cannot be resolved"
+                    "literal array getter reference MethodIdx({}) cannot be resolved",
+                    idx.0
                 ))
             })?;
             b.literal_array_add_u8(la, LiteralTag::Getter as u8);
             b.literal_array_add_raw_method(la, mh);
         }
-        LiteralValue::Setter(off) => {
-            let mh = resolve_method(*off).ok_or_else(|| {
+        LiteralValue::Setter(idx) => {
+            let mh = resolve_method(*idx).ok_or_else(|| {
                 Error::CodeRelocation(format!(
-                    "literal array setter reference at offset {off:#x} cannot be resolved"
+                    "literal array setter reference MethodIdx({}) cannot be resolved",
+                    idx.0
                 ))
             })?;
             b.literal_array_add_u8(la, LiteralTag::Setter as u8);
@@ -3152,7 +3180,7 @@ fn encode_literal_value(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            let target = ctx.literal_handles.get(idx.0 as usize).ok_or_else(|| {
+            let target = ctx.literal_handles.get(idx.index()).ok_or_else(|| {
                 Error::CodeRelocation(format!(
                     "nested literal array index {} out of bounds",
                     idx.0
@@ -3161,6 +3189,7 @@ fn encode_literal_value(
             b.literal_array_add_literalarray(la, *target);
         }
         LiteralValue::LiteralBufferIndex(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);
             b.literal_array_add_u32(la, idx.0);
         }
@@ -3178,52 +3207,64 @@ fn encode_literal_value(
             b.literal_array_add_u8(la, *v);
         }
         LiteralValue::ArrayU1(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU1 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayU8(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU8 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayI8(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI8 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayU16(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU16 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayI16(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI16 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayU32(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU32 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayI32(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI32 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayU64(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU64 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayI64(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI64 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayF32(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayF32 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayF64(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayF64 as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
         LiteralValue::ArrayString(idx) => {
+            check_la_idx(*idx)?;
             b.literal_array_add_u8(la, LiteralTag::ArrayString as u8);
-            b.literal_array_add_u32(la, idx.0);
+            b.literal_array_add_u32(la, 0);
         }
     }
     Ok(())
@@ -3350,7 +3391,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_resolve_by_offset_when_names_collide() {
+    fn handles_resolve_by_idx_and_offset_when_names_collide() {
         let mut pool = StringPool::default();
         let name = pool.get_or_intern("foo");
         let mut entities = EntityHandles::default();
@@ -3360,12 +3401,43 @@ mod tests {
         entities.insert_field(&field(&mut pool, "foo", 300), FieldHandle(3));
         entities.insert_field(&field(&mut pool, "foo", 400), FieldHandle(4));
 
-        assert_eq!(entities.resolve_method(name, 100), Some(MethodHandle(1)));
-        assert_eq!(entities.resolve_method(name, 200), Some(MethodHandle(2)));
-        assert_eq!(entities.resolve_field(name, 300), Some(FieldHandle(3)));
-        assert_eq!(entities.resolve_field(name, 400), Some(FieldHandle(4)));
-        assert_eq!(entities.resolve_method(name, 999), None);
-        assert_eq!(entities.resolve_field(name, 999), None);
+        assert_eq!(
+            entities.resolve_method(name, Some(MethodIdx(0)), 0),
+            Some(MethodHandle(1))
+        );
+        assert_eq!(
+            entities.resolve_method(name, Some(MethodIdx(1)), 0),
+            Some(MethodHandle(2))
+        );
+        assert_eq!(entities.resolve_method(name, Some(MethodIdx(99)), 0), None);
+        assert_eq!(
+            entities.resolve_field(name, Some(FieldIdx(0)), 0),
+            Some(FieldHandle(3))
+        );
+        assert_eq!(
+            entities.resolve_field(name, Some(FieldIdx(1)), 0),
+            Some(FieldHandle(4))
+        );
+        assert_eq!(entities.resolve_field(name, Some(FieldIdx(99)), 0), None);
+
+        assert_eq!(
+            entities.resolve_method(name, None, 100),
+            Some(MethodHandle(1))
+        );
+        assert_eq!(
+            entities.resolve_method(name, None, 200),
+            Some(MethodHandle(2))
+        );
+        assert_eq!(
+            entities.resolve_field(name, None, 300),
+            Some(FieldHandle(3))
+        );
+        assert_eq!(
+            entities.resolve_field(name, None, 400),
+            Some(FieldHandle(4))
+        );
+        assert_eq!(entities.resolve_method(name, None, 999), None);
+        assert_eq!(entities.resolve_field(name, None, 999), None);
     }
 
     #[test]
@@ -3377,11 +3449,14 @@ mod tests {
         entities.insert_method(&method(&mut pool, "bar", 0), MethodHandle(10));
         entities.insert_field(&field(&mut pool, "bar", 0), FieldHandle(20));
 
-        assert_eq!(entities.resolve_method(name, 0), Some(MethodHandle(10)));
-        assert_eq!(entities.resolve_field(name, 0), Some(FieldHandle(20)));
+        assert_eq!(
+            entities.resolve_method(name, None, 0),
+            Some(MethodHandle(10))
+        );
+        assert_eq!(entities.resolve_field(name, None, 0), Some(FieldHandle(20)));
         // Unknown non-zero offsets must never silently alias by name (#44 R1-H6 #7).
-        assert_eq!(entities.resolve_method(name, 999), None);
-        assert_eq!(entities.resolve_field(name, 999), None);
+        assert_eq!(entities.resolve_method(name, None, 999), None);
+        assert_eq!(entities.resolve_field(name, None, 999), None);
     }
 
     #[test]

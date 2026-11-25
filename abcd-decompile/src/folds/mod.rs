@@ -245,13 +245,25 @@ pub(in crate::folds) fn dissolve_rethrow_trys(nodes: &mut Vec<SNode>) {
                 !body.is_empty()
                     && catches.iter().all(|c| {
                         let binding = c.binding.clone().unwrap_or_default();
+                        let mut saw_rethrow = false;
                         c.body.iter().all(|n| match n {
-                            SNode::Stmts(leaves) => leaves.iter().all(|l| {
-                                matches!(l, Leaf::Raw(Stmt::Throw(e)) if temp_name(e) == Some(binding.as_str()))
-                                    || matches!(l, Leaf::Raw(Stmt::Unreachable))
+                            SNode::Stmts(leaves) => leaves.iter().all(|l| match l {
+                                Leaf::Raw(Stmt::Throw(e))
+                                    if temp_name(e) == Some(binding.as_str()) =>
+                                {
+                                    saw_rethrow = true;
+                                    true
+                                }
+                                Leaf::Raw(Stmt::Unreachable) => true,
+                                Leaf::Raw(Stmt::Elided { op, .. })
+                                    if *op == "SetGeneratorState" =>
+                                {
+                                    true
+                                }
+                                _ => false,
                             }),
                             _ => false,
-                        }) && !c.body.is_empty()
+                        }) && saw_rethrow
                     })
             }
             _ => false,
@@ -443,6 +455,15 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
         Expr::CreateGenerator { func } => out.push(func),
         Expr::GeneratorDriver { genobj, .. } => out.push(genobj),
         Expr::AsyncDriver { value, .. } => out.push(value),
+        Expr::AsyncGeneratorResolve {
+            genobj,
+            value,
+            done,
+        } => {
+            out.push(genobj);
+            out.push(value);
+            out.push(done);
+        }
         Expr::CopyDataProps { dst, src } => {
             out.push(dst);
             out.push(src);
@@ -516,6 +537,8 @@ pub(in crate::folds) fn strip_cond(mut e: &Expr) -> &Expr {
                 op:
                     abcd_ir::op::UnOp::IsTrue
                     | abcd_ir::op::UnOp::IsFalse
+                    | abcd_ir::op::UnOp::JumpNez
+                    | abcd_ir::op::UnOp::JumpEqz
                     | abcd_ir::op::UnOp::LogicalNot,
                 operand,
             } => e = operand,
@@ -569,6 +592,15 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
         Expr::CreateGenerator { func } => out.push(func),
         Expr::GeneratorDriver { genobj, .. } => out.push(genobj),
         Expr::AsyncDriver { value, .. } => out.push(value),
+        Expr::AsyncGeneratorResolve {
+            genobj,
+            value,
+            done,
+        } => {
+            out.push(genobj);
+            out.push(value);
+            out.push(done);
+        }
         Expr::CopyDataProps { dst, src } => {
             out.push(dst);
             out.push(src);

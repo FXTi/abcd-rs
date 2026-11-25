@@ -898,6 +898,7 @@ fn s14_object_literal_fold() {
             object: obj,
             name: ka,
             value: one,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     emit_void(&mut m, b, Op::CopyDataProps { dst: obj, src: p1 });
@@ -929,6 +930,7 @@ fn s15_array_literal_fold() {
             object: arr,
             index: zero,
             value: one,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     let idx = load_number(&mut m, b, 1.0);
@@ -1026,9 +1028,9 @@ fn s17_class_reconstruction() {
         &mut m,
         vec![
             Const::String(move_sym),
-            Const::MethodRef(method),
+            Const::method_ref(method),
             Const::String(x_sym),
-            Const::MethodRef(getter),
+            Const::method_ref(getter),
             Const::number(0.0),
         ],
     );
@@ -2156,6 +2158,7 @@ fn s34_scope_fold() {
             level: 0,
             slot: 0,
             value: c1,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let c2 = load_number(&mut m, b, 2.0);
@@ -2166,10 +2169,27 @@ fn s34_scope_fold() {
             level: 0,
             slot: 1,
             value: c2,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
-    let g1 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
-    let g2 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 1 });
+    let g1 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let g2 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let s = add(&mut m, b, g1, g2);
     emit_void(&mut m, b, Op::Return { value: Some(s) });
 
@@ -2218,6 +2238,7 @@ fn s35_scope_fold_partial() {
             level: 0,
             slot: 0,
             value: c1,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let c2 = load_number(&mut m, b, 2.0);
@@ -2228,6 +2249,7 @@ fn s35_scope_fold_partial() {
             level: 0,
             slot: 1,
             value: c2,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let c = istrue(&mut m, b, p1);
@@ -2241,12 +2263,29 @@ fn s35_scope_fold_partial() {
             level: 0,
             slot: 0,
             value: c3,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     emit_void(&mut m, t, Op::Branch { dest: j });
     emit_void(&mut m, e, Op::Branch { dest: j });
-    let g1 = emit(&mut m, j, Op::GetLexVar { level: 0, slot: 0 });
-    let g2 = emit(&mut m, j, Op::GetLexVar { level: 0, slot: 1 });
+    let g1 = emit(
+        &mut m,
+        j,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let g2 = emit(
+        &mut m,
+        j,
+        Op::GetLexVar {
+            level: 0,
+            slot: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let s = add(&mut m, j, g1, g2);
     emit_void(&mut m, j, Op::Return { value: Some(s) });
     link(&mut m, b, t);
@@ -2295,7 +2334,9 @@ fn s36_multi_catch_merge() {
     emit_void(&mut m, h2, Op::Return { value: None });
     link(&mut m, b0, h1);
     link(&mut m, b0, h2);
-    // One region, two typed catches (type_idx present but unnamed).
+    // One region, two typed catches (type_class present).
+    let tc1 = add_catch_class(&mut m, "LExc1;");
+    let tc2 = add_catch_class(&mut m, "LExc2;");
     m.func_mut(f)
         .unwrap()
         .try_regions
@@ -2305,12 +2346,12 @@ fn s36_multi_catch_merge() {
                 abcd_ir::function::Catch {
                     handler: h1,
                     exception: e1,
-                    type_idx: Some(7),
+                    type_class: Some(tc1),
                 },
                 abcd_ir::function::Catch {
                     handler: h2,
                     exception: e2,
-                    type_idx: Some(9),
+                    type_class: Some(tc2),
                 },
             ],
         });
@@ -2683,6 +2724,7 @@ fn s42_scope_fold_restore_no_redeclare() {
             level: 0,
             slot: 0,
             value: c1,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let c2 = load_number(&mut m, b, 2.0);
@@ -2693,6 +2735,7 @@ fn s42_scope_fold_restore_no_redeclare() {
             level: 0,
             slot: 1,
             value: c2,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     // A re-store to x in the SAME statement run (the wild shape: the
@@ -2705,10 +2748,27 @@ fn s42_scope_fold_restore_no_redeclare() {
             level: 0,
             slot: 0,
             value: c3,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
-    let g1 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
-    let g2 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 1 });
+    let g1 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let g2 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let s = add(&mut m, b, g1, g2);
     emit_void(&mut m, b, Op::Return { value: Some(s) });
 

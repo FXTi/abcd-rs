@@ -120,13 +120,18 @@ fn createobjectwithbuffer_stays_alloc_object() {
 }
 
 #[test]
-fn deprecated_buffer_forms_fold_to_alloc_array() {
-    // v0.1 lifts BOTH deprecated forms to CreateArrayWithBuffer (the
-    // raw table index, no entity indirection) — v0.2 folds both to
-    // AllocArray{Some} for parity.
-    for make in [
-        (|idx| Bytecode::DeprecatedCreatearraywithbuffer(idx)) as fn(Imm) -> Bytecode,
-        (|idx| Bytecode::DeprecatedCreateobjectwithbuffer(idx)) as fn(Imm) -> Bytecode,
+fn deprecated_buffer_forms_preserve_array_vs_object_tag() {
+    // R3-M4: deprecated.createarraywithbuffer → AllocArray{Some}, while
+    // deprecated.createobjectwithbuffer → AllocObject{shape}.
+    for (make, expect_array) in [
+        (
+            (|idx| Bytecode::DeprecatedCreatearraywithbuffer(idx)) as fn(Imm) -> Bytecode,
+            true,
+        ),
+        (
+            (|idx| Bytecode::DeprecatedCreateobjectwithbuffer(idx)) as fn(Imm) -> Bytecode,
+            false,
+        ),
     ] {
         let mut b = Builder::new();
         b.set_api(9, "");
@@ -141,11 +146,18 @@ fn deprecated_buffer_forms_fold_to_alloc_array() {
 
         let m = lift_file(&file).expect("lift");
         verify_clean(&m);
-        assert!(
-            m.insts
-                .iter()
-                .any(|i| matches!(i.op, Op::AllocArray { shape: Some(_) })),
-            "deprecated buffer form → AllocArray{{Some}} (v0.1 parity)"
-        );
+        if expect_array {
+            assert!(
+                m.insts
+                    .iter()
+                    .any(|i| matches!(i.op, Op::AllocArray { shape: Some(_) }))
+            );
+        } else {
+            assert!(
+                m.insts
+                    .iter()
+                    .any(|i| matches!(i.op, Op::AllocObject { .. }))
+            );
+        }
     }
 }

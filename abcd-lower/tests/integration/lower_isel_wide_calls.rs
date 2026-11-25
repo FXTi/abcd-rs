@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use abcd_ir::{BinOp, CallKind, FunctionKind, Module, Op};
 use abcd_isa::{Bytecode, Reg};
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
-use abcd_lower::{LowerError, fusion, isel, lower_function};
+use abcd_lower::{fusion, isel, lower_function};
 
 use common::{Halt, Machine, V2Builder};
 
@@ -272,16 +272,16 @@ fn five_arg_call_keeps_narrow_callrange_with_window_copies() {
     }
 }
 
-/// (d) The range-call window start must be ≤ 255 in EVERY vendored form
-/// (narrow AND wide). A function whose parameter area alone reaches past
-/// 255 cannot host the window: that is a hard error, never a silently
-/// misencoded start register.
+/// (d) `R3-M7`: when a function declares 253+ parameters AND performs a range
+/// call, `regalloc` places `low_scratches` (`0..5`) and `call_window` (`5..10`)
+/// at the bottom of the frame (`window_base <= 255`) and homes parameters above
+/// them (`10..263`), so lowering and encoding succeed without `CallWindowOverflow`.
 #[test]
-fn window_base_beyond_u8_is_a_hard_error() {
+fn large_param_count_places_call_window_at_low_regs_and_encodes() {
     const PARAMS: usize = 253;
 
     let mut module = Module::new();
-    let func = V2Builder::create_function(&mut module, "toomany", FunctionKind::Function);
+    let func = V2Builder::create_function(&mut module, "many_params_call", FunctionKind::Function);
 
     {
         let mut builder = V2Builder::new(&mut module, func);
@@ -295,10 +295,15 @@ fn window_base_beyond_u8_is_a_hard_error() {
         builder.emit_void(Op::Return { value: Some(call) });
     }
 
-    let result = lower_function(&module, func);
+    let result = lower_function(&module, func)
+        .expect("253 params + range call must lower with window placed at low regs (R3-M7)");
+    abcd_isa::encode(&result.bytecodes).expect("window start <= 255 must encode");
     assert!(
-        matches!(&result, Err(LowerError::CallWindowOverflow(f)) if *f == func),
-        "a window base > 255 must be a hard CallWindowOverflow error, not a \
-         truncated start register; got {result:?}"
+        result
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Callrange(_, _, Reg(start)) if *start <= 255)),
+        "expected Callrange with start <= 255: {:?}",
+        result.bytecodes
     );
 }

@@ -687,7 +687,7 @@ fn loop_cut_base(
             catches: vec![Catch {
                 handler: h1,
                 exception: e1,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link_exc(&mut m, hdr, h1);
@@ -987,7 +987,7 @@ fn loop_cut_bail_chain_two_deep() {
             catches: vec![Catch {
                 handler: h2,
                 exception: e2,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, h2, lc.midt);
@@ -1013,7 +1013,7 @@ fn loop_cut_bail_third_plan() {
             catches: vec![Catch {
                 handler: hx,
                 exception: ex,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, hx, lc.exit);
@@ -1036,7 +1036,7 @@ fn loop_cut_bail_two_rejoins() {
             .push(Catch {
                 handler: h0b,
                 exception: e0b,
-                type_idx: None,
+                type_class: None,
             });
         link(m, h0b, lc.chk);
         link_exc(m, lc.hdr, h0b);
@@ -1114,7 +1114,7 @@ fn loop_cut_bail_foreign_handler_cut() {
             catches: vec![Catch {
                 handler: hz,
                 exception: ez,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, hz, lc.midt);
@@ -1635,12 +1635,13 @@ fn loop_cut_multi_catch_p0() {
         let e0b = add_exception_param(m, h0b);
         call_p1(m, h0b, e0b);
         emit_void(m, h0b, Op::Branch { dest: lc.test });
+        let tc = add_catch_class(m, "LExc7;");
         m.func_mut(lc.f).unwrap().try_regions[0]
             .catches
             .push(Catch {
                 handler: h0b,
                 exception: e0b,
-                type_idx: Some(7),
+                type_class: Some(tc),
             });
         link(m, h0b, lc.test);
         link_exc(m, lc.hdr, h0b);
@@ -1663,12 +1664,13 @@ fn loop_cut_multi_catch_p1() {
         let e1b = add_exception_param(m, h1b);
         call_p1(m, h1b, e1b);
         emit_void(m, h1b, Op::Branch { dest: lc.midt });
+        let tc = add_catch_class(m, "LExc9;");
         m.func_mut(lc.f).unwrap().try_regions[1]
             .catches
             .push(Catch {
                 handler: h1b,
                 exception: e1b,
-                type_idx: Some(9),
+                type_class: Some(tc),
             });
         link(m, h1b, lc.midt);
         link_exc(m, lc.hdr, h1b);
@@ -1694,12 +1696,13 @@ fn loop_cut_bail_chain_two_rejoins() {
         let e1b = add_exception_param(m, h1b);
         call_p1(m, h1b, e1b);
         emit_void(m, h1b, Op::Branch { dest: lc.chk });
+        let tc = add_catch_class(m, "LExc9;");
         m.func_mut(lc.f).unwrap().try_regions[1]
             .catches
             .push(Catch {
                 handler: h1b,
                 exception: e1b,
-                type_idx: Some(9),
+                type_class: Some(tc),
             });
         link(m, h1b, lc.chk);
         link_exc(m, lc.hdr, h1b);
@@ -1775,12 +1778,13 @@ fn loop_cut_multi_catch_nested_handler() {
         link(m, lc.h0, inner);
         link(m, inner, lc.test);
         link(m, hx, lc.test);
+        let tc = add_catch_class(m, "LExc3;");
         m.func_mut(lc.f).unwrap().try_regions[0]
             .catches
             .push(Catch {
                 handler: hx,
                 exception: ex,
-                type_idx: Some(3),
+                type_class: Some(tc),
             });
         link_exc(m, lc.hdr, hx);
         link_exc(m, lc.thr1, hx);
@@ -1789,7 +1793,7 @@ fn loop_cut_multi_catch_nested_handler() {
             catches: vec![Catch {
                 handler: hx,
                 exception: ex,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link_exc(m, inner, hx);
@@ -2060,7 +2064,7 @@ fn cut_try_bail_outer_finally_chain() {
             catches: vec![Catch {
                 handler: h1,
                 exception: e1,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, h1, ct.j);
@@ -2091,12 +2095,13 @@ fn cut_try_bail_two_rejoin_points() {
         let e2 = add_exception_param(m, h2);
         call_p1(m, h2, e2);
         emit_void(m, h2, Op::Branch { dest: j2 });
+        let tc = add_catch_class(m, "LExc5;");
         m.func_mut(ct.f).unwrap().try_regions[0]
             .catches
             .push(Catch {
                 handler: h2,
                 exception: e2,
-                type_idx: Some(5),
+                type_class: Some(tc),
             });
         link(m, h2, j2);
         link_exc(m, ct.b0, h2);
@@ -2115,12 +2120,13 @@ fn cut_try_multi_catch() {
         let e2 = add_exception_param(m, h2);
         call_p1(m, h2, e2);
         emit_void(m, h2, Op::Branch { dest: ct.j });
+        let tc = add_catch_class(m, "LExc5;");
         m.func_mut(ct.f).unwrap().try_regions[0]
             .catches
             .push(Catch {
                 handler: h2,
                 exception: e2,
-                type_idx: Some(5),
+                type_class: Some(tc),
             });
         link(m, h2, ct.j);
         link_exc(m, ct.b0, h2);
@@ -2465,7 +2471,7 @@ fn tower_base(edit: &mut dyn FnMut(&mut Module, &Tower)) -> (Module, Tower) {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, b0, h1);
@@ -2651,12 +2657,13 @@ fn tower_multi_catch_inner() {
         let e0b = add_exception_param(m, h0b);
         call_p1(m, h0b, e0b);
         emit_void(m, h0b, Op::Branch { dest: tw.disp });
+        let tc = add_catch_class(m, "LExc7;");
         m.func_mut(tw.f).unwrap().try_regions[0]
             .catches
             .push(Catch {
                 handler: h0b,
                 exception: e0b,
-                type_idx: Some(7),
+                type_class: Some(tc),
             });
         link(m, h0b, tw.disp);
         link_exc(m, tw.b0, h0b);
@@ -2679,12 +2686,13 @@ fn tower_multi_catch_outer() {
         let e1b = add_exception_param(m, h1b);
         call_p1(m, h1b, e1b);
         emit_void(m, h1b, Op::Branch { dest: tw.disp });
+        let tc = add_catch_class(m, "LExc9;");
         m.func_mut(tw.f).unwrap().try_regions[1]
             .catches
             .push(Catch {
                 handler: h1b,
                 exception: e1b,
-                type_idx: Some(9),
+                type_class: Some(tc),
             });
         link(m, h1b, tw.disp);
         link_exc(m, tw.b0, h1b);
@@ -2713,7 +2721,7 @@ fn tower_chain_two_deep() {
             catches: vec![Catch {
                 handler: h2,
                 exception: e2,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, h2, tw.disp);
@@ -2974,7 +2982,7 @@ fn xarm_bail_try_plan_crossing() {
             catches: vec![Catch {
                 handler: h,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link_exc(m, xa.b1, h);
@@ -3403,7 +3411,7 @@ fn shim_tail_bail_target_protected() {
             catches: vec![Catch {
                 handler: h2,
                 exception: e2,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link_exc(m, st.ret2, h2);
@@ -3853,7 +3861,7 @@ fn loop_cut_chain_raw_shape() {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, hdr, h1);
@@ -3909,7 +3917,7 @@ fn tower_dispatch_shared_raw_shape() {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, b0, h1);
@@ -4001,7 +4009,7 @@ fn loop_cut_bails_nested_loop_chain() {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link(&mut m, h1, midt);
@@ -4371,7 +4379,7 @@ fn tower_uniq_cond_boundary() {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, b0, h1);
@@ -4809,7 +4817,7 @@ fn debug_env_smoke() {
             catches: vec![Catch {
                 handler: h1,
                 exception: e1,
-                type_idx: None,
+                type_class: None,
             }],
         });
         link(m, h1, ct.j);
@@ -5345,7 +5353,7 @@ fn handler_entry_swallowed_by_ancestor() {
         catches: vec![Catch {
             handler: h,
             exception: e2,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, hx, h);
@@ -5395,7 +5403,7 @@ fn tower_handler_without_binding() {
         catches: vec![Catch {
             handler: h0,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, b0, h0);
@@ -5404,7 +5412,7 @@ fn tower_handler_without_binding() {
         catches: vec![Catch {
             handler: h1,
             exception: e1,
-            type_idx: None,
+            type_class: None,
         }],
     });
     link_exc(&mut m, b0, h1);

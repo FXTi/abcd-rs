@@ -838,10 +838,10 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
 
     // 1) Nested `_ESTypeAnnotation._TypeOfInstruction` on Lmain::func_main_0
     let nested_type_idx = file.literal_arrays.len() as u32;
-    file.literal_arrays.push(LiteralArray {
-        values: vec![LiteralValue::Integer(1), LiteralValue::Integer(51)],
-    });
-    file.literal_array_offsets.insert(0x70_000, nested_type_idx);
+    file.literal_arrays.push(LiteralArray::new(vec![
+        LiteralValue::Integer(1),
+        LiteralValue::Integer(51),
+    ]));
 
     let s_estype = file.strings.get_or_intern("L_ESTypeAnnotation;");
     let s_typeof = file.strings.get_or_intern("_TypeOfInstruction");
@@ -885,8 +885,6 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
     // and 3) Catch handler at offset 0 on Lhelper;
     let s_loop = file.strings.get_or_intern("loopFromZero");
     let s_catch0 = file.strings.get_or_intern("catchAtZero");
-    file.entity_map.insert(0x80_010, s_loop);
-    file.entity_map.insert(0x80_020, s_catch0);
     let helper_cls = file
         .classes
         .values_mut()
@@ -894,7 +892,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
         .expect("Lhelper;");
     helper_cls.methods.push(Method {
         name: s_loop,
-        offset: 0x80_010,
+        offset: 0,
         access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
         function_kind: FileFunctionKind::Function,
         source_lang: SourceLang::EcmaScript,
@@ -917,7 +915,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                 Bytecode::Lda(Reg(0)),              // [9] exit
                 Bytecode::Return,                   // [10]
             ],
-            entity_offsets: std::collections::HashMap::new(),
+            entities: std::collections::HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: Some(2),
         }),
@@ -927,7 +925,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
     });
     helper_cls.methods.push(Method {
         name: s_catch0,
-        offset: 0x80_020,
+        offset: 0,
         access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
         function_kind: FileFunctionKind::Function,
         source_lang: SourceLang::EcmaScript,
@@ -945,12 +943,12 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                 Bytecode::Lda(Reg(0)),    // [4]
                 Bytecode::Return,         // [5]
             ],
-            entity_offsets: std::collections::HashMap::new(),
+            entities: std::collections::HashMap::new(),
             try_blocks: vec![TryBlock {
                 start: 2,
                 len: 2,
                 catches: vec![CatchBlock {
-                    type_idx: u32::MAX,
+                    type_class: None,
                     handler: 0,
                     len: 2,
                 }],
@@ -970,30 +968,13 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
     let s_func_main = file.strings.get_or_intern("func_main_0");
 
     let field_la_idx = file.literal_arrays.len() as u32;
-    file.literal_arrays.push(LiteralArray {
-        values: vec![
-            LiteralValue::String(s_field_x),
-            LiteralValue::Integer(2),
-            LiteralValue::Integer(1),
-        ],
-    });
-    file.literal_array_offsets.insert(0x70_100, field_la_idx);
-
+    file.literal_arrays.push(LiteralArray::new(vec![
+        LiteralValue::String(s_field_x),
+        LiteralValue::Integer(2),
+        LiteralValue::Integer(1),
+    ]));
     let class_la_idx = file.literal_arrays.len() as u32;
-    file.literal_arrays.push(LiteralArray {
-        values: vec![
-            LiteralValue::String(s_get_val),
-            LiteralValue::Getter(0x80_200),
-            LiteralValue::MethodAffiliate(0),
-            LiteralValue::Integer(1),
-            LiteralValue::LiteralArray(LiteralArrayIdx(field_la_idx)),
-        ],
-    });
-    file.literal_array_offsets.insert(0x70_200, class_la_idx);
-
-    file.entity_map.insert(0x80_100, s_send_ctor);
-    file.entity_map.insert(0x80_200, s_get_val);
-    file.entity_map.insert(0x80_300, s_func_main);
+    file.literal_arrays.push(LiteralArray::new(Vec::new()));
 
     file.classes.insert(
         s_send_desc,
@@ -1009,7 +990,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
             methods: vec![
                 Method {
                     name: s_send_ctor,
-                    offset: 0x80_100,
+                    offset: 0,
                     access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
                     function_kind: FileFunctionKind::SendableFunction,
                     source_lang: SourceLang::EcmaScript,
@@ -1020,7 +1001,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                         num_vregs: 0,
                         num_args: 3,
                         bytecodes: vec![Bytecode::Lda(Reg(2)), Bytecode::Return],
-                        entity_offsets: std::collections::HashMap::new(),
+                        entities: std::collections::HashMap::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1030,7 +1011,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                 },
                 Method {
                     name: s_get_val,
-                    offset: 0x80_200,
+                    offset: 0,
                     access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
                     function_kind: FileFunctionKind::SendableFunction,
                     source_lang: SourceLang::EcmaScript,
@@ -1041,7 +1022,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                         num_vregs: 0,
                         num_args: 3,
                         bytecodes: vec![Bytecode::Ldai(Imm(7)), Bytecode::Return],
-                        entity_offsets: std::collections::HashMap::new(),
+                        entities: std::collections::HashMap::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1051,7 +1032,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                 },
                 Method {
                     name: s_func_main,
-                    offset: 0x80_300,
+                    offset: 0,
                     access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
                     function_kind: FileFunctionKind::Function,
                     source_lang: SourceLang::EcmaScript,
@@ -1073,10 +1054,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                             ),
                             Bytecode::Return,
                         ],
-                        entity_offsets: std::collections::HashMap::from([
-                            ((EntityKind::MethodId, 0), 0x80_100),
-                            ((EntityKind::LiteralarrayId, 1), 0x70_200),
-                        ]),
+                        entities: std::collections::HashMap::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1089,6 +1067,36 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
             annotations: Default::default(),
         },
     );
+
+    let send_ctor_idx = file
+        .all_methods()
+        .position(|(d, m)| d == s_send_desc && m.name == s_send_ctor)
+        .expect("sendable ctor method index") as u32;
+    let get_val_idx = file
+        .all_methods()
+        .position(|(d, m)| d == s_send_desc && m.name == s_get_val)
+        .expect("sendable getter method index") as u32;
+    file.literal_arrays[class_la_idx as usize].values = vec![
+        LiteralValue::String(s_get_val),
+        LiteralValue::Getter(abcd_file::MethodIdx(get_val_idx)),
+        LiteralValue::MethodAffiliate(0),
+        LiteralValue::Integer(1),
+        LiteralValue::LiteralArray(LiteralArrayIdx(field_la_idx)),
+    ];
+    file.classes.get_mut(&s_send_desc).unwrap().methods[2]
+        .body
+        .as_mut()
+        .unwrap()
+        .entities = std::collections::HashMap::from([
+        (
+            (EntityKind::MethodId, 0),
+            abcd_file::EntityRef::Method(abcd_file::MethodIdx(send_ctor_idx)),
+        ),
+        (
+            (EntityKind::LiteralarrayId, 1),
+            abcd_file::EntityRef::LiteralArray(LiteralArrayIdx(class_la_idx)),
+        ),
+    ]);
 
     encode(&file).expect("encode commercial edge merge-abc")
 }

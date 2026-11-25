@@ -6,9 +6,9 @@
 use std::fmt;
 
 use abcd_file::File;
-use abcd_ir::{FuncId, Module, verify_module};
+use abcd_ir::{Module, verify_module};
 use abcd_lift::lift_file;
-use abcd_lower::{EntityResolver, LowerError, lower_function_with_options};
+use abcd_lower::{LowerError, rewrite_file};
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
 /// histogram keys are gate evidence — keep them stable).
@@ -82,49 +82,22 @@ pub(crate) fn front_end(path: &std::path::Path) -> Result<(File, Module), Skip> 
 /// v0.1 pipeline's ADCE swept the seed INSTRUCTION in that case (the
 /// v0.2 seed is instruction-less, so the lower must skip the
 /// materialization — see `LowerOptions`).
+/// Lower every function of `module` via `abcd_lower::rewrite_file` (syncing
+/// `MethodBody::entities`, `_ESSlotNumberAnnotation` IC counts, synthesized
+/// pool entries, and reconstructed `MethodDebugInfo` — `#50`, `#57` `R3-H8`)
+/// and encode. Returns the encoded bytes and lowered function count.
 pub(crate) fn rewrite_fixture(
     module: &Module,
     file: &File,
     options: abcd_lower::LowerOptions,
 ) -> Result<(Vec<u8>, usize), Skip> {
-    // Function i corresponds to the i-th method in lift order (classes in
-    // file order, methods in declaration order — the lift's pass-1
-    // reservation order, which is `File::all_methods()` order).
-    //
-    // Bodyless functions (external/native declarations, lifted as
-    // block-less external FunctionData) keep their `None` body; every
-    // other function lowers to a fresh MethodBody.
-    let resolver = EntityResolver::new(module, file);
-    let mut bodies = Vec::with_capacity(module.functions.len());
-    for index in 0..module.functions.len() {
-        let func_id = FuncId::new(index as u32);
-        let func = module.func(func_id).expect("function-table index");
-        if func.blocks.is_empty() {
-            bodies.push(None);
-            continue;
-        }
-        let name = module.sym.resolve(func.name).unwrap_or("?").to_string();
-        let lowered = lower_function_with_options(module, func_id, options)
-            .map_err(|e| (lower_category(&e), format!("lower {name}: {e}")))?;
-        let body = resolver
-            .to_method_body(func_id, &lowered)
-            .map_err(|e| (lower_category(&e), format!("to_method_body {name}: {e}")))?;
-        bodies.push(Some(body));
-    }
-    let functions = bodies.iter().filter(|b| b.is_some()).count();
-
-    let mut rebuilt = file.clone();
-    let mut cursor = bodies.into_iter();
-    for class in rebuilt.classes.values_mut() {
-        for method in &mut class.methods {
-            let body = cursor.next().expect("one slot per method");
-            if method.body.is_some() {
-                method.body = Some(body.expect("a lowered body for every method that had one"));
-            }
-        }
-    }
-    assert!(cursor.next().is_none());
-
+    let functions = module
+        .functions
+        .iter()
+        .filter(|f| !f.blocks.is_empty())
+        .count();
+    let rebuilt =
+        rewrite_file(module, file, options).map_err(|e| (lower_category(&e), format!("{e}")))?;
     let encoded =
         abcd_file::encode(&rebuilt).map_err(|e| (SkipCategory::Encode, format!("encode: {e}")))?;
     Ok((encoded, functions))

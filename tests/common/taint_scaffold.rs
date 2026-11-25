@@ -141,7 +141,7 @@ pub fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: Bloc
         catches: vec![Catch {
             handler,
             exception: exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 }

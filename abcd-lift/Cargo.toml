@@ -2,6 +2,7 @@
 name = "abcd-lift"
 description = "Lifter: decode (abcd_file::File) → IR (abcd_ir::Module) — layering: lift = decode→IR (design/ir.md)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -11,3 +12,6 @@ abcd-file.workspace = true
 abcd-isa.workspace = true
 abcd-ir.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

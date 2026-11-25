@@ -24,9 +24,12 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use abcd_ir::{BlockId, FuncId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{
+    BlockId, EdgeKind, ExceptionHandlerMap, FuncId, Module, Op, ValueDef, ValueId,
+    normal_succs_inline,
+};
 
-use crate::analysis::{self, augmented_succs};
+use crate::analysis;
 use crate::fusion::Suppression;
 
 /// The result of register allocation for a function.
@@ -148,11 +151,9 @@ pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     analysis::compute_rpo(module, func_id)
 }
 
-/// All phi-instruction entries of a block as `(pred, incoming value, phi
-/// result)` triples derived from `(Edge, value)` phi entries. Duplicate
-/// `pred`s (a Normal and an Exceptional edge from one block) appear once per
-/// entry.
-fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueId)> {
+/// All phi-instruction entries of a block as `(edge, incoming value, phi
+/// result)` triples.
+fn phi_edge_entries(module: &Module, block: BlockId) -> Vec<(abcd_ir::Edge, ValueId, ValueId)> {
     let mut out = Vec::new();
     let Some(bb) = module.block(block) else {
         return out;
@@ -165,8 +166,8 @@ fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueI
             break; // phis form the leading prefix
         };
         let Some(result) = inst.result else { continue };
-        for (edge, val) in entries {
-            out.push((edge.from, *val, result));
+        for &(edge, val) in entries {
+            out.push((edge, val, result));
         }
     }
     out
@@ -394,29 +395,60 @@ pub fn allocate_with_options(
     } else {
         LOW_SCRATCH_COUNT as u64
     };
-    let window_base = param_count + low_scratches;
-    if window > 0 {
-        if window_base > 255 {
-            return Err(RegAllocError::WindowBaseOverflow);
-        }
-        if window_base + window > u16::MAX as u64 {
-            // The frame cannot hold the window (this also rejects
-            // argc > u16::MAX, which no vendored form can encode).
-            return Err(RegAllocError::RegisterOverflow);
+
+    // R3-M7: Keep parameters at 0..param_count whenever low_scratches and
+    // call_window still fit low registers; when a large parameter count would
+    // push low_scratches past v255 or window_base past v255, place
+    // low_scratches (0..low_scratches) and call_window (low_scratches..) at
+    // the bottom of the frame and assign parameter homes above them (isel's
+    // entry prologue copies incoming ABI args into each parameter's home).
+    let params_at_bottom =
+        param_count + low_scratches <= 256 && (window == 0 || param_count + low_scratches <= 255);
+
+    let (param_base, reserved_start, reserved_len, window_base, low_scratch_base) =
+        if params_at_bottom {
+            let wb = param_count + low_scratches;
+            if window > 0 && wb + window > u64::from(u16::MAX) {
+                return Err(RegAllocError::RegisterOverflow);
+            }
+            (
+                0u16,
+                param_count as u16,
+                (low_scratches + window) as u16,
+                wb as u16,
+                (low_scratches > 0).then_some(param_count as u16),
+            )
+        } else {
+            let wb = low_scratches;
+            if window > 0 && wb + window > u64::from(u16::MAX) {
+                return Err(RegAllocError::RegisterOverflow);
+            }
+            let res_len = low_scratches + window;
+            if res_len + param_count > u64::from(TEMP_REG_BASE) {
+                return Err(RegAllocError::RegisterOverflow);
+            }
+            (
+                res_len as u16,
+                0u16,
+                res_len as u16,
+                wb as u16,
+                (low_scratches > 0).then_some(0u16),
+            )
+        };
+
+    // Exception edges `(protected_block, handler_block)` from structured TryRegions.
+    let mut exception_edges: HashSet<(BlockId, BlockId)> = HashSet::new();
+    for region in &func.try_regions {
+        for &p in &region.protected {
+            for catch in &region.catches {
+                exception_edges.insert((p, catch.handler));
+            }
         }
     }
-    if low_scratches > 0 && param_count + low_scratches > 256 {
-        // The scratch block itself would not be low-addressable.
-        return Err(RegAllocError::RegisterOverflow);
-    }
-    let reserved_start = param_count as u16;
-    let reserved_len = (low_scratches + window) as u16;
 
-    // Step 1: Exact backward dataflow liveness (exception edges included).
-    let (live_in, live_out) = compute_liveness(module, func_id, &rpo, &const_values);
-
-    // Step 2: Build interference graph.
-    let mut interference = build_interference(module, &rpo, &live_out, &const_values);
+    // Step 1 & 2: Exact bitset backward dataflow liveness + interference graph (R3-A2).
+    let (live_in, mut interference) =
+        compute_liveness_and_interference(module, func_id, &rpo, &all_values, &const_values);
 
     // N13: an exception value has no defining instruction, so it never
     // acquires interference edges at a definition point. It is live from
@@ -433,23 +465,42 @@ pub fn allocate_with_options(
         }
     }
 
-    // N21 store-site safety. Every handler-phi entry (pred, src) lowers to
-    // a store `S ← slot(src)` where S is the phi result's slot, emitted at
-    // the pred's block start — or, when src is defined by an instruction
-    // inside the pred, immediately after that instruction (the closest
-    // implementable point to the vendored `sta`; an exception at an earlier
-    // instruction of the pred then correctly observes the PREVIOUS writer,
-    // exactly like the original bytecode). For this to be sound, no value
-    // colored S may be live across the store (everything in live_in[pred]
-    // for a block-start store) nor defined in the pred after the store
-    // point (its definition would overwrite S mid-block): hence result ×
-    // (live_in[pred] ∪ defs[pred]). defs[pred] ∪ live_in[pred] also covers
-    // live_out[pred] and the terminator's operands, so normal-path
-    // continuation and conditional branch conditions are safe as well.
+    // R3-X3 + N21 store-site safety:
+    // 1. Any handler-phi entry lowering via `handler_phi_stores` interferes with
+    //    `live_in[pred] ∪ defs[pred]`.
+    // 2. All distinct handler-phi results whose handlers share a common protected
+    //    block `p` (nested/competing catch handlers) interfere pairwise so one
+    //    handler's pinned store in `p` never clobbers another handler's phi home.
+    let mut handler_phis_by_pred: HashMap<BlockId, Vec<ValueId>> = HashMap::new();
+    for region in &func.try_regions {
+        for catch in &region.catches {
+            for &(_, _, result) in &phi_edge_entries(module, catch.handler) {
+                if !used.contains(&result) {
+                    continue;
+                }
+                for &p in &region.protected {
+                    let list = handler_phis_by_pred.entry(p).or_default();
+                    if !list.contains(&result) {
+                        list.push(result);
+                    }
+                }
+            }
+        }
+    }
     for &handler in &handler_blocks {
-        for &(pred, _, result) in &phi_entries(module, handler) {
+        for &(edge, _, result) in &phi_edge_entries(module, handler) {
             if !used.contains(&result) {
-                continue; // dead phi result: no stores (same class as edge copies)
+                continue;
+            }
+            if edge.kind != EdgeKind::Exceptional
+                && !exception_edges.contains(&(edge.from, handler))
+            {
+                continue; // normal-only incoming edge lowers via phi_copies (R3-M2)
+            }
+            let pred = edge.from;
+            let list = handler_phis_by_pred.entry(pred).or_default();
+            if !list.contains(&result) {
+                list.push(result);
             }
             let mut forbid: HashSet<ValueId> = live_in.get(&pred).cloned().unwrap_or_default();
             if let Some(pred_block) = module.block(pred) {
@@ -459,7 +510,6 @@ pub fn allocate_with_options(
                     }
                 }
             }
-            // Frame-initial constants are defined at entry-block start.
             if Some(pred) == entry {
                 forbid.extend(const_values.iter().copied());
             }
@@ -471,38 +521,73 @@ pub fn allocate_with_options(
             }
         }
     }
+    for phis in handler_phis_by_pred.values() {
+        for (i, &r1) in phis.iter().enumerate() {
+            for &r2 in &phis[i + 1..] {
+                if r1 != r2 {
+                    interference.entry(r1).or_default().insert(r2);
+                    interference.entry(r2).or_default().insert(r1);
+                }
+            }
+        }
+    }
 
-    // Step 3: MCS ordering + greedy coloring. The reserved parameter homes
-    // are pre-assigned; the reserved window/scratch range is skipped by the
-    // smallest-slot scan. Every value lands in a register — the accumulator
-    // is a physical emission-time resource (acc-as-cache, B4), not a color.
+    // Step 3: MCS ordering + chordal greedy coloring (R3-X6).
     let (allocation, colored_regs) = mcs_color(
         &all_values,
         &interference,
+        param_base,
         func.params.len() as u16,
         &func.params,
         reserved_start,
         reserved_len,
     )?;
 
-    // N21: handler-block phi slot consistency + the pinned store list
-    // (computed before SSA destruction, which skips handler blocks).
-    let handler_phi_stores =
-        collect_handler_phi_stores(module, &handler_blocks, &allocation, &interference, &used)?;
+    // N21: handler-block phi slot consistency + the pinned store list.
+    let handler_phi_stores = collect_handler_phi_stores(
+        module,
+        &handler_blocks,
+        &exception_edges,
+        &allocation,
+        &interference,
+        &used,
+    )?;
 
-    // The frame must cover the reserved window/scratch range even when
-    // coloring stayed below it.
-    let mut num_regs = colored_regs.max(reserved_start + reserved_len);
+    let min_param_end = if func.params.is_empty() {
+        0
+    } else {
+        param_base + func.params.len() as u16
+    };
+    let mut num_regs = colored_regs
+        .max(reserved_start + reserved_len)
+        .max(min_param_end);
 
-    // Step 5: Boissinot SSA destruction — collect the per-edge value-level
-    // copy sets. Slot-level resolution happens at the emission point in
-    // `layout`, so no value-level cycle breaking (or pseudo-temp) is done here.
-    let phi_copies = boissinot_destruction(module, &rpo, &allocation, &handler_blocks, &used);
+    // Step 5: Boissinot SSA destruction — collect per-edge value-level copies.
+    let phi_copies = boissinot_destruction(
+        module,
+        &rpo,
+        &allocation,
+        &handler_blocks,
+        &exception_edges,
+        &used,
+    );
 
-    // Step 6: When any edge carries phi copies, reserve exactly one real temp
-    // register for slot-level cycle breaking. Overflow is a hard error, not
-    // a silent saturation.
-    let copy_temp = if phi_copies.values().any(|copies| !copies.is_empty()) {
+    // Step 6: Reserve one real temp register whenever edge copies exist or
+    // same-block handler-phi stores share source/destination slots (R3-X3).
+    let handler_store_cycle_possible =
+        handler_phi_stores
+            .iter()
+            .enumerate()
+            .any(|(i, &(p1, s1, d1))| {
+                let s1_slot = allocation.get(&s1);
+                let d1_slot = allocation.get(&d1);
+                handler_phi_stores[i + 1..].iter().any(|&(p2, s2, d2)| {
+                    p1 == p2 && (allocation.get(&s2) == d1_slot || allocation.get(&d2) == s1_slot)
+                })
+            });
+    let need_copy_temp =
+        phi_copies.values().any(|copies| !copies.is_empty()) || handler_store_cycle_possible;
+    let copy_temp = if need_copy_temp {
         let temp = num_regs;
         if temp >= TEMP_REG_BASE {
             return Err(RegAllocError::RegisterOverflow);
@@ -519,16 +604,8 @@ pub fn allocate_with_options(
         handler_phi_stores,
         num_regs,
         copy_temp,
-        call_window_base: if window > 0 {
-            Some(window_base as u16)
-        } else {
-            None
-        },
-        low_scratch_base: if low_scratches > 0 {
-            Some(param_count as u16)
-        } else {
-            None
-        },
+        call_window_base: (window > 0).then_some(window_base),
+        low_scratch_base,
     })
 }
 
@@ -568,19 +645,25 @@ fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
                             // this + args ride the window.
                             (args.len() + 1 > 4).then_some(args.len() + 1)
                         }
-                        CallKind::Super | CallKind::SuperForwardAllArgs => Some(args.len()),
+                        CallKind::Super | CallKind::SuperArrow => Some(args.len()),
                         CallKind::New => Some(args.len() + 1),
-                        // Fixed-arity forms: apply passes (this, array) as
-                        // two register operands, supercallspread one — no
-                        // consecutive window.
-                        CallKind::Apply | CallKind::SuperSpread => None,
+                        // Fixed-arity / non-window forms: apply passes (this, array),
+                        // supercallspread passes array, supercallforwardallargs passes
+                        // thisFunc, newobjapply passes ctor, callinit passes this.
+                        CallKind::Apply
+                        | CallKind::SuperSpread
+                        | CallKind::SuperForwardAllArgs
+                        | CallKind::NewSpread
+                        | CallKind::ClassInit => None,
                     };
                     if let Some(argc) = range_argc {
                         window = window.max(argc);
                     }
                 }
                 Op::CreateObjectWithExcludedKeys { keys, .. } => {
-                    window = window.max(keys.len());
+                    // Reserve >= 1 slot so empty `keys` also has a dead low scratch
+                    // register for `createemptyobject + copydataproperties`.
+                    window = window.max(keys.len().max(1));
                 }
                 _ => {}
             }
@@ -589,242 +672,280 @@ fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
     window
 }
 
-// ─── Step 1: Exact backward dataflow liveness ────────────────────────────────
+// ─── Step 1 & 2: Dense Bitset Liveness & Interference (`R3-A2`) ──────────────
 
-/// Compute live_in and live_out sets for each block.
-/// Phi operands are treated as uses in the predecessor block.
-///
-/// Exception edges participate (`analysis::augmented_succs`): a catch
-/// handler is a control-flow successor of every block in its try region —
-/// an exception can transfer control from any protected instruction to
-/// the handler, so values the handler uses are live out of every try
-/// block. Terminator-only successors (`block_succs`) miss this: a try
-/// body may end in `Throw`/`Unreachable` while the handler still reads
-/// values defined there (S6 — without these edges such values look dead
-/// past their definition, never interfere, and can all be colored Acc).
-///
-/// `const_values` (frame-initial constants) are modeled as defined at the
-/// ENTRY block's start.
-fn compute_liveness(
+type InterferenceGraph = HashMap<ValueId, HashSet<ValueId>>;
+
+#[inline]
+fn bit_set(bits: &mut [u64], idx: usize) {
+    bits[idx >> 6] |= 1u64 << (idx & 63);
+}
+
+#[inline]
+fn bit_clear(bits: &mut [u64], idx: usize) {
+    bits[idx >> 6] &= !(1u64 << (idx & 63));
+}
+
+#[inline]
+fn bit_test(bits: &[u64], idx: usize) -> bool {
+    (bits[idx >> 6] & (1u64 << (idx & 63))) != 0
+}
+
+fn bitset_to_values(bits: &[u64], bit_to_val: &[ValueId]) -> HashSet<ValueId> {
+    let mut out = HashSet::new();
+    for (w_idx, &word) in bits.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            out.insert(bit_to_val[(w_idx << 6) + tz]);
+            w &= w - 1;
+        }
+    }
+    out
+}
+
+fn add_live_interferences(
+    graph: &mut InterferenceGraph,
+    def_val: ValueId,
+    def_bit: usize,
+    live: &[u64],
+    bit_to_val: &[ValueId],
+) {
+    for (w_idx, &word) in live.iter().enumerate() {
+        let mut w = word;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            let bit = (w_idx << 6) + tz;
+            if bit != def_bit {
+                let other = bit_to_val[bit];
+                graph.entry(def_val).or_default().insert(other);
+                graph.entry(other).or_default().insert(def_val);
+            }
+            w &= w - 1;
+        }
+    }
+}
+
+/// Compute exact backward liveness (including exception edges) over dense `[u64]`
+/// bitsets using [`ExceptionHandlerMap`] and pre-grouped phi incoming lists,
+/// then construct the interference graph in a single backward scan (`#58` `R3-A2`).
+fn compute_liveness_and_interference(
     module: &Module,
     func_id: FuncId,
     rpo: &[BlockId],
+    all_values: &[ValueId],
     const_values: &[ValueId],
-) -> (
-    HashMap<BlockId, HashSet<ValueId>>,
-    HashMap<BlockId, HashSet<ValueId>>,
-) {
-    // Augmented successor map: terminator successors plus, for every try
-    // region, an edge from each protected block to each of its handlers.
-    let succs: HashMap<BlockId, Vec<BlockId>> = rpo
-        .iter()
-        .map(|&bb| (bb, augmented_succs(module, func_id, bb)))
-        .collect();
+) -> (HashMap<BlockId, HashSet<ValueId>>, InterferenceGraph) {
+    let num_blocks = rpo.len();
+    if num_blocks == 0 {
+        return (HashMap::new(), HashMap::new());
+    }
 
-    let entry = rpo.first().copied();
+    let mut bb_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(num_blocks);
+    for (idx, &bb) in rpo.iter().enumerate() {
+        bb_to_idx.entry(bb).or_insert(idx);
+    }
 
-    // Compute use and def sets per block.
-    let mut block_use: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
-    let mut block_def: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
-
+    // Assign dense bit indices `0..V` to every value referenced in `all_values`,
+    // `const_values`, or any instruction operand.
+    let mut val_to_bit: HashMap<ValueId, usize> = HashMap::with_capacity(all_values.len() + 8);
+    let mut bit_to_val: Vec<ValueId> = Vec::with_capacity(all_values.len() + 8);
+    let mut intern_val = |v: ValueId| -> usize {
+        if let Some(&b) = val_to_bit.get(&v) {
+            b
+        } else {
+            let b = bit_to_val.len();
+            val_to_bit.insert(v, b);
+            bit_to_val.push(v);
+            b
+        }
+    };
+    for &v in all_values {
+        let _ = intern_val(v);
+    }
+    for &c in const_values {
+        let _ = intern_val(c);
+    }
     for &bb in rpo {
-        let mut uses = HashSet::new();
-        let mut defs = HashSet::new();
         let Some(block) = module.block(bb) else {
             continue;
         };
-
-        for &inst_id in &block.insts {
-            let Some(node) = module.inst(inst_id) else {
+        for &iid in &block.insts {
+            let Some(inst) = module.inst(iid) else {
                 continue;
             };
-            if node.op.is_phi() {
-                // Phi results are defs, but phi operands are NOT uses in
-                // this block — they're uses in the predecessor blocks.
+            if let Some(res) = inst.result {
+                let _ = intern_val(res);
+            }
+            inst.op.for_each_operand(|op| {
+                let _ = intern_val(op);
+            });
+        }
+    }
+
+    let words = bit_to_val.len().div_ceil(64).max(1);
+    let exc_map = ExceptionHandlerMap::build(module, func_id);
+
+    // Precompute augmented successor indices per RPO block once (`O(B + ∑|handlers|)`).
+    let mut succ_indices: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (b_idx, &bb) in rpo.iter().enumerate() {
+        let out = &mut succ_indices[b_idx];
+        if let Some(term_op) = module
+            .block(bb)
+            .and_then(|b| b.insts.last())
+            .and_then(|&iid| module.inst(iid))
+            .map(|i| &i.op)
+        {
+            let (ns, nlen) = normal_succs_inline(term_op);
+            for &succ_bb in &ns[..nlen] {
+                if let Some(&si) = bb_to_idx.get(&succ_bb)
+                    && !out.contains(&si)
+                {
+                    out.push(si);
+                }
+            }
+        }
+        if let Some(ref em) = exc_map {
+            for &h_bb in em.handlers_of(bb) {
+                if let Some(&hi) = bb_to_idx.get(&h_bb)
+                    && !out.contains(&hi)
+                {
+                    out.push(hi);
+                }
+            }
+        }
+    }
+
+    // Compute per-block `use` / `def` bitsets and pre-group phi incoming operands by `pred_idx`.
+    let mut block_use: Vec<Vec<u64>> = vec![vec![0u64; words]; num_blocks];
+    let mut block_def: Vec<Vec<u64>> = vec![vec![0u64; words]; num_blocks];
+    let mut phi_out_bits: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+
+    for (b_idx, &bb) in rpo.iter().enumerate() {
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
+        let uses = &mut block_use[b_idx];
+        let defs = &mut block_def[b_idx];
+        for &iid in &block.insts {
+            let Some(node) = module.inst(iid) else {
+                continue;
+            };
+            if let Op::Phi { entries } = &node.op {
                 if let Some(result) = node.result {
-                    defs.insert(result);
+                    bit_set(defs, val_to_bit[&result]);
+                }
+                for &(edge, val) in entries {
+                    if let Some(&pred_idx) = bb_to_idx.get(&edge.from)
+                        && succ_indices[pred_idx].contains(&b_idx)
+                    {
+                        phi_out_bits[pred_idx].push(val_to_bit[&val]);
+                    }
                 }
                 continue;
             }
-            // Uses that aren't already defined in this block.
-            for val in node.op.operands() {
-                if !defs.contains(&val) {
-                    uses.insert(val);
+            node.op.for_each_operand(|val| {
+                let bit = val_to_bit[&val];
+                if !bit_test(defs, bit) {
+                    bit_set(uses, bit);
                 }
-            }
+            });
             if let Some(result) = node.result {
-                defs.insert(result);
-            }
-        }
-
-        block_use.insert(bb, uses);
-        block_def.insert(bb, defs);
-    }
-
-    // Frame-initial constants are defined at the entry block's start.
-    if let Some(entry) = entry {
-        for &c in const_values {
-            block_def.entry(entry).or_default().insert(c);
-        }
-    }
-
-    // Add phi operands as uses in predecessor blocks.
-    for &bb in rpo {
-        for &(pred, val, _) in &phi_entries(module, bb) {
-            let pred_def = block_def.get(&pred).cloned().unwrap_or_default();
-            if !pred_def.contains(&val) {
-                block_use.entry(pred).or_default().insert(val);
+                bit_set(defs, val_to_bit[&result]);
             }
         }
     }
 
-    // Iterative dataflow: live_in[B] = use[B] ∪ (live_out[B] \ def[B])
-    //                      live_out[B] = ∪ live_in[S] for S ∈ succs(B)
-    let mut live_in: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
-    let mut live_out: HashMap<BlockId, HashSet<ValueId>> = HashMap::new();
-
-    for &bb in rpo {
-        live_in.insert(bb, HashSet::new());
-        live_out.insert(bb, HashSet::new());
+    // Frame-initial constants are defined at the entry block (`rpo[0]`) start.
+    for &c in const_values {
+        bit_set(&mut block_def[0], val_to_bit[&c]);
     }
+    for pred_idx in 0..num_blocks {
+        for &bit in &phi_out_bits[pred_idx] {
+            if !bit_test(&block_def[pred_idx], bit) {
+                bit_set(&mut block_use[pred_idx], bit);
+            }
+        }
+    }
+
+    // Iterative bitset dataflow in reverse RPO order.
+    let mut live_in_bits: Vec<Vec<u64>> = vec![vec![0u64; words]; num_blocks];
+    let mut live_out_bits: Vec<Vec<u64>> = vec![vec![0u64; words]; num_blocks];
+    let mut scratch_out = vec![0u64; words];
+    let mut scratch_in = vec![0u64; words];
 
     let mut changed = true;
     while changed {
         changed = false;
-        // Process in reverse RPO for faster convergence.
-        for &bb in rpo.iter().rev() {
-            let empty: Vec<BlockId> = Vec::new();
-            let bb_succs = succs.get(&bb).unwrap_or(&empty);
-            // live_out = union of live_in of successors
-            let mut new_out = HashSet::new();
-            for &succ in bb_succs {
-                if let Some(succ_in) = live_in.get(&succ) {
-                    new_out.extend(succ_in);
+        for b_idx in (0..num_blocks).rev() {
+            scratch_out.fill(0);
+            for &succ_idx in &succ_indices[b_idx] {
+                for (dst_w, &src_w) in scratch_out.iter_mut().zip(&live_in_bits[succ_idx]) {
+                    *dst_w |= src_w;
                 }
             }
-            // Also add phi operands from successors that come from this block.
-            for &succ in bb_succs {
-                for &(pred, val, _) in &phi_entries(module, succ) {
-                    if pred == bb {
-                        new_out.insert(val);
-                    }
-                }
+            for &bit in &phi_out_bits[b_idx] {
+                bit_set(&mut scratch_out, bit);
             }
-
-            // live_in = use ∪ (live_out \ def)
-            let uses = block_use.get(&bb).cloned().unwrap_or_default();
-            let defs = block_def.get(&bb).cloned().unwrap_or_default();
-            let mut new_in: HashSet<ValueId> = uses;
-            for &v in &new_out {
-                if !defs.contains(&v) {
-                    new_in.insert(v);
-                }
+            for w in 0..words {
+                scratch_in[w] = block_use[b_idx][w] | (scratch_out[w] & !block_def[b_idx][w]);
             }
-
-            if live_in.get(&bb) != Some(&new_in) || live_out.get(&bb) != Some(&new_out) {
+            if scratch_in != live_in_bits[b_idx] || scratch_out != live_out_bits[b_idx] {
+                live_in_bits[b_idx].copy_from_slice(&scratch_in);
+                live_out_bits[b_idx].copy_from_slice(&scratch_out);
                 changed = true;
-                live_in.insert(bb, new_in);
-                live_out.insert(bb, new_out);
             }
         }
     }
 
-    (live_in, live_out)
-}
-
-// ─── Step 2: Interference graph ──────────────────────────────────────────────
-
-type InterferenceGraph = HashMap<ValueId, HashSet<ValueId>>;
-
-/// Build interference graph by scanning each block backward from live_out.
-/// After the entry block's backward walk, the frame-initial constants are
-/// defined: each interferes with everything live across the entry block.
-fn build_interference(
-    module: &Module,
-    rpo: &[BlockId],
-    live_out: &HashMap<BlockId, HashSet<ValueId>>,
-    const_values: &[ValueId],
-) -> InterferenceGraph {
+    // Build interference graph directly over `live_out_bits`.
     let mut graph: InterferenceGraph = HashMap::new();
-    let entry = rpo.first().copied();
-
-    for &bb in rpo {
+    let mut live = vec![0u64; words];
+    for (b_idx, &bb) in rpo.iter().enumerate() {
         let Some(block) = module.block(bb) else {
             continue;
         };
-        let mut live: HashSet<ValueId> = live_out.get(&bb).cloned().unwrap_or_default();
-
-        // Walk instructions backward.
-        for &inst_id in block.insts.iter().rev() {
-            let Some(node) = module.inst(inst_id) else {
+        live.copy_from_slice(&live_out_bits[b_idx]);
+        for &iid in block.insts.iter().rev() {
+            let Some(node) = module.inst(iid) else {
                 continue;
             };
-
             if let Some(result) = node.result {
-                // result interferes with everything currently live (except itself).
-                for &v in &live {
-                    if v != result {
-                        graph.entry(result).or_default().insert(v);
-                        graph.entry(v).or_default().insert(result);
-                    }
-                }
-                // result is no longer live above its definition.
-                live.remove(&result);
+                let res_bit = val_to_bit[&result];
+                add_live_interferences(&mut graph, result, res_bit, &live, &bit_to_val);
+                bit_clear(&mut live, res_bit);
             }
-
             if node.op.is_phi() {
-                continue; // phi operands are uses in the preds, not here
+                continue;
             }
-            // Operands become live.
-            for val in node.op.operands() {
-                live.insert(val);
-            }
+            node.op.for_each_operand(|val| {
+                bit_set(&mut live, val_to_bit[&val]);
+            });
         }
-
-        // Entry block: define the frame-initial constants at its start.
-        // Ascending id order is creation order — the pairwise edges are
-        // symmetric, so the resulting graph is order-independent.
-        if Some(bb) == entry {
+        if b_idx == 0 {
             for &c in const_values {
-                for &v in &live {
-                    if v != c {
-                        graph.entry(c).or_default().insert(v);
-                        graph.entry(v).or_default().insert(c);
-                    }
-                }
-                live.remove(&c);
+                let c_bit = val_to_bit[&c];
+                add_live_interferences(&mut graph, c, c_bit, &live, &bit_to_val);
+                bit_clear(&mut live, c_bit);
             }
         }
     }
 
-    graph
+    let live_in_map: HashMap<BlockId, HashSet<ValueId>> = rpo
+        .iter()
+        .enumerate()
+        .map(|(b_idx, &bb)| (bb, bitset_to_values(&live_in_bits[b_idx], &bit_to_val)))
+        .collect();
+
+    (live_in_map, graph)
 }
 
-// ─── Step 3: MCS + Greedy coloring ──────────────────────────────────────────
+// ─── Step 3: MCS + Chordal Greedy Coloring (`R3-X6`) ────────────────────────
 
-/// MCS ordering followed by reverse greedy coloring.
-/// Returns (allocation, num_regs).
-///
-/// Parameters are pre-assigned to their vreg homes: `params[i]` gets
-/// `Reg(i)`, the bottom of the frame. isel's copy-in prologue moves the
-/// ABI top slots into these homes. `param_count` still seeds `next_reg`
-/// so a hand-built function that declares more args than it created
-/// values for keeps the bottom slots reserved, preserving the historical
-/// frame size.
-///
-/// Every value is colored to a register: the accumulator is not a
-/// coloring class (B4, acc-as-cache) — an acc-"colored" value used after
-/// an intervening acc write reads garbage, and only emission-time
-/// tracking (isel) can know the physical acc content.
-///
-/// `reserved_start .. reserved_start + reserved_len` is the reserved
-/// low-slot range (low scratch block + range-call argument window, starting
-/// right after the parameter homes): the smallest-slot scan never hands
-/// those slots to a value, so isel can use them as dead scratch at any
-/// emission point.
 fn mcs_color(
     all_values: &[ValueId],
     interference: &InterferenceGraph,
+    param_base: u16,
     param_count: u16,
     params: &[ValueId],
     reserved_start: u16,
@@ -834,9 +955,8 @@ fn mcs_color(
     let val_set: HashSet<ValueId> = all_values.iter().copied().collect();
 
     // Deterministic MCS tie-breaking (`N20`): `BinaryHeap` pops `(weight, rank)`
-    // max-first, where `rank` is the dense creation-order rank among the
-    // non-suppressed values (so suppressed fusion intermediates interleaved
-    // in the raw `ValueId` space cannot perturb tie-breaks).
+    // max-first, where `rank` is the dense creation-order rank among non-suppressed
+    // values.
     let mut sorted = all_values.to_vec();
     sorted.sort_unstable();
     let rank_of: HashMap<ValueId, u32> = sorted
@@ -845,18 +965,49 @@ fn mcs_color(
         .map(|(i, &v)| (v, i as u32))
         .collect();
 
-    // MCS: repeatedly pick the unvisited vertex with the most visited
-    // neighbors. A heap avoids rescanning the complete value set for every
-    // vertex on high-register-pressure methods.
-    let mut weight: HashMap<ValueId, u32> = HashMap::new();
-    let mut visited = HashSet::new();
-    let mut mcs_order: Vec<ValueId> = Vec::with_capacity(n);
-    let mut heap: BinaryHeap<(u32, u32)> = BinaryHeap::new();
-    for &value in all_values {
-        heap.push((0, rank_of[&value]));
+    let mut allocation: HashMap<ValueId, RegSlot> = HashMap::with_capacity(n);
+    let mut next_reg = if param_count == 0 {
+        0
+    } else {
+        param_base + param_count
+    };
+
+    // Pre-assign parameters to their homes (`param_base .. param_base + param_count`).
+    for (i, &val) in params.iter().enumerate() {
+        let r = param_base + i as u16;
+        if r >= TEMP_REG_BASE {
+            return Err(RegAllocError::RegisterOverflow);
+        }
+        allocation.insert(val, RegSlot::Reg(r));
     }
 
-    for _ in 0..n {
+    // Seed MCS with pre-colored parameters already visited so their uncolored
+    // neighbors immediately accrue weight from pre-assigned parameter cliques.
+    let mut weight: HashMap<ValueId, u32> = HashMap::with_capacity(n);
+    let mut visited: HashSet<ValueId> = HashSet::with_capacity(n);
+    let mut mcs_order: Vec<ValueId> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<(u32, u32)> = BinaryHeap::with_capacity(n * 2);
+
+    for &p in params {
+        if val_set.contains(&p) && visited.insert(p) {
+            mcs_order.push(p);
+            if let Some(neighbors) = interference.get(&p) {
+                for &nb in neighbors {
+                    if !visited.contains(&nb) && val_set.contains(&nb) {
+                        *weight.entry(nb).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    for &value in all_values {
+        if !visited.contains(&value) {
+            let w = weight.get(&value).copied().unwrap_or(0);
+            heap.push((w, rank_of[&value]));
+        }
+    }
+
+    while mcs_order.len() < n {
         let v = loop {
             let Some((w, rank)) = heap.pop() else {
                 return Err(RegAllocError::RegisterOverflow);
@@ -871,7 +1022,6 @@ fn mcs_color(
         visited.insert(v);
         mcs_order.push(v);
 
-        // Increment weight of unvisited neighbors.
         if let Some(neighbors) = interference.get(&v) {
             for &nb in neighbors {
                 if !visited.contains(&nb) && val_set.contains(&nb) {
@@ -883,22 +1033,15 @@ fn mcs_color(
         }
     }
 
-    // Greedy coloring in reverse MCS order.
-    let mut allocation: HashMap<ValueId, RegSlot> = HashMap::new();
-    let mut next_reg = param_count;
-
-    // Pre-assign params to their vreg homes at the bottom of the frame.
-    for (i, &val) in params.iter().enumerate() {
-        allocation.insert(val, RegSlot::Reg(i as u16));
-    }
-
-    for &v in mcs_order.iter().rev() {
+    // R3-X6: Greedy coloring in forward MCS simplicial-clique build order
+    // (`&mcs_order`, NOT `.rev()`), which is reverse Perfect Elimination Order
+    // and achieves optimal chordal coloring.
+    let mut used_colors: HashSet<u16> = HashSet::new();
+    for &v in &mcs_order {
         if allocation.contains_key(&v) {
             continue;
         }
-
-        // Collect colors used by neighbors.
-        let mut used_colors: HashSet<u16> = HashSet::new();
+        used_colors.clear();
         if let Some(neighbors) = interference.get(&v) {
             for nb in neighbors {
                 if let Some(&RegSlot::Reg(color)) = allocation.get(nb) {
@@ -907,8 +1050,6 @@ fn mcs_color(
             }
         }
 
-        // Find smallest available register, skipping the reserved
-        // scratch/window range: those slots must stay dead for isel.
         let mut reg = 0u16;
         loop {
             if reg >= reserved_start && reg < reserved_start + reserved_len {
@@ -960,19 +1101,13 @@ fn boissinot_destruction(
     rpo: &[BlockId],
     allocation: &HashMap<ValueId, RegSlot>,
     handler_blocks: &HashSet<BlockId>,
+    exception_edges: &HashSet<(BlockId, BlockId)>,
     used: &HashSet<ValueId>,
 ) -> HashMap<(BlockId, BlockId), Vec<(ValueId, ValueId)>> {
     let mut copies: HashMap<(BlockId, BlockId), Vec<(ValueId, ValueId)>> = HashMap::new();
 
     for &bb in rpo {
-        // N21: phis in catch-handler blocks lower to def-site write-through
-        // stores (`collect_handler_phi_stores`), never edge copies — no
-        // code may run on an exception edge, and the store covers the
-        // normal-path arrival too when a handler block is also reachable by
-        // a terminator edge.
-        if handler_blocks.contains(&bb) {
-            continue;
-        }
+        let is_handler = handler_blocks.contains(&bb);
         for_each_phi(module, bb, |inst_node| {
             let dst = match inst_node.result {
                 Some(v) => v,
@@ -985,8 +1120,17 @@ fn boissinot_destruction(
 
             if let Op::Phi { entries } = &inst_node.op {
                 for (edge, src) in entries {
+                    // R3-M2: Exceptional edges (and any predecessor that also
+                    // dispatches exceptionally to `bb`) lower via `handler_phi_stores`;
+                    // pure normal edges into `bb` (e.g. loop back-edges inside a
+                    // catch body) lower via standard edge copies.
+                    if is_handler
+                        && (edge.kind == EdgeKind::Exceptional
+                            || exception_edges.contains(&(edge.from, bb)))
+                    {
+                        continue;
+                    }
                     let src_color = allocation.get(src);
-                    // Only insert copy if colors differ.
                     if src_color != dst_color {
                         copies.entry((edge.from, bb)).or_default().push((*src, dst));
                     }
@@ -1000,31 +1144,10 @@ fn boissinot_destruction(
 
 // ─── N21: handler-phi slot pinning (pinned stores) ──────────────────────────
 
-/// Collect the pinned stores for handler-block phis as `(pred, src,
-/// result)` triples sorted by index, and check slot consistency.
-///
-/// A phi in a catch handler means "the handler sees the variable as of the
-/// dynamic exception point". The VM dispatches directly to the handler's
-/// flat offset, so no copy code may run on the exception edge; instead the
-/// phi result's slot S tracks the variable imperatively (the vendored vreg
-/// home): isel emits `S ← slot(src)` at the pred's block start — or
-/// immediately after the defining instruction when `src` is defined inside
-/// the pred. `allocate` added interference edges `result × (live_in[pred]
-/// ∪ defs[pred])` so that no value colored S is live across or defined
-/// after the store point; the store is therefore invisible to the normal
-/// path as well.
-///
-/// Hard checks (never silent):
-///
-/// - the result must be colored (it always has a register home — there is
-///   no accumulator coloring since B4);
-/// - every differently-keyed incoming source must be colored;
-/// - a same-slot result/incoming pair must not interfere — coloring never
-///   assigns one slot to an interfering pair, so this can only fire on
-///   hand-crafted allocations.
 fn collect_handler_phi_stores(
     module: &Module,
     handler_blocks: &HashSet<BlockId>,
+    exception_edges: &HashSet<(BlockId, BlockId)>,
     allocation: &HashMap<ValueId, RegSlot>,
     interference: &InterferenceGraph,
     used: &HashSet<ValueId>,
@@ -1048,6 +1171,11 @@ fn collect_handler_phi_stores(
                 .copied()
                 .ok_or(RegAllocError::HandlerPhiUncoalesced)?;
             for (edge, src) in entries {
+                if edge.kind != EdgeKind::Exceptional
+                    && !exception_edges.contains(&(edge.from, handler))
+                {
+                    continue; // pure normal edge into handler lowers via phi_copies (R3-M2)
+                }
                 if *src == result {
                     continue; // self-reference (loop phi)
                 }

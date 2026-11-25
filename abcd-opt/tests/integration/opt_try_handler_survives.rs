@@ -119,7 +119,7 @@ fn optimize_preserves_catch_handler_and_try_region() {
         1,
         "catch entry pruned with its handler (N11): {region:?}"
     );
-    assert_eq!(region.catches[0].type_idx, None);
+    assert_eq!(region.catches[0].type_class, None);
     assert_eq!(
         region.catches[0].handler, handler,
         "try region must still reference the handler block: {region:?}"
@@ -396,7 +396,7 @@ fn lifted_try_function_optimized_lowers_with_handler() {
         "try range must exclude the handler range (try: {tb:?}, handler pc: {handler_pc})"
     );
     assert_eq!(tb.catches.len(), 1, "{:?}", tb.catches);
-    assert_eq!(tb.catches[0].type_idx, u32::MAX);
+    assert_eq!(tb.catches[0].type_class, None);
     assert_eq!(
         tb.catches[0].handler as usize, handler_pc,
         "catch entry must resolve to the handler's flat offset"

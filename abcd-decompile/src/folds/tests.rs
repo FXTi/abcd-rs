@@ -9086,7 +9086,10 @@ fn ys_small_matcher_tables() {
         ys_undefined_test(&isfalse(cmp(CmpOp::Eq, undef(), tm("t", 5)))),
         Some((ValueId::new(5), true))
     );
-    assert!(ys_undefined_test(&cmp(CmpOp::Eq, tm("t", 5), undef())).is_none());
+    assert_eq!(
+        ys_undefined_test(&cmp(CmpOp::Eq, tm("t", 5), undef())),
+        Some((ValueId::new(5), false))
+    );
     assert!(ys_undefined_test(&isfalse(cmp(CmpOp::StrictEq, tm("t", 5), undef()))).is_none());
     assert!(ys_undefined_test(&isfalse(cmp(CmpOp::Eq, tm("t", 5), ident("u")))).is_none());
     // ys_driver / ys_prop / ys_declare_of.
@@ -11323,4 +11326,302 @@ fn last_residual_pins() {
         vec![SNode::Break { label: None }],
     );
     assert!(match_switch_chain(&bad).is_none());
+}
+
+#[test]
+fn round3_yield_star_polarity_in_loop_exit_and_async_gen_resolve() {
+    let jnez = |e: Expr| Expr::Unary {
+        op: UnOp::JumpNez,
+        operand: bx(e),
+    };
+    // 1. dissolve_rethrow_trys: SetGeneratorState + rethrow dissolves; SetGeneratorState alone stays.
+    let mut nodes = vec![
+        try_node(
+            vec![run(vec![expr_stmt(ident("body"))])],
+            vec![catch(
+                "e",
+                vec![run(vec![
+                    elided("SetGeneratorState"),
+                    Leaf::Raw(Stmt::Throw(tm("e", 1))),
+                ])],
+            )],
+        ),
+        try_node(
+            vec![run(vec![expr_stmt(ident("keep"))])],
+            vec![catch("e", vec![run(vec![elided("SetGeneratorState")])])],
+        ),
+    ];
+    dissolve_rethrow_trys(&mut nodes);
+    assert!(matches!(&nodes[0], SNode::Honest(_)), "{nodes:?}");
+    assert!(matches!(&nodes[2], SNode::Try { .. }), "{nodes:?}");
+
+    // 2. Sync R3-M1/R3-X1 shape: positive mode/undefined/throw polarities + 4-node in-loop exit.
+    let pos_ret = |async_: bool| {
+        let mut out = vec![run(vec![
+            decl("vt", 120, boolean(true)),
+            decl("vret", 121, prop(tm("vit", 102), "return")),
+        ])];
+        if !async_ {
+            out.push(run(vec![
+                elided("SetGeneratorState"),
+                Leaf::Raw(Stmt::Return(Some(tm("vrv", 101)))),
+                exc_assign("vex", tm("vg", 103)),
+            ]));
+        }
+        out.push(if_node(
+            jnez(cmp(CmpOp::Eq, tm("vret", 121), undef())),
+            vec![SNode::Break { label: None }],
+            vec![run(vec![
+                phi_assign("vexit", tm("vt", 120)),
+                phi_assign("vm1", tm("vnext", 201)),
+            ])],
+        ));
+        out
+    };
+    let pos_throw = || {
+        vec![
+            run(vec![
+                decl("vthrow", 130, prop(tm("vit", 102), "throw")),
+                decl("veq", 131, cmp(CmpOp::Eq, tm("vthrow", 130), undef())),
+            ]),
+            if_node(
+                jnez(tm("veq", 131)),
+                vec![SNode::Break { label: None }],
+                vec![run(vec![phi_assign("vexit", tm("vexit0", 105))])],
+            ),
+            if_node(
+                istrue(tm("vflag", 104)),
+                vec![run(vec![elided("ThrowNotExists")])],
+                vec![run(vec![])],
+            ),
+        ]
+    };
+    let pos_dispatch = |async_: bool| {
+        if_node(
+            jnez(cmp(CmpOp::StrictEq, tm("vrt", 100), num(2.0))),
+            vec![run(vec![phi_assign("vm0", tm("vnext", 201))])],
+            vec![if_node(
+                cmp(CmpOp::StrictEq, tm("vrt", 100), num(1.0)),
+                pos_throw(),
+                pos_ret(async_),
+            )],
+        )
+    };
+    let drv = |resume: bool| Expr::GeneratorDriver {
+        resume,
+        genobj: bx(tm("vg", 103)),
+    };
+    let exit_if = |res_name: &str, res_id: u32| {
+        if_node(
+            isfalse(tm("vexit", 110)),
+            vec![run(vec![
+                decl("vval", 150, prop(tm(res_name, res_id), "value")),
+                expr_stmt(tm("vval", 150)),
+            ])],
+            vec![run(vec![
+                decl("vv2", 151, prop(tm(res_name, res_id), "value")),
+                elided("SetGeneratorState"),
+                Leaf::Raw(Stmt::Return(Some(tm("vv2", 151)))),
+            ])],
+        )
+    };
+    let sync_w = SNode::While {
+        label: None,
+        cond: None,
+        body: vec![
+            ys_header(),
+            pos_dispatch(false),
+            ys_sync_tail().into_iter().next().unwrap(),
+            if_node(
+                istrue(tm("vdone", 113)),
+                vec![exit_if("vres", 112), SNode::Break { label: None }],
+                vec![
+                    run(vec![
+                        expr_stmt(Expr::Yield {
+                            value: bx(tm("vres", 112)),
+                        }),
+                        elided("SetGeneratorState"),
+                        decl("vresume", 140, drv(true)),
+                        phi_assign("vrt", drv(false)),
+                        phi_assign("vrv", tm("vresume", 140)),
+                        exc_assign("vex", tm("vg", 103)),
+                    ]),
+                    SNode::Continue { label: None },
+                ],
+            ),
+        ],
+    };
+    let [setup, init] = ys_setup_init(false);
+    let mut bare = vec![setup.clone(), init.clone(), sync_w.clone()];
+    let mut stats = FoldStats::default();
+    yield_star_fold(&mut bare, FunctionKind::Generator, &mut stats);
+    assert_eq!((stats.yield_star_sites, stats.yield_star_bound), (1, 1));
+    assert_eq!(bare.len(), 2, "{bare:?}");
+
+    let mut frags = vec![
+        try_node(vec![setup, init], vec![]),
+        try_node(vec![sync_w], vec![]),
+    ];
+    let mut stats = FoldStats::default();
+    yield_star_fold(&mut frags, FunctionKind::Generator, &mut stats);
+    assert_eq!((stats.yield_star_sites, stats.yield_star_bound), (1, 1));
+
+    // 3. Async R3-C2/R3-X1 shape: AsyncGeneratorResolve + SetGeneratorState + positive throw/mode.
+    let [asetup, ainit] = ys_setup_init(true);
+    let mut async_nodes = vec![
+        asetup,
+        ainit,
+        SNode::While {
+            label: None,
+            cond: None,
+            body: vec![
+                ys_header(),
+                pos_dispatch(true),
+                run(vec![
+                    phi_decl("vexit", 110),
+                    phi_decl("vm", 111),
+                    decl(
+                        "vres",
+                        112,
+                        Expr::Call {
+                            callee: bx(tm("vm", 111)),
+                            this: Some(bx(tm("vit", 102))),
+                            args: vec![tm("vrv", 101)],
+                            kind: CallKind::Dynamic,
+                        },
+                    ),
+                    decl(
+                        "aw0",
+                        141,
+                        Expr::Await {
+                            value: bx(tm("vres", 112)),
+                            uncaught: true,
+                        },
+                    ),
+                    elided("SetGeneratorState"),
+                    expr_stmt(Expr::Yield {
+                        value: bx(tm("aw0", 141)),
+                    }),
+                    decl("vres1", 142, drv(true)),
+                    exc_assign("vex", tm("vg", 103)),
+                ]),
+                if_node(
+                    cmp(CmpOp::Eq, drv(false), num(1.0)),
+                    vec![
+                        run(vec![
+                            Leaf::Raw(Stmt::Throw(tm("vres1", 142))),
+                            Leaf::Raw(Stmt::Unreachable),
+                        ]),
+                        SNode::Break { label: None },
+                    ],
+                    vec![
+                        run(vec![
+                            elided("ThrowIfNotObject"),
+                            decl("vdone", 113, prop(tm("vres1", 142), "done")),
+                        ]),
+                        if_node(
+                            istrue(tm("vdone", 113)),
+                            vec![exit_if("vres1", 142), SNode::Break { label: None }],
+                            vec![
+                                run(vec![
+                                    decl("v2", 143, prop(tm("vres1", 142), "value")),
+                                    decl(
+                                        "av2",
+                                        144,
+                                        Expr::Await {
+                                            value: bx(tm("v2", 143)),
+                                            uncaught: true,
+                                        },
+                                    ),
+                                    elided("SetGeneratorState"),
+                                    expr_stmt(Expr::Yield {
+                                        value: bx(tm("av2", 144)),
+                                    }),
+                                    decl("vres2", 145, drv(true)),
+                                ]),
+                                if_node(
+                                    cmp(CmpOp::Eq, drv(false), num(1.0)),
+                                    vec![
+                                        run(vec![
+                                            Leaf::Raw(Stmt::Throw(tm("vres2", 145))),
+                                            Leaf::Raw(Stmt::Unreachable),
+                                        ]),
+                                        SNode::Break { label: None },
+                                    ],
+                                    vec![
+                                        run(vec![
+                                            decl("vf", 160, boolean(false)),
+                                            decl(
+                                                "agr",
+                                                161,
+                                                Expr::AsyncGeneratorResolve {
+                                                    genobj: bx(tm("vg", 103)),
+                                                    value: bx(tm("vres2", 145)),
+                                                    done: bx(tm("vf", 160)),
+                                                },
+                                            ),
+                                            elided("SetGeneratorState"),
+                                            expr_stmt(Expr::Yield {
+                                                value: bx(tm("agr", 161)),
+                                            }),
+                                            decl("r3", 146, drv(true)),
+                                            decl("m3", 147, drv(false)),
+                                            exc_assign("vex", tm("vg", 103)),
+                                        ]),
+                                        if_node(
+                                            cmp(CmpOp::NotEq, tm("m3", 147), num(0.0)),
+                                            vec![
+                                                run(vec![
+                                                    phi_assign("vrt", tm("m3", 147)),
+                                                    phi_assign("vrv", tm("r3", 146)),
+                                                ]),
+                                                SNode::Continue { label: None },
+                                            ],
+                                            vec![],
+                                        ),
+                                        run(vec![
+                                            decl(
+                                                "aw3",
+                                                148,
+                                                Expr::Await {
+                                                    value: bx(tm("r3", 146)),
+                                                    uncaught: true,
+                                                },
+                                            ),
+                                            elided("SetGeneratorState"),
+                                            expr_stmt(Expr::Yield {
+                                                value: bx(tm("aw3", 148)),
+                                            }),
+                                            decl("r4", 152, drv(true)),
+                                            decl("m4", 153, drv(false)),
+                                        ]),
+                                        if_node(
+                                            cmp(CmpOp::Eq, tm("m4", 153), num(1.0)),
+                                            vec![
+                                                run(vec![
+                                                    phi_assign("vrt", tm("m4", 153)),
+                                                    phi_assign("vrv", tm("r4", 152)),
+                                                ]),
+                                                SNode::Continue { label: None },
+                                            ],
+                                            vec![],
+                                        ),
+                                        run(vec![
+                                            phi_assign("vrt", num(0.0)),
+                                            phi_assign("vrv", tm("r4", 152)),
+                                        ]),
+                                        SNode::Continue { label: None },
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        },
+    ];
+    let mut stats = FoldStats::default();
+    yield_star_fold(&mut async_nodes, FunctionKind::AsyncGenerator, &mut stats);
+    assert_eq!((stats.yield_star_sites, stats.yield_star_bound), (1, 1));
+    assert_eq!(async_nodes.len(), 2, "{async_nodes:?}");
 }

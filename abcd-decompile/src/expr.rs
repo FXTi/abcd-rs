@@ -358,13 +358,25 @@ pub enum Expr {
         /// The generator object.
         genobj: Box<Expr>,
     },
-    /// `AsyncResolve` / `AsyncReject` — async promise plumbing, fitness
-    /// class H (R4). Explicit fallback nodes.
+    /// `AsyncResolve` / `AsyncReject` / `AsyncGeneratorReject` — async
+    /// promise plumbing, fitness class H (R4). Explicit fallback nodes.
     AsyncDriver {
         /// `true` for resolve, `false` for reject.
         resolve: bool,
         /// The resolution value / rejection reason.
         value: Box<Expr>,
+    },
+    /// `AsyncGeneratorResolve` — async-generator yield/return step
+    /// resolution plumbing, fitness class H (R4). Folds to plain `yield`
+    /// or `return` in [`crate::folds::async_generator_machine_fold`];
+    /// survives as an explicit loud fallback otherwise.
+    AsyncGeneratorResolve {
+        /// The async generator object.
+        genobj: Box<Expr>,
+        /// The yielded or returned value.
+        value: Box<Expr>,
+        /// The boolean `done` flag.
+        done: Box<Expr>,
     },
     /// `CopyDataProps` (object spread plumbing): folds into a literal
     /// `{...src}` at d-P3; standalone fallback is `Object.assign`-style

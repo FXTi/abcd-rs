@@ -24,4 +24,5 @@ mod n72_unicode;
 mod n73_segv;
 mod regalloc_pressure;
 mod rewrite_pipeline;
+mod round3_conformance;
 mod test262_vm;

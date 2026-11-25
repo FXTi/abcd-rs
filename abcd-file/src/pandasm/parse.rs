@@ -11,9 +11,9 @@
 //! The emitter prints layout offsets in three places — LITERALS entry keys
 //! (`{index} 0x{offset}`), STRING entries (`[offset:0x{offset}, …]`), and
 //! u32 field values (`= 0x{offset}`) — and the parser PRESERVES them in the
-//! model (`literal_array_offsets` / `literal_array_header_offsets` /
-//! `entity_offsets` / `entity_map`), so `parse_file` → `emit_file` is a
-//! byte-exact round trip. A fresh `encode` re-lays the file out (the
+//! model (`LiteralArray::source_offset` / `literal_array_header_offsets` /
+//! `MethodBody::entities` / `FieldValue::LiteralArrayRef`), so `parse_file` →
+//! `emit_file` is a byte-exact round trip. A fresh `encode` re-lays the file out (the
 //! vendored writer assigns offsets in its own order; the original string
 //! order is not recoverable from the text), so the binary leg is validated
 //! under layout-offset normalization by the corpus gate
@@ -44,9 +44,9 @@ use std::sync::OnceLock;
 use abcd_isa::{BytecodeFlags, EntityKind, Version};
 
 use crate::model::{
-    Annotation, AnnotationElem, AnnotationValue, Annotations, CatchBlock, Class, Field, FieldValue,
-    File, LiteralArray, Method, MethodBody, ModuleData, ModuleRecord, ModuleRequestPhase,
-    ParamAnnotations, TryBlock,
+    Annotation, AnnotationElem, AnnotationValue, Annotations, CatchBlock, Class, EntityRef, Field,
+    FieldValue, File, LiteralArray, Method, MethodBody, MethodIdx, ModuleData, ModuleRecord,
+    ModuleRequestPhase, ParamAnnotations, TryBlock,
 };
 use crate::types::{AccessFlags, FunctionKind, SourceLang, Type};
 use crate::{LiteralArrayIdx, LiteralValue, StringId, StringPool};
@@ -1373,7 +1373,6 @@ impl Parser {
             // signature at most once anyway).
             b.method_by_signature.entry(sig).or_insert(offset);
             b.method_by_name.entry(bare).or_insert(offset);
-            b.entity_map.insert(offset, name_sid);
             b.method_shells.push(MethodShell {
                 owner: owner_sid,
                 name_sid,
@@ -1404,7 +1403,8 @@ impl Parser {
             self.nested_targets = nested;
         }
 
-        // Bodies.
+        // Bodies (temporary method shell offsets and literal source offsets in
+        // `MethodBody::entities` are rewritten to dense indices below).
         let mut methods_by_owner: HashMap<StringId, Vec<Method>> = HashMap::new();
         for (idx, fun) in functions.iter().enumerate() {
             let shell = MethodShell {
@@ -1419,15 +1419,16 @@ impl Parser {
                 .push(method);
         }
 
-        // Literal arrays → model values (needs the method name table).
-        // `regular` is detached; `lit_by_offset` indices refer to it.
+        // Allocate `literal_arrays` slots with `source_offset` first so both
+        // `FieldValue::LiteralArrayRef` and bytecode `EntityRef::LiteralArray`
+        // have final dense `LiteralArrayIdx` handles before `fix_literal_assignment`.
         let regular = std::mem::take(&mut self.regular);
-        let mut literal_arrays: Vec<LiteralArray> = Vec::new();
-        let mut literal_array_offsets: HashMap<u32, u32> = HashMap::new();
-        for (_, offset, items, _) in &regular {
-            let values = self.resolve_literal_items(items, &b)?;
-            literal_array_offsets.insert(*offset, literal_arrays.len() as u32);
-            literal_arrays.push(LiteralArray { values });
+        let mut literal_arrays: Vec<LiteralArray> = Vec::with_capacity(regular.len());
+        let mut offset_to_lit_idx: HashMap<u32, LiteralArrayIdx> = HashMap::new();
+        for (_, offset, _, _) in &regular {
+            let idx = LiteralArrayIdx(literal_arrays.len() as u32);
+            offset_to_lit_idx.insert(*offset, idx);
+            literal_arrays.push(LiteralArray::with_source_offset(*offset, Vec::new()));
         }
 
         // 13/24 scope-names arrays are not printed: synthesize an empty
@@ -1436,14 +1437,40 @@ impl Parser {
             .values()
             .flat_map(|fields| fields.iter())
             .filter_map(|f| match f.initial_value {
-                Some(FieldValue::LiteralArrayRef(off)) => Some(off),
+                Some(FieldValue::LiteralArrayRef {
+                    source_offset: Some(off),
+                    ..
+                }) => Some(off),
                 _ => None,
             })
             .collect();
         for off in scope_targets {
-            if let std::collections::hash_map::Entry::Vacant(e) = literal_array_offsets.entry(off) {
-                e.insert(literal_arrays.len() as u32);
-                literal_arrays.push(LiteralArray { values: Vec::new() });
+            if let std::collections::hash_map::Entry::Vacant(e) = offset_to_lit_idx.entry(off) {
+                let idx = LiteralArrayIdx(literal_arrays.len() as u32);
+                e.insert(idx);
+                literal_arrays.push(LiteralArray::with_source_offset(off, Vec::new()));
+            }
+        }
+        for fields in class_fields.values_mut() {
+            for field in fields {
+                if let Some(FieldValue::LiteralArrayRef {
+                    index,
+                    source_offset: Some(off),
+                }) = &mut field.initial_value
+                {
+                    *index = offset_to_lit_idx[off];
+                }
+            }
+        }
+        for methods in methods_by_owner.values_mut() {
+            for method in methods {
+                if let Some(body) = &mut method.body {
+                    for eref in body.entities.values_mut() {
+                        if let EntityRef::LiteralArray(la_idx) = eref {
+                            *la_idx = offset_to_lit_idx[&la_idx.0];
+                        }
+                    }
+                }
             }
         }
 
@@ -1529,7 +1556,40 @@ impl Parser {
             });
         }
 
-        let mut file = File {
+        // 13.x/24.x: sort per-class methods BEFORE computing final dense
+        // `MethodIdx` positions so `MethodIdx` reflects the final method order.
+        if self.version > LAST_HEADER_LITERAL_VERSION && !self.key_index_to_offset.is_empty() {
+            let mut target: Vec<(u32, u32)> = self.key_index_to_offset.clone();
+            target.sort_by_key(|(index, _)| *index);
+            fix_literal_assignment(&mut classes, &literal_arrays, &target);
+        }
+
+        let offset_to_method_idx: HashMap<u32, MethodIdx> = classes
+            .values()
+            .flat_map(|c| c.methods.iter())
+            .enumerate()
+            .map(|(idx, m)| (m.offset, MethodIdx(idx as u32)))
+            .collect();
+        for class in classes.values_mut() {
+            for method in &mut class.methods {
+                if let Some(body) = &mut method.body {
+                    for eref in body.entities.values_mut() {
+                        if let EntityRef::Method(midx) = eref {
+                            *midx = offset_to_method_idx[&midx.0];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Populate literal array items now that both `offset_to_lit_idx` and
+        // `offset_to_method_idx` are finalized.
+        for (slot, (_, _, items, _)) in regular.iter().enumerate() {
+            literal_arrays[slot].values =
+                self.resolve_literal_items(items, &b, &offset_to_method_idx, &offset_to_lit_idx)?;
+        }
+
+        Ok(File {
             version: self.version,
             checksum: 0,
             size: 0,
@@ -1537,20 +1597,8 @@ impl Parser {
             strings: self.strings,
             classes,
             literal_arrays,
-            literal_array_offsets,
             literal_array_header_offsets,
-            entity_map: b.entity_map,
-        };
-        // 13.x/24.x: the LITERALS index assignment is a pure function of
-        // the (textually invisible) per-class method order and of which
-        // source offset each same-content literal operand referenced.
-        // Recover both (see fix_literal_assignment).
-        if self.version > LAST_HEADER_LITERAL_VERSION && !self.key_index_to_offset.is_empty() {
-            let mut target: Vec<(u32, u32)> = self.key_index_to_offset.clone();
-            target.sort_by_key(|(index, _)| *index);
-            fix_literal_assignment(&mut file, &target);
-        }
-        Ok(file)
+        })
     }
 
     /// Build one field; the value classification mirrors `decode_field_at`
@@ -1566,7 +1614,6 @@ impl Parser {
         let field_type = parse_type(&mut |raw| self.intern(raw), &pf.ty)?;
         let name_sid = self.intern(&pf.name)?;
         let offset = b.next_synthetic_offset();
-        b.entity_map.insert(offset, name_sid);
         let descriptor = self.strings.resolve(desc_sid).unwrap_or("").to_owned();
         let value_text = pf.value.as_deref();
         let initial_value = match value_text {
@@ -1599,7 +1646,10 @@ impl Parser {
                     Some(if off == 0 {
                         FieldValue::I32(0)
                     } else {
-                        FieldValue::LiteralArrayRef(off)
+                        FieldValue::LiteralArrayRef {
+                            index: LiteralArrayIdx(u32::MAX),
+                            source_offset: Some(off),
+                        }
                     })
                 } else if name_str == crate::MODULE_REQUEST_PHASE_FIELD && field_type == Type::U32 {
                     let off = parse_hex_u32(text)?;
@@ -1647,7 +1697,11 @@ impl Parser {
                     || name_str == crate::SCOPE_NAMES_FIELD)
                     && field_type == Type::U32
                 {
-                    Some(FieldValue::LiteralArrayRef(parse_hex_u32(text)?))
+                    let off = parse_hex_u32(text)?;
+                    Some(FieldValue::LiteralArrayRef {
+                        index: LiteralArrayIdx(u32::MAX),
+                        source_offset: Some(off),
+                    })
                 } else {
                     match field_type {
                         Type::U32 | Type::U8 | Type::Bool => {
@@ -1752,12 +1806,14 @@ impl Parser {
         })
     }
 
-    /// Resolve parsed literal items to model values (method names →
-    /// synthetic method offsets, `lit_offset` → table indices).
+    /// Resolve parsed literal items to model values (method names → dense
+    /// [`MethodIdx`] handles, `lit_offset` → [`LiteralArrayIdx`] handles).
     fn resolve_literal_items(
         &mut self,
         items: &[PaItem],
         b: &BuildCtx,
+        offset_to_method_idx: &HashMap<u32, MethodIdx>,
+        offset_to_lit_idx: &HashMap<u32, LiteralArrayIdx>,
     ) -> Result<Vec<LiteralValue>, ParseError> {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -1769,30 +1825,33 @@ impl Parser {
                 PaItem::Double(v) => LiteralValue::Double(*v),
                 PaItem::Str(s) => LiteralValue::String(self.intern(s)?),
                 PaItem::EtsImplements(s) => LiteralValue::EtsImplements(self.intern(s)?),
-                PaItem::Method(name) => LiteralValue::Method(self.method_ref(name, b)?),
+                PaItem::Method(name) => {
+                    LiteralValue::Method(self.method_ref(name, b, offset_to_method_idx)?)
+                }
                 PaItem::GeneratorMethod(name) => {
-                    LiteralValue::GeneratorMethod(self.method_ref(name, b)?)
+                    LiteralValue::GeneratorMethod(self.method_ref(name, b, offset_to_method_idx)?)
                 }
-                PaItem::Getter(name) => LiteralValue::Getter(self.method_ref(name, b)?),
-                PaItem::Setter(name) => LiteralValue::Setter(self.method_ref(name, b)?),
-                PaItem::AsyncGeneratorMethod(name) => {
-                    LiteralValue::AsyncGeneratorMethod(self.method_ref(name, b)?)
+                PaItem::Getter(name) => {
+                    LiteralValue::Getter(self.method_ref(name, b, offset_to_method_idx)?)
                 }
+                PaItem::Setter(name) => {
+                    LiteralValue::Setter(self.method_ref(name, b, offset_to_method_idx)?)
+                }
+                PaItem::AsyncGeneratorMethod(name) => LiteralValue::AsyncGeneratorMethod(
+                    self.method_ref(name, b, offset_to_method_idx)?,
+                ),
                 PaItem::Accessor(v) => LiteralValue::Accessor(*v),
                 PaItem::MethodAffiliate(v) => LiteralValue::MethodAffiliate(*v),
                 PaItem::NullValue(v) => LiteralValue::NullValue(*v),
                 PaItem::LitOffset(off) => {
-                    // Decode rewrites the payload to a table index when the
-                    // target decoded; mirror that here.
-                    let idx = self
-                        .lit_by_offset
+                    let idx = offset_to_lit_idx
                         .get(off)
                         .copied()
                         .ok_or_else(|| ParseError {
                             line: 0,
                             message: format!("lit_offset 0x{off:x} names no literal array"),
                         })?;
-                    LiteralValue::LiteralArray(LiteralArrayIdx(idx as u32))
+                    LiteralValue::LiteralArray(idx)
                 }
                 PaItem::LitBufferIndex(v) => LiteralValue::LiteralBufferIndex(LiteralArrayIdx(*v)),
                 PaItem::BuiltinType(v) => LiteralValue::BuiltinTypeIndex(*v),
@@ -1802,9 +1861,15 @@ impl Parser {
         Ok(out)
     }
 
-    /// Method name (bare bytes) → the method's synthetic entity offset.
-    fn method_ref(&mut self, name: &[u8], b: &BuildCtx) -> Result<u32, ParseError> {
-        b.method_by_name
+    /// Method name (bare bytes) → the method's dense [`MethodIdx`].
+    fn method_ref(
+        &mut self,
+        name: &[u8],
+        b: &BuildCtx,
+        offset_to_method_idx: &HashMap<u32, MethodIdx>,
+    ) -> Result<MethodIdx, ParseError> {
+        let off = b
+            .method_by_name
             .get(name)
             .copied()
             .ok_or_else(|| ParseError {
@@ -1813,7 +1878,8 @@ impl Parser {
                     "literal method reference `{}` names no defined function",
                     String::from_utf8_lossy(name)
                 ),
-            })
+            })?;
+        Ok(offset_to_method_idx[&off])
     }
 
     /// Build one method (body finalization: registers, labels, entities,
@@ -1919,7 +1985,7 @@ impl Parser {
             fun,
             num_vregs,
             insn_count,
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             next_raw: HashMap::new(),
         };
         let mut bytecodes = Vec::with_capacity(fun.insns.len());
@@ -1967,13 +2033,13 @@ impl Parser {
             bytecodes.push(bc);
         }
 
-        let try_blocks = self.build_try_blocks(fun, insn_count, b)?;
+        let try_blocks = self.build_try_blocks(fun, insn_count)?;
 
         Ok(MethodBody {
             num_vregs,
             num_args: fun.params.len().saturating_sub(usize::from(!fun.is_static)) as u32,
             bytecodes,
-            entity_offsets: state.entity_offsets,
+            entities: state.entities,
             try_blocks,
             ic_size: None,
         })
@@ -2030,23 +2096,22 @@ impl Parser {
             (OpKind::Label, PaOp::Imm(v)) => Ok(RawOperand::L(*v as u32)),
             (OpKind::Str, PaOp::Str(content)) => {
                 let sid = self.intern(content)?;
-                // The offset the STRING section printed for this content
-                // (first listed), so re-emission reproduces the section.
-                let offset = match self.string_offsets.get(content) {
-                    Some(offsets) => offsets[0],
-                    None => {
-                        let off = b.next_synthetic_offset();
-                        b.entity_map.insert(off, sid);
-                        off
-                    }
-                };
-                b.entity_map.insert(offset, sid);
+                // Preserve the STRING section's first listed offset when
+                // present so re-emission reproduces the section verbatim.
+                let source_offset = self
+                    .string_offsets
+                    .get(content)
+                    .and_then(|offsets| offsets.first().copied());
                 let raw = state.next_raw.entry(EntityKind::StringId).or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                state
-                    .entity_offsets
-                    .insert((EntityKind::StringId, id), offset);
+                state.entities.insert(
+                    (EntityKind::StringId, id),
+                    EntityRef::String {
+                        id: sid,
+                        source_offset,
+                    },
+                );
                 Ok(RawOperand::E(id))
             }
             (OpKind::Method, PaOp::MethodSig(sig)) => {
@@ -2064,27 +2129,22 @@ impl Parser {
                 let raw = state.next_raw.entry(EntityKind::MethodId).or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                state
-                    .entity_offsets
-                    .insert((EntityKind::MethodId, id), offset);
+                // Temporarily store the synthetic method offset; rewritten to
+                // the post-sort dense `MethodIdx` in `build()`.
+                state.entities.insert(
+                    (EntityKind::MethodId, id),
+                    EntityRef::Method(MethodIdx(offset)),
+                );
                 Ok(RawOperand::E(id))
             }
             (OpKind::LiteralArr, PaOp::Literal(text)) => {
                 let offset = match self.lit_by_text.get_mut(text) {
                     Some((offsets, cursor)) => {
-                        // The list was rank-ordered at build time (target
-                        // index order, nested-pinned offsets last): the
-                        // walk's first-appearance order then matches the
-                        // printed index order. Extra references cycle.
                         let off = offsets[*cursor % offsets.len()];
                         *cursor += 1;
                         off
                     }
                     None => {
-                        // An inline literal the LITERALS section does not
-                        // list: parse it and give it a synthetic offset so
-                        // the model stays encodable (the re-emitted
-                        // LITERALS section then diverges — loudly).
                         let items = if text.is_empty() {
                             Vec::new()
                         } else {
@@ -2115,9 +2175,12 @@ impl Parser {
                     .or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                state
-                    .entity_offsets
-                    .insert((EntityKind::LiteralarrayId, id), offset);
+                // Temporarily store the literal source offset; rewritten to
+                // `offset_to_lit_idx[&offset]` in `build()`.
+                state.entities.insert(
+                    (EntityKind::LiteralarrayId, id),
+                    EntityRef::LiteralArray(LiteralArrayIdx(offset)),
+                );
                 Ok(RawOperand::E(id))
             }
             _ => Err(mismatch()),
@@ -2131,7 +2194,6 @@ impl Parser {
         &mut self,
         fun: &PaFunction,
         insn_count: u32,
-        b: &mut BuildCtx,
     ) -> Result<Vec<TryBlock>, ParseError> {
         let label_idx = |fun: &PaFunction, name: &[u8], line: usize| -> Result<u32, ParseError> {
             match fun.labels.get(name) {
@@ -2160,17 +2222,14 @@ impl Parser {
             if handler_end < handler || handler_end > insn_count {
                 return err(catch.line, "catch handler range out of bounds".to_owned());
             }
-            let type_idx = if catch.record.is_empty() {
-                u32::MAX
+            let type_class = if catch.record.is_empty() {
+                None
             } else {
                 let desc = record_descriptor(&catch.record);
-                let sid = self.intern(&desc)?;
-                let off = b.next_synthetic_offset();
-                b.entity_map.insert(off, sid);
-                off
+                Some(self.intern(&desc)?)
             };
             let cb = CatchBlock {
-                type_idx,
+                type_class,
                 handler,
                 len: handler_end - handler,
             };
@@ -2207,7 +2266,6 @@ struct BuildCtx {
     method_by_signature: HashMap<Vec<u8>, u32>,
     /// Bare method name → synthetic method offset (literal method refs).
     method_by_name: HashMap<Vec<u8>, u32>,
-    entity_map: HashMap<u32, StringId>,
     method_shells: Vec<MethodShell>,
     next_offset: u32,
 }
@@ -2235,7 +2293,7 @@ struct BodyBuildState<'a> {
     fun: &'a PaFunction,
     num_vregs: u32,
     insn_count: u32,
-    entity_offsets: HashMap<(EntityKind, u32), u32>,
+    entities: HashMap<(EntityKind, u32), EntityRef>,
     next_raw: HashMap<EntityKind, u32>,
 }
 
@@ -2730,12 +2788,11 @@ fn parse_language(text: &[u8]) -> Option<SourceLang> {
 // (scripts/pandasm-asm-divergences.json,
 // `text:literal-index-order-underdetermined`).
 
-fn fix_literal_assignment(file: &mut File, target: &[(u32, u32)]) {
-    // No fast path: simulated_literal_assignment was deleted (its emitter
-    // keys are bare `{index} 0x{offset}` while parse_literal_key requires
-    // a trailing value byte, so it always returned [] and the compare
-    // against a non-empty target was never true). The sort below always
-    // runs — same behavior as before.
+fn fix_literal_assignment(
+    classes: &mut BTreeMap<StringId, Class>,
+    literal_arrays: &[LiteralArray],
+    target: &[(u32, u32)],
+) {
     // Method order within a class is invisible in the text (functions print
     // signature-sorted) but drives the 13.x/24.x collection order. Sort
     // each class's methods by the smallest printed index their literal
@@ -2745,16 +2802,20 @@ fn fix_literal_assignment(file: &mut File, target: &[(u32, u32)]) {
         .enumerate()
         .map(|(i, (_, off))| (*off, i as u32))
         .collect();
-    for class in file.classes.values_mut() {
+    for class in classes.values_mut() {
         class
             .methods
-            .sort_by_key(|m| method_min_literal_rank(m, &rank));
+            .sort_by_key(|m| method_min_literal_rank(m, literal_arrays, &rank));
     }
 }
 
 /// The smallest `rank` among the literal arrays a method's instructions
 /// reference (`u32::MAX` when it references none).
-fn method_min_literal_rank(m: &Method, rank: &HashMap<u32, u32>) -> u32 {
+fn method_min_literal_rank(
+    m: &Method,
+    literal_arrays: &[LiteralArray],
+    rank: &HashMap<u32, u32>,
+) -> u32 {
     let Some(body) = &m.body else {
         return u32::MAX;
     };
@@ -2763,7 +2824,10 @@ fn method_min_literal_rank(m: &Method, rank: &HashMap<u32, u32>) -> u32 {
         let (ops, len) = bc.entity_operands_inline();
         for &(kind, id) in &ops[..len] {
             if kind == EntityKind::LiteralarrayId
-                && let Some(&off) = body.entity_offsets.get(&(kind, id.0))
+                && let Some(&EntityRef::LiteralArray(la_idx)) = body.entities.get(&(kind, id.0))
+                && let Some(off) = literal_arrays
+                    .get(la_idx.index())
+                    .and_then(|la| la.source_offset)
                 && let Some(&r) = rank.get(&off)
             {
                 best = best.min(r);
@@ -3465,7 +3529,7 @@ mod tests {
             "field initial value on a type the emitter never prints"
         );
 
-        // `typeSummaryOffset` parses to I32(0) when zero and LiteralArrayRef(off) when non-zero.
+        // `typeSummaryOffset` parses to I32(0) when zero and LiteralArrayRef when non-zero.
         let input = doc(
             b"0 0x40 { 1 [ i32:7, ]}\n",
             b".record R0 {\n\tu32 typeSummaryOffset = 0x0\n}\n.record R1 {\n\tu32 typeSummaryOffset = 0x40\n}\n",
@@ -3478,7 +3542,10 @@ mod tests {
         let r1 = parsed.class_by_str("LR1;").expect("R1");
         assert_eq!(
             r1.fields[0].initial_value,
-            Some(FieldValue::LiteralArrayRef(0x40))
+            Some(FieldValue::LiteralArrayRef {
+                index: LiteralArrayIdx(0),
+                source_offset: Some(0x40),
+            })
         );
     }
 
@@ -3746,9 +3813,13 @@ mod tests {
             [abcd_isa::Operand::Reg(0), abcd_isa::Operand::Reg(2)],
             "mov v0, a1"
         );
-        // The unlisted string got a synthetic offset.
+        // The unlisted string was interned with `source_offset: None`.
         let hello = file.strings.get("hello").unwrap();
-        assert!(file.entity_map.values().any(|&sid| sid == hello));
+        assert!(
+            body.entities
+                .values()
+                .any(|&e| e == EntityRef::string(hello))
+        );
         // Emit side: hex immediates, scientific floats (inf/-nan included),
         // jump label naming, method signature rendering, STRING section.
         let out = super::super::emit_file(&file, "t.abc");
@@ -3811,14 +3882,14 @@ mod tests {
         let tb = &body.try_blocks[0];
         assert_eq!((tb.start, tb.len), (0, 2));
         assert_eq!(tb.catches.len(), 2, "second catch joins the range");
-        assert_ne!(tb.catches[0].type_idx, u32::MAX, "typed catch record");
-        assert_eq!(tb.catches[1].type_idx, u32::MAX, "catchall");
-        // The typed record interned its descriptor.
-        assert!(
-            file.entity_map
-                .values()
-                .any(|&sid| file.strings.resolve(sid) == Some("LR;"))
+        assert_eq!(
+            tb.catches[0]
+                .type_class
+                .and_then(|sid| file.strings.resolve(sid)),
+            Some("LR;"),
+            "typed catch record"
         );
+        assert_eq!(tb.catches[1].type_class, None, "catchall");
         // Emit side: `.catch <record>, …` rendering and the trailing `:`
         // (the try end binds one past the last instruction).
         let out = super::super::emit_file(&file, "t.abc");
@@ -3854,7 +3925,7 @@ mod tests {
             file.literal_array_header_offsets,
             [0x10, 0x20, 0x30, 0x40, 0x50]
         );
-        let idx = |off: u32| file.literal_array_offsets[&off] as usize;
+        let idx = |off: u32| file.literal_array_by_offset(off).unwrap().0.index();
         let values = &file.literal_arrays[idx(0x10)].values;
         assert_eq!(values[0], LiteralValue::Bool(true));
         assert_eq!(values[1], LiteralValue::Integer8(5));
@@ -4033,9 +4104,17 @@ mod tests {
         assert!(matches!(md.records[4], ModuleRecord::StarExport { .. }));
         // The scope-names field references a synthesized empty array.
         let scope = &file.class_by_str("L_ESScopeNamesRecord;").unwrap().fields[0];
-        assert_eq!(scope.initial_value, Some(FieldValue::LiteralArrayRef(0x10)));
-        let idx = file.literal_array_offsets[&0x10] as usize;
-        assert!(file.literal_arrays[idx].values.is_empty());
+        let Some(FieldValue::LiteralArrayRef {
+            index,
+            source_offset: Some(0x10),
+        }) = scope.initial_value
+        else {
+            panic!(
+                "expected LiteralArrayRef at 0x10, got {:?}",
+                scope.initial_value
+            );
+        };
+        assert!(file.literal_arrays[index.index()].values.is_empty());
         // Emit side (13.x/24.x collector): the module blob routes to the
         // module table via the field-driven classification.
         let out = super::super::emit_file(&file, "t.abc");
@@ -4083,7 +4162,16 @@ mod tests {
         assert_eq!(body.bytecodes.len(), 4);
         // The listed text resolves to its printed offset; the other two get
         // synthetic offsets.
-        let offsets: Vec<u32> = body.entity_offsets.values().copied().collect();
+        let offsets: Vec<u32> = body
+            .entities
+            .values()
+            .filter_map(|e| match e {
+                EntityRef::LiteralArray(la_idx) => {
+                    file.literal_arrays[la_idx.index()].source_offset
+                }
+                _ => None,
+            })
+            .collect();
         assert!(
             offsets.contains(&0x10),
             "listed literal offset: {offsets:?}"
@@ -4103,8 +4191,8 @@ mod tests {
             .collect();
         let mut saw_empty = false;
         for off in synth {
-            let idx = file.literal_array_offsets[&off] as usize;
-            if file.literal_arrays[idx].values.is_empty() {
+            let (_, la) = file.literal_array_by_offset(off).unwrap();
+            if la.values.is_empty() {
                 saw_empty = true;
             }
         }
@@ -4304,12 +4392,9 @@ mod tests {
             b"[offset:0x40, name_value:x\ny]",
         );
         let file = parse_file(&input).expect("multi-line literal string parses");
-        let idx = file.literal_array_offsets[&0x10] as usize;
+        let (_, la) = file.literal_array_by_offset(0x10).unwrap();
         let expected = file.strings.get("x\ny").unwrap();
-        assert_eq!(
-            file.literal_arrays[idx].values,
-            [LiteralValue::String(expected)]
-        );
+        assert_eq!(la.values, [LiteralValue::String(expected)]);
     }
 
     #[test]
@@ -4337,7 +4422,14 @@ mod tests {
         let body = global.methods[0].body.as_ref().unwrap();
         // Every printed offset is referenced exactly once, in rank order.
         let got: Vec<u32> = (0..14u32)
-            .map(|id| body.entity_offsets[&(EntityKind::LiteralarrayId, id)])
+            .map(
+                |id| match body.entities[&(EntityKind::LiteralarrayId, id)] {
+                    EntityRef::LiteralArray(la_idx) => {
+                        file.literal_arrays[la_idx.index()].source_offset.unwrap()
+                    }
+                    other => panic!("expected EntityRef::LiteralArray, got {other:?}"),
+                },
+            )
             .collect();
         assert_eq!(got, offsets, "rank order = printed index order");
         // Emit side: all fourteen collect (rehash + same-bucket inserts) —
@@ -4365,8 +4457,14 @@ mod tests {
         let body = global.methods[0].body.as_ref().unwrap();
         assert_eq!(body.bytecodes.len(), 2, "the insn spans two lines");
         // The operand is the two-line string at its listed offset.
-        assert_eq!(body.entity_offsets[&(EntityKind::StringId, 0)], 0x50);
-        assert!(file.strings.get("ab\"\nq").is_some());
+        let sid = file
+            .strings
+            .get("ab\"\nq")
+            .expect("two-line string interned");
+        assert_eq!(
+            body.entities[&(EntityKind::StringId, 0)],
+            EntityRef::string_with_offset(sid, 0x50)
+        );
     }
 
     // -- Mainline batch: a moderate document, byte-exact ---------------------

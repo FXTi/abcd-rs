@@ -59,6 +59,7 @@ fn run_edge_copies(
         entity_traces: HashMap::new(),
         ic_size: 0,
         unsupported: None,
+        ..Default::default()
     };
 
     let allocation: HashMap<ValueId, RegSlot> =

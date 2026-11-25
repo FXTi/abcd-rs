@@ -172,18 +172,18 @@ fn assert_module_data(file: &abcd_file::File) {
 }
 
 fn assert_scope_ref(file: &abcd_file::File) {
-    let Some(FieldValue::LiteralArrayRef(off)) = &scope_field(file).initial_value else {
+    let Some(FieldValue::LiteralArrayRef {
+        index,
+        source_offset: Some(off),
+    }) = &scope_field(file).initial_value
+    else {
         panic!(
             "scope field must decode as FieldValue::LiteralArrayRef, got {:?}",
             scope_field(file).initial_value
         );
     };
     assert_ne!(*off, 0);
-    let idx = file
-        .literal_array_offsets
-        .get(off)
-        .expect("scope blob offset must map into the literal-array table");
-    let la = &file.literal_arrays[*idx as usize];
+    let la = &file.literal_arrays[index.index()];
     assert_eq!(la.values.len(), 1);
     let abcd_file::LiteralValue::String(sid) = la.values[0] else {
         panic!(
@@ -446,14 +446,13 @@ fn assert_merge_abc_decoded(file: &abcd_file::File, expect_json: bool) {
         .iter()
         .find(|f| file.strings.resolve(f.name) == Some(abcd_file::SCOPE_NAMES_FIELD))
         .expect("La.scopeNames");
-    let Some(FieldValue::LiteralArrayRef(off_a)) = scope_a.initial_value else {
+    let Some(FieldValue::LiteralArrayRef { index: idx_a, .. }) = scope_a.initial_value else {
         panic!(
             "La.scopeNames must be LiteralArrayRef, got {:?}",
             scope_a.initial_value
         );
     };
-    let idx_a = file.literal_array_offsets[&off_a] as usize;
-    assert_eq!(file.literal_arrays[idx_a].values.len(), 1);
+    assert_eq!(file.literal_arrays[idx_a.index()].values.len(), 1);
 
     let cls_b = file.class_by_str("Lb;").expect("Lb;");
     let mod_b = cls_b

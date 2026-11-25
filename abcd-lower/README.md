@@ -17,14 +17,14 @@ Format-aware SSA lowering converter from [`abcd_ir::Module`](../abcd-ir/README.m
 
 | Stage / API | Module | Responsibility |
 | :--- | :--- | :--- |
-| `fusion::analyze` | [`fusion`](src/fusion.rs) | Pre-allocation suppression of single-use expansion chains (`DefineFunc`→`AllocClosure`→`DefineMethod`, integral by-index `LoadConst`, `undefined` `TryGetGlobal` defaults) |
-| `regalloc::allocate` | [`regalloc`](src/regalloc.rs) | Exception-augmented backward liveness, SSA chordal MCS + greedy coloring, reserved `v0..v255` low scratch slots (`lda`/`sta`) & contiguous `*range` call windows, and handler-phi pinned stores |
-| `resolve_slot_copies` | [`copy_resolve`](src/copy_resolve.rs) | Boissinot out-of-SSA slot-level parallel-copy topological scheduling with cycle-breaking `copy_temp` on Normal edges (zero copies on exception edges) |
-| `isel::select` | [`isel`](src/isel.rs) | Physical `AccContent` (`acc`-as-cache) emission, unfused `cmp + jnez` conditional branches, narrow/wide call selection, and `ReArrangeIc` 8-bit-first IC-slot assignment |
-| `layout::layout` | [`layout`](src/layout.rs) | Reachable-first RPO block placement, conditional-edge phi trampolines, label resolution, and contiguous-run `TryBlock` span reconstruction |
-| `EntityResolver`, `to_method_body`, `lower_module_bodies` | [`method_body`](src/method_body.rs) | Shared `O(1)` reverse entity lookup (`Sym` / `FuncId` / `ConstId` → source offsets) and per-method `u16` entity operand compaction |
-| `rewrite_file`, `lower_module` | [`module_lower`](src/module_lower.rs) | Pool-materializing in-place container rewrite, standalone `File` construction, and `_ESSlotNumberAnnotation` synchronization |
-| `LowerOptions`, `LowerError` | [`lib`](src/lib.rs) | Top-level configuration and typed hard-error taxonomy (register/window/IC/entity-index overflows, untraceable entities, exception-edge copy violations) |
+| `fusion::analyze` | [`fusion`](src/fusion.rs) | Pre-allocation `O(B + I)` suppression of single-use expansion chains (`DefineFunc`→`AllocClosure`→`DefineMethod`, `0..=u32::MAX` by-index `LoadConst`, `undefined` `TryGetGlobal` defaults, `JumpEqz`/`JumpNez` + `CondBranch`) |
+| `regalloc::allocate` | [`regalloc`](src/regalloc.rs) | Exception-augmented `[u64]` bitset backward liveness, forward MCS chordal greedy coloring, reserved `v0..v255` low scratch slots & contiguous `*range` call windows, and interference-guarded handler-phi pinned stores |
+| `resolve_slot_copies` | [`copy_resolve`](src/copy_resolve.rs) | Linear `O(N)` Boissinot out-of-SSA slot-level parallel-copy topological scheduling with cycle-breaking `copy_temp` |
+| `isel::select` | [`isel`](src/isel.rs) | Physical `AccContent` (`acc`-as-cache) emission, unfused conditional branches (`istrue` coercion on non-boolean conditions), narrow/wide opcode selection, and `0xFF`-safe `ReArrangeIc` IC-slot assignment |
+| `layout::layout` | [`layout`](src/layout.rs) | Reachable-first RPO block placement, conditional-edge phi trampolines, fallthrough `jmp` elision / boolean `jnez`→`jeqz` inversion, label resolution, `inst_pcs` tracking, and `LoweredTryBlock` span reconstruction |
+| `EntityResolver`, `to_method_body`, `lower_module_bodies` | [`method_body`](src/method_body.rs) | Shared `O(1)` reverse entity lookup (`Sym` / `FuncId` / tag-exact `ConstId` → typed `EntityRef`), `CatchBlock::type_class` resolution, and per-method `u16` entity operand compaction |
+| `rewrite_file`, `lower_module`, `rebuild_method_debug` | [`module_lower`](src/module_lower.rs) | Pool-materializing in-place container rewrite, standalone offsetless `File` construction, `MethodDebugInfo` reconstruction, and `_ESSlotNumberAnnotation` synchronization |
+| `LowerOptions`, `LowerError` | [`lib`](src/lib.rs) | Top-level configuration and typed hard-error taxonomy (register/window/entity-index overflows, untraceable entities, unresolved labels, entity operand mismatches, exception-edge copy violations) |
 
 ## Key Invariants
 
@@ -34,7 +34,7 @@ Full specification in [`../design/ir.md`](../design/ir.md) and canonical rulings
 2. **Zero Exception-Edge Copies (`ADR-04`, `N13`, `N21`, `N43`, `N49`)**: VM exception dispatch jumps directly to handler offsets without running trampolines. Catch-handler phis lower to interference-guarded write-through stores in protected predecessors (`LowerError::HandlerEdgeCopies` on any residual exception-edge copy), `TryBlock` spans split around interleaved unprotected blocks (`N43`), and zero-bytecode blocks are rejected (`N49`).
 3. **Unfused Conditional Branches (`ADR-07`)**: `abcd-lower` never emits the 24 dead/unimplemented fused compare-and-branch opcodes (`jeq*`, `jne*`, `jstricteq*`, `jnstricteq*`, etc.); comparisons always emit unfused (`eq`/`noteq`/`stricteq`/`strictnoteq`/…) followed by `jnez`/`jeqz`.
 4. **IC-Slot Synchronization & Per-Method `u16` Entity Compaction (`ADR-10`, `N71`, `N73`, `#32`)**: Methods exceeding `255` IC slots prioritize `EIGHT_BIT_IC` instructions in `0..0xFF` (degrading excess 8-bit sites to `0xFF`), propagate recomputed `MethodBody::ic_size` to `_ESSlotNumberAnnotation`, and compact module-wide `u32` `Sym`/`FuncId`/`ConstId` IDs into deduplicated per-method `u16` slots (`LowerError::EntityIndexOverflow` only above `65,536` distinct entities of one kind in a single method).
-5. **Bit-Exact Determinism & Zero Input-Depth Recursion (`N20`)**: Edge copies, handler-phi stores, entity tables, and parallel `rayon` lowering preserve deterministic ordering across runs, literal-array shape walks use explicit heap stacks, and non-test code enforces `#![deny(missing_docs)]` and `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`.
+5. **Bit-Exact Determinism & Zero Input-Depth Recursion (`N20`)**: Edge copies, handler-phi stores, entity tables, and parallel `rayon` lowering preserve deterministic ordering across runs, literal-array shape walks use explicit heap stacks with flat hash-consed `ShapeId`s, and library code enforces `#![forbid(unsafe_code)]`, `#![deny(missing_docs)]`, and `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`.
 
 ## Quick Start
 

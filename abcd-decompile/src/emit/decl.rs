@@ -367,7 +367,11 @@ pub(in crate::emit) fn fn_uses_super(module: &Module, func: FuncId) -> bool {
             match &inst.op {
                 Op::LoadSuper { .. } | Op::StoreSuper { .. } => return true,
                 Op::Call {
-                    kind: CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs,
+                    kind:
+                        CallKind::Super
+                        | CallKind::SuperArrow
+                        | CallKind::SuperSpread
+                        | CallKind::SuperForwardAllArgs,
                     ..
                 } => {
                     return true;

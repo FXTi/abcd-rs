@@ -77,10 +77,10 @@ fn b01_static_method_placement() {
         &mut m,
         vec![
             Const::String(move_sym),
-            Const::MethodRef(method),
+            Const::method_ref(method),
             Const::number(0.0),
             Const::String(has_sym),
-            Const::MethodRef(statik),
+            Const::method_ref(statik),
             Const::number(1.0),
             Const::number(1.0),
         ],
@@ -155,7 +155,7 @@ fn b02_getter_kind_from_buffer_tag() {
         &mut m,
         vec![
             Const::String(x_sym),
-            Const::MethodRef(getter),
+            Const::method_ref(getter),
             Const::number(0.0),
             Const::number(1.0),
         ],
@@ -230,7 +230,15 @@ fn b03_instance_initializer_class_field_fold() {
         add_param(&mut m, ctor); // func
         add_param(&mut m, ctor); // new.target
         let this = add_param(&mut m, ctor); // this
-        let callee = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 1 });
+        let callee = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let _unused = emit(
             &mut m,
             b,
@@ -265,6 +273,7 @@ fn b03_instance_initializer_class_field_fold() {
             level: 0,
             slot: 1,
             value: closure,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let members = const_array(&mut m, vec![Const::number(0.0)]);
@@ -342,7 +351,7 @@ fn b04_private_brand_bare_declaration_without_fold() {
         &mut m,
         vec![
             Const::String(has_sym),
-            Const::MethodRef(has),
+            Const::method_ref(has),
             Const::number(1.0),
             Const::number(0.0),
         ],

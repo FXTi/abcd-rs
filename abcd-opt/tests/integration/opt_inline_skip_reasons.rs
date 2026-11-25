@@ -477,7 +477,11 @@ fn nested_class_roots_walk() {
     set_call_type(&mut module, ctor_bad, 0);
     {
         let mut b = V2Builder::new(&mut module, ctor_bad);
-        b.emit_val(Op::GetLexVar { level: 0, slot: 0 });
+        b.emit_val(Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        });
         b.emit_void(Op::Return { value: None });
     }
     // g_ok's body defines both class forms; g_bad's ctor reads the env.

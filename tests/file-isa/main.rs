@@ -187,12 +187,23 @@ fn rewritten_corpus_preserves_arithmetic_entities() {
                             .iter()
                             .flat_map(|bc| {
                                 bc.entity_operands().into_iter().map(|(kind, id)| {
-                                    let offset = body.entity_offsets[&(kind, id.0)];
-                                    (
-                                        bc.mnemonic(),
-                                        kind,
-                                        f.resolve_entity_str(offset).unwrap().to_owned(),
-                                    )
+                                    let resolved = match body.entities[&(kind, id.0)] {
+                                        abcd_file::EntityRef::String { id: sid, .. } => {
+                                            f.strings.resolve(sid).unwrap().to_owned()
+                                        }
+                                        abcd_file::EntityRef::Method(midx) => {
+                                            let (_, _, m) = f.method_by_idx(midx).unwrap();
+                                            f.strings.resolve(m.name).unwrap().to_owned()
+                                        }
+                                        abcd_file::EntityRef::ExternalMethod { name, .. } => {
+                                            f.strings.resolve(name).unwrap().to_owned()
+                                        }
+                                        abcd_file::EntityRef::LiteralArray(lidx) => format!(
+                                            "lit_len={}",
+                                            f.literal_arrays[lidx.index()].values.len()
+                                        ),
+                                    };
+                                    (bc.mnemonic(), kind, resolved)
                                 })
                             })
                             .collect::<Vec<_>>();
@@ -280,12 +291,8 @@ fn module_field_snapshots(f: &abcd_file::File) -> Vec<(String, String)> {
                 Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => {
                     format!("phase({:?})", p.flags)
                 }
-                Some(abcd_file::FieldValue::LiteralArrayRef(off)) => {
-                    let idx = f
-                        .literal_array_offsets
-                        .get(off)
-                        .unwrap_or_else(|| panic!("scope blob offset {off:#x} must decode"));
-                    let values: Vec<String> = f.literal_arrays[*idx as usize]
+                Some(abcd_file::FieldValue::LiteralArrayRef { index, .. }) => {
+                    let values: Vec<String> = f.literal_arrays[index.index()]
                         .values
                         .iter()
                         .map(|v| match v {

@@ -175,8 +175,16 @@ pub(in crate::folds) struct DriverSite {
     /// The folded yield value for real yield points (the opened
     /// iter-result); `None` at the entry site.
     pub(in crate::folds) yield_value: Option<Expr>,
+    /// Index of the `SuspendGenerator` (`Yield`) leaf in `run`.
+    pub(in crate::folds) pre_idx: usize,
+    /// Indices of `[resume_idx, mode_idx]` in `run` (ascending).
+    pub(in crate::folds) pair_indices: [usize; 2],
     /// The dispatch's continuation (the real control flow).
     pub(in crate::folds) continuation: Vec<SNode>,
+}
+
+fn is_set_gen_state(l: &Leaf) -> bool {
+    matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
 }
 
 /// Match `nodes[i]` (a `Stmts` run ending in
@@ -190,8 +198,20 @@ pub(in crate::folds) fn match_driver_site(
     let SNode::Stmts(run) = &nodes[i] else {
         return None;
     };
-    let [
-        ..,
+    let mut cur = run.len();
+    let prev_sig = |cur: &mut usize| -> Option<usize> {
+        while *cur > 0 {
+            *cur -= 1;
+            if !is_set_gen_state(&run[*cur]) {
+                return Some(*cur);
+            }
+        }
+        None
+    };
+    let mode_idx = prev_sig(&mut cur)?;
+    let resume_idx = prev_sig(&mut cur)?;
+    let pre_idx = prev_sig(&mut cur)?;
+    let (
         pre,
         Leaf::Raw(Stmt::Declare {
             name: resume_name,
@@ -212,7 +232,7 @@ pub(in crate::folds) fn match_driver_site(
             value_id: mode,
             ..
         }),
-    ] = run.as_slice()
+    ) = (&run[pre_idx], &run[resume_idx], &run[mode_idx])
     else {
         return None;
     };
@@ -261,6 +281,8 @@ pub(in crate::folds) fn match_driver_site(
         resume_name: resume_name.clone(),
         entry,
         yield_value,
+        pre_idx,
+        pair_indices: [resume_idx, mode_idx],
         continuation,
     })
 }
@@ -347,14 +369,14 @@ pub(in crate::folds) fn mode_test(
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsFalse,
+                op: UnOp::IsFalse | UnOp::JumpEqz,
                 operand,
             } => {
                 positive = !positive;
                 e = operand;
             }
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => {
                 e = operand;
@@ -408,7 +430,8 @@ pub(in crate::folds) fn check_return_arm(arm: &[SNode], resume: ValueId) -> Opti
     if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
         return None;
     }
-    let [Leaf::Raw(Stmt::Return(Some(value)))] = run.as_slice() else {
+    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_set_gen_state(l)).collect();
+    let [Leaf::Raw(Stmt::Return(Some(value)))] = sig.as_slice() else {
         return None;
     };
     (temp_value(value) == Some(resume)).then_some(())
@@ -423,7 +446,8 @@ pub(in crate::folds) fn check_throw_arm(arm: &[SNode], resume: ValueId) -> Optio
     if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
         return None;
     }
-    match run.as_slice() {
+    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_set_gen_state(l)).collect();
+    match sig.as_slice() {
         [Leaf::Raw(Stmt::Throw(value))]
         | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
             (temp_value(value) == Some(resume)).then_some(())
@@ -491,17 +515,18 @@ pub(in crate::folds) fn gen_fold_seq(
                 let SNode::Stmts(run) = &mut nodes[i] else {
                     unreachable!()
                 };
-                // Pop the GetResumeMode/ResumeGenerator decl pair.
-                run.pop();
-                run.pop();
+                // Remove the GetResumeMode/ResumeGenerator decl pair in
+                // descending index order (tolerating SetGeneratorState).
+                run.remove(site.pair_indices[1]);
+                run.remove(site.pair_indices[0]);
                 if site.entry {
                     // The entry protocol suspend is invisible in
                     // source; its resume value is dead (entry gate).
-                    run.pop();
+                    run.remove(site.pre_idx);
                     stats.gen_driver_entry += 1;
                 } else {
                     let v = site.yield_value.expect("yield site carries a value");
-                    let leaf = run.last_mut().expect("the yield stmt");
+                    let leaf = &mut run[site.pre_idx];
                     if nodes_use_temp(&site.continuation, site.resume) {
                         // `x = yield v` — the resumption value has
                         // real uses; bind the temp at the yield site.

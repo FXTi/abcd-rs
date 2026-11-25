@@ -138,11 +138,12 @@ fn deprecated_defineclasswithbuffer_direct_table_index_lifts_define_class() {
         "direct table-index fallback extracts class_member_attrs"
     );
     let c_greet = m.consts.intern(Const::String(greet_sym));
-    let c_member = m.consts.intern(Const::MethodRef(member_fid));
-    let c_one = m.consts.intern(Const::number(1.0));
+    let c_member = m.consts.intern(Const::method_ref(member_fid));
+    let c_aff = m.consts.intern(Const::MethodAffiliate(1));
+    let c_one = m.consts.intern(Const::Int32(1));
     assert_eq!(
         m.consts.get(members),
-        Some(&Const::ArrayLiteral(vec![c_greet, c_member, c_one, c_one])),
+        Some(&Const::ArrayLiteral(vec![c_greet, c_member, c_aff, c_one])),
         "members pool constant matches literal array"
     );
 
@@ -191,7 +192,7 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
             num_vregs: 0,
             num_args: 0,
             bytecodes: vec![Bytecode::Returnundefined],
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -229,16 +230,22 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
                 Bytecode::Sta(Reg(0)),    // 8
                 Bytecode::DeprecatedDefineclasswithbuffer(
                     EntityId(9),
-                    Imm(0), // raw imm 0 mapped via entity_offsets -> 0x200 -> table index 1!
+                    Imm(0), // raw imm 0 mapped via entities -> table index 1!
                     Imm(2),
                     Reg(0),
                     Reg(1),
                 ), // 9
                 Bytecode::Return,         // 10
             ],
-            entity_offsets: HashMap::from([
-                ((EntityKind::MethodId, 9), 0x100),
-                ((EntityKind::LiteralarrayId, 0), 0x200),
+            entities: HashMap::from([
+                (
+                    (EntityKind::MethodId, 9),
+                    abcd_file::EntityRef::Method(abcd_file::MethodIdx(0)),
+                ),
+                (
+                    (EntityKind::LiteralarrayId, 0),
+                    abcd_file::EntityRef::LiteralArray(abcd_file::LiteralArrayIdx(1)),
+                ),
             ]),
             try_blocks: Vec::new(),
             ic_size: None,
@@ -248,17 +255,13 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
         debug: None,
     };
 
-    let decoy_array = abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(999)],
-    };
-    let target_array = abcd_file::LiteralArray {
-        values: vec![
-            LiteralValue::String(mem_name),
-            LiteralValue::Method(0x140),
-            LiteralValue::MethodAffiliate(0),
-            LiteralValue::Integer(0), // 0 non-static -> static method!
-        ],
-    };
+    let decoy_array = abcd_file::LiteralArray::new(vec![LiteralValue::Integer(999)]);
+    let target_array = abcd_file::LiteralArray::new(vec![
+        LiteralValue::String(mem_name),
+        LiteralValue::Method(abcd_file::MethodIdx(1)),
+        LiteralValue::MethodAffiliate(0),
+        LiteralValue::Integer(0), // 0 non-static -> static method!
+    ]);
 
     let class = abcd_file::Class {
         descriptor: desc,
@@ -281,18 +284,17 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
         strings,
         classes: [(desc, class)].into_iter().collect(),
         literal_arrays: vec![decoy_array, target_array],
-        entity_map: HashMap::from([(0x100, ctor_name), (0x140, mem_name)]),
-        literal_array_offsets: HashMap::from([(0x190, 0), (0x200, 1)]),
         literal_array_header_offsets: Vec::new(),
     };
 
-    let mut m = lift_file(&file).expect("legacy entity_offsets shape lifts cleanly");
+    let mut m = lift_file(&file).expect("legacy entities shape lifts cleanly");
     verify_clean(&m);
 
     let mem_sym = m.sym.intern("staticFn");
     let c_mem = m.consts.intern(Const::String(mem_sym));
-    let c_fn = m.consts.intern(Const::MethodRef(abcd_ir::FuncId::new(1)));
-    let c_zero = m.consts.intern(Const::number(0.0));
+    let c_fn = m.consts.intern(Const::method_ref(abcd_ir::FuncId::new(1)));
+    let c_aff0 = m.consts.intern(Const::MethodAffiliate(0));
+    let c_zero = m.consts.intern(Const::Int32(0));
     let def_inst = m
         .insts
         .iter()
@@ -322,11 +324,11 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
             is_static: true,
             kind: FunctionKind::Function,
         }],
-        "entity_offsets resolved literal array index 1 (static method), not decoy index 0"
+        "entities resolved literal array index 1 (static method), not decoy index 0"
     );
     assert_eq!(
         m.consts.get(members),
-        Some(&Const::ArrayLiteral(vec![c_mem, c_fn, c_zero, c_zero]))
+        Some(&Const::ArrayLiteral(vec![c_mem, c_fn, c_aff0, c_zero]))
     );
 
     // Join block must carry the non-trivial Phi joining `[1.0, 2.0]` materialized

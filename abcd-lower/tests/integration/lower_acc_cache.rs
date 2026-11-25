@@ -34,6 +34,7 @@ fn definegettersetter_operands_survive_intervening_acc_writes() {
     const O: i64 = 222;
     const G: i64 = 333;
     const S: i64 = 444;
+    const SN: i64 = 1;
 
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "accessors", FunctionKind::Function);
@@ -43,15 +44,17 @@ fn definegettersetter_operands_survive_intervening_acc_writes() {
             let cid = b.konst(abcd_ir::Const::number(v));
             b.emit_val(Op::LoadConst(cid))
         };
+        let sn = lit(&mut builder, SN as f64);
         let k = lit(&mut builder, 111.0);
         let o = lit(&mut builder, 222.0);
         let g = lit(&mut builder, 333.0);
         let s = lit(&mut builder, 444.0);
-        builder.emit_void(Op::DefineGetterSetterByValue {
+        builder.emit_val(Op::DefineGetterSetterByValue {
             obj: o,
             key: k,
             getter: g,
             setter: s,
+            set_name: sn,
         });
         builder.emit_void(Op::Return { value: None });
     }
@@ -63,6 +66,7 @@ fn definegettersetter_operands_survive_intervening_acc_writes() {
         key,
         getter,
         setter,
+        set_name,
     } = halt
     else {
         panic!(
@@ -85,6 +89,11 @@ fn definegettersetter_operands_survive_intervening_acc_writes() {
     assert_eq!(
         setter, S,
         "setter operand (bytecodes: {:?})",
+        result.bytecodes
+    );
+    assert_eq!(
+        set_name, SN,
+        "set_name acc operand (bytecodes: {:?})",
         result.bytecodes
     );
 }
@@ -483,7 +492,7 @@ fn handler_entry_never_inherits_predecessor_acc_content() {
         catches: vec![Catch {
             handler,
             exception,
-            type_idx: None,
+            type_class: None,
         }],
     });
 
@@ -553,7 +562,7 @@ fn unused_exception_value_is_uncolored() {
         catches: vec![Catch {
             handler,
             exception,
-            type_idx: None,
+            type_class: None,
         }],
     });
     let suppression = fusion::analyze(&module, &module.functions[func.index()].blocks);

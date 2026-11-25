@@ -9,7 +9,7 @@
 //! pin that contract so a future vendor change (e.g. AddItems switching to
 //! append) fails loudly here instead of corrupting output.
 
-use abcd_file::{AccessFlags, Builder, CodeEntity, LiteralValue, Type, decode};
+use abcd_file::{AccessFlags, Builder, CodeEntity, EntityRef, LiteralValue, Type, decode};
 use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, encode};
 
 #[test]
@@ -55,8 +55,11 @@ fn second_finalize_produces_identical_bytes() {
         .1;
     let body = f.body.as_ref().unwrap();
     let array_id = body.bytecodes[1].entity_operands()[0].1;
-    let array_offset = body.entity_offsets[&(EntityKind::LiteralarrayId, array_id.0)];
-    let values = &file.literal_arrays[file.literal_array_offsets[&array_offset] as usize].values;
+    let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, array_id.0)]
+    else {
+        panic!("expected EntityRef::LiteralArray");
+    };
+    let values = &file.literal_arrays[la_idx.index()].values;
     assert_eq!(
         values.len(),
         2,
@@ -106,8 +109,11 @@ fn staged_items_added_after_finalize_accumulate() {
         .1;
     let body = f.body.as_ref().unwrap();
     let array_id = body.bytecodes[0].entity_operands()[0].1;
-    let array_offset = body.entity_offsets[&(EntityKind::LiteralarrayId, array_id.0)];
-    let values = &file.literal_arrays[file.literal_array_offsets[&array_offset] as usize].values;
+    let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, array_id.0)]
+    else {
+        panic!("expected EntityRef::LiteralArray");
+    };
+    let values = &file.literal_arrays[la_idx.index()].values;
     assert!(
         matches!(
             values.as_slice(),

@@ -589,7 +589,7 @@ fn class_method_quoted_key() {
     let m_fn = add_ret_fn(&mut m, "meth");
     let key = m.sym.intern("1bad");
     let ckey = m.consts.intern(Const::String(key));
-    let cmfn = m.consts.intern(Const::MethodRef(m_fn));
+    let cmfn = m.consts.intern(Const::method_ref(m_fn));
     let members = m.consts.push_array(vec![ckey, cmfn]);
     let opts = EmitOptions::default();
     let mut em = emitter(&m, &opts);
@@ -654,10 +654,10 @@ fn consumed_functions_const_shapes() {
     let hb = entry_of(&m, holder);
     let key = m.sym.intern("k");
     let ckey = m.consts.intern(Const::String(key));
-    let cmb = m.consts.intern(Const::MethodRef(m_b));
-    let cmc = m.consts.intern(Const::MethodRef(m_c));
+    let cmb = m.consts.intern(Const::method_ref(m_b));
+    let cmc = m.consts.intern(Const::method_ref(m_c));
     // Bare MethodRef members constant (383-385).
-    let cid_a = m.consts.push(Const::MethodRef(m_a));
+    let cid_a = m.consts.push(Const::method_ref(m_a));
     // Flat ObjectLiteral members (393-394 via the const walker).
     let cid_b = m.consts.push_object(vec![ckey], vec![cmb]);
     // ObjectLiteral NESTED in an ArrayLiteral (410-413).
@@ -904,7 +904,14 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
     let f_lex = add_fn(&mut m, "with_lex");
     {
         let b = entry_of(&m, f_lex);
-        let _env = emit_val(&mut m, b, Op::NewLexEnv { num_vars: 2 });
+        let _env = emit_val(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 2,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let c = m.consts.push(Const::number(1.0));
         let v = emit_val(&mut m, b, Op::LoadConst(c));
         push_inst(
@@ -914,9 +921,18 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
                 level: 0,
                 slot: 1,
                 value: v,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
-        let rd = emit_val(&mut m, b, Op::GetLexVar { level: 3, slot: 2 });
+        let rd = emit_val(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 3,
+                slot: 2,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         push_inst(&mut m, b, Op::Return { value: Some(rd) });
     }
 
@@ -962,7 +978,7 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
             catches: vec![Catch {
                 handler: bh,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         let call_res = emit_val(
@@ -1080,6 +1096,7 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
                 level: 0,
                 slot: 0,
                 value: v,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let df = emit_val(
@@ -1094,7 +1111,15 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
         push_inst(&mut m, b_p, Op::Return { value: Some(df) });
 
         let b_c = entry_of(&m, f_named_child);
-        let rd = emit_val(&mut m, b_c, Op::GetLexVar { level: 0, slot: 0 });
+        let rd = emit_val(
+            &mut m,
+            b_c,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         push_inst(&mut m, b_c, Op::Return { value: Some(rd) });
     }
 
@@ -1337,7 +1362,7 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
     // Flat 5,000-function DefineFunc chain + cycle (`f_4999 -> f_0`) and a
     // 5,000-deep ConstPool ArrayLiteral chain.
     let mut m = mk_module();
-    let mut deep_const_id = m.consts.push(Const::MethodRef(FuncId::new(7)));
+    let mut deep_const_id = m.consts.push(Const::method_ref(FuncId::new(7)));
     for _ in 0..5_000 {
         deep_const_id = m.consts.push_array(vec![deep_const_id]);
     }
@@ -1404,4 +1429,620 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn round3_jump_nez_and_jump_eqz_conditions_emit_clean_if_and_while() {
+    use abcd_ir::function::{Edge, EdgeKind};
+
+    let mut m = mk_module();
+    let f = add_fn(&mut m, "func_main_0");
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+
+    let b0 = entry_of(&m, f);
+    let b_then = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    m.func_mut(f).unwrap().blocks.push(b_then);
+    let b_else = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    m.func_mut(f).unwrap().blocks.push(b_else);
+    let b_hdr = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    m.func_mut(f).unwrap().blocks.push(b_hdr);
+    let b_body = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    m.func_mut(f).unwrap().blocks.push(b_body);
+    let b_exit = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    m.func_mut(f).unwrap().blocks.push(b_exit);
+
+    // `if (JumpNez(p1))` -> `if (p1)`; inside else `if (JumpEqz(p2))` -> `if (!p2)`.
+    let c_nez = emit_val(
+        &mut m,
+        b0,
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand: p1,
+        },
+    );
+    push_inst(
+        &mut m,
+        b0,
+        Op::CondBranch {
+            cond: c_nez,
+            true_dest: b_then,
+            false_dest: b_else,
+        },
+    );
+    push_inst(&mut m, b_then, Op::Return { value: Some(p1) });
+
+    let c_eqz = emit_val(
+        &mut m,
+        b_else,
+        Op::UnaryOp {
+            op: UnOp::JumpEqz,
+            operand: p2,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_else,
+        Op::CondBranch {
+            cond: c_eqz,
+            true_dest: b_hdr,
+            false_dest: b_exit,
+        },
+    );
+
+    let w_cond = emit_val(
+        &mut m,
+        b_hdr,
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand: p2,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_hdr,
+        Op::CondBranch {
+            cond: w_cond,
+            true_dest: b_body,
+            false_dest: b_exit,
+        },
+    );
+    push_inst(&mut m, b_body, Op::Branch { dest: b_hdr });
+    push_inst(&mut m, b_exit, Op::Return { value: Some(p2) });
+
+    for (from, to) in [
+        (b0, b_then),
+        (b0, b_else),
+        (b_else, b_hdr),
+        (b_else, b_exit),
+        (b_hdr, b_body),
+        (b_hdr, b_exit),
+        (b_body, b_hdr),
+    ] {
+        m.block_mut(to).unwrap().preds.push(Edge {
+            from,
+            kind: EdgeKind::Normal,
+        });
+    }
+    m.classes[0].methods.push(f);
+
+    let out = decompile_module(&m, &EmitOptions::default());
+    assert!(out.stats.fallback_comments.is_empty(), "{}", out.text);
+    assert!(
+        out.text.contains("if (p1) {"),
+        "JumpNez -> if (p1):\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("if (!p2) {"),
+        "JumpEqz -> if (!p2):\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("while (p2) {"),
+        "JumpNez while condition:\n{}",
+        out.text
+    );
+}
+
+#[test]
+fn round3_call_kinds_topropertykey_symbol_concurrent_and_patch_lex() {
+    let mut m = mk_module();
+    let super_arrow = add_fn(&mut m, "arr");
+    m.func_mut(super_arrow).unwrap().kind = FunctionKind::Arrow;
+    {
+        let _this = add_param(&mut m, super_arrow);
+        let a0 = add_param(&mut m, super_arrow);
+        let b = entry_of(&m, super_arrow);
+        let sup = emit_val(
+            &mut m,
+            b,
+            Op::Call {
+                callee: a0,
+                this: None,
+                args: vec![a0],
+                kind: CallKind::SuperArrow,
+            },
+        );
+        push_inst(&mut m, b, Op::Return { value: Some(sup) });
+    }
+    assert!(fn_uses_super(&m, super_arrow));
+
+    let f = add_fn(&mut m, "func_main_0");
+    m.classes[0].methods.push(f);
+    let this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b = entry_of(&m, f);
+
+    let new_sp = emit_val(
+        &mut m,
+        b,
+        Op::Call {
+            callee: p1,
+            this: None,
+            args: vec![p2],
+            kind: CallKind::NewSpread,
+        },
+    );
+    let cls_init = emit_val(
+        &mut m,
+        b,
+        Op::Call {
+            callee: p1,
+            this: Some(this),
+            args: vec![],
+            kind: CallKind::ClassInit,
+        },
+    );
+    let sym_v = emit_val(&mut m, b, Op::LoadSymbol);
+    let tpk_dyn = emit_val(
+        &mut m,
+        b,
+        Op::UnaryOp {
+            op: UnOp::ToPropertyKey,
+            operand: sym_v,
+        },
+    );
+    // Rest-destructure key wrapped in `UnOp::ToPropertyKey` over `"a"`:
+    let a_sym = m.sym.intern("a");
+    let a_cid = m.consts.push(Const::String(a_sym));
+    let a_str = emit_val(&mut m, b, Op::LoadConst(a_cid));
+    let a_key = emit_val(
+        &mut m,
+        b,
+        Op::UnaryOp {
+            op: UnOp::ToPropertyKey,
+            operand: a_str,
+        },
+    );
+    let rest = emit_val(
+        &mut m,
+        b,
+        Op::CreateObjectWithExcludedKeys {
+            obj: p1,
+            keys: vec![a_key],
+        },
+    );
+    let a_prop = emit_val(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: p1,
+            name: a_sym,
+        },
+    );
+    push_inst(&mut m, b, Op::NotifyConcurrentResult { value: new_sp });
+    let _env = emit_val(
+        &mut m,
+        b,
+        Op::NewLexEnv {
+            num_vars: 3,
+            kind: abcd_ir::LexEnvKind::Sendable,
+        },
+    );
+    push_inst(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 2,
+            value: cls_init,
+            kind: abcd_ir::LexEnvKind::Sendable,
+        },
+    );
+    push_inst(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 2,
+            value: tpk_dyn,
+            kind: abcd_ir::LexEnvKind::Patch,
+        },
+    );
+    let rd_patch = emit_val(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 2,
+            kind: abcd_ir::LexEnvKind::Patch,
+        },
+    );
+    let df = emit_val(
+        &mut m,
+        b,
+        Op::DefineFunc {
+            body: super_arrow,
+            captures: vec![],
+            length: 1,
+        },
+    );
+    let cl = emit_val(&mut m, b, Op::AllocClosure { func: df });
+    let sum0 = emit_val(
+        &mut m,
+        b,
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: rest,
+            right: a_prop,
+        },
+    );
+    let sum1 = emit_val(
+        &mut m,
+        b,
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: sum0,
+            right: rd_patch,
+        },
+    );
+    let sum2 = emit_val(
+        &mut m,
+        b,
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: sum1,
+            right: cl,
+        },
+    );
+    push_inst(&mut m, b, Op::Return { value: Some(sum2) });
+
+    let out = decompile_module(&m, &EmitOptions::default());
+    assert!(out.stats.fallback_comments.is_empty(), "{}", out.text);
+    assert!(out.text.contains("let v999999_2;"), "{}", out.text);
+    assert!(out.text.contains("new p1(...p2)"), "{}", out.text);
+    assert!(out.text.contains("p1.call(this)"), "{}", out.text);
+    assert!(out.text.contains("super(p1)"), "{}", out.text);
+    assert!(
+        out.text.contains("Reflect.ownKeys({ [Symbol]: 0 })[0]"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("const {a, ..."), "{}", out.text);
+    assert!(out.text.contains("NotifyConcurrentResult"), "{}", out.text);
+}
+
+#[test]
+fn round3_async_generator_ops_full_fold() {
+    use abcd_ir::function::{Catch, Edge, EdgeKind, TryRegion};
+
+    let mut m = mk_module();
+    let f = add_fn(&mut m, "func_main_0");
+    m.func_mut(f).unwrap().kind = FunctionKind::AsyncGenerator;
+    m.func_mut(f).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+    m.classes[0].methods.push(f);
+    let func_param = add_param(&mut m, f);
+    let _new_target = add_param(&mut m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+
+    let mk_blk = |m: &mut Module| {
+        let id = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(f).unwrap().blocks.push(id);
+        id
+    };
+    let b_entry = entry_of(&m, f);
+    let b_try = mk_blk(&mut m);
+    let b_throw1 = mk_blk(&mut m);
+    let b_yield = mk_blk(&mut m);
+    let b_ret_arm = mk_blk(&mut m);
+    let b_ret_throw = mk_blk(&mut m);
+    let b_ret_done = mk_blk(&mut m);
+    let b_chk_throw = mk_blk(&mut m);
+    let b_throw_ry = mk_blk(&mut m);
+    let b_next = mk_blk(&mut m);
+    let b_catch = mk_blk(&mut m);
+
+    let ld_num = |m: &mut Module, b: BlockId, x: f64| {
+        let c = m.consts.push(Const::number(x));
+        emit_val(m, b, Op::LoadConst(c))
+    };
+    let ld_bool = |m: &mut Module, b: BlockId, v: bool| {
+        let c = m.consts.push(Const::Bool(v));
+        emit_val(m, b, Op::LoadConst(c))
+    };
+
+    // Entry: CreateAsyncGenerator + SetGeneratorState + SuspendGenerator(undefined) + dead drivers.
+    let genobj = emit_val(
+        &mut m,
+        b_entry,
+        Op::CreateAsyncGenerator { func: func_param },
+    );
+    push_inst(&mut m, b_entry, Op::SetGeneratorState { genobj, state: 0 });
+    let undef_cid = m.consts.push(Const::Undefined);
+    let undef = emit_val(&mut m, b_entry, Op::LoadConst(undef_cid));
+    let _ = emit_val(
+        &mut m,
+        b_entry,
+        Op::SuspendGenerator {
+            genobj,
+            value: undef,
+        },
+    );
+    let _ = emit_val(&mut m, b_entry, Op::ResumeGenerator { genobj });
+    let _ = emit_val(&mut m, b_entry, Op::GetResumeMode { genobj });
+    push_inst(&mut m, b_entry, Op::Branch { dest: b_try });
+
+    // Pre-yield await + JumpEqz mode==1 dispatch.
+    let aw1 = emit_val(
+        &mut m,
+        b_try,
+        Op::AwaitUncaught {
+            funcobj: genobj,
+            value: p1,
+        },
+    );
+    let _ = emit_val(&mut m, b_try, Op::SuspendGenerator { genobj, value: aw1 });
+    let r1 = emit_val(&mut m, b_try, Op::ResumeGenerator { genobj });
+    let m1 = emit_val(&mut m, b_try, Op::GetResumeMode { genobj });
+    let one1 = ld_num(&mut m, b_try, 1.0);
+    let cmp1 = emit_val(
+        &mut m,
+        b_try,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: m1,
+            right: one1,
+        },
+    );
+    let cond1 = emit_val(
+        &mut m,
+        b_try,
+        Op::UnaryOp {
+            op: UnOp::JumpEqz,
+            operand: cmp1,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_try,
+        Op::CondBranch {
+            cond: cond1,
+            true_dest: b_yield,
+            false_dest: b_throw1,
+        },
+    );
+    push_inst(&mut m, b_throw1, Op::Throw { value: r1 });
+
+    // Yield point: SetGeneratorState + AsyncGeneratorResolve(genobj, r1, false) + resumption + 3-way.
+    push_inst(&mut m, b_yield, Op::SetGeneratorState { genobj, state: 1 });
+    let f_bool = ld_bool(&mut m, b_yield, false);
+    let _ = emit_val(
+        &mut m,
+        b_yield,
+        Op::AsyncGeneratorResolve {
+            genobj,
+            value: r1,
+            done: f_bool,
+        },
+    );
+    let ry = emit_val(&mut m, b_yield, Op::ResumeGenerator { genobj });
+    let my = emit_val(&mut m, b_yield, Op::GetResumeMode { genobj });
+    let zero = ld_num(&mut m, b_yield, 0.0);
+    let cmp_ret = emit_val(
+        &mut m,
+        b_yield,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: my,
+            right: zero,
+        },
+    );
+    let cond_ret = emit_val(
+        &mut m,
+        b_yield,
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand: cmp_ret,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_yield,
+        Op::CondBranch {
+            cond: cond_ret,
+            true_dest: b_ret_arm,
+            false_dest: b_chk_throw,
+        },
+    );
+
+    // RETURN(0) arm.
+    let aw_r = emit_val(
+        &mut m,
+        b_ret_arm,
+        Op::AwaitUncaught {
+            funcobj: genobj,
+            value: ry,
+        },
+    );
+    let _ = emit_val(
+        &mut m,
+        b_ret_arm,
+        Op::SuspendGenerator {
+            genobj,
+            value: aw_r,
+        },
+    );
+    let r_ret = emit_val(&mut m, b_ret_arm, Op::ResumeGenerator { genobj });
+    let m_ret = emit_val(&mut m, b_ret_arm, Op::GetResumeMode { genobj });
+    let one_r = ld_num(&mut m, b_ret_arm, 1.0);
+    let cmp_rt = emit_val(
+        &mut m,
+        b_ret_arm,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: m_ret,
+            right: one_r,
+        },
+    );
+    let cond_rt = emit_val(
+        &mut m,
+        b_ret_arm,
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand: cmp_rt,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_ret_arm,
+        Op::CondBranch {
+            cond: cond_rt,
+            true_dest: b_ret_throw,
+            false_dest: b_ret_done,
+        },
+    );
+    push_inst(&mut m, b_ret_throw, Op::Throw { value: r_ret });
+    let t_bool_r = ld_bool(&mut m, b_ret_done, true);
+    let res_r = emit_val(
+        &mut m,
+        b_ret_done,
+        Op::AsyncGeneratorResolve {
+            genobj,
+            value: r_ret,
+            done: t_bool_r,
+        },
+    );
+    push_inst(&mut m, b_ret_done, Op::Return { value: Some(res_r) });
+
+    // THROW(1) vs NEXT(2).
+    let one2 = ld_num(&mut m, b_chk_throw, 1.0);
+    let cmp_th = emit_val(
+        &mut m,
+        b_chk_throw,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: my,
+            right: one2,
+        },
+    );
+    let cond_th = emit_val(
+        &mut m,
+        b_chk_throw,
+        Op::UnaryOp {
+            op: UnOp::JumpNez,
+            operand: cmp_th,
+        },
+    );
+    push_inst(
+        &mut m,
+        b_chk_throw,
+        Op::CondBranch {
+            cond: cond_th,
+            true_dest: b_throw_ry,
+            false_dest: b_next,
+        },
+    );
+    push_inst(&mut m, b_throw_ry, Op::Throw { value: ry });
+
+    push_inst(&mut m, b_next, Op::SetGeneratorState { genobj, state: 4 });
+    let t_bool = ld_bool(&mut m, b_next, true);
+    let fin = emit_val(
+        &mut m,
+        b_next,
+        Op::AsyncGeneratorResolve {
+            genobj,
+            value: ry,
+            done: t_bool,
+        },
+    );
+    push_inst(&mut m, b_next, Op::Return { value: Some(fin) });
+
+    // Catch-all: AsyncGeneratorReject + return.
+    let exc = ValueId::new(m.values.len() as u32);
+    m.values.push(Value {
+        def: ValueDef::ExceptionParam(b_catch),
+        ty: Ty::Any,
+    });
+    let rej = emit_val(
+        &mut m,
+        b_catch,
+        Op::AsyncGeneratorReject { genobj, value: exc },
+    );
+    push_inst(&mut m, b_catch, Op::Return { value: Some(rej) });
+
+    for (from, to) in [
+        (b_entry, b_try),
+        (b_try, b_yield),
+        (b_try, b_throw1),
+        (b_yield, b_ret_arm),
+        (b_yield, b_chk_throw),
+        (b_ret_arm, b_ret_throw),
+        (b_ret_arm, b_ret_done),
+        (b_chk_throw, b_throw_ry),
+        (b_chk_throw, b_next),
+    ] {
+        m.block_mut(to).unwrap().preds.push(Edge {
+            from,
+            kind: EdgeKind::Normal,
+        });
+    }
+    let protected = vec![
+        b_try,
+        b_throw1,
+        b_yield,
+        b_ret_arm,
+        b_ret_throw,
+        b_chk_throw,
+        b_throw_ry,
+    ];
+    for &p in &protected {
+        m.block_mut(b_catch).unwrap().preds.push(Edge {
+            from: p,
+            kind: EdgeKind::Exceptional,
+        });
+    }
+    m.func_mut(f).unwrap().try_regions.push(TryRegion {
+        protected,
+        catches: vec![Catch {
+            handler: b_catch,
+            exception: exc,
+            type_class: None,
+        }],
+    });
+
+    let out = decompile_module(&m, &EmitOptions::default());
+    assert!(out.stats.fallback_comments.is_empty(), "{}", out.text);
+    assert!(
+        out.text.contains("async function* func_main_0(p3) {"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("yield p3"), "{}", out.text);
+    assert!(!out.text.contains("AsyncGeneratorResolve"), "{}", out.text);
+    assert!(!out.text.contains("AsyncGeneratorReject"), "{}", out.text);
+    assert!(
+        out.text.contains("elided SetGeneratorState"),
+        "{}",
+        out.text
+    );
 }

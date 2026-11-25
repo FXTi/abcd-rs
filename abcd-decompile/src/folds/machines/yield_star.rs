@@ -78,8 +78,12 @@ pub(in crate::folds) struct YsLoop {
     /// from the done arm inside the loop; sync: from the sibling
     /// completion dispatch — filled by [`ys_match_exit`]).
     pub(in crate::folds) bind: Option<(String, ValueId)>,
-    /// The post-delegation continuation (async: done-arm content).
+    /// The post-delegation continuation (async or R3-M1 sync: done-arm content).
     pub(in crate::folds) continuation: Vec<SNode>,
+    /// Whether `bind` and `continuation` were extracted from an in-loop
+    /// completion dispatch inside the `done` arm (always true for async;
+    /// true for R3-M1 sync when `ThrowNotExists` has no fallthrough edge).
+    pub(in crate::folds) in_loop_exit: bool,
 }
 
 /// Fold the es2panda YieldStar driver loop back to `yield* <expr>`.
@@ -246,9 +250,10 @@ pub(in crate::folds) fn ys_phi_decls(n: &SNode) -> Option<BTreeMap<String, Value
 
 /// A mode test: `IsFalse(StrictEq(Temp(phi), <num>))` in either
 /// operand order; returns the phi and the immediate.
+#[cfg(test)]
 pub(in crate::folds) fn ys_mode_test(cond: &Expr, want: f64) -> Option<ValueId> {
     let Expr::Unary {
-        op: UnOp::IsFalse,
+        op: UnOp::IsFalse | UnOp::JumpEqz,
         operand,
     } = cond
     else {
@@ -272,22 +277,22 @@ pub(in crate::folds) fn ys_mode_test(cond: &Expr, want: f64) -> Option<ValueId> 
     (n == want).then_some(t)
 }
 
-/// An `istrue`/`isfalse`-wrapped temp test: strips the wrappers and
-/// returns (temp, positive).
+/// An `istrue`/`isfalse`/`jnez`/`jeqz`-wrapped temp test: strips the
+/// wrappers and returns (temp, positive).
 pub(in crate::folds) fn ys_flag_test(cond: &Expr) -> Option<(ValueId, bool)> {
     let mut e = cond;
     let mut positive = true;
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsFalse,
+                op: UnOp::IsFalse | UnOp::JumpEqz,
                 operand,
             } => {
                 positive = !positive;
                 e = operand;
             }
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => e = operand,
             _ => break,
@@ -296,28 +301,65 @@ pub(in crate::folds) fn ys_flag_test(cond: &Expr) -> Option<(ValueId, bool)> {
     Some((temp_value(e)?, positive))
 }
 
-/// `<temp> == undefined` (either order, `Eq`).
-pub(in crate::folds) fn ys_undefined_test(cond: &Expr) -> Option<(ValueId, bool)> {
-    let Expr::Unary {
-        op: UnOp::IsFalse,
-        operand,
-    } = cond
+/// Polarity-aware mode test: `(IsFalse|JumpEqz|IsTrue|JumpNez)? StrictEq(Temp(phi), <num>)`.
+/// Returns `(phi, positive)` where `positive == true` means the `then` arm is `phi === want`.
+fn ys_mode_test_pol(cond: &Expr, want: f64) -> Option<(ValueId, bool)> {
+    let (cmp_expr, positive) = match cond {
+        Expr::Unary {
+            op: UnOp::IsFalse | UnOp::JumpEqz,
+            operand,
+        } => (operand.as_ref(), false),
+        Expr::Unary {
+            op: UnOp::IsTrue | UnOp::JumpNez,
+            operand,
+        } => (operand.as_ref(), true),
+        _ => (cond, true),
+    };
+    let Expr::Compare {
+        op: CmpOp::StrictEq,
+        left,
+        right,
+    } = cmp_expr
     else {
         return None;
+    };
+    let (t, n) = if let Expr::Lit(Lit::Number(bits)) = right.as_ref() {
+        (temp_value(left)?, f64::from_bits(*bits))
+    } else if let Expr::Lit(Lit::Number(bits)) = left.as_ref() {
+        (temp_value(right)?, f64::from_bits(*bits))
+    } else {
+        return None;
+    };
+    (n == want).then_some((t, positive))
+}
+
+/// `<temp> == undefined` (either order, `Eq`):
+/// - negated (`IsFalse | JumpEqz` over `Eq(t, undefined)`) → `(t, true)` ("t is defined")
+/// - positive (`IsTrue | JumpNez` or bare `Eq(t, undefined)`) → `(t, false)` ("t is undefined")
+pub(in crate::folds) fn ys_undefined_test(cond: &Expr) -> Option<(ValueId, bool)> {
+    let (cmp_expr, defined) = match cond {
+        Expr::Unary {
+            op: UnOp::IsFalse | UnOp::JumpEqz,
+            operand,
+        } => (operand.as_ref(), true),
+        Expr::Unary {
+            op: UnOp::IsTrue | UnOp::JumpNez,
+            operand,
+        } => (operand.as_ref(), false),
+        _ => (cond, false),
     };
     let Expr::Compare {
         op: CmpOp::Eq,
         left,
         right,
-    } = operand.as_ref()
+    } = cmp_expr
     else {
         return None;
     };
     if matches!(right.as_ref(), Expr::Lit(Lit::Undefined)) {
-        // IsFalse(temp == undefined) → "temp is defined".
-        temp_value(left).map(|t| (t, true))
+        temp_value(left).map(|t| (t, defined))
     } else if matches!(left.as_ref(), Expr::Lit(Lit::Undefined)) {
-        temp_value(right).map(|t| (t, true))
+        temp_value(right).map(|t| (t, defined))
     } else {
         None
     }
@@ -424,7 +466,7 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
         ys_trace("loop:sig1-not-if");
         return None;
     };
-    let Some(rt_id) = ys_mode_test(cond, 2.0).filter(in_phis) else {
+    let Some((rt_id, pos_next)) = ys_mode_test_pol(cond, 2.0).filter(|(id, _)| in_phis(id)) else {
         ys_trace("loop:mode-test");
         return None;
     };
@@ -432,7 +474,12 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
         .iter()
         .find(|(_, v)| **v == rt_id)
         .map(|(n, _)| n.clone())?;
-    let Some(first) = ys_sig(otherwise).into_iter().next().cloned() else {
+    let (next_arm_nodes, rest_arm_nodes) = if pos_next {
+        (then, otherwise)
+    } else {
+        (otherwise, then)
+    };
+    let Some(first) = ys_sig(next_arm_nodes).into_iter().next().cloned() else {
         ys_trace("loop:next-arm");
         return None;
     };
@@ -440,20 +487,26 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
         ys_trace("loop:next-arm-assigns");
         return None;
     };
-    let dsig = ys_sig(then);
+    let dsig = ys_sig(rest_arm_nodes);
     let [
         SNode::If {
             cond: cond2,
-            then: ret_arm,
-            otherwise: throw_arm,
+            then: arm_a,
+            otherwise: arm_b,
         },
     ] = dsig.as_slice()
     else {
         return None;
     };
-    if ys_mode_test(cond2, 1.0) != Some(rt_id) {
+    let (rt_id2, pos_throw) = ys_mode_test_pol(cond2, 1.0)?;
+    if rt_id2 != rt_id {
         return None;
     }
+    let (throw_arm, ret_arm) = if pos_throw {
+        (arm_a, arm_b)
+    } else {
+        (arm_b, arm_a)
+    };
 
     // ── RETURN arm: extract the iterator phi, the exitReturn phi,
     // and the received-value phi (the DirectReturn temp) ──
@@ -548,11 +601,27 @@ pub(in crate::folds) fn ys_match_return_arm(
                     }
                 }
                 // The propagation return: `return received`.
-                if !async_
-                    && let [Leaf::Raw(Stmt::Return(Some(e)))] = run.as_slice()
-                    && let Some(t) = temp_value(e).filter(in_phis)
-                {
-                    rv_id = Some(t);
+                if !async_ {
+                    let ret_sig: Vec<&Leaf> = run
+                        .iter()
+                        .filter(|l| {
+                            !matches!(
+                                l,
+                                Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState"
+                            ) && !matches!(
+                                l,
+                                Leaf::Raw(Stmt::PhiAssign {
+                                    exceptional: true,
+                                    ..
+                                })
+                            )
+                        })
+                        .collect();
+                    if let [Leaf::Raw(Stmt::Return(Some(e)))] = ret_sig.as_slice()
+                        && let Some(t) = temp_value(e).filter(in_phis)
+                    {
+                        rv_id = Some(t);
+                    }
                 }
                 let _ = idx;
             }
@@ -561,8 +630,9 @@ pub(in crate::folds) fn ys_match_return_arm(
                 then,
                 otherwise,
             } => {
-                // `if (retM !== undefined) { assigns → B_call } else { break }`.
-                let Some((t, _)) = ys_undefined_test(cond) else {
+                // `if (retM !== undefined) { assigns → B_call } else { break }`
+                // or `if (retM == undefined) { break } else { assigns → B_call }`.
+                let Some((t, defined)) = ys_undefined_test(cond) else {
                     ys_trace("ret-arm:undefined-test");
                     return None;
                 };
@@ -570,7 +640,12 @@ pub(in crate::folds) fn ys_match_return_arm(
                     ys_trace("ret-arm:method-id");
                     return None;
                 }
-                let tsig = ys_sig(then);
+                let (assign_arm, break_arm) = if defined {
+                    (then, otherwise)
+                } else {
+                    (otherwise, then)
+                };
+                let tsig = ys_sig(assign_arm);
                 let [assigns] = tsig.as_slice() else {
                     ys_trace("ret-arm:then-shape");
                     return None;
@@ -597,7 +672,7 @@ pub(in crate::folds) fn ys_match_return_arm(
                     ys_trace("ret-arm:exit-phi");
                     return None;
                 }
-                let [SNode::Break { .. }] = ys_sig(otherwise).as_slice() else {
+                let [SNode::Break { .. }] = ys_sig(break_arm).as_slice() else {
                     ys_trace("ret-arm:break");
                     return None;
                 };
@@ -687,10 +762,15 @@ pub(in crate::folds) fn ys_match_throw_arm(
                 otherwise,
             } => {
                 if let Some((t, positive)) = ys_flag_test(cond) {
-                    if Some(t) == eq_m && !positive {
-                        // `if (!eqM) { assigns → B_call incl.
-                        // exitPhi ← exitDecl }` — method exists → call.
-                        let tsig = ys_sig(then);
+                    if Some(t) == eq_m {
+                        // `!eqM`: `then = [assigns]`, `otherwise = []`.
+                        // `eqM` (R3-M1): `then = [] | [Break]`, `otherwise = [assigns]`.
+                        let (assign_arm, other_arm) = if !positive {
+                            (then, otherwise)
+                        } else {
+                            (otherwise, then)
+                        };
+                        let tsig = ys_sig(assign_arm);
                         let [assigns] = tsig.as_slice() else {
                             return None;
                         };
@@ -709,7 +789,13 @@ pub(in crate::folds) fn ys_match_throw_arm(
                         }) {
                             return None;
                         }
-                        if !ys_sig(otherwise).is_empty() {
+                        let osig = ys_sig(other_arm);
+                        let other_ok = if !positive {
+                            osig.is_empty()
+                        } else {
+                            matches!(osig.as_slice(), [] | [SNode::Break { .. }])
+                        };
+                        if !other_ok {
                             return None;
                         }
                         continue;
@@ -740,6 +826,126 @@ pub(in crate::folds) fn ys_match_throw_arm(
     flag
 }
 
+fn ys_skip_plumbing_leaf(l: &Leaf) -> bool {
+    matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
+        || matches!(
+            l,
+            Leaf::Raw(Stmt::PhiAssign {
+                exceptional: true,
+                ..
+            })
+        )
+}
+
+fn ys_match_sync_suspend_loopback(
+    runs: &[&SNode],
+    res: ValueId,
+    phis: &BTreeMap<String, ValueId>,
+    rt_name: &str,
+    rv_name: &str,
+) -> Option<ValueId> {
+    let check_loopback = |lrun: &[Leaf], g_id: ValueId, resume: ValueId| -> Option<()> {
+        let wrapped = SNode::Stmts(lrun.to_vec());
+        let _header_block = ys_assign_run(&wrapped)?;
+        let mut saw_mode = false;
+        let mut saw_value = false;
+        for l in lrun {
+            let Leaf::Raw(Stmt::PhiAssign {
+                target,
+                value,
+                exceptional,
+                ..
+            }) = l
+            else {
+                return None;
+            };
+            if *exceptional {
+                continue;
+            }
+            if *target == rt_name && ys_driver(value, false, g_id) {
+                saw_mode = true;
+            }
+            if *target == rv_name && temp_value(value) == Some(resume) {
+                saw_value = true;
+            }
+        }
+        (saw_mode && saw_value).then_some(())
+    };
+    match runs {
+        [SNode::Stmts(srun), SNode::Stmts(lrun)] => {
+            let srun_sig: Vec<&Leaf> = srun.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
+            let [
+                Leaf::Raw(Stmt::Expr(Expr::Yield { value })),
+                Leaf::Raw(Stmt::Declare {
+                    value: drv,
+                    value_id: resume,
+                    ..
+                }),
+            ] = srun_sig.as_slice()
+            else {
+                ys_trace("sync-tail:suspend-shape");
+                return None;
+            };
+            if temp_value(value) != Some(res) {
+                return None;
+            }
+            let Expr::GeneratorDriver {
+                resume: true,
+                genobj,
+            } = drv
+            else {
+                return None;
+            };
+            let g_id = temp_value(genobj).filter(|g| phis.values().any(|v| v == g))?;
+            if check_loopback(lrun, g_id, *resume).is_none() {
+                ys_trace("sync-tail:loopback-anchors");
+                return None;
+            }
+            Some(g_id)
+        }
+        [SNode::Stmts(crun)] => {
+            let crun_sig: Vec<Leaf> = crun
+                .iter()
+                .filter(|l| !ys_skip_plumbing_leaf(l))
+                .cloned()
+                .collect();
+            let [
+                Leaf::Raw(Stmt::Expr(Expr::Yield { value })),
+                Leaf::Raw(Stmt::Declare {
+                    value: drv,
+                    value_id: resume,
+                    ..
+                }),
+                lrun @ ..,
+            ] = crun_sig.as_slice()
+            else {
+                ys_trace("sync-tail:suspend-shape");
+                return None;
+            };
+            if temp_value(value) != Some(res) {
+                return None;
+            }
+            let Expr::GeneratorDriver {
+                resume: true,
+                genobj,
+            } = drv
+            else {
+                return None;
+            };
+            let g_id = temp_value(genobj).filter(|g| phis.values().any(|v| v == g))?;
+            if check_loopback(lrun, g_id, *resume).is_none() {
+                ys_trace("sync-tail:loopback-anchors");
+                return None;
+            }
+            Some(g_id)
+        }
+        _ => {
+            ys_trace("sync-tail:suspend-run");
+            None
+        }
+    }
+}
+
 /// The sync driver tail: pre-call run, done test, pass-through
 /// suspend, loop-back assigns, continue.
 #[allow(clippy::too_many_arguments)]
@@ -756,20 +962,12 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
     it_name: String,
     flag_name: String,
 ) -> Option<YsLoop> {
-    // [header, dispatch, precall, done-if, suspend, loopback, continue]
-    let [
-        _,
-        _,
-        precall,
-        done_if,
-        suspend,
-        loopback,
-        SNode::Continue { .. },
-    ] = sig
-    else {
+    if !matches!(sig.len(), 4 | 7) {
         ys_trace("sync-tail:skeleton");
         return None;
-    };
+    }
+    let precall = sig[2];
+    let done_if = sig[3];
     let pre_phis = ys_phi_decls(precall)?;
     let exit_id = pre_phis.get(&exit_phi.1).copied()?;
     let exit_phi = (exit_id, exit_phi.1);
@@ -813,6 +1011,7 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
                 }
             }
             Leaf::Raw(Stmt::Elided { op, .. }) if *op == "ThrowIfNotObject" => {}
+            l if ys_skip_plumbing_leaf(l) => {}
             _ => return None,
         }
     }
@@ -824,7 +1023,6 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
         ys_trace("sync-tail:done-decl");
         return None;
     };
-    // `if (done) break;`
     let SNode::If {
         cond,
         then,
@@ -836,65 +1034,39 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
     if ys_flag_test(cond) != Some((done, true)) {
         return None;
     }
-    let [SNode::Break { .. }] = ys_sig(then).as_slice() else {
-        return None;
-    };
-    if !ys_sig(otherwise).is_empty() {
-        return None;
-    }
-    // The pass-through suspend: `yield res; resume = ResumeGenerator(g)`.
-    let SNode::Stmts(srun) = suspend else {
-        ys_trace("sync-tail:suspend-run");
-        return None;
-    };
-    let [
-        Leaf::Raw(Stmt::Expr(Expr::Yield { value })),
-        Leaf::Raw(Stmt::Declare {
-            value: drv,
-            value_id: resume,
-            ..
-        }),
-    ] = srun.as_slice()
-    else {
-        ys_trace("sync-tail:suspend-shape");
-        return None;
-    };
-    if temp_value(value) != Some(res) {
-        return None;
-    }
-    let Expr::GeneratorDriver {
-        resume: true,
-        genobj,
-    } = drv
-    else {
-        return None;
-    };
-    let g_id = temp_value(genobj).filter(|g| phis.values().any(|v| v == g))?;
-    // Loop-back: `rt ← GetResumeMode(g)`, `rv ← resume`, all to the
-    // header block, then `continue`.
-    let SNode::Stmts(lrun) = loopback else {
-        ys_trace("sync-tail:loopback-run");
-        return None;
-    };
-    let header_block = ys_assign_run(loopback)?;
-    let mut saw_mode = false;
-    let mut saw_value = false;
-    for l in lrun {
-        let Leaf::Raw(Stmt::PhiAssign { target, value, .. }) = l else {
-            return None;
-        };
-        if *target == rt_name && ys_driver(value, false, g_id) {
-            saw_mode = true;
+    let (g_id, bind, continuation, in_loop_exit) = match sig {
+        [_, _, _, _, suspend, loopback, SNode::Continue { .. }] => {
+            let [SNode::Break { .. }] = ys_sig(then).as_slice() else {
+                return None;
+            };
+            if !ys_sig(otherwise).is_empty() {
+                return None;
+            }
+            let g_id = ys_match_sync_suspend_loopback(
+                &[*suspend, *loopback],
+                res,
+                phis,
+                &rt_name,
+                &rv_name,
+            )?;
+            (g_id, None, Vec::new(), false)
         }
-        if *target == rv_name && temp_value(value) == Some(*resume) {
-            saw_value = true;
+        [_, _, _, _] => {
+            // R3-M1 in-loop completion: `if (done) { exit_if; break; } else { suspend+loopback; continue; }`.
+            let then_sig = ys_sig(then);
+            let [exit_if, SNode::Break { .. }] = then_sig.as_slice() else {
+                return None;
+            };
+            let (bind, continuation) = ys_match_exit(exit_if, exit_phi.0, res)?;
+            let nsig = ys_sig(otherwise);
+            let [next_runs @ .., SNode::Continue { .. }] = nsig.as_slice() else {
+                return None;
+            };
+            let g_id = ys_match_sync_suspend_loopback(next_runs, res, phis, &rt_name, &rv_name)?;
+            (g_id, bind, continuation, true)
         }
-    }
-    if !saw_mode || !saw_value {
-        ys_trace("sync-tail:loopback-anchors");
-        return None;
-    }
-    let _ = header_block;
+        _ => return None,
+    };
     let _ = exit_decl;
     Some(YsLoop {
         rt: (rt, rt_name),
@@ -913,8 +1085,9 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
             flag_name,
         ),
         exit_phi,
-        bind: None,
-        continuation: Vec::new(),
+        bind,
+        continuation,
+        in_loop_exit,
     })
 }
 
@@ -947,7 +1120,10 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     };
     // [phis…, res = methodPhi.call(iter, received), aw = await res
     //  (uncaught), yield aw, resume1 = ResumeGenerator(g)]
-    let tail = &prun[pre_phis.len()..];
+    let tail: Vec<&Leaf> = prun[pre_phis.len()..]
+        .iter()
+        .filter(|l| !ys_skip_plumbing_leaf(l))
+        .collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value: Expr::Call {
@@ -971,7 +1147,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
             value_id: resume1,
             ..
         }),
-    ] = tail
+    ] = tail.as_slice()
     else {
         ys_trace("a-tail:precall-shape");
         return None;
@@ -1024,14 +1200,14 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     else {
         return None;
     };
-    if ys_async_throw_dispatch(cond, otherwise, g_id, *resume1).is_none() {
+    let Some(cont_arm) = ys_async_throw_dispatch_arms(cond, then, otherwise, g_id, *resume1) else {
         ys_trace("a-tail:throw-dispatch");
         return None;
-    }
+    };
 
     // Continuation: [elided ThrowIfNotObject, done = resume1.done],
     // then the done test.
-    let csig = ys_sig(then);
+    let csig = ys_sig(cont_arm);
     let [done_run, done_if] = csig.as_slice() else {
         ys_trace("a-tail:continuation");
         return None;
@@ -1043,6 +1219,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     for l in drun {
         match l {
             Leaf::Raw(Stmt::Elided { op, .. }) if *op == "ThrowIfNotObject" => {}
+            l if ys_skip_plumbing_leaf(l) => {}
             Leaf::Raw(Stmt::Declare {
                 value, value_id, ..
             }) if ys_prop(value, "done") == Some(*resume1) => {
@@ -1113,6 +1290,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     let Some(SNode::Stmts(rrun)) = rsig.first() else {
         return None;
     };
+    let rrun_sig: Vec<&Leaf> = rrun.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value: rv_val,
@@ -1120,11 +1298,17 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
             ..
         }),
         Leaf::Raw(Stmt::Return(Some(ret_e))),
-    ] = rrun.as_slice()
+        tail @ ..,
+    ] = rrun_sig.as_slice()
     else {
         return None;
     };
-    if ys_prop(rv_val, "value") != Some(*resume1) || temp_value(ret_e) != Some(*rvid) {
+    if ys_prop(rv_val, "value") != Some(*resume1)
+        || temp_value(ret_e) != Some(*rvid)
+        || !tail
+            .iter()
+            .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
+    {
         return None;
     }
 
@@ -1163,31 +1347,36 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
         exit_phi,
         bind: Some((bind_name.to_string(), bind_id)),
         continuation,
+        in_loop_exit: true,
     })
 }
 
-/// The async THROW-only dispatch on an inline `GetResumeMode(g)`
-/// cond: `if (mode != THROW) { … } else { throw resume; unreachable;
-/// break }` (the cond here is the IsFalse(Eq(driver, 1)) form —
-/// positive arm is the continuation).
-pub(in crate::folds) fn ys_async_throw_dispatch(
+/// Polarity-aware async THROW-only dispatch on an inline `GetResumeMode(g)`:
+/// returns the continuation arm slice when the THROW(1) arm matches
+/// `[throw resume; unreachable; break]`.
+fn ys_async_throw_dispatch_arms<'a>(
     cond: &Expr,
-    otherwise: &[SNode],
+    then: &'a [SNode],
+    otherwise: &'a [SNode],
     g: ValueId,
     resume: ValueId,
-) -> Option<()> {
-    let Expr::Unary {
-        op: UnOp::IsFalse,
-        operand,
-    } = cond
-    else {
-        return None;
+) -> Option<&'a [SNode]> {
+    let (cmp_expr, throw_first) = match cond {
+        Expr::Unary {
+            op: UnOp::IsFalse | UnOp::JumpEqz,
+            operand,
+        } => (operand.as_ref(), false),
+        Expr::Unary {
+            op: UnOp::IsTrue | UnOp::JumpNez,
+            operand,
+        } => (operand.as_ref(), true),
+        _ => (cond, true),
     };
     let Expr::Compare {
         op: CmpOp::Eq,
         left,
         right,
-    } = operand.as_ref()
+    } = cmp_expr
     else {
         return None;
     };
@@ -1198,14 +1387,30 @@ pub(in crate::folds) fn ys_async_throw_dispatch(
     if !ok(left, right) && !ok(right, left) {
         return None;
     }
-    let osig = ys_sig(otherwise);
+    let (throw_arm, cont_arm) = if throw_first {
+        (then, otherwise)
+    } else {
+        (otherwise, then)
+    };
+    let osig = ys_sig(throw_arm);
     let [SNode::Stmts(trun), SNode::Break { .. }] = osig.as_slice() else {
         return None;
     };
-    let [Leaf::Raw(Stmt::Throw(e)), Leaf::Raw(Stmt::Unreachable)] = trun.as_slice() else {
+    let tsig: Vec<&Leaf> = trun.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
+    let [Leaf::Raw(Stmt::Throw(e)), Leaf::Raw(Stmt::Unreachable)] = tsig.as_slice() else {
         return None;
     };
-    (temp_value(e) == Some(resume)).then_some(())
+    (temp_value(e) == Some(resume)).then_some(cont_arm)
+}
+
+#[cfg(test)]
+pub(in crate::folds) fn ys_async_throw_dispatch(
+    cond: &Expr,
+    otherwise: &[SNode],
+    g: ValueId,
+    resume: ValueId,
+) -> Option<()> {
+    ys_async_throw_dispatch_arms(cond, &[], otherwise, g, resume).map(|_| ())
 }
 
 /// The async not-done arm (AsyncGeneratorYield + the resumption
@@ -1229,6 +1434,7 @@ pub(in crate::folds) fn ys_match_async_yield(
     };
     // head: [value = resume1.value, av = await value (uncaught),
     //        yield av, res2 = ResumeGenerator(g)]
+    let head_sig: Vec<&Leaf> = head.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value: vload,
@@ -1250,7 +1456,7 @@ pub(in crate::folds) fn ys_match_async_yield(
             value_id: res2,
             ..
         }),
-    ] = head.as_slice()
+    ] = head_sig.as_slice()
     else {
         ys_trace("ay:head-shape");
         return None;
@@ -1271,15 +1477,15 @@ pub(in crate::folds) fn ys_match_async_yield(
         ys_trace("ay:mode-if");
         return None;
     };
-    if ys_async_throw_dispatch(cond, otherwise, g, *res2).is_none() {
+    let Some(cont_arm) = ys_async_throw_dispatch_arms(cond, then, otherwise, g, *res2) else {
         ys_trace("ay:throw-dispatch");
         return None;
-    }
+    };
     // The resumption re-entry: [r3 = ResumeGenerator(g), m3 =
     // GetResumeMode(g)]; `if (m3 != RETURN) loop-back`; the RETURN
     // await; `if (m4 == THROW) loop-back(THROW)`; the final
     // loop-back with mode RETURN.
-    let rsig = ys_sig(then);
+    let rsig = ys_sig(cont_arm);
     let [
         SNode::Stmts(pair),
         next_if,
@@ -1292,6 +1498,48 @@ pub(in crate::folds) fn ys_match_async_yield(
         ys_trace("ay:resumption-skeleton");
         return None;
     };
+    let mut pair_leaves: Vec<&Leaf> = pair.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
+    let mut false_id = None;
+    if let Some(Leaf::Raw(Stmt::Declare {
+        value: Expr::Lit(Lit::Bool(false)),
+        value_id,
+        ..
+    })) = pair_leaves.first().copied()
+    {
+        false_id = Some(*value_id);
+        pair_leaves.remove(0);
+    }
+    let is_ag_resolve = |e: &Expr| {
+        matches!(
+            e,
+            Expr::AsyncGeneratorResolve {
+                genobj: ag_g,
+                value: ag_v,
+                done: ag_d,
+            } if temp_value(ag_g) == Some(g)
+                && temp_value(ag_v) == Some(*res2)
+                && (matches!(ag_d.as_ref(), Expr::Lit(Lit::Bool(false)))
+                    || false_id.is_some_and(|fid| temp_value(ag_d) == Some(fid)))
+        )
+    };
+    if let Some(Leaf::Raw(Stmt::Expr(e))) = pair_leaves.first().copied()
+        && (is_ag_resolve(e) || matches!(e, Expr::Yield { value } if is_ag_resolve(value)))
+    {
+        pair_leaves.remove(0);
+    } else if let [
+        Leaf::Raw(Stmt::Declare {
+            value: ag_e,
+            value_id: agr,
+            ..
+        }),
+        Leaf::Raw(Stmt::Expr(Expr::Yield { value: yv })),
+        ..,
+    ] = pair_leaves.as_slice()
+        && is_ag_resolve(ag_e)
+        && temp_value(yv) == Some(*agr)
+    {
+        pair_leaves.drain(0..2);
+    }
     let [
         Leaf::Raw(Stmt::Declare {
             value: d3,
@@ -1303,7 +1551,7 @@ pub(in crate::folds) fn ys_match_async_yield(
             value_id: m3,
             ..
         }),
-    ] = pair.as_slice()
+    ] = pair_leaves.as_slice()
     else {
         return None;
     };
@@ -1329,6 +1577,10 @@ pub(in crate::folds) fn ys_match_async_yield(
     }
     // The RETURN await: [aw3 = await r3 (uncaught), yield aw3,
     // r4 = ResumeGenerator(g), m4 = GetResumeMode(g)].
+    let await_sig: Vec<&Leaf> = await_run
+        .iter()
+        .filter(|l| !ys_skip_plumbing_leaf(l))
+        .collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value:
@@ -1350,7 +1602,7 @@ pub(in crate::folds) fn ys_match_async_yield(
             value_id: m4,
             ..
         }),
-    ] = await_run.as_slice()
+    ] = await_sig.as_slice()
     else {
         return None;
     };
@@ -1398,36 +1650,41 @@ pub(in crate::folds) fn ys_match_async_yield(
     Some(())
 }
 
-/// `IsFalse(Eq(Temp(m), num))` — mode != num.
+/// `mode != num`: `IsFalse|JumpEqz(Eq(m, num))` or `(IsTrue|JumpNez)? NotEq(m, num)`.
 pub(in crate::folds) fn ys_mode_neq_test(cond: &Expr, m: ValueId, num: f64) -> Option<()> {
-    ys_mode_num_test(cond, m, num, CmpOp::Eq)
+    ys_mode_num_test(cond, m, num, CmpOp::Eq, CmpOp::NotEq)
 }
 
-/// `IsFalse(NotEq(Temp(m), num))` — mode == num.
+/// `mode == num`: `IsFalse|JumpEqz(NotEq(m, num))` or `(IsTrue|JumpNez)? Eq(m, num)`.
 pub(in crate::folds) fn ys_mode_eq_test(cond: &Expr, m: ValueId, num: f64) -> Option<()> {
-    ys_mode_num_test(cond, m, num, CmpOp::NotEq)
+    ys_mode_num_test(cond, m, num, CmpOp::NotEq, CmpOp::Eq)
 }
 
 pub(in crate::folds) fn ys_mode_num_test(
     cond: &Expr,
     m: ValueId,
     num: f64,
-    op: CmpOp,
+    negated_op: CmpOp,
+    positive_op: CmpOp,
 ) -> Option<()> {
-    let Expr::Unary {
-        op: UnOp::IsFalse,
-        operand,
-    } = cond
-    else {
-        return None;
+    let (cmp_expr, want_op) = match cond {
+        Expr::Unary {
+            op: UnOp::IsFalse | UnOp::JumpEqz,
+            operand,
+        } => (operand.as_ref(), negated_op),
+        Expr::Unary {
+            op: UnOp::IsTrue | UnOp::JumpNez,
+            operand,
+        } => (operand.as_ref(), positive_op),
+        _ => (cond, positive_op),
     };
     let Expr::Compare {
         op: o, left, right, ..
-    } = operand.as_ref()
+    } = cmp_expr
     else {
         return None;
     };
-    if *o != op {
+    if *o != want_op {
         return None;
     }
     let ok = |t: &Expr, n: &Expr| {
@@ -1563,11 +1820,15 @@ pub(in crate::folds) fn ys_match_exit(
         continuation.push(SNode::Stmts(first_rest.to_vec()));
     }
     continuation.extend(rest.iter().map(|n| (*n).clone()));
-    // Return arm: `v2 = res.value; return v2` (+ dead plumbing assigns).
+    // Return arm: `v2 = res.value; return v2` (+ dead plumbing assigns / SetGeneratorState).
     let rsig = ys_sig(otherwise);
     let [SNode::Stmts(rrun)] = rsig.as_slice() else {
         return None;
     };
+    let rrun_sig: Vec<&Leaf> = rrun
+        .iter()
+        .filter(|l| !matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState"))
+        .collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value: v2load,
@@ -1576,7 +1837,7 @@ pub(in crate::folds) fn ys_match_exit(
         }),
         Leaf::Raw(Stmt::Return(Some(ret_e))),
         tail @ ..,
-    ] = rrun.as_slice()
+    ] = rrun_sig.as_slice()
     else {
         return None;
     };
@@ -1764,7 +2025,7 @@ pub(in crate::folds) fn ys_apply_bare(
         ys_trace("init");
         return false;
     }
-    if !async_ {
+    if !async_ && !lp.in_loop_exit {
         // The sync completion dispatch must be the next sibling.
         let Some(res) = ys_sync_res(&nodes[i]) else {
             return false;
@@ -1889,7 +2150,7 @@ pub(in crate::folds) fn ys_apply_fragments(
         ys_trace("frag:init");
         return false;
     }
-    if !async_ {
+    if !async_ && !lp.in_loop_exit {
         // The completion dispatch is the first significant node of
         // nodes[i+1]'s innermost body.
         let Some(exit_body) = nodes.get(i + 1).and_then(ys_innermost_body).cloned() else {
@@ -1915,7 +2176,7 @@ pub(in crate::folds) fn ys_apply_fragments(
     }
     // ── apply ──
     // 1. The loop fragment: replace the While with the yield* stmt (+
-    //    the continuation for the async in-loop completion).
+    //    the continuation for in-loop completions).
     {
         let body = ys_innermost_body_mut(&mut nodes[i]);
         let pos = body
@@ -1923,7 +2184,7 @@ pub(in crate::folds) fn ys_apply_fragments(
             .rposition(|n| matches!(n, SNode::While { .. }))
             .expect("the matched While");
         let mut new = vec![ys_stmt(&lp, delegate.clone())];
-        if async_ {
+        if async_ || lp.in_loop_exit {
             new.extend(lp.continuation.clone());
         }
         body.splice(pos..pos + 1, new);
@@ -1949,9 +2210,9 @@ pub(in crate::folds) fn ys_apply_fragments(
             body[setup_pos] = SNode::Stmts(prefix);
         }
     }
-    // 3. The completion fragment (sync): replace the exit-If with its
+    // 3. The completion fragment (legacy sync): replace the exit-If with its
     //    continuation.
-    if !async_ {
+    if !async_ && !lp.in_loop_exit {
         let body = ys_innermost_body_mut(&mut nodes[i + 1]);
         let pos = body
             .iter()

@@ -530,14 +530,29 @@ fn env_joins_pops_and_dead_capture_points() {
             false_dest: b,
         },
     );
-    emit(&mut m, a, Op::NewLexEnv { num_vars: 1 });
+    emit(
+        &mut m,
+        a,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(&mut m, a, Op::Branch { dest: j });
     emit_void(&mut m, b, Op::Branch { dest: j });
     link(&mut m, entry, a);
     link(&mut m, entry, b);
     link(&mut m, a, j);
     link(&mut m, b, j);
-    let get_join = emit(&mut m, j, Op::GetLexVar { level: 0, slot: 0 });
+    let get_join = emit(
+        &mut m,
+        j,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let get_join = inst_of(&m, get_join);
     emit_void(&mut m, j, Op::Return { value: None });
     // (b) Bare PopLexEnv (past the bottom) then a read.
@@ -546,7 +561,15 @@ fn env_joins_pops_and_dead_capture_points() {
     {
         let e = entry_of(&m, g);
         emit_void(&mut m, e, Op::PopLexEnv);
-        let gg = emit(&mut m, e, Op::GetLexVar { level: 0, slot: 0 });
+        let gg = emit(
+            &mut m,
+            e,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         pop_get = inst_of(&m, gg);
         emit_void(&mut m, e, Op::Return { value: None });
     }
@@ -554,13 +577,28 @@ fn env_joins_pops_and_dead_capture_points() {
     let (cap, _) = add_static_func(&mut m, "cap", 0);
     {
         let b = entry_of(&m, cap);
-        let r = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let r = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         emit_void(&mut m, b, Op::Return { value: Some(r) });
     }
     let definer = add_func_named(&mut m, "definer");
     {
         let b = entry_of(&m, definer);
-        emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         emit(
             &mut m,
             b,
@@ -589,7 +627,15 @@ fn env_joins_pops_and_dead_capture_points() {
         },
     );
     emit(&mut m, ba, Op::AllocClosure { func: def_dead });
-    let dead_get = emit(&mut m, ba, Op::GetLexVar { level: 0, slot: 0 });
+    let dead_get = emit(
+        &mut m,
+        ba,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let dead_get = inst_of(&m, dead_get);
     emit_void(&mut m, ba, Op::Branch { dest: bb });
     emit_void(&mut m, bb, Op::Branch { dest: ba });

@@ -441,7 +441,10 @@ fn inline_barrier(op: &Op) -> bool {
         Op::BinaryOp { .. }
         | Op::UnaryOp { .. }
         | Op::Compare { .. }
-        | Op::GetPropIterator { .. } => false,
+        | Op::GetPropIterator { .. }
+        | Op::AsyncGeneratorResolve { .. }
+        | Op::SetGeneratorState { .. }
+        | Op::NotifyConcurrentResult { .. } => false,
         _ => !op.effects().is_removable_if_unused(),
     }
 }
@@ -482,6 +485,7 @@ fn base_outcome(op: &Op) -> Outcome {
         | Op::GetPropIterator { .. }
         | Op::NextPropName { .. }
         | Op::CreateGenerator { .. }
+        | Op::CreateAsyncGenerator { .. }
         | Op::ArraySpread { .. }
         | Op::CreateObjectWithExcludedKeys { .. }
         | Op::CopyRestArgs { .. } => Outcome::Plumbing,
@@ -961,6 +965,9 @@ impl<'m> Recover<'m> {
                     Op::GetModuleNamespace { index } => {
                         self.legal.reserve(&self.module_namespace_name(*index));
                     }
+                    Op::LoadSymbol => {
+                        self.legal.reserve("Symbol");
+                    }
                     _ => {}
                 }
             }
@@ -1397,7 +1404,7 @@ impl<'m> Recover<'m> {
     /// Statement-level ops (scope markers, control, throws, stores).
     fn step_statement_op(&mut self, iid: InstId, op: &Op, loc: Option<Loc>, out: &mut Vec<Stmt>) {
         match op {
-            Op::NewLexEnv { num_vars } => {
+            Op::NewLexEnv { num_vars, .. } => {
                 self.record(op, Outcome::Expressed);
                 out.push(Stmt::ScopePush {
                     names: vec![None; *num_vars as usize],
@@ -1458,6 +1465,7 @@ impl<'m> Recover<'m> {
                 object,
                 name,
                 value,
+                ..
             } => {
                 self.record(op, Outcome::Expressed);
                 let own = matches!(op, Op::StoreOwnPropName { .. });
@@ -1488,6 +1496,7 @@ impl<'m> Recover<'m> {
                 object,
                 index,
                 value,
+                ..
             } => {
                 self.record(op, Outcome::Expressed);
                 let own = matches!(op, Op::StoreOwnPropIdx { .. });
@@ -1499,7 +1508,9 @@ impl<'m> Recover<'m> {
                 });
             }
             Op::StorePropDyn { object, key, value }
-            | Op::StoreOwnPropDyn { object, key, value } => {
+            | Op::StoreOwnPropDyn {
+                object, key, value, ..
+            } => {
                 self.record(op, Outcome::Expressed);
                 let own = matches!(op, Op::StoreOwnPropDyn { .. });
                 out.push(Stmt::StoreDyn {
@@ -1528,6 +1539,7 @@ impl<'m> Recover<'m> {
                 key,
                 getter,
                 setter,
+                ..
             } => {
                 self.record(op, Outcome::Plumbing);
                 // Resolve an `undefined` constant THROUGH the temp
@@ -1596,15 +1608,29 @@ impl<'m> Recover<'m> {
                     value: self.expr_of(*value),
                 });
             }
-            Op::PutLexVar { level, slot, value } => {
+            Op::PutLexVar {
+                level,
+                slot,
+                value,
+                kind,
+            } => {
                 self.record(op, Outcome::Expressed);
-                let name = self
-                    .scopes
-                    .name_of(iid)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("v{level}_{slot}"));
+                let name =
+                    self.scopes
+                        .name_of(iid)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| match kind {
+                            abcd_ir::LexEnvKind::Patch => format!("v999999_{slot}"),
+                            abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => {
+                                format!("v{level}_{slot}")
+                            }
+                        });
+                let eff_level = match kind {
+                    abcd_ir::LexEnvKind::Patch => u16::MAX,
+                    abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => *level,
+                };
                 out.push(Stmt::LexStore {
-                    level: *level,
+                    level: eff_level,
                     slot: *slot,
                     name,
                     value: self.expr_of(*value),
@@ -2066,7 +2092,10 @@ impl<'m> Recover<'m> {
             } => {
                 let callee_expr = if matches!(
                     kind,
-                    CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs
+                    CallKind::Super
+                        | CallKind::SuperArrow
+                        | CallKind::SuperSpread
+                        | CallKind::SuperForwardAllArgs
                 ) {
                     Expr::SuperMarker
                 } else {
@@ -2110,9 +2139,11 @@ impl<'m> Recover<'m> {
                     .map(str::to_string)
                     .unwrap_or_else(|| "p?".to_string()),
             },
-            Op::CreateGenerator { func } => Expr::CreateGenerator {
-                func: Box::new(self.expr_of(*func)),
-            },
+            Op::CreateGenerator { func } | Op::CreateAsyncGenerator { func } => {
+                Expr::CreateGenerator {
+                    func: Box::new(self.expr_of(*func)),
+                }
+            }
             Op::SuspendGenerator { value, .. } => Expr::Yield {
                 value: Box::new(self.expr_of(*value)),
             },
@@ -2139,10 +2170,22 @@ impl<'m> Recover<'m> {
                 resolve: true,
                 value: Box::new(self.expr_of(*value)),
             },
-            Op::AsyncReject { value, .. } => Expr::AsyncDriver {
-                resolve: false,
+            Op::AsyncReject { value, .. } | Op::AsyncGeneratorReject { value, .. } => {
+                Expr::AsyncDriver {
+                    resolve: false,
+                    value: Box::new(self.expr_of(*value)),
+                }
+            }
+            Op::AsyncGeneratorResolve {
+                genobj,
+                value,
+                done,
+            } => Expr::AsyncGeneratorResolve {
+                genobj: Box::new(self.expr_of(*genobj)),
                 value: Box::new(self.expr_of(*value)),
+                done: Box::new(self.expr_of(*done)),
             },
+            Op::LoadSymbol => Expr::Ident("Symbol".to_string()),
             Op::LoadNewTarget => Expr::NewTarget,
             Op::LoadGlobalObject => Expr::GlobalThis,
             Op::LoadFunction => {
@@ -2326,7 +2369,9 @@ impl<'m> Recover<'m> {
                 continue;
             };
             let (object, index, value) = match &inst.op {
-                Op::StoreOwnPropDyn { object, key, value }
+                Op::StoreOwnPropDyn {
+                    object, key, value, ..
+                }
                 | Op::StorePropDyn { object, key, value } => {
                     let Some(i) = self.const_index_of(*key) else {
                         continue;
@@ -2337,6 +2382,7 @@ impl<'m> Recover<'m> {
                     object,
                     index,
                     value,
+                    ..
                 }
                 | Op::StorePropIdx {
                     object,
@@ -2389,7 +2435,9 @@ impl<'m> Recover<'m> {
         for &user in self.chains.users_of(arr) {
             let inst = self.module.inst(user)?;
             match &inst.op {
-                Op::StoreOwnPropDyn { object, key, value }
+                Op::StoreOwnPropDyn {
+                    object, key, value, ..
+                }
                 | Op::StorePropDyn { object, key, value } => {
                     if chase_mov(self.module, *object) == arr {
                         let i = self.const_index_of(*key)?;
@@ -2403,6 +2451,7 @@ impl<'m> Recover<'m> {
                     object,
                     index,
                     value,
+                    ..
                 }
                 | Op::StorePropIdx {
                     object,
@@ -2725,6 +2774,7 @@ mod tests {
         let getter = load_number(&mut m, b, 1.0);
         let undef_cid = m.consts.push(Const::Undefined);
         let setter = emit_val(&mut m, b, Op::LoadConst(undef_cid));
+        let set_name = load_const(&mut m, b, Const::Bool(false));
         emit_val(
             &mut m,
             b,
@@ -2733,6 +2783,7 @@ mod tests {
                 key,
                 getter,
                 setter,
+                set_name,
             },
         );
         let rf = recover_func(&m, f);
@@ -2827,7 +2878,7 @@ mod tests {
         let f = add_fn(&mut m, "f");
         let b = entry_of(&m, f);
         let c0 = m.consts.intern(Const::number(0.0));
-        let cmeth = m.consts.intern(Const::MethodRef(meth));
+        let cmeth = m.consts.intern(Const::method_ref(meth));
         let ctrue = m.consts.intern(Const::Bool(true));
         // (a) numeric key followed by a MethodRef (1597).
         let shape_a = m.consts.push_array(vec![c0, cmeth]);
@@ -2870,7 +2921,7 @@ mod tests {
         let b = entry_of(&m, f);
         let mname = m.sym.intern("m");
         let cmname = m.consts.intern(Const::String(mname));
-        let cmeth = m.consts.intern(Const::MethodRef(meth));
+        let cmeth = m.consts.intern(Const::method_ref(meth));
         let c7 = m.consts.intern(Const::number(7.0));
         // No trailing attrs payload: `i += 2` (1624).
         let shape_plain = m.consts.push_array(vec![cmname, cmeth]);
@@ -3055,6 +3106,7 @@ mod tests {
                 object: raw,
                 index: c0,
                 value: sa,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
         push_inst(
@@ -3239,6 +3291,7 @@ mod tests {
                 object: pair,
                 index: c0,
                 value: elems,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
         let g = emit_val(&mut m, b, Op::GetTemplateObject { literal: pair });

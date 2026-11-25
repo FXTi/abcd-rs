@@ -28,7 +28,7 @@
 //! the decoder never panics on random or legacy-shaped mutated input.
 
 use abcd_file::{
-    AccessFlags, Builder, CodeEntity, Error, LiteralValue, Type, Version, decode, encode,
+    AccessFlags, Builder, CodeEntity, EntityRef, Error, LiteralValue, Type, Version, decode, encode,
 };
 use abcd_file_sys as sys;
 use abcd_isa::{Bytecode, EntityId, EntityKind, Imm};
@@ -177,12 +177,24 @@ fn build_synthetic_legacy() -> SyntheticLegacy {
     let body = caller_model.body.as_ref().unwrap();
     let (kind, mid) = body.bytecodes[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
-    assert_eq!(body.entity_offsets[&(kind, mid.0)], target_offset);
+    let EntityRef::Method(target_idx) = body.entities[&(kind, mid.0)] else {
+        panic!("expected EntityRef::Method");
+    };
+    assert_eq!(
+        modern.method_by_idx(target_idx).unwrap().2.offset,
+        target_offset
+    );
     let method_index = u16::try_from(mid.0).unwrap();
     let (kind, sid) = body.bytecodes[1].entity_operands()[0];
     assert_eq!(kind, EntityKind::StringId);
-    let string_offset = body.entity_offsets[&(kind, sid.0)];
-    assert_eq!(modern.resolve_entity_str(string_offset), Some(NEEDLE));
+    let EntityRef::String {
+        id: str_sid,
+        source_offset: Some(string_offset),
+    } = body.entities[&(kind, sid.0)]
+    else {
+        panic!("expected EntityRef::String");
+    };
+    assert_eq!(modern.strings.resolve(str_sid), Some(NEEDLE));
     // The header's global literal-array table holds the array's file offset;
     // table index 0 is the legacy 16-bit global index the stream references.
     let lit_count = u32::from_le_bytes(
@@ -314,20 +326,31 @@ fn legacy_ir_contents() {
     // Entity resolution: the string operand resolved as a direct file
     // offset, the method operand through the index region, the literal
     // array through the header's global table.
+    let EntityRef::String {
+        id: str_sid,
+        source_offset: Some(got_str_off),
+    } = body.entities[&(EntityKind::StringId, syn.string_offset)]
+    else {
+        panic!("expected EntityRef::String");
+    };
+    assert_eq!(got_str_off, syn.string_offset);
+    assert_eq!(file.strings.resolve(str_sid), Some(NEEDLE));
+
+    let EntityRef::Method(target_idx) =
+        body.entities[&(EntityKind::MethodId, syn.method_index as u32)]
+    else {
+        panic!("expected EntityRef::Method");
+    };
     assert_eq!(
-        body.entity_offsets[&(EntityKind::StringId, syn.string_offset)],
-        syn.string_offset
-    );
-    assert_eq!(
-        body.entity_offsets[&(EntityKind::MethodId, syn.method_index as u32)],
+        file.method_by_idx(target_idx).unwrap().2.offset,
         syn.target_offset
     );
-    assert_eq!(
-        body.entity_offsets[&(EntityKind::LiteralarrayId, 0)],
-        syn.literal_offset
-    );
-    assert_eq!(file.resolve_entity_str(syn.string_offset), Some(NEEDLE));
-    let array = &file.literal_arrays[file.literal_array_offsets[&syn.literal_offset] as usize];
+
+    let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, 0)] else {
+        panic!("expected EntityRef::LiteralArray");
+    };
+    let array = &file.literal_arrays[la_idx.index()];
+    assert_eq!(array.source_offset, Some(syn.literal_offset));
     assert!(
         matches!(array.values.as_slice(), [LiteralValue::Integer(0x2a)]),
         "expected the header-table literal array to decode"

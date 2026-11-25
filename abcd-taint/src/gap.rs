@@ -103,7 +103,11 @@ pub fn resolve_callback_funcs(
     // The points-to arm: closure allocation sites → bodies.
     for site in oracle.may_sites_at(value, at).iter() {
         let func_value = match module.inst(site).map(|i| &i.op) {
-            Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => Some(*func),
+            Some(
+                Op::AllocClosure { func }
+                | Op::CreateGenerator { func }
+                | Op::CreateAsyncGenerator { func },
+            ) => Some(*func),
             _ => None,
         };
         if let Some(fv) = func_value {
@@ -149,11 +153,15 @@ fn trace_value(
             Some(Op::DefineFunc { body, .. }) => {
                 funcs.insert(*body);
             }
-            Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => {
+            Some(
+                Op::AllocClosure { func }
+                | Op::CreateGenerator { func }
+                | Op::CreateAsyncGenerator { func },
+            ) => {
                 stack.push(*func);
             }
             Some(Op::LoadConst(c)) => {
-                if let Some(Const::MethodRef(f)) = module.consts.get(*c) {
+                if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c) {
                     funcs.insert(*f);
                 }
             }
@@ -180,11 +188,15 @@ pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
             module.consts.get(c),
             Some(
                 Const::String(_)
+                    | Const::Int8(_)
+                    | Const::Int32(_)
+                    | Const::Float32(_)
                     | Const::Number(_)
                     | Const::Int64(_)
                     | Const::UInt64(_)
                     | Const::Bool(_)
                     | Const::Null
+                    | Const::LitNull(_)
                     | Const::Undefined
                     | Const::Hole
                     | Const::BigInt(_)

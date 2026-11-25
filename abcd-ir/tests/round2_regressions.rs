@@ -7,8 +7,9 @@ use std::hash::{Hash, Hasher};
 use abcd_ir::{
     BinOp, Block, BlockId, CallKind, Catch, ClassData, ClassId, CmpOp, Const, ConstId,
     DefineClassData, DomTree, DynPrim, Edge, EdgeKind, ExceptionHandlerMap, FuncId, FunctionData,
-    FunctionKind, Inst, InstId, Module, Op, StaticTy, Sym, SymbolTable, TryRegion, Ty, UnOp, Value,
-    ValueDef, ValueId, VerifyErrorKind, verify_func, verify_module,
+    FunctionKind, Inst, InstId, LexEnvKind, LitMethodKind, Module, Op, OwnStoreKind, StaticTy, Sym,
+    SymbolTable, TryRegion, Ty, TypedArrayTag, UnOp, Value, ValueDef, ValueId, VerifyErrorKind,
+    verify_func, verify_module,
 };
 
 fn mk_module() -> Module {
@@ -100,7 +101,7 @@ fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: BlockId,
         catches: vec![Catch {
             handler,
             exception: exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 }
@@ -379,6 +380,195 @@ fn r2_d2_effects_in_refinement_and_symbol_m9() {
     ));
     let nul = sym.intern("a\0b");
     assert!(matches!(sym.to_mutf8_bytes(nul), Some(Cow::Owned(_))));
+
+    // R3-D1: UnOp::ToPropertyKey refines to PURE on String/Symbol/Number/Bool, stays effectful on Any.
+    let v_sym = add_param(&mut m, f, 5, Ty::DynPrim(DynPrim::Symbol));
+    assert!(
+        Op::UnaryOp {
+            op: UnOp::ToPropertyKey,
+            operand: v_sym,
+        }
+        .effects_in(&m)
+        .is_pure()
+    );
+    assert!(
+        Op::UnaryOp {
+            op: UnOp::ToPropertyKey,
+            operand: v_any,
+        }
+        .effects_in(&m)
+        .may_throw
+    );
+
+    // #61 R3-X1: raw jeqz/jnez unary predicates are boolean-valued and unconditionally PURE.
+    for op in [UnOp::JumpEqz, UnOp::JumpNez] {
+        assert!(op.is_boolean_result());
+        let u = Op::UnaryOp { op, operand: v_any };
+        assert_eq!(u.effects(), abcd_ir::Effects::PURE);
+        assert_eq!(u.effects_in(&m), abcd_ir::Effects::PURE);
+    }
+    assert!(UnOp::LogicalNot.is_boolean_result());
+    assert!(UnOp::IsTrue.is_boolean_result());
+    assert!(UnOp::IsFalse.is_boolean_result());
+    assert!(!UnOp::Minus.is_boolean_result());
+    assert!(!UnOp::ToPropertyKey.is_boolean_result());
+}
+
+#[test]
+fn r3_stage1_call_lex_ownstore_and_const_verifier_checks() {
+    let mut m = mk_module();
+    let f = add_func(&mut m);
+    let b = m.func(f).unwrap().blocks[0];
+    let p0 = add_param(&mut m, f, 0, Ty::Any);
+    let h = add_block(&mut m, f);
+    let exc = add_exc_param(&mut m, h);
+    link(&mut m, b, h, EdgeKind::Exceptional);
+    m.func_mut(f).unwrap().try_regions.push(TryRegion {
+        protected: vec![b],
+        catches: vec![Catch {
+            handler: h,
+            exception: exc,
+            type_class: Some(ClassId::new(404)),
+        }],
+    });
+    emit_void(&mut m, h, Op::Return { value: None });
+
+    // InvalidCallShape for NewSpread (with `this`), SuperArrow (with `this`), ClassInit (with arg).
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: p0,
+            this: Some(p0),
+            args: vec![p0],
+            kind: CallKind::NewSpread,
+        },
+        Ty::Any,
+    );
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: p0,
+            this: Some(p0),
+            args: vec![],
+            kind: CallKind::SuperArrow,
+        },
+        Ty::Any,
+    );
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: p0,
+            this: Some(p0),
+            args: vec![p0],
+            kind: CallKind::ClassInit,
+        },
+        Ty::Any,
+    );
+
+    // InvalidOpModifier for NewLexEnv(Patch), GetLexVar(Patch, level=1), StoreOwnPropDyn(DefineProperty), StoreOwnPropIdx(OwnPropWithNameSet).
+    let _ = emit(
+        &mut m,
+        b,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: LexEnvKind::Patch,
+        },
+        Ty::Any,
+    );
+    let _ = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 1,
+            slot: 0,
+            kind: LexEnvKind::Patch,
+        },
+        Ty::Any,
+    );
+    emit_void(
+        &mut m,
+        b,
+        Op::StoreOwnPropDyn {
+            object: p0,
+            key: p0,
+            value: p0,
+            kind: OwnStoreKind::DefineProperty,
+        },
+    );
+    emit_void(
+        &mut m,
+        b,
+        Op::StoreOwnPropIdx {
+            object: p0,
+            index: p0,
+            value: p0,
+            kind: OwnStoreKind::OwnPropWithNameSet,
+        },
+    );
+    emit_void(&mut m, b, Op::Return { value: None });
+
+    // Const checks: EtsImplements(SymOutOfRange), MethodRef { func, kind } (FuncOutOfRange),
+    // TypedArrayLiteral -> LiteralBufferRef cycle (`ConstCycle`).
+    m.consts.push(Const::EtsImplements(Sym::new(555)));
+    m.consts.push(Const::method_ref_with_kind(
+        FuncId::new(666),
+        LitMethodKind::Setter,
+    ));
+    let cyc_a = ConstId::new(m.consts.len() as u32);
+    let cyc_b = ConstId::new(m.consts.len() as u32 + 1);
+    m.consts.push(Const::TypedArrayLiteral {
+        tag: TypedArrayTag::I32,
+        items: vec![cyc_b],
+    });
+    m.consts.push(Const::LiteralBufferRef(cyc_a));
+
+    let r = verify_module(&m);
+    assert!(
+        r.errors.iter().any(
+            |e| matches!(e.kind, VerifyErrorKind::ClassOutOfRange(c) if c == ClassId::new(404))
+        )
+    );
+    for want in [
+        CallKind::NewSpread,
+        CallKind::SuperArrow,
+        CallKind::ClassInit,
+    ] {
+        assert!(
+            r.errors.iter().any(
+                |e| matches!(e.kind, VerifyErrorKind::InvalidCallShape { kind } if kind == want)
+            ),
+            "missing InvalidCallShape for {want:?}: {:?}",
+            r.errors
+        );
+    }
+    let mod_errs = r
+        .errors
+        .iter()
+        .filter(|e| matches!(e.kind, VerifyErrorKind::InvalidOpModifier { .. }))
+        .count();
+    assert_eq!(
+        mod_errs, 4,
+        "expected 4 InvalidOpModifier errors, got: {:?}",
+        r.errors
+    );
+    assert!(
+        r.errors
+            .iter()
+            .any(|e| matches!(e.kind, VerifyErrorKind::SymOutOfRange(s) if s == Sym::new(555)))
+    );
+    assert!(
+        r.errors.iter().any(
+            |e| matches!(e.kind, VerifyErrorKind::FuncOutOfRange(id) if id == FuncId::new(666))
+        )
+    );
+    assert!(
+        r.errors
+            .iter()
+            .any(|e| matches!(e.kind, VerifyErrorKind::ConstCycle(c) if c == cyc_a))
+    );
 }
 
 #[test]

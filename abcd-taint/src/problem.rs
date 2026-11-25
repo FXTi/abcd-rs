@@ -1849,7 +1849,7 @@ impl<'m> TaintProblem<'m> {
             matches!(
                 self.module.inst(c).map(|i| &i.op),
                 Some(Op::Call {
-                    kind: CallKind::New,
+                    kind: CallKind::New | CallKind::NewSpread,
                     ..
                 })
             )
@@ -1871,8 +1871,13 @@ impl<'m> TaintProblem<'m> {
             return;
         }
         match &inst.op {
-            Op::Compare { .. } | Op::UnaryOp { .. } => {
+            Op::Compare { .. } => {
                 if fact.fields.is_empty() {
+                    out.push(Fact::of(TaintFact::local(result)));
+                }
+            }
+            Op::UnaryOp { op, .. } => {
+                if matches!(op, abcd_ir::UnOp::ToPropertyKey) || fact.fields.is_empty() {
                     out.push(Fact::of(TaintFact::local(result)));
                 }
             }
@@ -2310,7 +2315,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.push_passthrough_at(source, succ, out);
             }
             // ── Lexical environment slots ────────────────────────────
-            Op::GetLexVar { level, slot } => {
+            Op::GetLexVar { level, slot, .. } => {
                 if fact.base == TaintBase::LexVar(*level, *slot)
                     && let Some(result) = curr_inst.result
                 {
@@ -2347,7 +2352,9 @@ impl IfdsProblem for TaintProblem<'_> {
                 }
                 self.push_passthrough_at(source, succ, out);
             }
-            Op::PutLexVar { level, slot, value } => {
+            Op::PutLexVar {
+                level, slot, value, ..
+            } => {
                 if fact.base == TaintBase::Local(*value) {
                     // Rung 2 keys the slot by the environment's
                     // abstract object when the env analysis is precise
@@ -2435,6 +2442,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 object,
                 name,
                 value,
+                ..
             } => {
                 if self.store_rule(fact, *object, FieldKey::Named(*name), *value, curr, out) {
                     self.push_passthrough_at(source, succ, out);
@@ -2648,7 +2656,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 // (the pre-N66 table was written for a normalized ABI
                 // the lift never produced).
                 let allow_this_prop = if self.module.functions.len() > 512
-                    && *kind != CallKind::New
+                    && !matches!(kind, CallKind::New | CallKind::NewSpread)
                     && !args.contains(v)
                     && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
                 {
@@ -2686,7 +2694,12 @@ impl IfdsProblem for TaintProblem<'_> {
                         ParamBinding::OverApproxAll => unreachable!(),
                     };
                     match kind {
-                        CallKind::Direct | CallKind::Dynamic | CallKind::New | CallKind::Super => {
+                        CallKind::Direct
+                        | CallKind::Dynamic
+                        | CallKind::New
+                        | CallKind::Super
+                        | CallKind::SuperArrow
+                        | CallKind::ClassInit => {
                             for (i, &a) in args.iter().enumerate() {
                                 if a == *v
                                     && let Some(&p) = fd.params.get(formal_base + i)
@@ -2695,7 +2708,7 @@ impl IfdsProblem for TaintProblem<'_> {
                                 }
                             }
                         }
-                        CallKind::Apply | CallKind::SuperSpread => {
+                        CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread => {
                             // args[0] is an ARRAY spread over the formals: a
                             // tainted array conservatively taints every formal.
                             if args.first() == Some(v) {
@@ -2805,7 +2818,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     && matches!(
                         module.inst(call).map(|i| &i.op),
                         Some(Op::Call {
-                            kind: CallKind::New,
+                            kind: CallKind::New | CallKind::NewSpread,
                             ..
                         })
                     )
@@ -2962,7 +2975,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 // the callee body for Rung-0 field strong-kills unless no
                 // callee touches `f` on large bundles).
                 let untouched_this_prop = if self.module.functions.len() > 512
-                    && *kind != CallKind::New
+                    && !matches!(kind, CallKind::New | CallKind::NewSpread)
                     && let Some(v) = fact.local_base()
                     && !args.contains(&v)
                     && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
@@ -3047,7 +3060,7 @@ fn build_harness_guard(module: &Module) -> HarnessGuard {
                 Op::AllocObject { .. }
                 | Op::AllocArray { .. }
                 | Op::Call {
-                    kind: CallKind::New,
+                    kind: CallKind::New | CallKind::NewSpread,
                     ..
                 } => {
                     alloc_sites.insert(iid);
@@ -3084,6 +3097,7 @@ fn build_harness_guard(module: &Module) -> HarnessGuard {
                     object,
                     name,
                     value,
+                    ..
                 } if module.sym.resolve(*name) == Some("context") => {
                     if let Some(sites) = val_sites.get(value).cloned() {
                         val_sites.entry(*object).or_default().extend(sites);
@@ -3278,11 +3292,13 @@ pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
             object,
             key: index,
             value,
+            ..
         }
         | StoreOwnPropIdx {
             object,
             index,
             value,
+            ..
         } => {
             f(*object);
             f(*index);
@@ -3327,11 +3343,13 @@ pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
             key,
             getter,
             setter,
+            set_name,
         } => {
             f(*obj);
             f(*key);
             f(*getter);
             f(*setter);
+            f(*set_name);
         }
         GetTemplateObject { literal } => f(*literal),
         CreateIterResultObj { value, done } => {
@@ -3348,6 +3366,7 @@ pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
         | PopLexEnv
         | GetLexVar { .. }
         | CreatePrivateNames { .. }
+        | LoadSymbol
         | LoadNewTarget
         | LoadGlobalObject
         | LoadFunction
@@ -3404,23 +3423,39 @@ pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
         | ThrowConstAssignment { name: value }
         | ThrowIfNotObject { value }
         | ThrowUndefinedIfHoleWithName { value, .. }
-        | Await { value } => f(*value),
+        | Await { value }
+        | NotifyConcurrentResult { value } => f(*value),
         AwaitUncaught { funcobj, value }
         | AsyncResolve { funcobj, value }
-        | AsyncReject { funcobj, value } => {
+        | AsyncReject { funcobj, value }
+        | AsyncGeneratorReject {
+            genobj: funcobj,
+            value,
+        } => {
             f(*funcobj);
             f(*value);
+        }
+        AsyncGeneratorResolve {
+            genobj,
+            value,
+            done,
+        } => {
+            f(*genobj);
+            f(*value);
+            f(*done);
         }
         ThrowUndefinedIfHole { name, value } => {
             f(*name);
             f(*value);
         }
-        CreateGenerator { func } => f(*func),
+        CreateGenerator { func } | CreateAsyncGenerator { func } => f(*func),
         SuspendGenerator { genobj, value } => {
             f(*genobj);
             f(*value);
         }
-        ResumeGenerator { genobj } | GetResumeMode { genobj } => f(*genobj),
+        ResumeGenerator { genobj }
+        | GetResumeMode { genobj }
+        | SetGeneratorState { genobj, .. } => f(*genobj),
         LoadSuper { key, this_value } => {
             if let SuperKey::Dynamic(k) = key {
                 f(*k);
@@ -4213,7 +4248,7 @@ fn collect_jsbridge_seeds(
             Op::AllocObject { shape } => {
                 if let Some(Const::ObjectLiteral { keys, values }) = module.consts.get(*shape) {
                     for (&k_cid, &v_cid) in keys.iter().zip(values.iter()) {
-                        if let (Some(Const::String(ks)), Some(Const::MethodRef(mfid))) =
+                        if let (Some(Const::String(ks)), Some(Const::MethodRef { func: mfid, .. })) =
                             (module.consts.get(k_cid), module.consts.get(v_cid))
                             && let Some(mname) = module.sym.resolve(*ks)
                             && name_allowed(mname)
@@ -4234,6 +4269,7 @@ fn collect_jsbridge_seeds(
                                 object,
                                 name,
                                 value,
+                                ..
                             } if *object == obj_val => {
                                 if let Some(mname) = module.sym.resolve(*name)
                                     && name_allowed(mname)
@@ -4263,7 +4299,7 @@ fn collect_jsbridge_seeds(
             }
             Op::Call {
                 callee,
-                kind: CallKind::New,
+                kind: CallKind::New | CallKind::NewSpread,
                 ..
             } => {
                 if let Some(ValueDef::Inst(cls_iid)) = module.value(*callee).map(|v| v.def)
@@ -4275,7 +4311,7 @@ fn collect_jsbridge_seeds(
                     for &it_cid in items {
                         match module.consts.get(it_cid) {
                             Some(Const::String(s)) => pending = module.sym.resolve(*s),
-                            Some(Const::MethodRef(mfid)) => {
+                            Some(Const::MethodRef { func: mfid, .. }) => {
                                 if let Some(mname) = pending.take()
                                     && name_allowed(mname)
                                 {
@@ -4312,7 +4348,7 @@ fn collect_jsbridge_seeds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abcd_ir::op::{BinOp, CmpOp, ModuleVarKind, SuperCheck, UnOp};
+    use abcd_ir::op::{BinOp, CmpOp, LexEnvKind, ModuleVarKind, OwnStoreKind, SuperCheck, UnOp};
     use abcd_ir::{ConstId, DefineClassData, Edge, EdgeKind};
 
     #[test]
@@ -4321,6 +4357,7 @@ mod tests {
         let v1 = ValueId::new(11);
         let v2 = ValueId::new(12);
         let v3 = ValueId::new(13);
+        let v4 = ValueId::new(14);
         let absent = ValueId::new(99);
         let s = Sym::new(0);
         let c = ConstId::new(0);
@@ -4339,6 +4376,18 @@ mod tests {
             },
             Op::UnaryOp {
                 op: UnOp::Minus,
+                operand: v0,
+            },
+            Op::UnaryOp {
+                op: UnOp::ToPropertyKey,
+                operand: v0,
+            },
+            Op::UnaryOp {
+                op: UnOp::JumpEqz,
+                operand: v0,
+            },
+            Op::UnaryOp {
+                op: UnOp::JumpNez,
                 operand: v0,
             },
             Op::Compare {
@@ -4386,16 +4435,19 @@ mod tests {
                 object: v0,
                 name: s,
                 value: v1,
+                kind: OwnStoreKind::OwnProp,
             },
             Op::StoreOwnPropDyn {
                 object: v0,
                 key: v1,
                 value: v2,
+                kind: OwnStoreKind::OwnProp,
             },
             Op::StoreOwnPropIdx {
                 object: v0,
                 index: v1,
                 value: v2,
+                kind: OwnStoreKind::OwnProp,
             },
             Op::DefineMethod {
                 object: v0,
@@ -4435,6 +4487,7 @@ mod tests {
                 key: v1,
                 getter: v2,
                 setter: v3,
+                set_name: v4,
             },
             Op::GetTemplateObject { literal: v0 },
             Op::CreateIterResultObj {
@@ -4448,17 +4501,25 @@ mod tests {
             Op::IteratorThrow { iterator: v0 },
             Op::GetPropIterator { obj: v0 },
             Op::NextPropName { iterator: v0 },
-            Op::NewLexEnv { num_vars: 2 },
+            Op::NewLexEnv {
+                num_vars: 2,
+                kind: LexEnvKind::Plain,
+            },
             Op::NewLexEnvWithName {
                 num_vars: 2,
                 scope_names: c,
             },
             Op::PopLexEnv,
-            Op::GetLexVar { level: 0, slot: 1 },
+            Op::GetLexVar {
+                level: 0,
+                slot: 1,
+                kind: LexEnvKind::Plain,
+            },
             Op::PutLexVar {
                 level: 0,
                 slot: 1,
                 value: v0,
+                kind: LexEnvKind::Plain,
             },
             Op::TryGetGlobal {
                 name: s,
@@ -4555,6 +4616,11 @@ mod tests {
             Op::ThrowConstAssignment { name: v0 },
             Op::ThrowIfNotObject { value: v0 },
             Op::CreateGenerator { func: v0 },
+            Op::CreateAsyncGenerator { func: v0 },
+            Op::SetGeneratorState {
+                genobj: v0,
+                state: 1,
+            },
             Op::SuspendGenerator {
                 genobj: v0,
                 value: v1,
@@ -4575,6 +4641,17 @@ mod tests {
                 funcobj: v0,
                 value: v1,
             },
+            Op::AsyncGeneratorResolve {
+                genobj: v0,
+                value: v1,
+                done: v2,
+            },
+            Op::AsyncGeneratorReject {
+                genobj: v0,
+                value: v1,
+            },
+            Op::NotifyConcurrentResult { value: v0 },
+            Op::LoadSymbol,
             Op::LoadNewTarget,
             Op::LoadGlobalObject,
             Op::LoadFunction,
@@ -4618,7 +4695,7 @@ mod tests {
             let mut visited = Vec::new();
             for_each_op_operand(op, |v| visited.push(v));
             assert_eq!(visited, expected, "visitor mismatch on {op:?}");
-            for cand in [v0, v1, v2, v3, absent] {
+            for cand in [v0, v1, v2, v3, v4, absent] {
                 assert_eq!(
                     op_uses_value(op, cand),
                     expected.contains(&cand),

@@ -55,10 +55,12 @@ enum SsaFrame {
 
 /// SSA construction context using the Braun algorithm.
 pub struct SsaBuilder {
+    /// First `BlockId` index owned by the current function (`0` in standalone tests).
+    block_base: usize,
     /// Per-block definition maps.
     defs: HashMap<BlockId, BlockDefs>,
-    /// Tracks which blocks are "sealed" (all predecessors known).
-    sealed: HashMap<BlockId, bool>,
+    /// Dense per-block sealed flags indexed by `block.index() - block_base` (`R3-A4`).
+    sealed: Vec<bool>,
     /// Incomplete phis: block → [(location, phi_value)] for unsealed
     /// blocks.
     incomplete_phis: HashMap<BlockId, Vec<(RegOrAcc, ValueId)>>,
@@ -77,12 +79,17 @@ pub struct SsaBuilder {
 }
 
 impl SsaBuilder {
-    /// A fresh builder; `undefined_const`/`hole_const` are the pooled
-    /// frame-initial constants (deduplicated module-wide).
-    pub fn new(undefined_const: ConstId, hole_const: ConstId) -> Self {
+    /// A fresh builder pre-sized for `num_blocks` starting at `block_base`.
+    pub fn with_blocks(
+        undefined_const: ConstId,
+        hole_const: ConstId,
+        block_base: usize,
+        num_blocks: usize,
+    ) -> Self {
         Self {
-            defs: HashMap::new(),
-            sealed: HashMap::new(),
+            block_base,
+            defs: HashMap::with_capacity(num_blocks),
+            sealed: vec![false; num_blocks],
             incomplete_phis: HashMap::new(),
             frame_initial_undefined: None,
             frame_initial_hole: None,
@@ -90,6 +97,12 @@ impl SsaBuilder {
             undefined_const,
             hole_const,
         }
+    }
+
+    /// A fresh builder (`block_base = 0`, dynamically grown in unit tests).
+    #[cfg(test)]
+    pub fn new(undefined_const: ConstId, hole_const: ConstId) -> Self {
+        Self::with_blocks(undefined_const, hole_const, 0, 0)
     }
 
     /// Record a definition: `loc` is defined as `val` in `block`.
@@ -299,7 +312,14 @@ impl SsaBuilder {
     /// Mark a block as sealed (all predecessors are known). Completes
     /// any incomplete phis.
     pub fn seal_block(&mut self, block: BlockId, module: &mut Module) {
-        self.sealed.insert(block, true);
+        let rel = block
+            .index()
+            .checked_sub(self.block_base)
+            .expect("sealed block precedes function block_base");
+        if rel >= self.sealed.len() {
+            self.sealed.resize(rel + 1, false);
+        }
+        self.sealed[rel] = true;
         if let Some(incomplete) = self.incomplete_phis.remove(&block) {
             for (loc, phi_val) in incomplete {
                 self.add_phi_operands(loc, block, phi_val, module);
@@ -308,8 +328,14 @@ impl SsaBuilder {
     }
 
     /// Whether the block is sealed.
+    #[inline]
     pub fn is_sealed(&self, block: BlockId) -> bool {
-        self.sealed.get(&block).copied().unwrap_or(false)
+        block
+            .index()
+            .checked_sub(self.block_base)
+            .and_then(|rel| self.sealed.get(rel))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Emit an empty phi node in `block` and return its result value.

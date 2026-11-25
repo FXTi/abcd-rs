@@ -46,6 +46,7 @@ fn build_template(m: &mut Module, b: BlockId, quasis: &[(&str, &str)]) -> ValueI
                 object: raw_arr,
                 key: k,
                 value: r,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
         let c = load_string(m, b, cooked);
@@ -56,6 +57,7 @@ fn build_template(m: &mut Module, b: BlockId, quasis: &[(&str, &str)]) -> ValueI
                 object: cooked_arr,
                 key: k,
                 value: c,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
     }
@@ -68,6 +70,7 @@ fn build_template(m: &mut Module, b: BlockId, quasis: &[(&str, &str)]) -> ValueI
             object: pair,
             key: k0,
             value: raw_arr,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     let k1 = load_number(m, b, 1.0);
@@ -78,6 +81,7 @@ fn build_template(m: &mut Module, b: BlockId, quasis: &[(&str, &str)]) -> ValueI
             object: pair,
             key: k1,
             value: cooked_arr,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     emit(m, b, Op::GetTemplateObject { literal: pair })

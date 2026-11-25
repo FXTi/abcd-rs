@@ -2195,7 +2195,7 @@ fn literal_array_header_entry_absent_is_skipped() {
     write_u32(&mut data, table_off, u32::MAX);
     let file = decode(&data).expect("an ABSENT header entry is skipped");
     assert!(
-        file.literal_arrays.is_empty() && file.literal_array_offsets.is_empty(),
+        file.literal_arrays.is_empty(),
         "the ABSENT entry must not decode"
     );
     assert!(

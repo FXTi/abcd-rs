@@ -510,6 +510,16 @@ pub fn dump_expr(e: &Expr) -> String {
             };
             format!("{name}({}) /*hard-fallback*/", dump_expr(value))
         }
+        Expr::AsyncGeneratorResolve {
+            genobj,
+            value,
+            done,
+        } => format!(
+            "async-generator-resolve({}, {}, {}) /*hard-fallback*/",
+            dump_expr(genobj),
+            dump_expr(value),
+            dump_expr(done)
+        ),
         Expr::CopyDataProps { dst, src } => {
             format!(
                 "copy-data-props({}, {}) /*plumbing*/",
@@ -604,13 +614,19 @@ fn dump_call(callee: &Expr, this: Option<&Expr>, args: &[Expr], kind: CallKind) 
         ),
         CallKind::Dynamic => format!("({}({}))", dump_expr(callee), args.join(", ")),
         CallKind::New => format!("(new {}({}))", dump_expr(callee), args.join(", ")),
+        CallKind::NewSpread => format!("(new {}(...{}))", dump_expr(callee), args.join(", ")),
         CallKind::Apply => format!(
             "({}.apply({}, {}))",
             dump_expr(callee),
             this.map(dump_expr).unwrap_or_else(|| "?".to_string()),
             args.join(", ")
         ),
-        CallKind::Super => format!("super({})", args.join(", ")),
+        CallKind::ClassInit => format!(
+            "({}.call({}))",
+            dump_expr(callee),
+            this.map(dump_expr).unwrap_or_else(|| "this".to_string())
+        ),
+        CallKind::Super | CallKind::SuperArrow => format!("super({})", args.join(", ")),
         CallKind::SuperSpread => format!("super(...{})", args.join(", ")),
         CallKind::SuperForwardAllArgs => "super(...args) /*forward-all*/".to_string(),
     }
@@ -627,9 +643,12 @@ fn dump_unary(op: UnOp, operand: &Expr) -> String {
         UnOp::TypeOf => format!("(typeof {e})"),
         UnOp::ToNumber => format!("(+{e})"),
         UnOp::ToNumeric => format!("(tonumeric {e})"),
+        UnOp::ToPropertyKey => format!("(topropertykey {e})"),
         UnOp::Void => format!("(void {e})"),
         UnOp::IsTrue => format!("(istrue {e})"),
         UnOp::IsFalse => format!("(isfalse {e})"),
+        UnOp::JumpEqz => format!("(jeqz {e})"),
+        UnOp::JumpNez => format!("(jnez {e})"),
     }
 }
 

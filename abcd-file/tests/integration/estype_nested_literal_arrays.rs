@@ -65,11 +65,10 @@ fn canon_lit_values(file: &abcd_file::File, values: &[LiteralValue]) -> String {
                         file.strings.resolve(*sid).unwrap_or("<?>")
                     ));
                 }
-                LiteralValue::Method(off) => {
+                LiteralValue::Method(midx) => {
                     let mname = file
-                        .all_methods()
-                        .find(|(_, m)| m.offset == *off)
-                        .and_then(|(_, m)| file.strings.resolve(m.name))
+                        .method_by_idx(*midx)
+                        .and_then(|(_, _, m)| file.strings.resolve(m.name))
                         .unwrap_or("<unresolved>");
                     out.push_str(&format!("method({mname})"));
                 }
@@ -326,7 +325,7 @@ fn deep_nested_literal_arrays_and_annotations_use_iterative_workstacks() {
                 } else {
                     vec![LiteralValue::Integer(0xCAFE_u32)]
                 };
-                file.literal_arrays.push(LiteralArray { values });
+                file.literal_arrays.push(LiteralArray::new(values));
             }
 
             let ann_desc = file.strings.get_or_intern("L_ESTypeAnnotation;");

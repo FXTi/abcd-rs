@@ -42,8 +42,7 @@ fn foreign_class_decode() {
     assert_eq!(desc, "LExternal;");
     assert!(external.methods.is_empty());
     assert!(external.fields.is_empty());
-    // The foreign class descriptor is registered in the entity map.
-    assert!(file.entity_map.values().any(|&v| v == external.descriptor));
+    assert!(file.classes.contains_key(&external.descriptor));
 }
 
 // (builder type, expected decoded type)

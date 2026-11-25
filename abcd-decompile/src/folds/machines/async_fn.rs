@@ -377,6 +377,7 @@ pub(in crate::folds) fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<Va
                 SNode::Stmts(run) => {
                     let sig = run.iter().find(|l| {
                         !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. }))
+                            && !matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
                     });
                     match sig {
                         None => continue,
@@ -545,12 +546,17 @@ pub(in crate::folds) struct AsyncSite {
     pub(in crate::folds) continuation: Vec<SNode>,
 }
 
+pub(in crate::folds) fn is_phi_or_gen_state(l: &Leaf) -> bool {
+    matches!(l, Leaf::Raw(Stmt::PhiAssign { .. }))
+        || matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
+}
+
 /// The index of the previous non-phi-assign leaf before `cur`
 /// (block-end phi materializations interleave with the machinery).
 pub(in crate::folds) fn prev_non_phi(run: &[Leaf], cur: &mut usize) -> Option<usize> {
     while *cur > 0 {
         *cur -= 1;
-        if !matches!(run[*cur], Leaf::Raw(Stmt::PhiAssign { .. })) {
+        if !is_phi_or_gen_state(&run[*cur]) {
             return Some(*cur);
         }
     }
@@ -572,7 +578,7 @@ pub(in crate::folds) fn prev_non_phi_multi<'a>(
         };
         while *li > 0 {
             *li -= 1;
-            if !matches!(run[*li], Leaf::Raw(Stmt::PhiAssign { .. })) {
+            if !is_phi_or_gen_state(&run[*li]) {
                 return Some((*ni, *li, &run[*li]));
             }
         }
@@ -720,13 +726,11 @@ pub(in crate::folds) fn match_await_site(
     // The dispatch follows, separated from the machinery run by any
     // number of phi-partition / empty runs.
     let mut dispatch_off = 1;
-    while matches!(
-        nodes.get(i + dispatch_off),
-        Some(SNode::Stmts(run))
-            if run
-                .iter()
-                .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
-    ) {
+    while match nodes.get(i + dispatch_off) {
+        Some(SNode::Honest(_)) => true,
+        Some(SNode::Stmts(run)) => run.iter().all(is_phi_or_gen_state),
+        _ => false,
+    } {
         dispatch_off += 1;
     }
     let continuation = match_async_dispatch_mode(
@@ -786,14 +790,14 @@ pub(in crate::folds) fn match_async_dispatch_mode(
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsFalse | UnOp::LogicalNot,
+                op: UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot,
                 operand,
             } => {
                 positive = !positive;
                 e = operand;
             }
             Expr::Unary {
-                op: UnOp::IsTrue,
+                op: UnOp::IsTrue | UnOp::JumpNez,
                 operand,
             } => {
                 e = operand;
@@ -874,20 +878,15 @@ pub(in crate::folds) fn check_async_throw_arm(
     for n in arm {
         match n {
             // Phi partitions are block-end bookkeeping — skip.
-            SNode::Stmts(run)
-                if run
-                    .iter()
-                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. }))) => {}
+            SNode::Stmts(run) if run.iter().all(is_phi_or_gen_state) => {}
             SNode::Stmts(run) => {
                 if found {
                     return None;
                 }
                 // (A mixed run with interleaved phi assigns is fine
                 // too.)
-                let significant: Vec<&Leaf> = run
-                    .iter()
-                    .filter(|l| !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
-                    .collect();
+                let significant: Vec<&Leaf> =
+                    run.iter().filter(|l| !is_phi_or_gen_state(l)).collect();
                 match significant.as_slice() {
                     [Leaf::Raw(Stmt::Throw(value))]
                     | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
@@ -909,8 +908,8 @@ pub(in crate::folds) fn check_async_throw_arm(
                     _ => return None,
                 }
             }
-            // Dead loop-bookkeeping breaks after the diverging throw.
-            SNode::Break { .. } => {}
+            // Dead loop-bookkeeping breaks and try-boundary notes after/around the throw.
+            SNode::Break { .. } | SNode::Honest(_) => {}
             _ => return None,
         }
     }
@@ -935,10 +934,8 @@ pub(in crate::folds) fn check_async_break_arm(
     let mut found = false;
     for n in arm {
         match n {
-            SNode::Stmts(run)
-                if run
-                    .iter()
-                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. }))) => {}
+            SNode::Stmts(run) if run.iter().all(is_phi_or_gen_state) => {}
+            SNode::Honest(_) => {}
             SNode::Break { label: None } if !found => found = true,
             _ => return None,
         }

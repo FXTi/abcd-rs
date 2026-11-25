@@ -70,7 +70,7 @@ fn handler_phi_pinned_store_after_an_entry_seed_const() {
                 catches: vec![Catch {
                     handler,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }
@@ -105,7 +105,8 @@ fn handler_phi_pinned_store_after_an_entry_seed_const() {
     );
 
     // Behavioral: the normal path returns 99, and a dispatch entering the
-    // handler AFTER the entry ran observes the pinned seed value.
+    // handler at the end of protected `entry` (before unprotected `exit`)
+    // observes the pinned seed value.
     let mut machine = Machine::new();
     let halt = machine.run(&result.bytecodes);
     assert_eq!(
@@ -114,8 +115,15 @@ fn handler_phi_pinned_store_after_an_entry_seed_const() {
         "normal path (bytecodes: {:?})",
         result.bytecodes
     );
-    let handler_pc = result.try_blocks[0].catches[0].handler as usize;
-    let halt = machine.run_at(&result.bytecodes, handler_pc);
+    let tb = &result.try_blocks[0];
+    let try_end = (tb.start + tb.len) as usize;
+    let handler_pc = tb.catches[0].handler as usize;
+    let mut exc_machine = Machine::new();
+    assert_eq!(
+        exc_machine.run_until(&result.bytecodes, 0, try_end),
+        Halt::Stopped
+    );
+    let halt = exc_machine.run_at(&result.bytecodes, handler_pc);
     assert_eq!(
         halt,
         Halt::Return(7),
@@ -168,7 +176,7 @@ fn handler_phi_self_reference_pins_no_store() {
                 catches: vec![Catch {
                     handler,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }
@@ -227,7 +235,7 @@ fn handler_phi_co_located_with_its_source_pins_no_store() {
                 catches: vec![Catch {
                     handler,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }
@@ -293,7 +301,7 @@ fn pinned_store_skipped_when_source_and_dest_are_co_located() {
                 catches: vec![Catch {
                     handler,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }

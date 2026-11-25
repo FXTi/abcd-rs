@@ -773,6 +773,7 @@ fn arkui_reconstructs_entry_struct_decorators_builders_and_ui_tree() {
                 object: props_obj,
                 name: k_active,
                 value: backing,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
         let child_inst = emit_val(
@@ -1005,11 +1006,11 @@ fn arkui_reconstructs_entry_struct_decorators_builders_and_ui_tree() {
         let s_render = m.sym.intern("initialRender");
         let member_items = [
             Const::String(s_rerender),
-            Const::MethodRef(f_rerender),
+            Const::method_ref(f_rerender),
             Const::String(s_appear),
-            Const::MethodRef(f_appear),
+            Const::method_ref(f_appear),
             Const::String(s_render),
-            Const::MethodRef(f_render),
+            Const::method_ref(f_render),
         ]
         .map(|c| m.consts.intern(c));
         let members = m.consts.push_array(member_items.to_vec());
@@ -1050,6 +1051,7 @@ fn arkui_reconstructs_entry_struct_decorators_builders_and_ui_tree() {
                 object: cls_proto,
                 name: hdr_sym,
                 value: cl_hdr,
+                kind: abcd_ir::OwnStoreKind::OwnProp,
             },
         );
 
@@ -1200,7 +1202,15 @@ fn split_each_multi_batch_matches_decompile_module_split_and_propagates_errors()
             let x = add_param(&mut m, helper);
             let b = entry_of(&m, helper);
             if idx % 13 == 0 {
-                let lex = emit_val(&mut m, b, Op::GetLexVar { level: 2, slot: 1 });
+                let lex = emit_val(
+                    &mut m,
+                    b,
+                    Op::GetLexVar {
+                        level: 2,
+                        slot: 1,
+                        kind: abcd_ir::LexEnvKind::Plain,
+                    },
+                );
                 let sum = emit_val(
                     &mut m,
                     b,

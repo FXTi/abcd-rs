@@ -128,7 +128,7 @@ pub fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: Bloc
         catches: vec![Catch {
             handler,
             exception: exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 }
@@ -166,7 +166,7 @@ pub fn load_string(m: &mut Module, b: BlockId, s: &str) -> ValueId {
 
 /// A `Const::MethodRef` load (function value as a pooled constant).
 pub fn load_method_ref(m: &mut Module, b: BlockId, func: FuncId) -> ValueId {
-    let c = m.consts.push(Const::MethodRef(func));
+    let c = m.consts.push(Const::method_ref(func));
     emit(m, b, Op::LoadConst(c))
 }
 

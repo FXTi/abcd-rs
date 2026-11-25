@@ -21,6 +21,96 @@ pub use crate::module::{ModuleData, ModuleRecord, ModuleRequestPhase};
 pub use abcd_isa::{Bytecode, DecodeError};
 
 // ---------------------------------------------------------------------------
+// Dense entity indices & typed bytecode entity references (`#50` `R3-D2`)
+// ---------------------------------------------------------------------------
+
+/// Dense 0-based index into [`File::all_methods`] (iterating `File::classes`
+/// in `BTreeMap` order, then `Class::methods` in `Vec` order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MethodIdx(pub u32);
+
+impl MethodIdx {
+    /// Underlying `usize` index into [`File::all_methods`].
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Dense 0-based index into [`File::all_fields`] (iterating `File::classes`
+/// in `BTreeMap` order, then `Class::fields` in `Vec` order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FieldIdx(pub u32);
+
+impl FieldIdx {
+    /// Underlying `usize` index into [`File::all_fields`].
+    #[inline]
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Typed target of a bytecode entity operand in [`MethodBody::entities`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntityRef {
+    /// String entity (`EntityKind::StringId`): interned string + optional
+    /// wire offset provenance (`Some(off)` from decode / `.pa` parse for
+    /// `ark_disasm` `# STRING` `[offset:0x…]` byte-identity; `None` on
+    /// hand-built / lowered models).
+    String {
+        id: StringId,
+        source_offset: Option<u32>,
+    },
+    /// Method entity (`EntityKind::MethodId`) → [`MethodIdx`] in [`File::all_methods`].
+    Method(MethodIdx),
+    /// Foreign/unowned method item not present in `Class::methods` (retains
+    /// interned name + source offset for `ark_disasm` fallback signature
+    /// rendering; rejected with `Error::CodeRelocation` on `encode`).
+    ExternalMethod { name: StringId, source_offset: u32 },
+    /// Literal-array entity (`EntityKind::LiteralarrayId`) → [`LiteralArrayIdx`]
+    /// in [`File::literal_arrays`].
+    LiteralArray(LiteralArrayIdx),
+}
+
+impl EntityRef {
+    /// Construct an offsetless string entity reference.
+    #[inline]
+    #[must_use]
+    pub const fn string(id: StringId) -> Self {
+        Self::String {
+            id,
+            source_offset: None,
+        }
+    }
+
+    /// Construct a string entity reference carrying wire offset provenance.
+    #[inline]
+    #[must_use]
+    pub const fn string_with_offset(id: StringId, off: u32) -> Self {
+        Self::String {
+            id,
+            source_offset: Some(off),
+        }
+    }
+
+    /// Construct a method entity reference.
+    #[inline]
+    #[must_use]
+    pub const fn method(idx: MethodIdx) -> Self {
+        Self::Method(idx)
+    }
+
+    /// Construct a literal-array entity reference.
+    #[inline]
+    #[must_use]
+    pub const fn literal_array(idx: LiteralArrayIdx) -> Self {
+        Self::LiteralArray(idx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
 
@@ -35,16 +125,11 @@ pub struct File {
     pub strings: StringPool,
     /// Classes keyed by interned descriptor (e.g. `"L_GLOBAL;"`).
     pub classes: BTreeMap<StringId, Class>,
-    /// Literal arrays (indexed by position in the file). Beyond
-    /// header-table entries this includes arrays reached through method
-    /// index regions, scope-names fields, and nested `LITERALARRAY`
-    /// payloads recovered transitively at decode (v2-P1a).
+    /// Literal arrays (indexed by [`LiteralArrayIdx`]). Beyond header-table
+    /// entries this includes arrays reached through method index regions,
+    /// scope-names / type-summary fields, and nested literal-array payloads
+    /// recovered transitively at decode.
     pub literal_arrays: Vec<LiteralArray>,
-    /// Source-file literal-array offset → decoded table index. Nested
-    /// arrays recovered from literal payloads are registered here too, so a
-    /// `LiteralValue::LiteralArray` slot is resolvable whenever its target
-    /// was decodable.
-    pub literal_array_offsets: HashMap<u32, u32>,
     /// The raw header literal-array index table, in header order and
     /// INCLUDING the module-record / module-request-phase blob slots that
     /// [`File::literal_arrays`] excludes (they are untagged blobs, not
@@ -56,8 +141,6 @@ pub struct File {
     /// header positions, which are otherwise unrecoverable once the
     /// excluded slots are dropped.
     pub literal_array_header_offsets: Vec<u32>,
-    /// offset → interned name/descriptor, for resolving bytecode `EntityId` operands.
-    pub entity_map: HashMap<u32, StringId>,
 }
 
 /// A decoded class with nested methods, fields, and annotations.
@@ -139,15 +222,16 @@ pub enum FieldValue {
     /// re-emits it as a fresh literal-array item and writes the field value as
     /// the item's NEW layout offset (never the stale source offset).
     ModuleData(ModuleData),
-    /// Tagged literal-array offset field (standalone `_ESScopeNamesRecord`,
+    /// Tagged literal-array reference field (standalone `_ESScopeNamesRecord`,
     /// `scopeNames` on `--merge-abc` module records, or non-zero
-    /// `typeSummaryOffset` fields): the u32 wire value is the source-file
-    /// offset of a normal tagged literal array. Decode ensures both the target
-    /// array and any transitively nested `LiteralValue::LiteralArray` entries
-    /// populate [`File::literal_arrays`]; `encode` resolves the offset through
-    /// [`File::literal_array_offsets`] so the rewritten field points at the
-    /// re-emitted literal array.
-    LiteralArrayRef(u32),
+    /// `typeSummaryOffset` fields): `index` names the decoded entry in
+    /// [`File::literal_arrays`] used by [`crate::encode`], while
+    /// `source_offset` optionally retains the wire offset for `pandasm`
+    /// byte-identity with `ark_disasm`.
+    LiteralArrayRef {
+        index: LiteralArrayIdx,
+        source_offset: Option<u32>,
+    },
     /// `moduleRequestPhaseIdx` field (on `_ModuleRequestPhaseRecord`, or on
     /// the module's own record in merge-abc output): the u32 wire value is
     /// the source-file offset of an untagged module-request-phase blob
@@ -168,6 +252,18 @@ pub enum FieldValue {
     },
 }
 
+impl FieldValue {
+    /// Construct an offsetless [`FieldValue::LiteralArrayRef`] pointing at `index`.
+    #[inline]
+    #[must_use]
+    pub const fn literal_array_ref(index: LiteralArrayIdx) -> Self {
+        Self::LiteralArrayRef {
+            index,
+            source_offset: None,
+        }
+    }
+}
+
 /// Decoded method body (bytecodes + exception handlers).
 #[derive(Clone, Debug)]
 pub struct MethodBody {
@@ -176,30 +272,17 @@ pub struct MethodBody {
     /// Number of arguments (including `this` for instance methods).
     pub num_args: u32,
     pub bytecodes: Vec<Bytecode>,
-    /// (Operand role, index) → source-file entity offset, resolved in
-    /// this method's index region. Bytecodes retain their raw operands.
-    /// Literal-array operands require separate version-dependent handling.
-    pub entity_offsets: HashMap<(abcd_isa::EntityKind, u32), u32>,
+    /// `(EntityKind, raw_operand_id)` → resolved [`EntityRef`]. Bytecodes
+    /// retain their raw immediate/index operands while semantic consumers and
+    /// [`crate::encode`] consult this table directly without raw file offsets.
+    pub entities: HashMap<(abcd_isa::EntityKind, u32), EntityRef>,
     pub try_blocks: Vec<TryBlock>,
     /// Total IC-slot consumption of this bytecode, as computed by the
-    /// lower that produced it (N73). The runtime sizes each method's
-    /// `ProfileTypeInfo` array from the method's
-    /// `_ESSlotNumberAnnotation`/`SlotNumber` value
-    /// (arkcompiler_ets_runtime-master/ecmascript/jspandafile/
-    /// method_literal.cpp:51-77 — the annotation IS the slot count), and
-    /// the interpreter's IC fast paths index that array with the
-    /// instruction's slot immediate WITHOUT a bounds check
-    /// (interpreter-inl.cpp:2556-2565 `profileTypeArray->Get(slotId)`).
-    /// A rewritten body can consume MORE slots than the source bytecode
-    /// did (e.g. a `wide.callthisrangewithname` — no IC — folding to a
-    /// narrow `callthisrange` — 2-slot IC), so a body-replacing rewrite
-    /// must re-synchronize the annotation or the VM reads/writes out of
-    /// bounds (N73: SIGSEGV on `call_this_range_with_name`).
+    /// lower that produced it (N73).
     ///
     /// `None` for decoded bodies: a plain decode → encode round-trip
-    /// keeps the source annotation verbatim (byte identity). `Some(n)`
-    /// tells [`crate::encode`] to sync the method's `SlotNumber` element
-    /// to `n`.
+    /// keeps the source annotation verbatim. `Some(n)` tells [`crate::encode`]
+    /// to sync the method's `SlotNumber` element to `n`.
     pub ic_size: Option<u32>,
 }
 
@@ -231,9 +314,34 @@ pub struct MethodDebugInfo {
 }
 
 /// Decoded literal array.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LiteralArray {
+    /// Optional wire offset in the source `.abc` / `.pa` file (`None` on
+    /// hand-built or lowered models).
+    pub source_offset: Option<u32>,
     pub values: Vec<LiteralValue>,
+}
+
+impl LiteralArray {
+    /// Create a literal array without wire offset provenance (`source_offset: None`).
+    #[inline]
+    #[must_use]
+    pub const fn new(values: Vec<LiteralValue>) -> Self {
+        Self {
+            source_offset: None,
+            values,
+        }
+    }
+
+    /// Create a literal array recording its wire `source_offset`.
+    #[inline]
+    #[must_use]
+    pub const fn with_source_offset(source_offset: u32, values: Vec<LiteralValue>) -> Self {
+        Self {
+            source_offset: Some(source_offset),
+            values,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,22 +361,63 @@ impl File {
         self.classes.get(&sid)
     }
 
-    /// Flat iterator over `(class_descriptor, method)` across all classes.
+    /// Flat iterator over `(class_descriptor, method)` across all classes
+    /// (indexed by [`MethodIdx`]).
     pub fn all_methods(&self) -> impl Iterator<Item = (StringId, &Method)> {
         self.classes
             .iter()
             .flat_map(|(&desc, c)| c.methods.iter().map(move |m| (desc, m)))
     }
 
-    /// Resolve a bytecode `EntityId` offset to an interned string id.
-    pub fn resolve_entity(&self, id: u32) -> Option<StringId> {
-        self.entity_map.get(&id).copied()
+    /// Flat iterator over `(class_descriptor, field)` across all classes
+    /// (indexed by [`FieldIdx`]).
+    pub fn all_fields(&self) -> impl Iterator<Item = (StringId, &Field)> {
+        self.classes
+            .iter()
+            .flat_map(|(&desc, c)| c.fields.iter().map(move |f| (desc, f)))
     }
 
-    /// Resolve a bytecode `EntityId` offset to a name/descriptor string.
-    pub fn resolve_entity_str(&self, id: u32) -> Option<&str> {
-        let sid = self.entity_map.get(&id)?;
-        self.strings.resolve(*sid)
+    /// Dense `(class_descriptor, class, method)` table indexed by [`MethodIdx`].
+    #[must_use]
+    pub fn method_table(&self) -> Vec<(StringId, &Class, &Method)> {
+        self.classes
+            .iter()
+            .flat_map(|(&desc, c)| c.methods.iter().map(move |m| (desc, c, m)))
+            .collect()
+    }
+
+    /// Look up `(class_descriptor, class, method)` by [`MethodIdx`].
+    #[must_use]
+    pub fn method_by_idx(&self, idx: MethodIdx) -> Option<(StringId, &Class, &Method)> {
+        let mut rem = idx.index();
+        for (&desc, cls) in &self.classes {
+            if rem < cls.methods.len() {
+                return Some((desc, cls, &cls.methods[rem]));
+            }
+            rem -= cls.methods.len();
+        }
+        None
+    }
+
+    /// Look up `(class_descriptor, class, field)` by [`FieldIdx`].
+    #[must_use]
+    pub fn field_by_idx(&self, idx: FieldIdx) -> Option<(StringId, &Class, &Field)> {
+        let mut rem = idx.index();
+        for (&desc, cls) in &self.classes {
+            if rem < cls.fields.len() {
+                return Some((desc, cls, &cls.fields[rem]));
+            }
+            rem -= cls.fields.len();
+        }
+        None
+    }
+
+    /// Find the first [`LiteralArray`] carrying `source_offset == Some(off)`.
+    #[must_use]
+    pub fn literal_array_by_offset(&self, off: u32) -> Option<(LiteralArrayIdx, &LiteralArray)> {
+        self.literal_arrays.iter().enumerate().find_map(|(i, la)| {
+            (la.source_offset == Some(off)).then_some((LiteralArrayIdx(i as u32), la))
+        })
     }
 
     /// Decode module data from the literal array at the given index.

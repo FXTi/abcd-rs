@@ -148,7 +148,8 @@ pub struct CallSiteReport {
     /// The call instruction's `InstId` arena index.
     pub inst: u32,
     /// The IR `CallKind`, snake_case (`direct`, `dynamic`, `apply`,
-    /// `new`, `super`, `super_spread`, `super_forward_all_args`).
+    /// `new`, `new_spread`, `super`, `super_arrow`, `super_spread`,
+    /// `super_forward_all_args`, `class_init`).
     pub kind: String,
     /// Edge classification: `direct` / `resolved_value_flow` /
     /// `unknown_callees`.
@@ -320,9 +321,12 @@ fn callgraph_section(ir: &Module, graph: &CallGraph) -> CallgraphReport {
             CallKind::Dynamic => "dynamic",
             CallKind::Apply => "apply",
             CallKind::Super => "super",
+            CallKind::SuperArrow => "super_arrow",
             CallKind::SuperSpread => "super_spread",
             CallKind::SuperForwardAllArgs => "super_forward_all_args",
             CallKind::New => "new",
+            CallKind::NewSpread => "new_spread",
+            CallKind::ClassInit => "class_init",
         };
         let edge_kind = match edge.edge_kind {
             CallEdgeKind::Direct => "direct",

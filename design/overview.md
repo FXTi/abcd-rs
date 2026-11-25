@@ -18,7 +18,7 @@ flowchart TD
     OPT["abcd-opt (Peephole / SCCP / ADCE / CopyProp / Inline)"]
     LFT["abcd-lift (File → IR)"]
     LWR["abcd-lower (IR → File)"]
-    IR["abcd-ir (88-op SSA IR + Verifier)"]
+    IR["abcd-ir (94-op SSA IR + Verifier)"]
     FIL["abcd-file (.abc decode / encode / pandasm)"]
     ISA["abcd-isa (Bytecode decode / encode / legacy 0.0.0.2)"]
     FSYS["abcd-file-sys (C99 libpandafile bridge)"]
@@ -44,7 +44,7 @@ flowchart TD
 | `abcd-file-sys` | Exception-guarded, span-clamped C99 bridge over vendored `libpandafile` reader/writer/debug/annotation classes |
 | `abcd-file` | `.abc` `decode` & `encode`, lossless dual-bucket MUTF-8 `StringPool`, structural module/literal/annotation relocation, and `pandasm` `.pa` disassembler/assembler |
 | `abcd-hap` | Pure-Rust, zero-C reader for `.hap`, `.hsp`, `.app`, and `.hqf` OpenHarmony packages |
-| `abcd-ir` | Format-independent `88`-op SSA IR (`Module`, `Op`, `Effects`, `Ty`, `TryRegion`, `frame::FrameSlots`, `verify_module`) |
+| `abcd-ir` | Format-independent `94`-op SSA IR (`Module`, `Op`, `Effects`, `Ty`, `TryRegion`, `frame::FrameSlots`, `verify_module`) |
 | `abcd-lift` | `File → Module` converter: entity resolution, literal trees, ES module records, Braun SSA construction, and exception CFG |
 | `abcd-opt` | `Module → Module` SSA passes: `Peephole`, `Sccp`, `Adce` + `CfgSimplify`, `CopyProp`, and opt-in intra-module `inline` |
 | `abcd-lower` | `Module → File` converter: chordal MCS register allocation, parallel-copy cycle breaking, `acc`-as-cache `isel`, RPO layout, IC-slot sync, and per-method `u16` entity compaction |

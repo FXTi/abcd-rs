@@ -68,21 +68,34 @@ enum ConstBuildFrame<'a> {
         pending_key: Option<Lit>,
         out: Vec<(Lit, Lit)>,
     },
+    Ref {
+        owner: Option<ConstId>,
+        target: ConstId,
+        resolved: bool,
+    },
 }
 
 fn scalar_const_to_lit(module: &Module, c: &Const) -> Option<Lit> {
     Some(match c {
         Const::Undefined => Lit::Undefined,
         Const::Hole => Lit::Hole,
-        Const::Null => Lit::Null,
+        Const::Null | Const::LitNull(_) => Lit::Null,
         Const::Bool(b) => Lit::Bool(*b),
+        Const::Int8(n) => Lit::Number((*n as f64).to_bits()),
+        Const::Int32(n) => Lit::Number(((*n as i32) as f64).to_bits()),
+        Const::Float32(bits) => Lit::Number((f32::from_bits(*bits) as f64).to_bits()),
         Const::Number(bits) => Lit::Number(*bits),
         Const::Int64(v) => Lit::Int64(*v),
         Const::UInt64(v) => Lit::UInt64(*v),
-        Const::String(s) => lit_of_sym(module, *s),
+        Const::Accessor(n) | Const::BuiltinTypeIndex(n) => Lit::Number((*n as f64).to_bits()),
+        Const::MethodAffiliate(n) => Lit::Number((*n as f64).to_bits()),
+        Const::String(s) | Const::EtsImplements(s) => lit_of_sym(module, *s),
         Const::BigInt(s) => Lit::BigInt(sym_str(module, *s)),
-        Const::MethodRef(f) => Lit::MethodRef(*f),
-        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => return None,
+        Const::MethodRef { func, .. } => Lit::MethodRef(*func),
+        Const::ArrayLiteral(_)
+        | Const::TypedArrayLiteral { .. }
+        | Const::ObjectLiteral { .. }
+        | Const::LiteralBufferRef(_) => return None,
     })
 }
 
@@ -92,12 +105,14 @@ fn push_const_frame<'a>(
     frames: &mut Vec<ConstBuildFrame<'a>>,
 ) {
     match c {
-        Const::ArrayLiteral(items) => frames.push(ConstBuildFrame::Array {
-            owner,
-            items,
-            idx: 0,
-            out: Vec::with_capacity(items.len()),
-        }),
+        Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+            frames.push(ConstBuildFrame::Array {
+                owner,
+                items,
+                idx: 0,
+                out: Vec::with_capacity(items.len()),
+            });
+        }
         Const::ObjectLiteral { keys, values } => frames.push(ConstBuildFrame::Object {
             owner,
             keys,
@@ -105,6 +120,11 @@ fn push_const_frame<'a>(
             idx: 0,
             pending_key: None,
             out: Vec::with_capacity(keys.len().min(values.len())),
+        }),
+        Const::LiteralBufferRef(target) => frames.push(ConstBuildFrame::Ref {
+            owner,
+            target: *target,
+            resolved: false,
         }),
         _ => {}
     }
@@ -207,6 +227,35 @@ fn const_to_lit_with_active(
                         return Some(done);
                     }
                     completed = Some(done);
+                }
+            }
+            ConstBuildFrame::Ref {
+                owner,
+                target,
+                resolved,
+            } => {
+                if *resolved {
+                    if let Some(id) = *owner {
+                        active.remove(&id);
+                    }
+                    let done = completed.take()?;
+                    frames.pop();
+                    if frames.is_empty() {
+                        return Some(done);
+                    }
+                    completed = Some(done);
+                } else {
+                    *resolved = true;
+                    let tcid = *target;
+                    let child = module.consts.get(tcid)?;
+                    if let Some(lit) = scalar_const_to_lit(module, child) {
+                        completed = Some(lit);
+                    } else {
+                        if !active.insert(tcid) {
+                            return None;
+                        }
+                        push_const_frame(child, Some(tcid), &mut frames);
+                    }
                 }
             }
         }
@@ -783,6 +832,67 @@ mod tests {
                     while let Lit::Array(mut v) = cur {
                         cur = v.pop().unwrap_or(Lit::Null);
                     }
+                })
+                .expect("spawn 256k thread");
+            handle.join().expect("256k thread must not stack-overflow");
+        });
+    }
+
+    #[test]
+    fn round3_const_variants_and_literal_buffer_ref_cycles_and_256k_stack() {
+        use abcd_ir::FuncId;
+        use abcd_ir::consts::{LitMethodKind, TypedArrayTag};
+
+        let mut m = Module::new();
+        let iface = m.sym.intern("IFoo");
+        let c_i8 = m.consts.push(Const::Int8(255));
+        let c_i32_neg = m.consts.push(Const::Int32((-7i32) as u32));
+        let c_f32 = m.consts.push(Const::Float32(1.5f32.to_bits()));
+        let c_acc = m.consts.push(Const::Accessor(0));
+        let c_aff = m.consts.push(Const::MethodAffiliate(3));
+        let c_bti = m.consts.push(Const::BuiltinTypeIndex(21));
+        let c_ets = m.consts.push(Const::EtsImplements(iface));
+        let c_null = m.consts.push(Const::LitNull(0));
+        let c_mref = m.consts.push(Const::method_ref_with_kind(
+            FuncId::new(9),
+            LitMethodKind::GeneratorMethod,
+        ));
+        assert_eq!(lit_of(&m, c_mref), Some(Lit::MethodRef(FuncId::new(9))));
+
+        let typed = m.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I32,
+            items: vec![c_i8, c_i32_neg, c_f32, c_acc, c_aff, c_bti, c_ets, c_null],
+        });
+        let buf_ref = m.consts.push(Const::LiteralBufferRef(typed));
+        let resolved = lit_of(&m, buf_ref).expect("resolve LiteralBufferRef -> TypedArrayLiteral");
+        assert_eq!(
+            render_lit(&resolved),
+            "[255.0, -7.0, 1.5, 0.0, 3.0, 21.0, \"IFoo\", null]"
+        );
+
+        // Cycle safety: `cyc_a -> cyc_b -> cyc_a` returns `None` without panicking.
+        let cyc_a = m.consts.push(Const::Undefined);
+        let cyc_b = m.consts.push(Const::LiteralBufferRef(cyc_a));
+        // Overwrite via fresh pool or direct cycle check: self-referential ref.
+        let mut cyc_mod = Module::new();
+        let self_ref = abcd_ir::ConstId::new(0);
+        let pushed = cyc_mod.consts.push(Const::LiteralBufferRef(self_ref));
+        assert_eq!(pushed, self_ref);
+        assert_eq!(lit_of(&cyc_mod, self_ref), None);
+        let _ = cyc_b;
+
+        // Deep 3,000-node `LiteralBufferRef` chain on a 256 KiB stack.
+        let mut deep_ref = c_i32_neg;
+        for _ in 0..3_000 {
+            deep_ref = m.consts.push(Const::LiteralBufferRef(deep_ref));
+        }
+        std::thread::scope(|s| {
+            let handle = std::thread::Builder::new()
+                .name("consts-ref-256k".to_string())
+                .stack_size(256 * 1024)
+                .spawn_scoped(s, || {
+                    let deep_lit = lit_of(&m, deep_ref).expect("deep LiteralBufferRef");
+                    assert_eq!(render_lit(&deep_lit), "-7.0");
                 })
                 .expect("spawn 256k thread");
             handle.join().expect("256k thread must not stack-overflow");

@@ -435,6 +435,7 @@ fn t06_literal_builders() {
             object: arr,
             index: c5,
             value: c6,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     let spread = emit_void(&mut m, b, Op::CopyDataProps { dst: arr, src: p1 });
@@ -890,9 +891,17 @@ fn t13_lexenv() {
             level: 0,
             slot: 0,
             value: c1,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
-    let _nu = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+    let _nu = emit(
+        &mut m,
+        b,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let c2 = load_number(&mut m, b, 2.0);
     emit_void(
         &mut m,
@@ -901,10 +910,27 @@ fn t13_lexenv() {
             level: 0,
             slot: 0,
             value: c2,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
-    let g1 = emit(&mut m, b, Op::GetLexVar { level: 1, slot: 1 });
-    let g2 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+    let g1 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 1,
+            slot: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let g2 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let s = add(&mut m, b, g1, g2);
     emit_void(&mut m, b, Op::PopLexEnv);
     emit_void(&mut m, b, Op::PopLexEnv);
@@ -1015,7 +1041,14 @@ fn t15_private_names() {
     let b = entry_of(&m, f);
     let _this = add_param(&mut m, f);
     let p1 = add_param(&mut m, f);
-    let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+    let _ne = emit(
+        &mut m,
+        b,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let a = intern(&mut m, "a");
     let bb = intern(&mut m, "b");
     let names = const_array(&mut m, vec![Const::String(a), Const::String(bb)]);
@@ -1303,7 +1336,14 @@ fn t20_capture_consistent_fallback() {
     {
         let b = entry_of(&m, child);
         let _this = add_param(&mut m, child);
-        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        let _ne = emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let c7 = load_number(&mut m, b, 7.0);
         emit_void(
             &mut m,
@@ -1312,10 +1352,27 @@ fn t20_capture_consistent_fallback() {
                 level: 0,
                 slot: 0,
                 value: c7,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
-        let g1 = emit(&mut m, b, Op::GetLexVar { level: 2, slot: 1 });
-        let g2 = emit(&mut m, b, Op::GetLexVar { level: 1, slot: 0 });
+        let g1 = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 2,
+                slot: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let g2 = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 1,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let s = add(&mut m, b, g1, g2);
         emit_void(&mut m, b, Op::PopLexEnv);
         emit_void(&mut m, b, Op::Return { value: Some(s) });
@@ -1325,7 +1382,14 @@ fn t20_capture_consistent_fallback() {
     {
         let b = entry_of(&m, parent);
         let _this = add_param(&mut m, parent);
-        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        let _ne = emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let c20 = load_number(&mut m, b, 20.0);
         emit_void(
             &mut m,
@@ -1334,6 +1398,7 @@ fn t20_capture_consistent_fallback() {
                 level: 0,
                 slot: 0,
                 value: c20,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let df = emit(
@@ -1353,7 +1418,14 @@ fn t20_capture_consistent_fallback() {
     {
         let b = entry_of(&m, grand);
         let _this = add_param(&mut m, grand);
-        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 2 });
+        let _ne = emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 2,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let c10 = load_number(&mut m, b, 10.0);
         emit_void(
             &mut m,
@@ -1362,6 +1434,7 @@ fn t20_capture_consistent_fallback() {
                 level: 0,
                 slot: 0,
                 value: c10,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let c21 = load_number(&mut m, b, 21.0);
@@ -1372,6 +1445,7 @@ fn t20_capture_consistent_fallback() {
                 level: 0,
                 slot: 1,
                 value: c21,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let df = emit(

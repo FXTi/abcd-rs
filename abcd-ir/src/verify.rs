@@ -36,7 +36,7 @@ use crate::consts::Const;
 use crate::function::{Edge, EdgeKind, ValueDef};
 use crate::id::{BlockId, ClassId, ConstId, FuncId, InstId, Sym, ValueId};
 use crate::module::{AnnValue, ExportDecl, ImportDecl, Module};
-use crate::op::{CallKind, Op};
+use crate::op::{CallKind, LexEnvKind, Op, OwnStoreKind};
 use crate::ty::{StaticTy, Ty};
 
 /// The error taxonomy. All variants derive their messages via thiserror
@@ -266,6 +266,14 @@ pub enum VerifyErrorKind {
         /// The call kind whose structural contract was violated.
         kind: CallKind,
     },
+    /// `LexEnvKind` or `OwnStoreKind` violates its opcode invariant (`#55`).
+    #[error("invalid op modifier on {inst}: {detail}")]
+    InvalidOpModifier {
+        /// The offending instruction id.
+        inst: InstId,
+        /// Description of the violated modifier rule.
+        detail: &'static str,
+    },
     /// A symbol reference outside `module.sym`.
     #[error("symbol {0} is outside the symbol table")]
     SymOutOfRange(Sym),
@@ -476,6 +484,15 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     None,
                     None,
                     VerifyErrorKind::ForeignHandler(catch.handler),
+                ));
+            }
+            if let Some(tc) = catch.type_class
+                && module.class(tc).is_none()
+            {
+                report.errors.push(err(
+                    Some(catch.handler),
+                    None,
+                    VerifyErrorKind::ClassOutOfRange(tc),
                 ));
             }
             // The exception value must be the dispatch-defined value of
@@ -765,9 +782,11 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             {
                 let valid_shape = match kind {
                     CallKind::Apply => this.is_some() && args.len() == 1,
-                    CallKind::SuperSpread | CallKind::SuperForwardAllArgs => {
+                    CallKind::SuperSpread | CallKind::SuperForwardAllArgs | CallKind::NewSpread => {
                         this.is_none() && args.len() == 1
                     }
+                    CallKind::SuperArrow => this.is_none(),
+                    CallKind::ClassInit => this.is_some() && args.is_empty(),
                     CallKind::Dynamic | CallKind::Direct | CallKind::Super | CallKind::New => true,
                 };
                 if !valid_shape {
@@ -777,6 +796,42 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                         VerifyErrorKind::InvalidCallShape { kind: *kind },
                     ));
                 }
+            }
+            let invalid_mod = match &inst.op {
+                Op::NewLexEnv {
+                    kind: LexEnvKind::Patch,
+                    ..
+                } => Some("NewLexEnv cannot use LexEnvKind::Patch"),
+                Op::GetLexVar {
+                    level,
+                    kind: LexEnvKind::Patch,
+                    ..
+                }
+                | Op::PutLexVar {
+                    level,
+                    kind: LexEnvKind::Patch,
+                    ..
+                } if *level != 0 => Some("LexEnvKind::Patch requires level == 0"),
+                Op::StoreOwnPropDyn {
+                    kind: OwnStoreKind::DefineProperty,
+                    ..
+                } => Some("StoreOwnPropDyn cannot use OwnStoreKind::DefineProperty"),
+                Op::StoreOwnPropIdx { kind, .. }
+                    if !matches!(kind, OwnStoreKind::OwnProp | OwnStoreKind::ClassField) =>
+                {
+                    Some("StoreOwnPropIdx only allows OwnProp or ClassField")
+                }
+                _ => None,
+            };
+            if let Some(detail) = invalid_mod {
+                report.errors.push(err(
+                    Some(bb),
+                    Some(inst_id),
+                    VerifyErrorKind::InvalidOpModifier {
+                        inst: inst_id,
+                        detail,
+                    },
+                ));
             }
             inst.op.for_each_const_id(|cid| {
                 if module.consts.get(cid).is_none() {
@@ -1537,13 +1592,22 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             continue;
         };
         match c {
-            Const::MethodRef(f) if module.func(*f).is_none() => {
+            Const::MethodRef { func, .. } if module.func(*func).is_none() => {
                 report
                     .errors
-                    .push(module_err(VerifyErrorKind::FuncOutOfRange(*f)));
+                    .push(module_err(VerifyErrorKind::FuncOutOfRange(*func)));
             }
-            Const::String(s) | Const::BigInt(s) => check_sym(*s, None, &mut report.errors),
-            Const::ArrayLiteral(items) => {
+            Const::String(s) | Const::BigInt(s) | Const::EtsImplements(s) => {
+                check_sym(*s, None, &mut report.errors);
+            }
+            Const::LiteralBufferRef(child) => {
+                if module.consts.get(*child).is_none() {
+                    report
+                        .errors
+                        .push(module_err(VerifyErrorKind::ConstOutOfRange(*child)));
+                }
+            }
+            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
                 for &child in items {
                     if module.consts.get(child).is_none() {
                         report
@@ -1585,7 +1649,10 @@ pub fn verify_module(module: &Module) -> VerifyReport {
         while let Some((ci, child_pos)) = dfs_stack.last_mut() {
             let cur = *ci;
             let next_child = match module.consts.get(ConstId::new(cur as u32)) {
-                Some(Const::ArrayLiteral(items)) => items.get(*child_pos).copied(),
+                Some(Const::LiteralBufferRef(child)) => (*child_pos == 0).then_some(*child),
+                Some(Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. }) => {
+                    items.get(*child_pos).copied()
+                }
                 Some(Const::ObjectLiteral { keys, values }) => {
                     let pos = *child_pos;
                     if pos < keys.len() {
@@ -1731,7 +1798,7 @@ mod tests {
             catches: vec![Catch {
                 handler,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
     }
@@ -2399,7 +2466,7 @@ mod tests {
             catches: vec![Catch {
                 handler: h,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         let r = verify_func(&m, f);
@@ -2428,7 +2495,7 @@ mod tests {
             catches: vec![Catch {
                 handler: h,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         let r = verify_func(&m, f);
@@ -2464,7 +2531,7 @@ mod tests {
             catches: vec![Catch {
                 handler: gx,
                 exception: exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         // Case 2: handler outside the block arena entirely.
@@ -2475,7 +2542,7 @@ mod tests {
             catches: vec![Catch {
                 handler: arena_bug,
                 exception: exc2,
-                type_idx: None,
+                type_class: None,
             }],
         });
         let r = verify_func(&m, f);
@@ -2526,7 +2593,7 @@ mod tests {
             catches: vec![Catch {
                 handler: h,
                 exception: not_exc,
-                type_idx: None,
+                type_class: None,
             }],
         });
         let r = verify_func(&m, f);
@@ -3651,16 +3718,16 @@ mod tests {
         let bogus_direct = FuncId::new(77);
         let bogus_nested = FuncId::new(78);
         let bogus_in_array = FuncId::new(79);
-        m.consts.push(Const::MethodRef(bogus_direct));
+        m.consts.push(Const::method_ref(bogus_direct));
         let key = m.sym.intern("k");
         let k_cid = m.consts.push(Const::String(key));
-        let nested_cid = m.consts.push(Const::MethodRef(bogus_nested));
+        let nested_cid = m.consts.push(Const::method_ref(bogus_nested));
         m.consts.push(Const::ObjectLiteral {
             keys: vec![k_cid],
             values: vec![nested_cid],
         });
         let null_cid = m.consts.push(Const::Null);
-        let arr_m_cid = m.consts.push(Const::MethodRef(bogus_in_array));
+        let arr_m_cid = m.consts.push(Const::method_ref(bogus_in_array));
         m.consts
             .push(Const::ArrayLiteral(vec![null_cid, arr_m_cid]));
         let r = verify_module(&m);

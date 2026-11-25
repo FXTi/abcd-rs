@@ -67,6 +67,7 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
         entity_traces: HashMap::new(),
         ic_size: 0,
         unsupported: None,
+        ..Default::default()
     };
 
     // Hand-pinned allocation. The (entry, s2) phi copy writes p2 into R5 —

@@ -387,6 +387,7 @@ fn annotation_array_member_elem_unresolvable() {
             tag: b'X',
             values: vec![AnnotationValue::Method {
                 name,
+                method: None,
                 offset: 0x77777,
             }],
         },
@@ -406,6 +407,7 @@ fn annotation_array_member_elem_unresolvable() {
             tag: b'Y',
             values: vec![AnnotationValue::Enum {
                 name,
+                field: None,
                 offset: 0x77777,
             }],
         },
@@ -431,6 +433,8 @@ fn annotation_array_method_handle_elem_unresolvable() {
                 abcd_file::ResolvedMethodHandle {
                     handle_type: abcd_file::MethodHandleType::InvokeStatic,
                     entity: name,
+                    target_method: None,
+                    target_field: None,
                     entity_offset: 0x77777,
                 },
             )],
@@ -506,9 +510,10 @@ fn embedded_nested_literal_array_index_out_of_bounds() {
 #[test]
 fn embedded_nested_literal_array_roundtrips() {
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(0x1111)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            0x1111,
+        )]));
     push_class_annotation(
         &mut file,
         AnnotationValue::LiteralArray(vec![
@@ -559,9 +564,10 @@ fn embedded_nested_literal_array_owner_contexts() {
 
     // Method annotation: in-bounds round-trips; out-of-bounds names method owner.
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(77)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            77,
+        )]));
     let ann = mk_ann(&mut file, 0);
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     cls.methods[0].annotations.runtime.push(ann);
@@ -603,9 +609,10 @@ fn embedded_nested_literal_array_owner_contexts() {
 
     // Field annotation: in-bounds round-trips; out-of-bounds names field owner.
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(88)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            88,
+        )]));
     let ann = mk_ann(&mut file, 0);
     let field_name = file.strings.get_or_intern("fld");
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
@@ -679,9 +686,10 @@ fn embedded_nested_literal_array_nested_annotation_site() {
     let build_nested = |in_bounds: bool| {
         let mut file = base_model();
         let target_idx = if in_bounds {
-            file.literal_arrays.push(abcd_file::LiteralArray {
-                values: vec![LiteralValue::Integer(555)],
-            });
+            file.literal_arrays
+                .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+                    555,
+                )]));
             0
         } else {
             7
@@ -788,9 +796,10 @@ fn embedded_nested_literal_array_through_array_element() {
 
     // In-bounds through 'Z' (ArrayAnnotation) element -> full encode -> decode round-trip!
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(321)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            321,
+        )]));
     let inner_desc = file.strings.get_or_intern("LInner;");
     let inner_name = file.strings.get_or_intern("arr_la");
     push_class_annotation(
@@ -841,9 +850,10 @@ fn embedded_nested_literal_array_through_array_element() {
 fn param_annotation_nested_literal_array_roundtrip_and_oob() {
     // In-bounds round-trip.
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(999)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            999,
+        )]));
     let desc = file.strings.get_or_intern("LAnno;");
     let name = file.strings.get_or_intern("p");
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
@@ -915,18 +925,14 @@ fn param_annotation_nested_literal_array_roundtrip_and_oob() {
 #[test]
 fn cyclic_literal_array_type_graph_roundtrips() {
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![
-            LiteralValue::Integer(101),
-            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
-        ],
-    });
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![
-            LiteralValue::Integer(202),
-            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
-        ],
-    });
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::Integer(101),
+        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
+    ]));
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::Integer(202),
+        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
+    ]));
     push_class_annotation(
         &mut file,
         AnnotationValue::LiteralArray(vec![
@@ -965,9 +971,10 @@ fn param_annotation_plain_literal_array_unaffected() {
     let mut file = base_model();
     // A model literal array AFTER the param-annotation one: with a
     // miscounting ann_la_base the debug handle assertion fires.
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(99)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(
+            99,
+        )]));
     let desc = file.strings.get_or_intern("LAnno;");
     let name = file.strings.get_or_intern("p");
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
@@ -1021,12 +1028,11 @@ fn param_annotation_plain_literal_array_unaffected() {
 fn model_nested_literal_array_unaffected_by_annotation_rejection() {
     let mut file = base_model();
     // Model-level nesting: array 0 references array 1.
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1))],
-    });
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(7)],
-    });
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
+    ]));
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Integer(7)]));
     // A plain annotation-embedded literal array (no nested reference).
     push_class_annotation(
         &mut file,
@@ -1052,9 +1058,9 @@ fn model_nested_literal_array_unaffected_by_annotation_rejection() {
 #[test]
 fn model_nested_literal_array_index_out_of_bounds() {
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(5))],
-    });
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(5)),
+    ]));
     let err = encode(&file).expect_err("out-of-bounds nested array must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("nested literal array index 5 out of bounds")),
@@ -1067,9 +1073,10 @@ fn model_nested_literal_array_index_out_of_bounds() {
 #[test]
 fn model_literal_method_refs_unresolvable() {
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Method(0x77777)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::Method(
+            abcd_file::MethodIdx(0x77777),
+        )]));
     let err = encode(&file).expect_err("unresolvable method literal must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("literal array method reference")),
@@ -1077,9 +1084,9 @@ fn model_literal_method_refs_unresolvable() {
     );
 
     let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::GeneratorMethod(0x77777)],
-    });
+    file.literal_arrays.push(abcd_file::LiteralArray::new(vec![
+        LiteralValue::GeneratorMethod(abcd_file::MethodIdx(0x77777)),
+    ]));
     let err = encode(&file).expect_err("unresolvable generator-method literal must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("generator-method reference")),
@@ -1089,16 +1096,23 @@ fn model_literal_method_refs_unresolvable() {
     // The async-generator / getter / setter arms share the same contract.
     for (mk, what) in [
         (
-            LiteralValue::AsyncGeneratorMethod as fn(u32) -> LiteralValue,
+            LiteralValue::AsyncGeneratorMethod as fn(abcd_file::MethodIdx) -> LiteralValue,
             "async-generator-method",
         ),
-        (LiteralValue::Getter as fn(u32) -> LiteralValue, "getter"),
-        (LiteralValue::Setter as fn(u32) -> LiteralValue, "setter"),
+        (
+            LiteralValue::Getter as fn(abcd_file::MethodIdx) -> LiteralValue,
+            "getter",
+        ),
+        (
+            LiteralValue::Setter as fn(abcd_file::MethodIdx) -> LiteralValue,
+            "setter",
+        ),
     ] {
         let mut file = base_model();
-        file.literal_arrays.push(abcd_file::LiteralArray {
-            values: vec![mk(0x77777)],
-        });
+        file.literal_arrays
+            .push(abcd_file::LiteralArray::new(vec![mk(
+                abcd_file::MethodIdx(0x77777),
+            )]));
         let err = encode(&file).expect_err("unresolvable method-kind literal must fail");
         assert!(
             matches!(err, Error::CodeRelocation(ref msg) if msg.contains(&format!("{what} reference"))),
@@ -1107,13 +1121,14 @@ fn model_literal_method_refs_unresolvable() {
     }
 }
 
-/// A literal-array entity operand whose offset maps to an out-of-range
-/// literal-array table index fails loudly in the relocation pass.
+/// A literal-array entity operand whose `LiteralArrayIdx` is out of range
+/// fails loudly in the relocation pass.
 #[test]
 fn code_ref_literal_array_index_out_of_range() {
-    let mut file = model_with_entity_ref(EntityKind::LiteralarrayId, 0x1234);
-    // The offset resolves through the map, but the table index dangles.
-    file.literal_array_offsets.insert(0x1234, 99);
+    let file = model_with_entity_ref(
+        EntityKind::LiteralarrayId,
+        abcd_file::EntityRef::LiteralArray(abcd_file::LiteralArrayIdx(99)),
+    );
     let err = encode(&file).expect_err("out-of-range literal-array index must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("LiteralarrayId index 0")),
@@ -1127,9 +1142,10 @@ fn code_ref_literal_array_index_out_of_range() {
 fn literal_string_dangling_string_id() {
     let mut file = base_model();
     let dangling = dangling_sid();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::String(dangling)],
-    });
+    file.literal_arrays
+        .push(abcd_file::LiteralArray::new(vec![LiteralValue::String(
+            dangling,
+        )]));
     let err = encode(&file).expect_err("dangling literal string must fail");
     assert!(
         matches!(
@@ -1143,53 +1159,40 @@ fn literal_string_dangling_string_id() {
     );
 }
 
-/// A scope-names field reference whose source offset was never decoded is
-/// a hard error, as is a decoded-but-out-of-range table index.
+/// A scope-names field reference whose `LiteralArrayIdx` is out of range
+/// (both offsetless and with `source_offset`) is a hard error.
 #[test]
 fn scope_names_reference_errors() {
-    // Offset absent from the offset map.
-    let mut file = base_model();
-    let field_name = file.strings.get_or_intern("scope_names");
-    let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
-    cls.fields.push(abcd_file::Field {
-        name: field_name,
-        offset: 0,
-        field_type: Type::U32,
-        access_flags: AccessFlags::PUBLIC,
-        is_external: false,
-        initial_value: Some(FieldValue::LiteralArrayRef(0xdead)),
-        annotations: Default::default(),
-    });
-    let err = encode(&file).expect_err("undecoded scope-names offset must fail");
-    assert!(
-        matches!(err, Error::ModuleData(ref msg) if msg.contains("was not decoded")),
-        "unexpected error: {err:?}"
-    );
-
-    // Offset present in the map but the table index is out of range.
-    let mut file = base_model();
-    file.literal_array_offsets.insert(0xdead, 99);
-    let field_name = file.strings.get_or_intern("scope_names");
-    let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
-    cls.fields.push(abcd_file::Field {
-        name: field_name,
-        offset: 0,
-        field_type: Type::U32,
-        access_flags: AccessFlags::PUBLIC,
-        is_external: false,
-        initial_value: Some(FieldValue::LiteralArrayRef(0xdead)),
-        annotations: Default::default(),
-    });
-    let err = encode(&file).expect_err("out-of-range scope-names index must fail");
-    assert!(
-        matches!(err, Error::ModuleData(ref msg) if msg.contains("out of range")),
-        "unexpected error: {err:?}"
-    );
+    for val in [
+        FieldValue::literal_array_ref(abcd_file::LiteralArrayIdx(u32::MAX)),
+        FieldValue::LiteralArrayRef {
+            index: abcd_file::LiteralArrayIdx(99),
+            source_offset: Some(0xdead),
+        },
+    ] {
+        let mut file = base_model();
+        let field_name = file.strings.get_or_intern("scope_names");
+        let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
+        cls.fields.push(abcd_file::Field {
+            name: field_name,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::PUBLIC,
+            is_external: false,
+            initial_value: Some(val),
+            annotations: Default::default(),
+        });
+        let err = encode(&file).expect_err("out-of-range scope-names index must fail");
+        assert!(
+            matches!(err, Error::ModuleData(ref msg) if msg.contains("out of range")),
+            "unexpected error: {err:?}"
+        );
+    }
 }
 
-/// Build a model whose single method body has one unresolved code
-/// reference of the given kind.
-fn model_with_entity_ref(kind: EntityKind, entity_offset: u32) -> abcd_file::File {
+/// Build a model whose single method body has one bytecode entity reference
+/// bound to `eref`.
+fn model_with_entity_ref(kind: EntityKind, eref: abcd_file::EntityRef) -> abcd_file::File {
     let mut file = base_model();
     let bytecode = match kind {
         EntityKind::StringId => Bytecode::LdaStr(EntityId(0)),
@@ -1203,45 +1206,47 @@ fn model_with_entity_ref(kind: EntityKind, entity_offset: u32) -> abcd_file::Fil
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     let body = cls.methods[0].body.as_mut().expect("body");
     body.bytecodes = vec![bytecode, Bytecode::Returnundefined];
-    body.entity_offsets.insert((kind, 0), entity_offset);
+    body.entities.insert((kind, 0), eref);
     file
 }
 
 /// The code-reference relocation pass fails loudly when the body's
-/// entity-offset map entry itself dangles.
+/// `entities` map entry itself is missing.
 #[test]
 fn code_ref_missing_entity_offset_entry() {
     let mut file = base_model();
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     let body = cls.methods[0].body.as_mut().expect("body");
     body.bytecodes = vec![Bytecode::LdaStr(EntityId(0)), Bytecode::Returnundefined];
-    // No entity_offsets entry for (StringId, 0).
-    let err = encode(&file).expect_err("missing entity-offset entry must fail");
+    // No `entities` entry for `(StringId, 0)`.
+    let err = encode(&file).expect_err("missing entity entry must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("StringId index 0")),
         "unexpected error: {err:?}"
     );
 }
 
-/// A string operand whose resolved offset is absent from the file's
-/// entity map is a hard error.
+/// A bytecode `StringId` operand paired with a non-string `EntityRef` is a
+/// hard error.
 #[test]
-fn code_ref_string_entity_map_miss() {
-    let file = model_with_entity_ref(EntityKind::StringId, 0x1234);
-    let err = encode(&file).expect_err("entity-map miss must fail");
+fn code_ref_string_entity_kind_mismatch() {
+    let file = model_with_entity_ref(
+        EntityKind::StringId,
+        abcd_file::EntityRef::Method(abcd_file::MethodIdx(0)),
+    );
+    let err = encode(&file).expect_err("mismatched EntityRef kind must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("StringId index 0")),
         "unexpected error: {err:?}"
     );
 }
 
-/// A string operand whose entity-map StringId dangles in the pool fails at
-/// the string-table intern.
+/// A string operand whose `EntityRef::String` `StringId` dangles in the pool
+/// fails at the string-table intern.
 #[test]
 fn code_ref_string_entity_dangling_id() {
-    let mut file = model_with_entity_ref(EntityKind::StringId, 0x1234);
     let dangling = dangling_sid();
-    file.entity_map.insert(0x1234, dangling);
+    let file = model_with_entity_ref(EntityKind::StringId, abcd_file::EntityRef::string(dangling));
     let err = encode(&file).expect_err("dangling string entity must fail");
     assert!(
         matches!(
@@ -1255,24 +1260,55 @@ fn code_ref_string_entity_dangling_id() {
     );
 }
 
-/// A method operand whose resolved offset names no known method is a hard
-/// error.
+/// A method operand whose `MethodIdx` is out of bounds or that points to an
+/// unencodable `ExternalMethod` is a hard error.
 #[test]
 fn code_ref_method_offset_miss() {
-    let file = model_with_entity_ref(EntityKind::MethodId, 0x1234);
-    let err = encode(&file).expect_err("unresolvable method offset must fail");
+    let file = model_with_entity_ref(
+        EntityKind::MethodId,
+        abcd_file::EntityRef::Method(abcd_file::MethodIdx(0x1234)),
+    );
+    let err = encode(&file).expect_err("unresolvable MethodIdx must fail");
+    assert!(
+        matches!(err, Error::CodeRelocation(ref msg) if msg.contains("MethodId index 0")),
+        "unexpected error: {err:?}"
+    );
+
+    let mut ext_file = base_model();
+    let ext_name = ext_file.strings.get_or_intern("foreign_fn");
+    let cls = ext_file
+        .classes
+        .values_mut()
+        .find(|c| !c.is_external)
+        .unwrap();
+    let body = cls.methods[0].body.as_mut().expect("body");
+    body.bytecodes = vec![
+        Bytecode::Definefunc(abcd_isa::Imm(0), EntityId(0), abcd_isa::Imm(0)),
+        Bytecode::Returnundefined,
+    ];
+    body.entities.insert(
+        (EntityKind::MethodId, 0),
+        abcd_file::EntityRef::ExternalMethod {
+            name: ext_name,
+            source_offset: 0x1234,
+        },
+    );
+    let err = encode(&ext_file).expect_err("ExternalMethod bytecode operand must fail encode");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("MethodId index 0")),
         "unexpected error: {err:?}"
     );
 }
 
-/// A literal-array operand whose resolved offset is absent from the
-/// literal-array offset map is a hard error.
+/// A literal-array operand whose `LiteralArrayIdx` is `u32::MAX` (unmapped)
+/// is a hard error.
 #[test]
 fn code_ref_literal_array_offset_miss() {
-    let file = model_with_entity_ref(EntityKind::LiteralarrayId, 0x1234);
-    let err = encode(&file).expect_err("unresolvable literal-array offset must fail");
+    let file = model_with_entity_ref(
+        EntityKind::LiteralarrayId,
+        abcd_file::EntityRef::LiteralArray(abcd_file::LiteralArrayIdx(u32::MAX)),
+    );
+    let err = encode(&file).expect_err("unresolvable literal-array index must fail");
     assert!(
         matches!(err, Error::CodeRelocation(ref msg) if msg.contains("LiteralarrayId index 0")),
         "unexpected error: {err:?}"

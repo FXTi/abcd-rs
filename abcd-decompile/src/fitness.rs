@@ -96,6 +96,8 @@ pub fn op_name(op: &Op) -> &'static str {
         ThrowConstAssignment { .. } => "ThrowConstAssignment",
         ThrowIfNotObject { .. } => "ThrowIfNotObject",
         CreateGenerator { .. } => "CreateGenerator",
+        CreateAsyncGenerator { .. } => "CreateAsyncGenerator",
+        SetGeneratorState { .. } => "SetGeneratorState",
         SuspendGenerator { .. } => "SuspendGenerator",
         ResumeGenerator { .. } => "ResumeGenerator",
         GetResumeMode { .. } => "GetResumeMode",
@@ -104,6 +106,10 @@ pub fn op_name(op: &Op) -> &'static str {
         AsyncFunctionEnter => "AsyncFunctionEnter",
         AsyncResolve { .. } => "AsyncResolve",
         AsyncReject { .. } => "AsyncReject",
+        AsyncGeneratorResolve { .. } => "AsyncGeneratorResolve",
+        AsyncGeneratorReject { .. } => "AsyncGeneratorReject",
+        NotifyConcurrentResult { .. } => "NotifyConcurrentResult",
+        LoadSymbol => "LoadSymbol",
         LoadNewTarget => "LoadNewTarget",
         LoadGlobalObject => "LoadGlobalObject",
         LoadFunction => "LoadFunction",
@@ -150,6 +156,7 @@ pub fn fitness_of(op: &Op) -> Fitness {
         | Throw { .. }
         | Await { .. }
         | AwaitUncaught { .. }
+        | LoadSymbol
         | LoadNewTarget
         | LoadGlobalObject
         | LoadFunction
@@ -161,23 +168,26 @@ pub fn fitness_of(op: &Op) -> Fitness {
         | Return { .. }
         | Unreachable
         | Debugger => Fitness::Trivial,
-        // ── H = 7 (driver plumbing / no surface syntax) ──
+        // ── H (driver plumbing / no surface syntax) ──
         IteratorReturn { .. }
         | IteratorThrow { .. }
         | DefineSendableClass(_)
         | ResumeGenerator { .. }
         | GetResumeMode { .. }
         | AsyncResolve { .. }
-        | AsyncReject { .. } => Fitness::Hard,
-        // ── N = 48 (everything else) ──
+        | AsyncReject { .. }
+        | AsyncGeneratorResolve { .. }
+        | AsyncGeneratorReject { .. } => Fitness::Hard,
+        // ── N (everything else) ──
         _ => Fitness::NeedsWork,
     }
 }
 
 /// The documented elision reason for the `Throw*` guard family (and the
-/// async-machinery entry) — `Some` iff Stage A elides the op on purpose
-/// (design/decompile.md §4.2.6 "the `Throw*` guard family → elided",
-/// §5 rows 58–65/72, R6: a future `--keep-guards` flag re-enables them).
+/// async/generator/concurrent machinery bookkeeping) — `Some` iff Stage A
+/// elides the op on purpose (design/decompile.md §4.2.6 "the `Throw*`
+/// guard family → elided", §5 rows 58–65/72, R6: a future `--keep-guards`
+/// flag re-enables them).
 pub fn elision_reason(op: &Op) -> Option<&'static str> {
     use Op::*;
     Some(match op {
@@ -203,6 +213,12 @@ pub fn elision_reason(op: &Op) -> Option<&'static str> {
         AsyncFunctionEnter => {
             "async-machinery entry; recognized and elided inside `async function` emission (§5 row 72)"
         }
+        SetGeneratorState { .. } => {
+            "generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow"
+        }
+        NotifyConcurrentResult { .. } => {
+            "ArkTS @Concurrent result notification; the function's `return` carries the source value"
+        }
         _ => return None,
     })
 }
@@ -220,8 +236,11 @@ pub fn fallback_note(op: &Op) -> &'static str {
         ResumeGenerator { .. } | GetResumeMode { .. } => {
             "generator/async-driver plumbing (H); folds with SuspendGenerator into plain `yield` at Stage B (folds::generator_machine_fold, d-P11) or into plain `await` control flow in async bodies (folds::async_machine_fold, N68 remainder; §5 rows 68-69, R4)"
         }
-        AsyncResolve { .. } | AsyncReject { .. } => {
+        AsyncResolve { .. } | AsyncReject { .. } | AsyncGeneratorReject { .. } => {
             "async promise plumbing (H); the es2abc completion pair folds to plain `return`/`throw` at Stage B (folds::async_driver_fold, N68/G6 — the lift now carries the acc value; §5 rows 73-74, R4)"
+        }
+        AsyncGeneratorResolve { .. } => {
+            "async-generator step resolution plumbing (H); folds to plain `yield`/`return` at Stage B (folds::async_generator_machine_fold, d-P14)"
         }
         ThrowDeleteSuperProperty => {
             "`delete super.x` reconstruction (N); the throw IS the delete's semantics, but the op carries no object operand — the member expression is unrecoverable at Stage A (§5 row 63)"

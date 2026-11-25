@@ -1311,6 +1311,7 @@ fn dyn_load_and_own_store_arms() {
             object: o,
             name: kk,
             value: p,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     let y = emit(
@@ -1332,6 +1333,7 @@ fn dyn_load_and_own_store_arms() {
             object: o2,
             key: idx,
             value: p,
+            kind: abcd_ir::OwnStoreKind::OwnProp,
         },
     );
     let z = emit(

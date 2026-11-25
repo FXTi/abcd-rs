@@ -97,7 +97,7 @@ pub fn plan_with_index(
                 callee,
                 this: Some(this),
                 args,
-                kind: abcd_ir::CallKind::Dynamic,
+                kind: abcd_ir::CallKind::Dynamic | abcd_ir::CallKind::ClassInit,
             } = &inst.op
             else {
                 continue;
@@ -114,7 +114,12 @@ pub fn plan_with_index(
             let ValueDef::Inst(def_iid) = module.value(*callee)?.def else {
                 continue;
             };
-            let Op::GetLexVar { level, slot } = &module.inst(def_iid)?.op else {
+            let Op::GetLexVar {
+                level,
+                slot,
+                kind: abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable,
+            } = &module.inst(def_iid)?.op
+            else {
                 continue;
             };
             // The call result must be unused (elision drops it).
@@ -158,6 +163,7 @@ pub fn plan_with_index(
                             level: l,
                             slot: s,
                             value,
+                            kind: abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable,
                         } = &inst.op
                         else {
                             continue;
@@ -416,12 +422,21 @@ mod tests {
                 level: 0,
                 slot: 0,
                 value: df_v,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         push_inst(&mut m, wire_b, Op::Return { value: None });
 
         // The ctor's callinit-shaped call (result dropped).
-        let callee_v = emit_val(&mut m, ctor_b, Op::GetLexVar { level: 0, slot: 0 });
+        let callee_v = emit_val(
+            &mut m,
+            ctor_b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let call_v = emit_val(
             &mut m,
             ctor_b,
@@ -549,7 +564,21 @@ mod tests {
         assert!(plan(&m, fx.ctor).is_none());
     }
 
-    /// A non-Dynamic call kind is not the callinit shape.
+    /// `CallKind::ClassInit` (`callruntime.callinit`) folds identically.
+    #[test]
+    fn fold_class_init_call_kind() {
+        let (m, fx) = fixture(&mut |m, fx| {
+            let Op::Call { kind, .. } = &mut m.inst_mut(fx.call_iid).unwrap().op else {
+                panic!("call fixture");
+            };
+            *kind = CallKind::ClassInit;
+        });
+        let fold = plan(&m, fx.ctor).expect("CallKind::ClassInit folds");
+        assert_eq!(fold.fields, vec![("p0_1".to_string(), fx.field_cid)]);
+        assert!(fold.call_insts.contains(&fx.call_iid));
+    }
+
+    /// A non-Dynamic/non-ClassInit call kind is not the callinit shape.
     #[test]
     fn bail_call_non_dynamic_kind() {
         let (m, fx) = fixture(&mut |m, fx| {
@@ -673,6 +702,7 @@ mod tests {
                     level: 0,
                     slot: 0,
                     value: df2,
+                    kind: abcd_ir::LexEnvKind::Plain,
                 },
             );
         });

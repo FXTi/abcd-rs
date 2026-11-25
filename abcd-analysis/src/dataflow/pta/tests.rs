@@ -45,7 +45,14 @@ fn closure_of(m: &mut Module, b: BlockId, body: FuncId) -> ValueId {
 /// Emit a `NewLexEnv` with its result value wired (emit() asserts
 /// has_result; NewLexEnv does produce the env).
 fn new_lex_env(m: &mut Module, b: BlockId) -> InstId {
-    emit(m, b, Op::NewLexEnv { num_vars: 1 });
+    emit(
+        m,
+        b,
+        Op::NewLexEnv {
+            num_vars: 1,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     InstId::new(m.insts.len() as u32 - 1)
 }
 
@@ -508,7 +515,15 @@ fn env_identity_separates_colliding_slots() {
     let get_in_f;
     {
         let b = entry_of(&m, f);
-        let r = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let r = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let ValueDef::Inst(i) = m.value(r).unwrap().def else {
             panic!()
         };
@@ -520,7 +535,15 @@ fn env_identity_separates_colliding_slots() {
     let get_in_g;
     {
         let b = entry_of(&m, g);
-        let r = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let r = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let ValueDef::Inst(i) = m.value(r).unwrap().def else {
             panic!()
         };
@@ -541,6 +564,7 @@ fn env_identity_separates_colliding_slots() {
                 level: 0,
                 slot: 0,
                 value: taint,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let clo_f = closure_of(&mut m, b, f);
@@ -570,6 +594,7 @@ fn env_identity_separates_colliding_slots() {
                 level: 0,
                 slot: 0,
                 value: clean,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let clo_g = closure_of(&mut m, b, g);
@@ -614,8 +639,24 @@ fn env_depth_cap_drops_outer_environments() {
     let b = entry_of(&m, f);
     let _e1 = new_lex_env(&mut m, b);
     let e2 = new_lex_env(&mut m, b);
-    let g0 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
-    let g1 = emit(&mut m, b, Op::GetLexVar { level: 1, slot: 0 });
+    let g0 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let g1 = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 1,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(&mut m, b, Op::Return { value: None });
 
     let base = CallGraph::build(&m);
@@ -763,6 +804,7 @@ fn two_runs_are_identical() {
                 level: 0,
                 slot: 0,
                 value: o,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         emit_void(&mut m, entry, Op::Return { value: None });
@@ -787,7 +829,15 @@ fn nested_closure_capture_propagates_through_lex_free_middle_function() {
     let inner_ret;
     {
         let b = entry_of(&m, inner);
-        inner_ret = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        inner_ret = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
         let ValueDef::Inst(i) = m.value(inner_ret).unwrap().def else {
             panic!()
         };
@@ -832,6 +882,7 @@ fn nested_closure_capture_propagates_through_lex_free_middle_function() {
                 level: 0,
                 slot: 0,
                 value: stored_obj,
+                kind: abcd_ir::LexEnvKind::Plain,
             },
         );
         let clo_mid = closure_of(&mut m, b, middle);
@@ -891,11 +942,27 @@ fn add_record_fn(
 fn define_class_methods_capture_enclosing_lexical_env() {
     let mut m = mk_module();
     let (ctor, ctor_b, _) = add_record_fn(&mut m, ClassId::new(0), "Cls", 0);
-    let get_in_ctor = emit(&mut m, ctor_b, Op::GetLexVar { level: 0, slot: 0 });
+    let get_in_ctor = emit(
+        &mut m,
+        ctor_b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(&mut m, ctor_b, Op::Return { value: None });
 
     let (method, method_b, _) = add_record_fn(&mut m, ClassId::new(0), "work", 0);
-    let get_in_method = emit(&mut m, method_b, Op::GetLexVar { level: 0, slot: 0 });
+    let get_in_method = emit(
+        &mut m,
+        method_b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     let ValueDef::Inst(get_method_iid) = m.value(get_in_method).unwrap().def else {
         panic!()
     };
@@ -918,11 +985,12 @@ fn define_class_methods_capture_enclosing_lexical_env() {
             level: 0,
             slot: 0,
             value: captured_obj,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let work_sym = intern(&mut m, "work");
     let c_work = m.consts.intern(Const::String(work_sym));
-    let c_method = m.consts.intern(Const::MethodRef(method));
+    let c_method = m.consts.intern(Const::method_ref(method));
     let c_one = m.consts.intern(Const::number(1.0));
     let members = m.consts.push_array(vec![c_work, c_method, c_one]);
     let cls_val = emit(
@@ -1137,7 +1205,15 @@ fn root_sliced_pta_skips_dead_functions_and_resolves_oop_imports_and_callbacks()
     // Callback closure passed to external `sdk_register`: must be activated via `DefineFunc`.
     let (sdk_cb, cb_b, _) = add_record_fn(&mut m, cid_entry, "sdk_cb", 0);
     let cb_local_alloc = alloc_object(&mut m, cb_b);
-    let cb_captured = emit(&mut m, cb_b, Op::GetLexVar { level: 0, slot: 0 });
+    let cb_captured = emit(
+        &mut m,
+        cb_b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
     emit_void(&mut m, cb_b, Op::Return { value: None });
 
     // Entry function (the ONLY function in `roots`).
@@ -1151,10 +1227,11 @@ fn root_sliced_pta_skips_dead_functions_and_resolves_oop_imports_and_callbacks()
             level: 0,
             slot: 0,
             value: lex_obj,
+            kind: abcd_ir::LexEnvKind::Plain,
         },
     );
     let c_read = m.consts.intern(Const::String(read_sym));
-    let c_svc_read = m.consts.intern(Const::MethodRef(svc_read));
+    let c_svc_read = m.consts.intern(Const::method_ref(svc_read));
     let c_one = m.consts.intern(Const::number(1.0));
     let members = m.consts.push_array(vec![c_read, c_svc_read, c_one]);
     let svc_cls = emit(
@@ -1367,7 +1444,7 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
         },
     );
     let c_oc = m.consts.intern(Const::String(on_create_sym));
-    let c_ab_oc = m.consts.intern(Const::MethodRef(ab_on_create));
+    let c_ab_oc = m.consts.intern(Const::method_ref(ab_on_create));
     let c_one = m.consts.intern(Const::number(1.0));
     let ab_members = m.consts.push_array(vec![c_oc, c_ab_oc, c_one]);
     let _ = emit(
@@ -1390,9 +1467,9 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
         },
     );
     let c_ir = m.consts.intern(Const::String(initial_render_sym));
-    let c_rv_ren = m.consts.intern(Const::MethodRef(rv_render));
+    let c_rv_ren = m.consts.intern(Const::method_ref(rv_render));
     let c_rr = m.consts.intern(Const::String(rerender_sym));
-    let c_rv_rer = m.consts.intern(Const::MethodRef(rv_rerender));
+    let c_rv_rer = m.consts.intern(Const::method_ref(rv_rerender));
     let c_two = m.consts.intern(Const::number(2.0));
     let rv_members = m
         .consts
@@ -1435,8 +1512,8 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
                 default: None,
             },
         );
-        let c_u_ren = m.consts.intern(Const::MethodRef(u_ren));
-        let c_u_rer = m.consts.intern(Const::MethodRef(u_rer));
+        let c_u_ren = m.consts.intern(Const::method_ref(u_ren));
+        let c_u_rer = m.consts.intern(Const::method_ref(u_rer));
         let mem = m
             .consts
             .push_array(vec![c_ir, c_u_ren, c_rr, c_u_rer, c_two]);
@@ -1597,4 +1674,101 @@ fn root_sliced_pta_activates_namespace_exports_define_method_and_fits_256k_stack
         .unwrap()
         .join()
         .unwrap();
+}
+
+#[test]
+fn patch_lex_vars_stay_isolated_and_new_spread_constructs_opaque_formals() {
+    let mut m = mk_module();
+    let f_sym = intern(&mut m, "f");
+    let (ctor, ctor_b, ctor_p) = add_record_fn(&mut m, ClassId::new(0), "Box", 1);
+    let own_alloc = alloc_object(&mut m, ctor_b);
+    emit_void(
+        &mut m,
+        ctor_b,
+        Op::StoreOwnPropName {
+            object: ctor_p[2],
+            name: f_sym,
+            value: own_alloc,
+            kind: abcd_ir::OwnStoreKind::ClassField,
+        },
+    );
+    let formal_val = ctor_p[3];
+    emit_void(&mut m, ctor_b, Op::Return { value: None });
+
+    let main = add_func_named(&mut m, "main");
+    let eb = entry_of(&m, main);
+    let env_site = new_lex_env(&mut m, eb);
+    let plain_obj = alloc_object(&mut m, eb);
+    emit_void(
+        &mut m,
+        eb,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: plain_obj,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let patch_get = emit(
+        &mut m,
+        eb,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Patch,
+        },
+    );
+    let ValueDef::Inst(patch_get_iid) = m.value(patch_get).unwrap().def else {
+        panic!()
+    };
+
+    let empty_mem = m.consts.push_array(Vec::new());
+    let cls = emit(
+        &mut m,
+        eb,
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+            ctor,
+            heritage: None,
+            members: empty_mem,
+            member_attrs: Vec::new(),
+            count: 1,
+        })),
+    );
+    let arr = alloc_array(&mut m, eb);
+    let inst = emit(
+        &mut m,
+        eb,
+        Op::Call {
+            callee: cls,
+            this: None,
+            args: vec![arr],
+            kind: CallKind::NewSpread,
+        },
+    );
+    let loaded_f = emit(
+        &mut m,
+        eb,
+        Op::LoadProp {
+            object: inst,
+            name: f_sym,
+        },
+    );
+    emit_void(&mut m, eb, Op::Return { value: None });
+
+    let out = run(&m);
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+
+    // Patch lexical access never aliases the enclosing `NewLexEnv` slot.
+    let patch_env = oracle.lex_env_at(patch_get_iid, 0);
+    assert!(patch_env.has_unknown && patch_env.sites.is_empty());
+    let patch_ans = oracle.query(patch_get, patch_get_iid);
+    assert!(patch_ans.has_unknown && patch_ans.sites.is_empty());
+
+    // `NewSpread` materializes the constructed receiver while keeping spread formals opaque.
+    let f_ans = oracle.query(loaded_f, env_site);
+    assert!(!f_ans.has_unknown);
+    assert_eq!(f_ans.sites, oracle.query(own_alloc, env_site).sites);
+    let formal_ans = oracle.query(formal_val, env_site);
+    assert!(formal_ans.has_unknown);
 }

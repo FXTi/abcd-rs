@@ -97,9 +97,9 @@ function func_main_0() {
   return "inner-done";
 };
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B31→B32, B24→B31, B30→B31); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B24→B31); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
-  const v45 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
+  const v39 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const inner$1 = inner;
   const value$1 = yield* inner$1();
   yield value$1;
@@ -108,8 +108,8 @@ function func_main_0() {
   let log = [];
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const outer$1 = outer;
-  const v166 = outer$1();
-  for (const value of v166) {
+  const v127 = outer$1();
+  for (const value of v127) {
     /* iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5) */
     /* try region 2: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary */
     const log$1 = log;
@@ -120,8 +120,8 @@ function func_main_0() {
   const print$1 = print;
   const log$2 = log;
   const join = log$2.join;
-  const v202 = join.call(log$2, ",");
-  print$1(v202);
+  const v160 = join.call(log$2, ",");
+  print$1(v160);
   return;
 }
 "#;
@@ -138,7 +138,7 @@ fn golden_yield_star_delegate_array() {
 let log;
 function func_main_0() {
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B21→B22, B14→B21, B20→B21); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B14→B21); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v5 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   yield 0.0;
@@ -149,8 +149,8 @@ function func_main_0() {
   let log = [];
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const outer$1 = outer;
-  const v136 = outer$1();
-  for (const value of v136) {
+  const v101 = outer$1();
+  for (const value of v101) {
     /* iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5) */
     /* try region 2: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary */
     const log$1 = log;
@@ -161,8 +161,8 @@ function func_main_0() {
   const print$1 = print;
   const log$2 = log;
   const join = log$2.join;
-  const v172 = join.call(log$2, ",");
-  print$1(v172);
+  const v134 = join.call(log$2, ",");
+  print$1(v134);
   return;
 }
 "#;
@@ -189,52 +189,52 @@ function func_main_0() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   yield "before";
   const Error$1 = Error;
-  const v30 = new Error$1("delegated-boom");
-  throw v30;
+  const v26 = new Error$1("delegated-boom");
+  throw v26;
   /* unreachable */
 };
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B28→B29, B21→B28, B27→B28); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B21→B28); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
-  const v37 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
+  const v33 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const boom$1 = boom;
   yield* boom$1();
   yield "after";
   return undefined;
 };
   const outer$1 = outer;
-  const v156 = outer$1();
-  let it = v156;
+  const v119 = outer$1();
+  let it = v119;
   let log = [];
   try {
     /* try region 0: the handler continuation (the try's join) is nested below the protected run in the region tree — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */
     const it$1 = it;
     const next = it$1.next;
-    const v161 = next.call(it$1);
-    v162 = v161;
+    const v124 = next.call(it$1);
+    v125 = v124;
     while (true) {
-      var v162; /* phi */
-      const done = v162.done;
+      var v125; /* phi */
+      const done = v125.done;
       if (done) {
-        v168 = false;
-        v174 = v162;
+        v130 = false;
+        v135 = v125;
       } else {
-        v168 = true;
-        v174 = v162;
+        v130 = true;
+        v135 = v125;
       }
-      var v168; /* phi */
-      var v174; /* phi */
-      if (!v168) {
+      var v130; /* phi */
+      var v135; /* phi */
+      if (!v130) {
         break;
       }
       const log$1 = log;
       const push = log$1.push;
-      const value = v162.value;
+      const value = v125.value;
       push.call(log$1, value);
       const it$2 = it;
       const next$1 = it$2.next;
-      const v180 = next$1.call(it$2);
-      v162 = v180;
+      const v141 = next$1.call(it$2);
+      v125 = v141;
       continue;
     }
     const log$2 = log;
@@ -243,15 +243,15 @@ function func_main_0() {
   } catch (e) {
     const log$3 = log;
     const push$2 = log$3.push;
-    const v189 = "caught:";
+    const v150 = "caught:";
     const message = e.message;
-    push$2.call(log$3, v189 + message);
+    push$2.call(log$3, v150 + message);
   }
   const print$1 = print;
   const log$4 = log;
   const join = log$4.join;
-  const v199 = join.call(log$4, ",");
-  print$1(v199);
+  const v160 = join.call(log$4, ",");
+  print$1(v160);
   return;
 }
 "#;
@@ -279,21 +279,24 @@ fn golden_yield_star_delegate_async() {
     let outer = outer.split("};").next().expect("outer body end");
     let expected = r#"
   var inner$1; /* hoisted temp: used outside its def's block */
-  /* cross-arm edges unfolded (B52→B53, B44→B52, B51→B52); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B44→B52); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   try {
-    const v144 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
+    const v131 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
     inner$1 = inner;
   } catch (e$1) {
-    var v309; /* phi */
+    var v257; /* phi */
+    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @7:0 */
     throw e$1;
   }
   try {
     /* try region 1: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
     const value$2 = yield* inner$1();
     yield value$2;
+    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @4294967295:0 */
     return undefined;
   } catch (e$1) {
-    var v309; /* phi */
+    var v257; /* phi */
+    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @7:0 */
     throw e$1;
   }
 "#;
@@ -366,8 +369,8 @@ fn golden_yield_star_delegate_async_main_for_await() {
   }
   const print$1 = print;
   const join = v8.join;
-  const v58 = join.call(v8, ",");
-  print$1(v58);
+  const v53 = join.call(v8, ",");
+  print$1(v53);
   return undefined;
 "#;
     assert!(

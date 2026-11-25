@@ -3256,6 +3256,20 @@ pub fn negate(e: &Expr) -> Expr {
             operand: operand.clone(),
         },
         Expr::Unary {
+            op: UnOp::JumpNez,
+            operand,
+        } => Expr::Unary {
+            op: UnOp::JumpEqz,
+            operand: operand.clone(),
+        },
+        Expr::Unary {
+            op: UnOp::JumpEqz,
+            operand,
+        } => Expr::Unary {
+            op: UnOp::JumpNez,
+            operand: operand.clone(),
+        },
+        Expr::Unary {
             op: UnOp::LogicalNot,
             operand,
         } => *operand.clone(),

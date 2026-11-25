@@ -1,17 +1,7 @@
-//! Shared helpers for `abcd-taint` corpus/integration tests.
-//!
-//! - Corpus harness (`corpus_root` / `runtime_passed_paths`): parses
-//!   the exported corpus `index.jsonl` manifest, filtered to the 1,149
-//!   runtime-passed fixtures (`runtime.status == "passed"`).
-//! - Hand-built IR module scaffolding for the mechanism/probe tests
-//!   (mirrors `abcd-analysis`'s cfg(test)-private testutil — duplicated
-//!   here because that one is not public).
+//! Shared IR module scaffolding for `abcd-taint` integration tests.
 
-// Each test binary uses a different subset.
+// Each test module uses a subset of helpers.
 #![allow(dead_code)]
-
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use abcd_ir::consts::Const;
 use abcd_ir::function::{Block, Catch, FunctionData, Inst, TryRegion, Value};
@@ -21,58 +11,6 @@ use abcd_ir::{
     BlockId, ClassId, ConstId, Edge, EdgeKind, FuncId, InstId, Loc, Module, Op, Sym, ValueDef,
     ValueId,
 };
-
-/// The corpus root: `$ABCD_CORPUS_ROOT` or `exports/corpus`.
-pub fn corpus_root() -> PathBuf {
-    std::env::var_os("ABCD_CORPUS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        })
-}
-
-/// The 1149 runtime-passed fixture paths (sorted for determinism),
-/// parsed with python3's standard JSON library.
-pub fn runtime_passed_paths(root: &Path) -> Vec<String> {
-    let output = Command::new("python3")
-        .arg("-c")
-        .arg(
-            r#"
-import json, sys
-paths = []
-with open(sys.argv[1], encoding="utf-8") as manifest:
-    for line in manifest:
-        row = json.loads(line)
-        if row["runtime"]["status"] == "passed":
-            paths.append(row["abc"])
-for path in sorted(paths):
-    print(path)
-"#,
-        )
-        .arg(root.join("index.jsonl"))
-        .output()
-        .expect("python3 is required by corpus tooling");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("UTF-8 fixture paths")
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Decode + lift one corpus fixture to a module.
-pub fn lift_fixture(root: &Path, relative: &str) -> Module {
-    let data = std::fs::read(root.join(relative)).expect("read fixture");
-    let file = abcd_file::decode(&data).expect("decode fixture");
-    abcd_lift::lift_file(&file).expect("lift fixture")
-}
 
 // ── IR module scaffolding (mechanism/probe tests) ────────────────────
 
@@ -209,7 +147,7 @@ pub fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: Bloc
         catches: vec![Catch {
             handler,
             exception: exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 }
@@ -295,7 +233,10 @@ pub fn const_value(m: &mut Module, c: Const) -> ValueId {
 
 /// A `Const::MethodRef` load (function value as a pooled constant).
 pub fn load_method_ref(m: &mut Module, b: BlockId, func: FuncId) -> ValueId {
-    let c = m.consts.push(Const::MethodRef(func));
+    let c = m.consts.push(Const::MethodRef {
+        func,
+        kind: abcd_ir::LitMethodKind::Method,
+    });
     emit(m, b, Op::LoadConst(c))
 }
 

@@ -43,6 +43,7 @@ fn isel_result(pairs: Vec<(BlockId, Vec<Bytecode>)>) -> IselResult {
         entity_traces: HashMap::new(),
         ic_size: 0,
         unsupported: None,
+        ..Default::default()
     }
 }
 
@@ -227,7 +228,7 @@ fn try_region_with_a_dangling_protected_block_is_skipped() {
                 catches: vec![Catch {
                     handler,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }
@@ -271,7 +272,7 @@ fn try_region_with_an_orphan_handler_is_skipped() {
                 catches: vec![Catch {
                     handler: orphan,
                     exception,
-                    type_idx: None,
+                    type_class: None,
                 }],
             });
     }
@@ -286,10 +287,10 @@ fn try_region_with_an_orphan_handler_is_skipped() {
 // ── dangling jump targets at label resolution (layout.rs:461) ───────────
 
 /// A jump whose target block has no flat offset (a dangling destination —
-/// inconsistent input) passes label resolution unchanged: the None-path of
-/// the `offsets.get` guard, never a panic and never a rewrite.
+/// inconsistent input) fails loudly with `LowerError::UnresolvedLabel`
+/// (`R3-M3`) instead of silently emitting a garbage instruction index.
 #[test]
-fn dangling_jump_targets_pass_resolution_unchanged() {
+fn dangling_jump_targets_fail_with_unresolved_label() {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     let entry;
@@ -304,8 +305,6 @@ fn dangling_jump_targets_pass_resolution_unchanged() {
             false_dest: BlockId::new(999),
         });
     }
-    // A real CondBranch block's codes end with the conditional branch;
-    // layout appends the explicit false-edge Jmp itself.
     let isel = isel_result(vec![(
         entry,
         vec![
@@ -315,12 +314,17 @@ fn dangling_jump_targets_pass_resolution_unchanged() {
     )]);
     let mut alloc = empty_alloc();
     alloc.num_regs = 1;
-    let result = layout::layout(&module, func, &isel, &alloc, &[entry])
-        .expect("dangling targets resolve to themselves, never panic");
+    let err = layout::layout(&module, func, &isel, &alloc, &[entry])
+        .expect_err("dangling targets must fail loudly with UnresolvedLabel");
     assert!(
-        matches!(result.bytecodes[1], Bytecode::Jnez(abcd_isa::Label(998)))
-            && matches!(result.bytecodes[2], Bytecode::Jmp(abcd_isa::Label(999))),
-        "unresolvable labels pass through verbatim: {:?}",
-        result.bytecodes
+        matches!(
+            err,
+            LowerError::UnresolvedLabel {
+                func: f,
+                target: 998,
+                ..
+            } if f == func
+        ),
+        "expected UnresolvedLabel(998), got {err:?}"
     );
 }

@@ -3,8 +3,8 @@
 //! order.
 //!
 //! Try regions are structured `abcd_ir::TryRegion`s (`protected` blocks +
-//! `catches` with `handler` / `exception` / `type_idx`), and the catch-all
-//! sentinel `type_idx: None` maps to `u32::MAX` in `.abc` containers.
+//! `catches` with `handler` / `exception` / `type_class`), and the catch-all
+//! sentinel is `type_class: None`.
 
 use crate::common;
 use abcd_ir::{Catch, FunctionKind, Module, Op, TryRegion, UnOp};
@@ -31,7 +31,7 @@ fn find_ldai(bytecodes: &[Bytecode], v: i64) -> usize {
 /// True when instruction index `pc` lies inside any emitted try range —
 /// exactly the containment test the VM's `FindCatchBlock` performs
 /// (`start_pc <= pc && start_pc + length > pc`, method.cpp:99).
-fn dispatches(try_blocks: &[abcd_file::TryBlock], pc: usize) -> bool {
+fn dispatches(try_blocks: &[abcd_lower::LoweredTryBlock], pc: usize) -> bool {
     try_blocks
         .iter()
         .any(|tb| (tb.start as usize) <= pc && pc < (tb.start + tb.len) as usize)
@@ -110,7 +110,7 @@ fn try_ranges_exclude_interleaved_unprotected_block() {
         catches: vec![Catch {
             handler: h,
             exception,
-            type_idx: None, // catch-all
+            type_class: None, // catch-all
         }],
     });
 
@@ -173,7 +173,7 @@ fn try_ranges_exclude_interleaved_unprotected_block() {
     );
     for tb in &result.try_blocks {
         assert_eq!(tb.catches.len(), 1, "{tb:?}");
-        assert_eq!(tb.catches[0].type_idx, u32::MAX, "{tb:?}");
+        assert_eq!(tb.catches[0].type_class, None, "{tb:?}");
         assert_eq!(
             tb.catches[0].handler as usize, h_start,
             "every run must dispatch to the region's handler"
@@ -237,7 +237,7 @@ fn contiguous_region_still_emits_single_span() {
         catches: vec![Catch {
             handler: h,
             exception,
-            type_idx: None,
+            type_class: None,
         }],
     });
 
@@ -316,7 +316,7 @@ fn nested_regions_keep_first_match_dispatch_order() {
         catches: vec![Catch {
             handler: inner_h,
             exception: inner_exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
     module.functions[func.index()].try_regions.push(TryRegion {
@@ -324,7 +324,7 @@ fn nested_regions_keep_first_match_dispatch_order() {
         catches: vec![Catch {
             handler: outer_h,
             exception: outer_exc,
-            type_idx: None,
+            type_class: None,
         }],
     });
 

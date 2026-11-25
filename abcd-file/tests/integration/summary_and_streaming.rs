@@ -8,7 +8,7 @@ use abcd_file::{
 };
 use abcd_isa::{EntityId, Imm, Label, Reg, insn};
 
-fn summary_from_decoded(file: &File, verify: bool) -> FileSummary {
+fn summary_from_decoded(file: &File, entity_index_entries: usize, verify: bool) -> FileSummary {
     let methods: Vec<_> = file.all_methods().collect();
     let methods_with_body = methods.iter().filter(|(_, m)| m.body.is_some()).count();
     let debug_infos = methods.iter().filter(|(_, m)| m.debug.is_some()).count();
@@ -36,7 +36,7 @@ fn summary_from_decoded(file: &File, verify: bool) -> FileSummary {
         methods_with_body,
         fields: file.classes.values().map(|c| c.fields.len()).sum(),
         literal_arrays: file.literal_arrays.len(),
-        entity_index_entries: file.entity_map.len(),
+        entity_index_entries,
         debug_infos,
         verify: verify_summary,
     }
@@ -46,14 +46,20 @@ fn assert_summary_parity(bytes: &[u8]) {
     let file = decode(bytes).expect("decode must succeed");
     let fast = inspect_summary(bytes, false).expect("inspect_summary(..., false) must succeed");
     let verified = inspect_summary(bytes, true).expect("inspect_summary(..., true) must succeed");
+    assert_eq!(fast.entity_index_entries, verified.entity_index_entries);
+    assert!(
+        fast.entity_index_entries >= fast.classes + fast.methods + fast.fields,
+        "entity_index_entries ({}) must cover at least classes+methods+fields",
+        fast.entity_index_entries
+    );
     assert_eq!(
         fast,
-        summary_from_decoded(&file, false),
+        summary_from_decoded(&file, fast.entity_index_entries, false),
         "verify=false mismatch"
     );
     assert_eq!(
         verified,
-        summary_from_decoded(&file, true),
+        summary_from_decoded(&file, verified.entity_index_entries, true),
         "verify=true mismatch"
     );
 
@@ -521,8 +527,15 @@ fn local_corpus_and_modules_abc_parity_and_streaming_gate() {
         );
         let fast = inspect_summary(&bytes, false).expect("fast summary");
         let verified = inspect_summary(&bytes, true).expect("verified summary");
-        assert_eq!(fast, summary_from_decoded(&file, false));
-        assert_eq!(verified, summary_from_decoded(&file, true));
+        assert_eq!(fast.entity_index_entries, verified.entity_index_entries);
+        assert_eq!(
+            fast,
+            summary_from_decoded(&file, fast.entity_index_entries, false)
+        );
+        assert_eq!(
+            verified,
+            summary_from_decoded(&file, verified.entity_index_entries, true)
+        );
     }
 
     // 2. If `exports/corpus/index.jsonl` is present, verify pandasm byte-identity
@@ -574,14 +587,15 @@ fn local_corpus_and_modules_abc_parity_and_streaming_gate() {
             let verified = inspect_summary(&bytes, true).unwrap_or_else(|e| {
                 panic!("inspect_summary(true) failed on {abc_rel}: {e}");
             });
+            assert_eq!(fast.entity_index_entries, verified.entity_index_entries);
             assert_eq!(
                 fast,
-                summary_from_decoded(&file, false),
+                summary_from_decoded(&file, fast.entity_index_entries, false),
                 "fast summary mismatch on {abc_rel}"
             );
             assert_eq!(
                 verified,
-                summary_from_decoded(&file, true),
+                summary_from_decoded(&file, verified.entity_index_entries, true),
                 "verified summary mismatch on {abc_rel}"
             );
             checked_summary += 1;

@@ -683,6 +683,7 @@ fn apply_and_super_kinds_bind_opaque() {
         CallKind::Apply,
         CallKind::SuperSpread,
         CallKind::SuperForwardAllArgs,
+        CallKind::NewSpread,
     ] {
         let clo = closure_of(&mut m, entry, id);
         let r = emit(

@@ -51,8 +51,8 @@ use std::io::{self, Write as _};
 use abcd_isa::{Bytecode, BytecodeFlags, EntityKind, Operand};
 
 use crate::model::{
-    Annotation, AnnotationValue, Class, FieldValue, File, Method, MethodBody, ModuleData,
-    ModuleRecord,
+    Annotation, AnnotationValue, Class, EntityRef, FieldValue, File, LiteralArrayIdx, Method,
+    MethodBody, MethodIdx, ModuleData, ModuleRecord,
 };
 use crate::types::{HasAccessFlags, SourceLang, Type};
 use crate::{LiteralValue, StringId, Version};
@@ -592,13 +592,18 @@ struct Emitter<'f> {
     /// STRING section: offset → raw bytes (upstream `string_offset_to_name_`,
     /// a map sorted by offset).
     strings: BTreeMap<u32, Vec<u8>>,
+    /// Deterministic synthetic offsets assigned to offsetless `EntityRef::String`s.
+    synth_string_offsets: HashMap<StringId, u32>,
+    next_synth_string_off: u32,
     /// `_ESModuleRecord`-style u32 field values (module blob offsets).
     module_literals: HashSet<u32>,
-    /// Pre-indexed `method.offset → (owner_desc, class, method)` (first match
-    /// in class/method iteration order).
-    method_by_offset: HashMap<u32, (StringId, &'f Class, &'f Method)>,
-    /// Pre-indexed `table_idx → source_offset` for `literal_offset_of`.
-    rev_literal_offsets: HashMap<u32, u32>,
+    /// Dense `(owner_desc, class, method)` table indexed by [`MethodIdx`].
+    methods: Vec<(StringId, &'f Class, &'f Method)>,
+    /// Dense `LiteralArrayIdx → effective u32 offset` (`source_offset` when
+    /// present, otherwise a deterministic synthetic offset).
+    literal_offsets: Vec<u32>,
+    /// Pre-indexed `offset → LiteralArrayIdx` (first match in table order).
+    literal_by_offset: HashMap<u32, usize>,
     /// Pre-indexed `md.source_offset → &ModuleData` (first match in
     /// class/field iteration order).
     module_data_by_offset: HashMap<u32, &'f ModuleData>,
@@ -606,32 +611,31 @@ struct Emitter<'f> {
 
 impl<'f> Emitter<'f> {
     fn new(file: &'f File) -> Self {
-        let mut method_by_offset = HashMap::new();
+        let methods = file.method_table();
         let mut module_data_by_offset = HashMap::new();
-        for (&desc, class) in &file.classes {
-            for m in &class.methods {
-                method_by_offset.entry(m.offset).or_insert((desc, class, m));
-            }
+        for class in file.classes.values() {
             for field in &class.fields {
                 if let Some(FieldValue::ModuleData(md)) = &field.initial_value {
                     module_data_by_offset.entry(md.source_offset).or_insert(md);
                 }
             }
         }
-        let mut rev_literal_offsets: HashMap<u32, u32> =
-            HashMap::with_capacity(file.literal_array_offsets.len());
-        for (&off, &idx) in &file.literal_array_offsets {
-            rev_literal_offsets
-                .entry(idx)
-                .and_modify(|existing| *existing = (*existing).min(off))
-                .or_insert(off);
+        let mut literal_offsets = Vec::with_capacity(file.literal_arrays.len());
+        let mut literal_by_offset = HashMap::with_capacity(file.literal_arrays.len());
+        for (idx, la) in file.literal_arrays.iter().enumerate() {
+            let off = la.source_offset.unwrap_or(0x2000_0000 + (idx as u32) * 4);
+            literal_offsets.push(off);
+            literal_by_offset.entry(off).or_insert(idx);
         }
         Emitter {
             file,
             strings: BTreeMap::new(),
+            synth_string_offsets: HashMap::new(),
+            next_synth_string_off: 0x1000_0000,
             module_literals: HashSet::new(),
-            method_by_offset,
-            rev_literal_offsets,
+            methods,
+            literal_offsets,
+            literal_by_offset,
             module_data_by_offset,
         }
     }
@@ -661,19 +665,12 @@ impl<'f> Emitter<'f> {
     }
 
     /// Signature text for a method reference (`GetMethodSignature`): full
-    /// name + `:(` + param types + `)`. Falls back to the bare entity name
-    /// with an empty parameter list when the method is not a decoded class
-    /// method (external — no corpus coverage).
-    fn method_signature_by_offset(&self, offset: u32) -> Vec<u8> {
-        if let Some(&(desc, class, m)) = self.method_by_offset.get(&offset) {
+    /// name + `:(` + param types + `)`.
+    fn method_signature_by_idx(&self, idx: MethodIdx) -> Vec<u8> {
+        if let Some(&(desc, class, m)) = self.methods.get(idx.index()) {
             return self.build_fn_header(desc, class, m).signature();
         }
-        let mut sig = match self.file.resolve_entity(offset) {
-            Some(sid) => self.str_bytes(sid),
-            None => format!("!invalid:method:{offset:#x}").into_bytes(),
-        };
-        sig.extend_from_slice(b":()");
-        sig
+        format!("!invalid:method:{:#x}:()", idx.0).into_bytes()
     }
 
     // -- function construction (upstream GetMethod/AddMethodToTables) -------
@@ -720,15 +717,20 @@ impl<'f> Emitter<'f> {
         }
     }
 
-    fn register_string_offset(&mut self, off: u32) {
+    fn register_string_ref(&mut self, sid: StringId, source_offset: Option<u32>) -> u32 {
+        let off = match source_offset {
+            Some(off) => off,
+            None => *self.synth_string_offsets.entry(sid).or_insert_with(|| {
+                let assigned = self.next_synth_string_off;
+                self.next_synth_string_off = self.next_synth_string_off.wrapping_add(4);
+                assigned
+            }),
+        };
         if !self.strings.contains_key(&off) {
-            let bytes = self
-                .file
-                .resolve_entity(off)
-                .map(|sid| self.str_bytes(sid))
-                .unwrap_or_else(|| b"!invalid:string".to_vec());
+            let bytes = self.str_bytes(sid);
             self.strings.insert(off, bytes);
         }
+        off
     }
 
     fn register_body_strings(&mut self, body: &MethodBody) {
@@ -736,9 +738,12 @@ impl<'f> Emitter<'f> {
             let (ops, len) = bc.entity_operands_inline();
             for &(kind, id) in &ops[..len] {
                 if kind == EntityKind::StringId
-                    && let Some(&off) = body.entity_offsets.get(&(kind, id.0))
+                    && let Some(&EntityRef::String {
+                        id: sid,
+                        source_offset,
+                    }) = body.entities.get(&(kind, id.0))
                 {
-                    self.register_string_offset(off);
+                    self.register_string_ref(sid, source_offset);
                 }
             }
         }
@@ -834,13 +839,12 @@ impl<'f> Emitter<'f> {
             let try_begin = alloc_label(&mut labels, begin, format!("try_begin_label_{try_idx}"));
             let try_end = alloc_label(&mut labels, end, format!("try_end_label_{try_idx}"));
             for (catch_idx, cb) in tb.catches.iter().enumerate() {
-                let exception_record = if cb.type_idx == u32::MAX {
-                    Vec::new()
-                } else {
-                    match self.file.resolve_entity(cb.type_idx) {
-                        Some(sid) => record_pandasm_name(&self.str_bytes(sid)),
-                        None => format!("!invalid:catch:{:#x}", cb.type_idx).into_bytes(),
-                    }
+                let exception_record = match cb.type_class {
+                    None => Vec::new(),
+                    Some(sid) => match self.file.strings.to_mutf8_bytes(sid) {
+                        Some(bytes) => record_pandasm_name(&bytes),
+                        None => format!("!invalid:catch:{}", sid.index()).into_bytes(),
+                    },
                 };
                 let hbegin = cb.handler;
                 let Some(hend) = cb.handler.checked_add(cb.len) else {
@@ -954,39 +958,39 @@ impl<'f> Emitter<'f> {
     }
 
     fn render_entity(&mut self, kind: EntityKind, id: u32, body: &MethodBody, out: &mut Vec<u8>) {
-        let offset = body.entity_offsets.get(&(kind, id)).copied();
-        match (kind, offset) {
-            (EntityKind::StringId, Some(off)) => {
-                self.register_string_offset(off);
+        let eref = body.entities.get(&(kind, id)).copied();
+        match (kind, eref) {
+            (
+                EntityKind::StringId,
+                Some(EntityRef::String {
+                    id: sid,
+                    source_offset,
+                }),
+            ) => {
+                let off = self.register_string_ref(sid, source_offset);
                 out.push(b'"');
                 if let Some(bytes) = self.strings.get(&off) {
                     out.extend_from_slice(bytes);
                 }
                 out.push(b'"');
             }
-            (EntityKind::MethodId, Some(off)) => {
-                let sig = self.method_signature_by_offset(off);
+            (EntityKind::MethodId, Some(EntityRef::Method(midx))) => {
+                let sig = self.method_signature_by_idx(midx);
                 out.extend_from_slice(&sig);
             }
-            (EntityKind::LiteralarrayId, Some(off)) => {
-                self.literal_array_by_offset_into(off, out);
+            (EntityKind::MethodId, Some(EntityRef::ExternalMethod { name, .. })) => {
+                out.extend_from_slice(&self.str_bytes(name));
+                out.extend_from_slice(b":()");
+            }
+            (EntityKind::LiteralarrayId, Some(EntityRef::LiteralArray(la_idx))) => {
+                match self.file.literal_arrays.get(la_idx.index()) {
+                    Some(array) => self.serialize_literal_array_into(&array.values, out),
+                    None => out.extend_from_slice(b"!invalid:literalarray"),
+                }
             }
             _ => {
                 let _ = write!(out, "!invalid:entity:{kind:?}:{id}");
             }
-        }
-    }
-
-    /// Append the literal-array operand text (`{ N [ … ]}`) for a source offset.
-    fn literal_array_by_offset_into(&self, offset: u32, out: &mut Vec<u8>) {
-        match self
-            .file
-            .literal_array_offsets
-            .get(&offset)
-            .and_then(|idx| self.file.literal_arrays.get(*idx as usize))
-        {
-            Some(array) => self.serialize_literal_array_into(&array.values, out),
-            None => out.extend_from_slice(b"!invalid:literalarray"),
         }
     }
 
@@ -1039,15 +1043,15 @@ impl<'f> Emitter<'f> {
                 out.extend_from_slice(&self.str_bytes(*sid));
                 out.push(b'"');
             }
-            LiteralValue::Method(off) => self.method_name_item(b"method", *off, out),
-            LiteralValue::GeneratorMethod(off) => {
-                self.method_name_item(b"generator_method", *off, out)
+            LiteralValue::Method(idx) => self.method_name_item(b"method", *idx, out),
+            LiteralValue::GeneratorMethod(idx) => {
+                self.method_name_item(b"generator_method", *idx, out)
             }
-            LiteralValue::Getter(off) => self.method_name_item(b"getter", *off, out),
-            LiteralValue::Setter(off) => self.method_name_item(b"setter", *off, out),
-            LiteralValue::AsyncGeneratorMethod(off) => {
+            LiteralValue::Getter(idx) => self.method_name_item(b"getter", *idx, out),
+            LiteralValue::Setter(idx) => self.method_name_item(b"setter", *idx, out),
+            LiteralValue::AsyncGeneratorMethod(idx) => {
                 // No upstream rendering (UNREACHABLE); deterministic fallback.
-                self.method_name_item(b"async_generator_method", *off, out)
+                self.method_name_item(b"async_generator_method", *idx, out)
             }
             LiteralValue::Accessor(v) => {
                 let _ = write!(out, "accessor:{}", i16::from(*v as i8));
@@ -1070,8 +1074,8 @@ impl<'f> Emitter<'f> {
             LiteralValue::BuiltinTypeIndex(v) => {
                 let _ = write!(out, "builtin_type:{}", i16::from(*v));
             }
-            // ARRAY_* payloads stay undecoded offsets in our model and never
-            // occur in the corpus; render a deterministic placeholder.
+            // ARRAY_* payloads never occur in dynamic pandasm corpus; render a
+            // deterministic placeholder.
             other => {
                 let _ = write!(out, "!invalid:literal:{other:?}");
             }
@@ -1079,21 +1083,21 @@ impl<'f> Emitter<'f> {
     }
 
     /// Reverse a decode-rewritten literal-array table index to its source
-    /// file offset (identity when the target was never decoded).
-    fn literal_offset_of(&self, idx: crate::LiteralArrayIdx) -> u32 {
-        self.rev_literal_offsets
-            .get(&idx.0)
+    /// file offset (or assigned synthetic offset).
+    fn literal_offset_of(&self, idx: LiteralArrayIdx) -> u32 {
+        self.literal_offsets
+            .get(idx.index())
             .copied()
             .unwrap_or(idx.0)
     }
 
-    fn method_name_item(&self, tag: &[u8], offset: u32, out: &mut Vec<u8>) {
+    fn method_name_item(&self, tag: &[u8], idx: MethodIdx, out: &mut Vec<u8>) {
         out.extend_from_slice(tag);
         out.push(b':');
-        match self.file.resolve_entity(offset) {
-            Some(sid) => out.extend_from_slice(&self.str_bytes(sid)),
+        match self.methods.get(idx.index()) {
+            Some(&(_, _, m)) => out.extend_from_slice(&self.str_bytes(m.name)),
             None => {
-                let _ = write!(out, "!invalid:method:{offset:#x}");
+                let _ = write!(out, "!invalid:method:{:#x}", idx.0);
             }
         }
     }
@@ -1111,7 +1115,7 @@ impl<'f> Emitter<'f> {
                     continue;
                 }
                 let name = self.file.strings.resolve(field.name).unwrap_or("");
-                let Some(offset) = field_u32_offset(field) else {
+                let Some(offset) = self.field_u32_offset(field) else {
                     continue;
                 };
                 if name == crate::MODULE_REQUEST_PHASE_FIELD {
@@ -1197,7 +1201,7 @@ impl<'f> Emitter<'f> {
         regular: &mut BTreeMap<Vec<u8>, u32>,
         modules: &mut BTreeMap<Vec<u8>, &'f ModuleData>,
     ) {
-        let scope_offsets: HashSet<u32> = self
+        let scope_indices: HashSet<usize> = self
             .file
             .classes
             .values()
@@ -1208,23 +1212,20 @@ impl<'f> Emitter<'f> {
                     let is_scope_field = c_is_scope
                         || self.file.strings.resolve(f.name) == Some(crate::SCOPE_NAMES_FIELD);
                     match (&f.initial_value, is_scope_field) {
-                        (Some(FieldValue::LiteralArrayRef(off)), true) => Some(*off),
+                        (Some(FieldValue::LiteralArrayRef { index, .. }), true) => {
+                            Some(index.index())
+                        }
                         _ => None,
                     }
                 })
             })
             .collect();
-        let mut decoded: Vec<(u32, u32)> = self
-            .file
-            .literal_array_offsets
-            .iter()
-            .map(|(o, i)| (*o, *i))
-            .collect();
-        decoded.sort_by_key(|(o, i)| (*i, *o));
         let mut index: u32 = 0;
-        for (offset, _) in decoded.iter().filter(|(o, _)| !scope_offsets.contains(o)) {
-            regular.insert(format!("{index} 0x{offset:x}").into_bytes(), *offset);
-            index += 1;
+        for (arr_idx, &offset) in self.literal_offsets.iter().enumerate() {
+            if !scope_indices.contains(&arr_idx) {
+                regular.insert(format!("{index} 0x{offset:x}").into_bytes(), offset);
+                index += 1;
+            }
         }
         // Module blobs in field order (class file order × field order).
         for class in self.file.classes.values() {
@@ -1236,9 +1237,11 @@ impl<'f> Emitter<'f> {
             }
         }
         // Scope-names arrays (tagged literal arrays, header order).
-        for (offset, _) in decoded.iter().filter(|(o, _)| scope_offsets.contains(o)) {
-            regular.insert(format!("{index} 0x{offset:x}").into_bytes(), *offset);
-            index += 1;
+        for (arr_idx, &offset) in self.literal_offsets.iter().enumerate() {
+            if scope_indices.contains(&arr_idx) {
+                regular.insert(format!("{index} 0x{offset:x}").into_bytes(), offset);
+                index += 1;
+            }
         }
     }
 
@@ -1257,10 +1260,6 @@ impl<'f> Emitter<'f> {
             if class.is_external {
                 continue;
             }
-            // Field-driven collection: upstream matches the RAW class name
-            // against "_ESModuleRecord;"/"_ESScopeNamesRecord" (never true
-            // for the "L…;"-shaped descriptors these records carry) and
-            // field names "scopeNames"/"moduleRecordIdx".
             let class_raw = self.str_bytes(class.name);
             let class_matches =
                 class_raw == b"_ESModuleRecord;" || class_raw == b"_ESScopeNamesRecord";
@@ -1272,7 +1271,7 @@ impl<'f> Emitter<'f> {
                 {
                     continue;
                 }
-                if let Some(offset) = field_u32_offset(field) {
+                if let Some(offset) = self.field_u32_offset(field) {
                     processed.insert(offset);
                 }
             }
@@ -1284,22 +1283,21 @@ impl<'f> Emitter<'f> {
                         if kind != EntityKind::LiteralarrayId {
                             continue;
                         }
-                        if let Some(&off) = body.entity_offsets.get(&(kind, id.0)) {
-                            nest.insert(off);
+                        if let Some(&EntityRef::LiteralArray(la_idx)) =
+                            body.entities.get(&(kind, id.0))
+                        {
+                            nest.insert(self.literal_offset_of(la_idx));
                         }
                     }
                 }
             }
         }
-        // ProcessNestLiteralArray: pop the iteration-first element, collect
-        // its nested literal-array references, repeat.
         while let Some(offset) = nest.first() {
             processed.insert(offset);
             if let Some(array) = self
-                .file
-                .literal_array_offsets
+                .literal_by_offset
                 .get(&offset)
-                .and_then(|idx| self.file.literal_arrays.get(*idx as usize))
+                .and_then(|&idx| self.file.literal_arrays.get(idx))
             {
                 for v in &array.values {
                     if let LiteralValue::LiteralArray(target) = v {
@@ -1314,8 +1312,6 @@ impl<'f> Emitter<'f> {
         }
         for (index, offset) in processed.iter().into_iter().enumerate() {
             let key = format!("{index} 0x{offset:x}").into_bytes();
-            // Upstream routes by module_literals_ membership
-            // (GetMetadataFieldValue's u32-field classification).
             if self.module_literals.contains(&offset)
                 && let Some(md) = self.module_data_at(offset)
             {
@@ -1338,9 +1334,6 @@ impl<'f> Emitter<'f> {
 
         self.classify_field_offsets();
 
-        // GetRecords runs before GetLiteralArrays upstream and registers
-        // strings during instruction processing (including duplicate-signature
-        // methods that are subsequently dropped from `functions`).
         let mut records: BTreeMap<Vec<u8>, PaRecord> = BTreeMap::new();
         let mut functions: BTreeMap<Vec<u8>, (StringId, &'f Class, &'f Method)> = BTreeMap::new();
         self.index_records_and_functions(&mut records, &mut functions);
@@ -1352,10 +1345,9 @@ impl<'f> Emitter<'f> {
             scratch.extend_from_slice(key);
             scratch.push(b' ');
             if let Some(array) = self
-                .file
-                .literal_array_offsets
+                .literal_by_offset
                 .get(offset)
-                .and_then(|idx| self.file.literal_arrays.get(*idx as usize))
+                .and_then(|&idx| self.file.literal_arrays.get(idx))
             {
                 self.serialize_literal_array_into(&array.values, &mut scratch);
             }
@@ -1478,7 +1470,7 @@ impl<'f> Emitter<'f> {
     fn render_field_value(&self, field: &crate::model::Field, line: &mut Vec<u8>) {
         match field.field_type {
             Type::U32 => {
-                if let Some(v) = field_u32_offset(field) {
+                if let Some(v) = self.field_u32_offset(field) {
                     let _ = write!(line, " = 0x{v:x}");
                 }
             }
@@ -1691,24 +1683,30 @@ impl<'f> Emitter<'f> {
         }
         out.extend_from_slice(b"}\n\n");
     }
+    /// The u32 wire value of a field's initial value, abstracting over the
+    /// structural module/scope/phase models.
+    fn field_u32_offset(&self, field: &crate::model::Field) -> Option<u32> {
+        match &field.initial_value {
+            Some(FieldValue::I32(v)) => u32::try_from(*v).ok(),
+            Some(FieldValue::ModuleData(md)) => Some(md.source_offset),
+            Some(FieldValue::LiteralArrayRef {
+                index,
+                source_offset,
+            }) => Some(
+                source_offset
+                    .or_else(|| self.literal_offsets.get(index.index()).copied())
+                    .unwrap_or(index.0),
+            ),
+            Some(FieldValue::ModuleRequestPhase(p)) => Some(p.source_offset),
+            Some(FieldValue::JsonFileContent { source_offset, .. }) => Some(*source_offset),
+            _ => None,
+        }
+    }
 }
 
 /// First-name-wins label allocation (upstream `LabelTable` insert).
 fn alloc_label(labels: &mut BTreeMap<u32, String>, idx: u32, name: String) -> String {
     labels.entry(idx).or_insert(name).clone()
-}
-
-/// The u32 wire value of a field's initial value, abstracting over the
-/// structural module/scope/phase models (which keep the source offset).
-fn field_u32_offset(field: &crate::model::Field) -> Option<u32> {
-    match &field.initial_value {
-        Some(FieldValue::I32(v)) => u32::try_from(*v).ok(),
-        Some(FieldValue::ModuleData(md)) => Some(md.source_offset),
-        Some(FieldValue::LiteralArrayRef(off)) => Some(*off),
-        Some(FieldValue::ModuleRequestPhase(p)) => Some(p.source_offset),
-        Some(FieldValue::JsonFileContent { source_offset, .. }) => Some(*source_offset),
-        _ => None,
-    }
 }
 
 /// `FieldTypeToPandasmType`: primitive tag names, `any` for tagged, and the
@@ -1771,9 +1769,7 @@ mod tests {
             strings: crate::StringPool::default(),
             classes: BTreeMap::new(),
             literal_arrays: Vec::new(),
-            literal_array_offsets: HashMap::new(),
             literal_array_header_offsets: Vec::new(),
-            entity_map: HashMap::new(),
         }
     }
 
@@ -1800,7 +1796,7 @@ mod tests {
             num_vregs: 0,
             num_args: 0,
             bytecodes,
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }
@@ -1871,7 +1867,7 @@ mod tests {
             num_vregs: 1,
             num_args: 0,
             bytecodes: Vec::new(),
-            entity_offsets: HashMap::new(),
+            entities: HashMap::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         };
@@ -2045,15 +2041,20 @@ mod tests {
 
     #[test]
     fn external_method_reference_falls_back_to_bare_signature() {
-        // A MethodId operand whose offset is no class method (an external
-        // reference): the signature falls back to `<name>:()`.
+        // A MethodId operand referencing an external method (not in any class):
+        // the signature falls back to `<name>:()`.
         let mut file = file_at(DEFAULT_VERSION);
         let orphan = file.strings.get_or_intern("orphan");
-        file.entity_map.insert(0x500, orphan);
-        let mut entity_offsets = HashMap::new();
-        entity_offsets.insert((EntityKind::MethodId, 0), 0x500);
+        let mut entities = HashMap::new();
+        entities.insert(
+            (EntityKind::MethodId, 0),
+            EntityRef::ExternalMethod {
+                name: orphan,
+                source_offset: 0x500,
+            },
+        );
         let body = MethodBody {
-            entity_offsets,
+            entities,
             ..body_of(vec![
                 abcd_isa::insn::Definefunc::new(
                     abcd_isa::Imm(0),
@@ -2096,7 +2097,10 @@ mod tests {
                 &mut file,
                 crate::TYPE_SUMMARY_OFFSET_FIELD,
                 Type::U32,
-                Some(FieldValue::LiteralArrayRef(0x123)),
+                Some(FieldValue::LiteralArrayRef {
+                    index: LiteralArrayIdx(0),
+                    source_offset: Some(0x123),
+                }),
             ),
             // A u32 field whose value is not an offset: nothing prints.
             bare_field(&mut file, "odd", Type::U32, Some(FieldValue::F64(1.0))),
@@ -2122,13 +2126,13 @@ mod tests {
         // arrays in decoded order, then module blobs, then scope-names
         // arrays.
         let mut file = file_at(Version::new(12, 0, 6, 0));
-        file.literal_arrays.push(crate::LiteralArray {
-            values: vec![LiteralValue::Integer(7)],
-        });
         file.literal_arrays
-            .push(crate::LiteralArray { values: Vec::new() });
-        file.literal_array_offsets.insert(0x10, 0);
-        file.literal_array_offsets.insert(0x50, 1);
+            .push(crate::LiteralArray::with_source_offset(
+                0x10,
+                vec![LiteralValue::Integer(7)],
+            ));
+        file.literal_arrays
+            .push(crate::LiteralArray::with_source_offset(0x50, Vec::new()));
         let req = file.strings.get_or_intern("r");
         let md = ModuleData {
             source_offset: 0x100,
@@ -2148,7 +2152,10 @@ mod tests {
             &mut file,
             "scopeNames",
             Type::U32,
-            Some(FieldValue::LiteralArrayRef(0x50)),
+            Some(FieldValue::LiteralArrayRef {
+                index: LiteralArrayIdx(1),
+                source_offset: Some(0x50),
+            }),
         );
         add_class(
             &mut file,
@@ -2174,10 +2181,11 @@ mod tests {
         // occupy slots but never list, and a slot whose array never decoded
         // prints key-only.
         let mut file = file_at(Version::new(12, 0, 6, 0));
-        file.literal_arrays.push(crate::LiteralArray {
-            values: vec![LiteralValue::Integer(7)],
-        });
-        file.literal_array_offsets.insert(0x10, 0);
+        file.literal_arrays
+            .push(crate::LiteralArray::with_source_offset(
+                0x10,
+                vec![LiteralValue::Integer(7)],
+            ));
         file.literal_array_header_offsets = vec![0x10, 0x200, 0x99];
         let phase_field = bare_field(
             &mut file,
@@ -2212,7 +2220,7 @@ mod tests {
             start: 1,
             len: u32::MAX,
             catches: vec![crate::CatchBlock {
-                type_idx: u32::MAX,
+                type_class: None,
                 handler: 1,
                 len: u32::MAX,
             }],
@@ -2229,22 +2237,26 @@ mod tests {
         let mut file = file_at(DEFAULT_VERSION);
         let s1 = file.strings.get_or_intern("kept_str");
         let s2 = file.strings.get_or_intern("dropped_dup_str");
-        file.entity_map.insert(0x200, s1);
-        file.entity_map.insert(0x300, s2);
 
         let mut e1 = HashMap::new();
-        e1.insert((EntityKind::StringId, 0), 0x200);
+        e1.insert(
+            (EntityKind::StringId, 0),
+            EntityRef::string_with_offset(s1, 0x200),
+        );
         let b1 = MethodBody {
-            entity_offsets: e1,
+            entities: e1,
             ..body_of(vec![
                 abcd_isa::insn::LdaStr::new(abcd_isa::EntityId(0)),
                 abcd_isa::insn::Returnundefined::new(),
             ])
         };
         let mut e2 = HashMap::new();
-        e2.insert((EntityKind::StringId, 0), 0x300);
+        e2.insert(
+            (EntityKind::StringId, 0),
+            EntityRef::string_with_offset(s2, 0x300),
+        );
         let b2 = MethodBody {
-            entity_offsets: e2,
+            entities: e2,
             ..body_of(vec![
                 abcd_isa::insn::LdaStr::new(abcd_isa::EntityId(0)),
                 abcd_isa::insn::Returnundefined::new(),
@@ -2335,10 +2347,12 @@ mod tests {
     fn static_dialect_does_not_treat_version_as_dynamic_12x_header_table() {
         let mut static_file = file_at(Version::new(0, 1, 0, 7));
         static_file.file_type = crate::FileType::Static;
-        static_file.literal_arrays.push(crate::LiteralArray {
-            values: vec![LiteralValue::Integer(42)],
-        });
-        static_file.literal_array_offsets.insert(0x10, 0);
+        static_file
+            .literal_arrays
+            .push(crate::LiteralArray::with_source_offset(
+                0x10,
+                vec![LiteralValue::Integer(42)],
+            ));
         assert_eq!(static_file.dialect(), Some(crate::Dialect::Static));
 
         let out = emit_file(&static_file, "static.abc");
