@@ -155,6 +155,11 @@ jobs:
           CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
           QEMU_LD_PREFIX: /usr/arm-linux-gnueabihf
+          # QEMU linux-user (6.2 on ubuntu-22.04) can deadlock between fork() and
+          # execve() when multiple emulated Rust test threads spawn child processes
+          # (e.g. `node`) concurrently.
+          RUST_TEST_THREADS: "1"
+          RAYON_NUM_THREADS: "1"
 
   # ── Per-push corpus jobs ───────────────────────────────────────────
   # Depend directly on the five fast Tier-1 gates (`fmt`, `clippy`, `doc`,
