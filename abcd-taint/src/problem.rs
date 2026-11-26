@@ -968,17 +968,16 @@ impl<'m> TaintProblem<'m> {
                             | Op::Throw { .. } => {
                                 has_dyn = true;
                             }
-                            Op::Call { .. } => {
+                            Op::Call { .. }
                                 if !self.call_has_body_callee(iid)
                                     || self.call_resolution_incomplete(iid)
                                     || self.call_matches_sink_leaf(fid, iid, inst)
                                     || matches!(
                                         self.compute_class(iid, true).0,
                                         SiteClass::Summary { .. }
-                                    )
-                                {
-                                    has_dyn = true;
-                                }
+                                    ) =>
+                            {
+                                has_dyn = true;
                             }
                             _ => {}
                         }
@@ -3694,10 +3693,8 @@ impl IfdsProblem for TaintProblem<'_> {
                     ));
                 }
             }
-            Op::Call { .. } => {
-                if fact.local_base() == Some(UNCAUGHT_EXCEPTION_VALUE) {
-                    out.push(source.clone());
-                }
+            Op::Call { .. } if fact.local_base() == Some(UNCAUGHT_EXCEPTION_VALUE) => {
+                out.push(source.clone());
             }
             _ => {}
         }
