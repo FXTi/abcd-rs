@@ -408,4 +408,6 @@ fn dream_gate_t262_oracle() {
 /// N78 (2026-09-28): try/S12.14_A9_T5 fixed (the loop-cut do-while
 /// driver, `Ctx::try_loop_cut_do_while`) and delisted — the
 /// decompile-bug ledger bucket is EMPTY — 2676.
-const T262_PASS_FLOOR: usize = 2676;
+/// Round 5 (#86 D1, 2026-11-27): pre-throw exceptional PhiAssign hoisting
+/// fixed GeneratorPrototype/throw/try-catch-within-catch (delisted) — 2677.
+const T262_PASS_FLOOR: usize = 2677;

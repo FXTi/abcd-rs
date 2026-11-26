@@ -478,3 +478,233 @@ fn part1_async_eq_throw_await_folds_under_if_cond_use_counting() {
         decompiled.text
     );
 }
+
+#[test]
+fn es2abc_dynamic_arkts_getter_hides_three_abi_slots() {
+    // Reproduces OpenHarmony-6.1-LTS `Photos.hap` (`SaveUIExtensionPage`):
+    // `es2abc` tags dynamic `.ets` records with `SourceLang::ArkTS` while
+    // emitting `L_ESSlotNumberAnnotation;` and 3 hidden ABI slots
+    // `(a0=funcobj, a1=new.target, a2=this)`. Concise getters must emit
+    // `get id() { return this; }`, never `get id(p0, p1, p2)`.
+    let mut m = Module::new();
+    let ark_sym = m.sym.intern("Lcom/ohos/photos/Page;");
+    let mut ark_cls = abcd_ir::module::ClassData::new(ark_sym, ark_sym);
+    ark_cls.source_lang = abcd_ir::SourceLang::ArkTS;
+    m.classes.push(ark_cls);
+
+    let es_sym = m.sym.intern("L_ESSlotNumberAnnotation;");
+    let es_cls_id = abcd_ir::ClassId::new(m.classes.len() as u32);
+    m.classes
+        .push(abcd_ir::module::ClassData::new(es_sym, es_sym));
+
+    let f_main_name = m.sym.intern("func_main_0");
+    let mut fd_main = abcd_ir::function::FunctionData::new(
+        abcd_ir::ClassId::new(0),
+        f_main_name,
+        FunctionKind::Function,
+    );
+    fd_main.modifiers |= abcd_ir::Modifiers::STATIC;
+    fd_main.annotations.push(abcd_ir::module::Annotation {
+        class: es_cls_id,
+        elements: vec![],
+    });
+    let f_main = abcd_ir::FuncId::new(0);
+    m.functions.push(fd_main);
+    m.classes[0].methods.push(f_main);
+    let b_main = add_block(&mut m, f_main);
+    let _ = add_param(&mut m, f_main);
+    let _ = add_param(&mut m, f_main);
+    let _ = add_param(&mut m, f_main);
+
+    let f_get_name = m.sym.intern("get_id");
+    let mut fd_get = abcd_ir::function::FunctionData::new(
+        abcd_ir::ClassId::new(0),
+        f_get_name,
+        FunctionKind::Getter,
+    );
+    fd_get.modifiers |= abcd_ir::Modifiers::STATIC;
+    fd_get.annotations.push(abcd_ir::module::Annotation {
+        class: es_cls_id,
+        elements: vec![],
+    });
+    let f_get = abcd_ir::FuncId::new(1);
+    m.functions.push(fd_get);
+    m.classes[0].methods.push(f_get);
+    let b_get = add_block(&mut m, f_get);
+    let _g0 = add_param(&mut m, f_get);
+    let _g1 = add_param(&mut m, f_get);
+    let g_this = add_param(&mut m, f_get);
+    emit_void(
+        &mut m,
+        b_get,
+        Op::Return {
+            value: Some(g_this),
+        },
+    );
+
+    let empty_shape = m.consts.push(abcd_ir::Const::ObjectLiteral {
+        keys: vec![],
+        values: vec![],
+    });
+    let obj = emit(&mut m, b_main, Op::AllocObject { shape: empty_shape });
+    let getter_closure = emit(
+        &mut m,
+        b_main,
+        Op::DefineFunc {
+            body: f_get,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    let key = load_string(&mut m, b_main, "id");
+    let undef = load_const(&mut m, b_main, abcd_ir::Const::Undefined);
+    let set_name = load_const(&mut m, b_main, abcd_ir::Const::Bool(false));
+    let _ = emit(
+        &mut m,
+        b_main,
+        Op::DefineGetterSetterByValue {
+            obj,
+            key,
+            getter: getter_closure,
+            setter: undef,
+            set_name,
+        },
+    );
+    emit_void(&mut m, b_main, Op::Return { value: Some(obj) });
+
+    let out = decompile_module(&m, &EmitOptions::default()).text;
+    assert!(
+        out.contains("get id() {") && out.contains("return this;") && !out.contains("get id(p0"),
+        "dynamic es2abc ArkTS getter must hide 3 ABI slots and bind params[2] to `this`:\n{out}"
+    );
+}
+
+#[test]
+fn derived_ctor_exceptional_phi_this_param_avoids_premature_tdz() {
+    // Reproduces test262 `language/expressions/super/call-arg-evaluation-err`:
+    // in a derived constructor (`ThrowIfSuperNotCalled` / `CallKind::Super`),
+    // `params[2]` (`this`) holds `Hole` before `super(...)` completes. Hoisting
+    // an exceptional `PhiAssign` before `thrower()` must emit `undefined`, never
+    // `this` (which would prematurely throw TDZ `ReferenceError` in JS).
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "DerivedCtor", FunctionKind::Constructor);
+    m.func_mut(f).unwrap().modifiers |= abcd_ir::Modifiers::STATIC;
+    let _p_func = add_param(&mut m, f);
+    let _p_newt = add_param(&mut m, f);
+    let p_this = add_param(&mut m, f);
+
+    let b_try = entry_of(&m, f);
+    let b_catch = add_block(&mut m, f);
+    let b_join = add_block(&mut m, f);
+
+    let thrower_sym = m.sym.intern("thrower");
+    let thrower_fn = emit(
+        &mut m,
+        b_try,
+        Op::TryGetGlobal {
+            name: thrower_sym,
+            default: None,
+        },
+    );
+    let arg = emit(
+        &mut m,
+        b_try,
+        Op::Call {
+            callee: thrower_fn,
+            this: None,
+            args: vec![],
+            kind: abcd_ir::op::CallKind::Direct,
+        },
+    );
+    let undef = load_const(&mut m, b_try, abcd_ir::Const::Undefined);
+    let super_res = emit(
+        &mut m,
+        b_try,
+        Op::Call {
+            callee: undef,
+            this: None,
+            args: vec![arg],
+            kind: abcd_ir::op::CallKind::Super,
+        },
+    );
+    emit_void(
+        &mut m,
+        b_try,
+        Op::ThrowIfSuperNotCalled {
+            value: super_res,
+            kind: abcd_ir::op::SuperCheck::NotCalled,
+        },
+    );
+    emit_void(&mut m, b_try, Op::Branch { dest: b_join });
+
+    let exc = add_exception_param(&mut m, b_catch);
+    let phi_this_catch = emit(&mut m, b_catch, Op::Phi { entries: vec![] });
+    wire_phi(
+        &mut m,
+        phi_this_catch,
+        vec![(
+            Edge {
+                from: b_try,
+                kind: EdgeKind::Exceptional,
+            },
+            p_this,
+        )],
+    );
+    let caught_sym = m.sym.intern("caught");
+    emit_void(
+        &mut m,
+        b_catch,
+        Op::TryStoreGlobal {
+            name: caught_sym,
+            value: exc,
+        },
+    );
+    emit_void(&mut m, b_catch, Op::Branch { dest: b_join });
+
+    let phi_ret = emit(&mut m, b_join, Op::Phi { entries: vec![] });
+    wire_phi(
+        &mut m,
+        phi_ret,
+        vec![
+            (
+                Edge {
+                    from: b_try,
+                    kind: EdgeKind::Normal,
+                },
+                super_res,
+            ),
+            (
+                Edge {
+                    from: b_catch,
+                    kind: EdgeKind::Normal,
+                },
+                phi_this_catch,
+            ),
+        ],
+    );
+    emit_void(
+        &mut m,
+        b_join,
+        Op::ThrowIfSuperNotCalled {
+            value: phi_ret,
+            kind: abcd_ir::op::SuperCheck::NotCalled,
+        },
+    );
+    emit_void(
+        &mut m,
+        b_join,
+        Op::Return {
+            value: Some(phi_ret),
+        },
+    );
+
+    link(&mut m, b_try, b_join);
+    link(&mut m, b_catch, b_join);
+    add_try(&mut m, f, vec![b_try], b_catch, exc);
+
+    let out = decompile_module(&m, &EmitOptions::default()).text;
+    assert!(
+        !out.contains("= this;") && out.contains("= undefined;"),
+        "derived ctor exceptional PhiAssign from Param(this) must emit `undefined`, not `this`:\n{out}"
+    );
+}

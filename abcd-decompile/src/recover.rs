@@ -770,6 +770,10 @@ struct Recover<'m> {
     /// Explicit leading ABI frame layout when [`abcd_ir::frame::FrameSlots`]
     /// governs `func` (`None` on legacy unannotated non-static DynamicEcma IR).
     frame_slots: Option<abcd_ir::frame::FrameSlots>,
+    /// True when `func` is a derived class constructor (`ThrowIfSuperNotCalled`
+    /// or direct `super(...)` call), where the entry `this` parameter slot holds
+    /// `Hole` (`undefined`) until `super(...)` returns the constructed receiver.
+    is_derived_ctor: bool,
     /// Bare global/lexical/module/symbol names referenced in `func`, collected
     /// before synthetic fallback `p{i}`/`e` names are minted so fallbacks never
     /// shadow referenced bindings while explicit debug names keep their source spelling.
@@ -792,6 +796,26 @@ struct Recover<'m> {
 
 impl<'m> Recover<'m> {
     fn new(module: &'m Module, func: FuncId, index: Option<&'m DecompileIndex>) -> Self {
+        let is_derived_ctor = module.func(func).is_some_and(|fd| {
+            fd.blocks.iter().any(|&bid| {
+                module.block(bid).is_some_and(|bl| {
+                    bl.insts.iter().any(|&iid| {
+                        module.inst(iid).is_some_and(|inst| {
+                            matches!(
+                                inst.op,
+                                Op::ThrowIfSuperNotCalled { .. }
+                                    | Op::Call {
+                                        kind: CallKind::Super
+                                            | CallKind::SuperSpread
+                                            | CallKind::SuperForwardAllArgs,
+                                        ..
+                                    }
+                            )
+                        })
+                    })
+                })
+            })
+        });
         let mut r = Recover {
             hidden_params: 0,
             module,
@@ -805,6 +829,7 @@ impl<'m> Recover<'m> {
             temp_names: HashMap::new(),
             param_names: Vec::new(),
             frame_slots: None,
+            is_derived_ctor,
             referenced_bare_names: HashSet::new(),
             catch_names: HashMap::new(),
             handler_binds: HashMap::new(),
@@ -962,12 +987,32 @@ impl<'m> Recover<'m> {
             .unwrap_or_default();
         let n = f.params.len();
         let is_static_method = f.modifiers.contains(abcd_ir::Modifiers::STATIC);
-        let slots_opt = if self.module.func_dialect(f) == abcd_ir::Dialect::StaticArkTS {
+        // `es2abc` tags `.ets` (ArkTS 1.0/1.1 dynamic bytecode) classes with
+        // `SourceLang::ArkTS` while still using the 3-slot dynamic ECMA frame
+        // (`[func][new.target][this]`) and emitting `L_ES*` annotation classes
+        // (`L_ESSlotNumberAnnotation;`, etc.) / ECMAScript module records.
+        let is_es2abc_dynamic = !self.module.imports.is_empty()
+            || !self.module.exports.is_empty()
+            || !self.module.module_requests.is_empty()
+            || f.annotations.iter().any(|ann| {
+                self.module
+                    .class(ann.class)
+                    .and_then(|c| self.module.sym.resolve(c.descriptor))
+                    .is_some_and(|d| d.starts_with("L_ES"))
+            })
+            || self.module.classes.iter().any(|c| {
+                self.module
+                    .sym
+                    .resolve(c.descriptor)
+                    .is_some_and(|d| d.starts_with("L_ES"))
+            });
+        let slots_opt = if let Some(ann_slots) = decode_call_type_slots(self.module, f) {
+            Some(ann_slots)
+        } else if !is_es2abc_dynamic && self.module.func_dialect(f) == abcd_ir::Dialect::StaticArkTS
+        {
             Some(abcd_ir::frame::FrameSlots::for_static_arkts(
                 is_static_method,
             ))
-        } else if let Some(ann_slots) = decode_call_type_slots(self.module, f) {
-            Some(ann_slots)
         } else if is_static_method && n >= 3 {
             Some(abcd_ir::frame::FrameSlots::DEFAULT)
         } else {
@@ -2357,7 +2402,19 @@ impl<'m> Recover<'m> {
                 value_id: result,
             });
             for (edge, v) in entries {
-                let value = self.expr_of(*v);
+                let value = if edge.kind == EdgeKind::Exceptional
+                    && self.is_derived_ctor
+                    && matches!(
+                        self.module.value(chase_mov(self.module, *v)),
+                        Some(Value {
+                            def: ValueDef::Param(i),
+                            ..
+                        }) if self.param_names.get(*i as usize).is_some_and(|n| n == "this")
+                    ) {
+                    Expr::Lit(Lit::Undefined)
+                } else {
+                    self.expr_of(*v)
+                };
                 phi_tail.push(PendingPhiAssign {
                     pred: edge.from,
                     to: block,
