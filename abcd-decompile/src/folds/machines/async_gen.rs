@@ -164,26 +164,38 @@ pub fn async_generator_machine_fold(
 /// `GeneratorDriver` genobj operand, an `IterResultObj` value slot,
 /// an `AsyncGeneratorResolve` genobj operand, or a phi assign of the temp.
 pub(in crate::folds) fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
-    fn expr_ok(e: &Expr, genobj: ValueId, slot: bool) -> bool {
-        if temp_value(e) == Some(genobj) {
-            return slot;
-        }
-        match e {
-            Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, genobj, true),
-            Expr::IterResultObj { value, done } => {
-                expr_ok(value, genobj, true) && expr_ok(done, genobj, false)
+    fn expr_ok(root: &Expr, genobj: ValueId) -> bool {
+        let mut stack: Vec<(&Expr, bool)> = vec![(root, false)];
+        while let Some((e, slot)) = stack.pop() {
+            if temp_value(e) == Some(genobj) {
+                if !slot {
+                    return false;
+                }
+                continue;
             }
-            Expr::AsyncGeneratorResolve {
-                genobj: g,
-                value,
-                done,
-            } => {
-                expr_ok(g, genobj, true)
-                    && expr_ok(value, genobj, false)
-                    && expr_ok(done, genobj, false)
+            match e {
+                Expr::GeneratorDriver { genobj: g, .. } => stack.push((g, true)),
+                Expr::IterResultObj { value, done } => {
+                    stack.push((done, false));
+                    stack.push((value, true));
+                }
+                Expr::AsyncGeneratorResolve {
+                    genobj: g,
+                    value,
+                    done,
+                } => {
+                    stack.push((done, false));
+                    stack.push((value, false));
+                    stack.push((g, true));
+                }
+                _ => {
+                    for c in expr_children(e) {
+                        stack.push((c, false));
+                    }
+                }
             }
-            _ => expr_children(e).iter().all(|c| expr_ok(c, genobj, false)),
         }
+        true
     }
     let mut ok = true;
     walk_leaves(nodes, &mut |l| {
@@ -195,7 +207,7 @@ pub(in crate::folds) fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId
             return;
         }
         for e in leaf_exprs(l) {
-            if !expr_ok(e, genobj, false) {
+            if !expr_ok(e, genobj) {
                 ok = false;
                 return;
             }
@@ -204,19 +216,20 @@ pub(in crate::folds) fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId
     ok
 }
 
-/// The entry-site elision (the entry gate): find the run declaring the
-/// `CreateGenerator` temp; behind any pure const decls the profile
-/// hoisted there, the entry protocol suspend (`yield undefined` — the
-// entry `SuspendGenerator`, recovered as a `Yield` expression) plus
-/// the optional dead entry resume/mode expression statements must
-/// follow. Elide them. Returns false (no fold at all) when the site
-/// does not match.
+/// The entry-site elision (the entry gate; iterative pre-order walk).
 pub(in crate::folds) fn agen_entry_elide(
     nodes: &mut [SNode],
     genobj: ValueId,
     stats: &mut FoldStats,
 ) -> bool {
-    for n in nodes.iter_mut() {
+    let mut stack: Vec<&mut [SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        let Some((n, rest)) = slice.split_first_mut() else {
+            continue;
+        };
+        if !rest.is_empty() {
+            stack.push(rest);
+        }
         match n {
             SNode::Stmts(run) => {
                 let decl_at = run.iter().position(|l| {
@@ -230,9 +243,6 @@ pub(in crate::folds) fn agen_entry_elide(
                     )
                 });
                 if let Some(j) = decl_at {
-                    // Skip pure const decls (the optimized profile
-                    // materializes the mode immediates early) and
-                    // entry `SetGeneratorState` markers.
                     let mut elide = Vec::new();
                     let mut k = j + 1;
                     while k < run.len() {
@@ -240,6 +250,9 @@ pub(in crate::folds) fn agen_entry_elide(
                             Leaf::Raw(Stmt::Declare {
                                 value: Expr::Lit(_),
                                 ..
+                            })
+                            | Leaf::Raw(Stmt::PhiAssign {
+                                exceptional: true, ..
                             }) => k += 1,
                             Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState" => {
                                 elide.push(k);
@@ -248,8 +261,6 @@ pub(in crate::folds) fn agen_entry_elide(
                             _ => break,
                         }
                     }
-                    // The entry protocol suspend: bare `yield
-                    // undefined`.
                     if !matches!(
                         run.get(k),
                         Some(Leaf::Raw(Stmt::Expr(Expr::Yield { value })))
@@ -259,9 +270,6 @@ pub(in crate::folds) fn agen_entry_elide(
                     }
                     elide.push(k);
                     k += 1;
-                    // The dead entry resume/mode results, when they
-                    // survived as expression statements (impure ops
-                    // with dead results; at most one each).
                     let mut seen_resume = false;
                     let mut seen_mode = false;
                     loop {
@@ -288,6 +296,11 @@ pub(in crate::folds) fn agen_entry_elide(
                                 elide.push(k);
                                 k += 1;
                             }
+                            Some(Leaf::Raw(Stmt::PhiAssign {
+                                exceptional: true, ..
+                            })) => {
+                                k += 1;
+                            }
                             _ => break,
                         }
                     }
@@ -301,52 +314,31 @@ pub(in crate::folds) fn agen_entry_elide(
             SNode::If {
                 then, otherwise, ..
             } => {
-                if agen_entry_elide(then, genobj, stats)
-                    || agen_entry_elide(otherwise, genobj, stats)
-                {
-                    return true;
-                }
+                stack.push(otherwise);
+                stack.push(then);
             }
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // async_generator_machine_fold (emit.rs:524 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => {
-                if agen_entry_elide(body, genobj, stats) {
-                    return true;
-                }
-            }
+            | SNode::ForIn { body, .. } => stack.push(body),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                // unreachable (finally conjunct): Try.finally is Some only
-                // after fold_finally (folds.rs:4143/4154) inside fold(),
-                // which runs after async_generator_machine_fold — c-COV diagnosis
-                if agen_entry_elide(body, genobj, stats)
-                    || catches
-                        .iter_mut()
-                        .any(|c| agen_entry_elide(&mut c.body, genobj, stats))
-                    || finally
-                        .as_mut()
-                        .is_some_and(|f| agen_entry_elide(f, genobj, stats))
-                {
-                    return true;
+                if let Some(f) = finally {
+                    stack.push(f);
                 }
+                for c in catches.iter_mut().rev() {
+                    stack.push(&mut c.body);
+                }
+                stack.push(body);
             }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_generator_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
-                for c in cases {
-                    if agen_entry_elide(&mut c.body, genobj, stats) {
-                        return true;
-                    }
+                for c in cases.iter_mut().rev() {
+                    stack.push(&mut c.body);
                 }
             }
             SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
@@ -395,163 +387,111 @@ fn agen_fold_seq_inner(
     bool_env: &BTreeMap<ValueId, bool>,
     stats: &mut FoldStats,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                agen_fold_seq_inner(then, cx, bool_env, stats);
-                agen_fold_seq_inner(otherwise, cx, bool_env, stats);
+    fold_snode_vecs_postorder(nodes, |seq| {
+        for n in seq.iter_mut() {
+            if let SNode::Stmts(run) = n {
+                agen_fold_run_inner(
+                    run,
+                    &cx.aliases,
+                    bool_env,
+                    &cx.uses,
+                    &mut cx.consumed_consts,
+                    stats,
+                );
             }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // async_generator_machine_fold (emit.rs:524 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => agen_fold_seq_inner(body, cx, bool_env, stats),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                agen_fold_seq_inner(body, cx, bool_env, stats);
-                for c in catches {
-                    agen_fold_seq_inner(&mut c.body, cx, bool_env, stats);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // async_generator_machine_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    agen_fold_seq_inner(f, cx, bool_env, stats);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_generator_machine_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    agen_fold_seq_inner(&mut c.body, cx, bool_env, stats);
-                }
-            }
-            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
-    }
-    // Per-run rewrites: completion resolves (`return { value: genobj, done: X }`
-    // or `return AsyncGeneratorResolve(gen, X, true)`) fold to `return X`,
-    // and explicit-return await sites fold with them.
-    for n in nodes.iter_mut() {
-        if let SNode::Stmts(run) = n {
-            agen_fold_run_inner(
-                run,
-                &cx.aliases,
-                bool_env,
-                &cx.uses,
-                &mut cx.consumed_consts,
-                stats,
-            );
-        }
-    }
-    agen_fold_multi_run_explicit_returns(nodes, &cx.aliases, stats);
-    let mut i = 0;
-    while i + 1 < nodes.len() {
-        // The yield site first: the pre-yield await must fold with its
-        // yield machinery, never as a bare `await`.
-        if let Some(site) = match_ag_yield_inner(nodes, i, cx, bool_env) {
-            let &(insert_ni, insert_li) = site
-                .await_site
-                .remove
-                .last()
-                .expect("at least the suspend leaf");
-            for &(rni, rli) in &site.await_site.remove {
-                let SNode::Stmts(run) = &mut nodes[rni] else {
-                    unreachable!()
+        agen_fold_multi_run_explicit_returns(seq, &cx.aliases, stats);
+        let mut i = 0;
+        while i + 1 < seq.len() {
+            if let Some(site) = match_ag_yield_inner(seq, i, cx, bool_env) {
+                let Some(&(insert_ni, insert_li)) = site.await_site.remove.last() else {
+                    i += 1;
+                    continue;
                 };
-                run.remove(rli);
-            }
-            let y = Expr::Yield {
-                value: Box::new(site.await_site.awaited),
-            };
-            {
-                let SNode::Stmts(run) = &mut nodes[insert_ni] else {
-                    unreachable!()
-                };
-                let insert_at = insert_li.min(run.len());
-                if nodes_use_temp(&site.continuation, site.ry) {
-                    // `x = yield v` — the resumption value has real uses
-                    // in the NEXT continuation; bind the temp.
-                    run.insert(
-                        insert_at,
-                        Leaf::Raw(Stmt::Declare {
-                            name: site.ry_name,
-                            mutable: false,
-                            value: y,
-                            value_id: site.ry,
-                        }),
-                    );
-                    stats.agen_bound += 1;
-                } else {
-                    run.insert(insert_at, Leaf::Raw(Stmt::Expr(y)));
+                for &(rni, rli) in &site.await_site.remove {
+                    let SNode::Stmts(run) = &mut seq[rni] else {
+                        unreachable!()
+                    };
+                    run.remove(rli);
                 }
-            }
-            stats.agen_yields += 1;
-            nodes.splice(
-                i + site.await_site.dispatch_off..i + site.await_site.dispatch_off + 1,
-                site.continuation,
-            );
-            i = insert_ni + 1;
-            continue;
-        }
-        // A source-level await (d-P13's site shape) — guarded: a
-        // continuation opening with the resumption pair on the same
-        // genObj is yield machinery, not a source await's
-        // continuation. If the yield match refused it, the whole site
-        // stays loud.
-        if let Some(site) = match_ag_await(nodes, i, cx) {
-            let &(insert_ni, insert_li) = site.remove.last().expect("at least the suspend leaf");
-            for &(rni, rli) in &site.remove {
-                let SNode::Stmts(run) = &mut nodes[rni] else {
-                    unreachable!()
+                let y = Expr::Yield {
+                    value: Box::new(site.await_site.awaited),
                 };
-                run.remove(rli);
-            }
-            let aw = Expr::Await {
-                value: Box::new(site.awaited),
-                uncaught: true,
-            };
-            {
-                let SNode::Stmts(run) = &mut nodes[insert_ni] else {
-                    unreachable!()
-                };
-                let insert_at = insert_li.min(run.len());
-                match site.resume {
-                    Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                {
+                    let SNode::Stmts(run) = &mut seq[insert_ni] else {
+                        unreachable!()
+                    };
+                    let insert_at = insert_li.min(run.len());
+                    if nodes_use_temp(&site.continuation, site.ry) {
                         run.insert(
                             insert_at,
                             Leaf::Raw(Stmt::Declare {
-                                name,
+                                name: site.ry_name,
                                 mutable: false,
-                                value: aw,
-                                value_id: r,
+                                value: y,
+                                value_id: site.ry,
                             }),
                         );
-                        stats.agen_await_bound += 1;
+                        stats.agen_bound += 1;
+                    } else {
+                        run.insert(insert_at, Leaf::Raw(Stmt::Expr(y)));
                     }
-                    _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
                 }
+                stats.agen_yields += 1;
+                seq.splice(
+                    i + site.await_site.dispatch_off..i + site.await_site.dispatch_off + 1,
+                    site.continuation,
+                );
+                i = insert_ni + 1;
+                continue;
             }
-            stats.agen_awaits += 1;
-            nodes.splice(
-                i + site.dispatch_off..i + site.dispatch_off + 1,
-                site.continuation,
-            );
-            i = insert_ni + 1;
-            continue;
+            if let Some(site) = match_ag_await(seq, i, cx) {
+                let Some(&(insert_ni, insert_li)) = site.remove.last() else {
+                    i += 1;
+                    continue;
+                };
+                for &(rni, rli) in &site.remove {
+                    let SNode::Stmts(run) = &mut seq[rni] else {
+                        unreachable!()
+                    };
+                    run.remove(rli);
+                }
+                let aw = Expr::Await {
+                    value: Box::new(site.awaited),
+                    uncaught: true,
+                };
+                {
+                    let SNode::Stmts(run) = &mut seq[insert_ni] else {
+                        unreachable!()
+                    };
+                    let insert_at = insert_li.min(run.len());
+                    match site.resume {
+                        Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                            run.insert(
+                                insert_at,
+                                Leaf::Raw(Stmt::Declare {
+                                    name,
+                                    mutable: false,
+                                    value: aw,
+                                    value_id: r,
+                                }),
+                            );
+                            stats.agen_await_bound += 1;
+                        }
+                        _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
+                    }
+                }
+                stats.agen_awaits += 1;
+                seq.splice(
+                    i + site.dispatch_off..i + site.dispatch_off + 1,
+                    site.continuation,
+                );
+                i = insert_ni + 1;
+                continue;
+            }
+            i += 1;
         }
-        i += 1;
-    }
+    });
 }
 
 /// Per-run completion folds: `return { value: genobj, done: X }` (the

@@ -30,7 +30,9 @@ impl<'m> Emitter<'m> {
                 "  var {h}; /* hoisted temp: used outside its def's block */\n"
             ));
         }
+        self.emitting_funcs.insert(func);
         self.emit_nodes(&body, 1, out);
+        self.emitting_funcs.remove(&func);
         out.push_str("}\n");
         if self.current_fn_has_fallback {
             self.stats.functions_with_fallbacks += 1;
@@ -38,78 +40,103 @@ impl<'m> Emitter<'m> {
         (name, raw)
     }
 
-    /// A closure/class-member body at a given indent.
-    pub(in crate::emit) fn emit_function_body(
+    pub(in crate::emit) fn step_enter_inline_func<'b>(
         &mut self,
         func: FuncId,
         indent: usize,
+        style: InlineHeaderStyle,
+        inline_pool: &'b BTreeMap<FuncId, PreparedFunc>,
+        tasks: &mut Vec<PrintTask<'b>>,
         out: &mut String,
-    ) -> RecoveredFunc {
-        let (rf, body) = self.func_nodes(func, false);
-        let prev = self.current_kind;
-        self.current_kind = rf.kind;
-        let prev_hoisted = std::mem::replace(&mut self.hoisted, escaped_temps(&body));
-        let pad = "  ".repeat(indent);
-        for d in lex_decls(&body, &rf.params) {
-            out.push_str(&format!("{pad}let {d};\n"));
-        }
-        for h in self.hoisted.clone() {
+    ) {
+        let body_pad = "  ".repeat(indent);
+        if !self.emitting_funcs.insert(func) {
+            *self
+                .stats
+                .fallback_comments
+                .entry("DefineFunc(cycle)")
+                .or_insert(0) += 1;
+            self.current_fn_has_fallback = true;
+            let rf = crate::recover::recover_func(self.module, func);
+            let (params, mut ret) = self.params_ret(&rf);
+            if style.drop_ret_ty {
+                ret.clear();
+            }
+            if style.open_paren {
+                out.push('(');
+            }
+            out.push_str(&params);
+            out.push(')');
+            out.push_str(&ret);
+            out.push_str(if style.arrow { " => {\n" } else { " {\n" });
             out.push_str(&format!(
-                "{pad}var {h}; /* hoisted temp: used outside its def's block */\n"
+                "{body_pad}/* fallback DefineFunc(cycle): cyclic inline function reference fn#{} */\n",
+                func.index()
+            ));
+            out.push_str(&style.closing);
+            return;
+        }
+
+        let Some(p) = inline_pool.get(&func) else {
+            self.emitting_funcs.remove(&func);
+            return;
+        };
+        self.stats.function_bodies += 1;
+        self.stats.structure =
+            merge_struct_stats(std::mem::take(&mut self.stats.structure), &p.struct_stats);
+        self.stats.folds = merge_fold_stats(std::mem::take(&mut self.stats.folds), &p.fold_stats);
+
+        let (params, mut ret) = self.params_ret(&p.rf);
+        if style.drop_ret_ty {
+            ret.clear();
+        }
+        if style.open_paren {
+            out.push('(');
+        }
+        out.push_str(&params);
+        out.push(')');
+        out.push_str(&ret);
+        out.push_str(if style.arrow { " => {\n" } else { " {\n" });
+
+        let prev_kind = std::mem::replace(&mut self.current_kind, p.rf.kind);
+        let prev_hoisted = std::mem::replace(&mut self.hoisted, escaped_temps(&p.body));
+        for d in lex_decls(&p.body, &p.rf.params) {
+            out.push_str(&format!("{body_pad}let {d};\n"));
+        }
+        for h in &self.hoisted {
+            out.push_str(&format!(
+                "{body_pad}var {h}; /* hoisted temp: used outside its def's block */\n"
             ));
         }
-        self.emit_nodes(&body, indent, out);
-        self.current_kind = prev;
-        self.hoisted = prev_hoisted;
-        rf
+        tasks.push(PrintTask::ExitInlineFunc {
+            func,
+            prev_kind,
+            prev_hoisted,
+            closing: style.closing,
+        });
+        tasks.push(PrintTask::Nodes {
+            slice: &p.body,
+            indent,
+        });
     }
 
     // ── Classes & closures ───────────────────────────────────────────
 
-    /// Assignment form of a hoisted class (`name = class …`); the
-    /// hoisted check in [`Emitter::emit_class`] does the work.
-    // Signature mirrors `emit_class` (it is a thin forwarder): every
-    // parameter is a distinct facet of the class IR node.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::emit) fn emit_class_assign(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "class emission threads indent, name, ctor, heritage, members, attrs, and task stack"
+    )]
+    pub(in crate::emit) fn step_start_class<'b>(
         &mut self,
         pad: &str,
         indent: usize,
         name: &str,
         ctor: FuncId,
-        heritage: Option<Box<Expr>>,
+        heritage: Option<&'b Expr>,
         members: abcd_ir::ConstId,
-        member_attrs: &[abcd_ir::op::MemberAttrs],
+        member_attrs: &'b [abcd_ir::op::MemberAttrs],
         sendable: bool,
-        out: &mut String,
-    ) {
-        self.emit_class(
-            pad,
-            indent,
-            name,
-            ctor,
-            heritage,
-            members,
-            member_attrs,
-            sendable,
-            out,
-        );
-    }
-
-    /// `class Name extends H { constructor(…) {…} …methods… }`.
-    // Every parameter is a distinct facet of the class IR node; a
-    // bundling struct would only rename the plumbing.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::emit) fn emit_class(
-        &mut self,
-        pad: &str,
-        indent: usize,
-        name: &str,
-        ctor: FuncId,
-        heritage: Option<Box<Expr>>,
-        members: abcd_ir::ConstId,
-        member_attrs: &[abcd_ir::op::MemberAttrs],
-        sendable: bool,
+        tasks: &mut Vec<PrintTask<'b>>,
         out: &mut String,
     ) {
         if self.opts.arkui
@@ -121,7 +148,7 @@ impl<'m> Emitter<'m> {
                 indent,
                 name,
                 ctor,
-                heritage.as_deref(),
+                heritage,
                 members,
                 member_attrs,
                 out,
@@ -135,117 +162,128 @@ impl<'m> Emitter<'m> {
                 "{pad}/* sendable class (DefineSendableClass — no JS surface syntax) */\n"
             ));
         }
-        let ext = match heritage.as_deref() {
-            // The hole is es2abc's "no extends" marker (suppressed
-            // upstream at recover — belt here for direct Lit heritage).
-            // An explicit `extends undefined` (Lit::Undefined) is real
-            // source semantics and must survive (N74-W4).
-            Some(Expr::Lit(Lit::Hole)) | None => String::new(),
-            Some(h) => {
-                let mut s = String::new();
-                self.expr(h, 0, &mut s);
-                format!(" extends {s}")
-            }
-        };
         if self.hoisted.contains(name) {
-            // Hoisted escapee: `name = class name …` (the `var` is at
-            // the function top; a block-scoped `class` declaration
-            // would not escape this structured block).
-            out.push_str(&format!("{pad}{name} = class {name}{ext} {{\n"));
+            out.push_str(&format!("{pad}{name} = class {name}"));
         } else {
-            out.push_str(&format!("{pad}class {name}{ext} {{\n"));
+            out.push_str(&format!("{pad}class {name}"));
         }
+        tasks.push(PrintTask::StartClassBody {
+            pad: pad.to_string(),
+            indent,
+            ctor,
+            members,
+            member_attrs,
+        });
+        match heritage {
+            Some(Expr::Lit(Lit::Hole)) | None => {
+                tasks.push(PrintTask::Raw(" {\n"));
+            }
+            Some(h) => {
+                out.push_str(" extends ");
+                tasks.push(PrintTask::Raw(" {\n"));
+                tasks.push(PrintTask::Expr { expr: h, prec: 0 });
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "class body step emits constructor, private fields, and member methods iteratively"
+    )]
+    pub(in crate::emit) fn step_start_class_body<'b>(
+        &mut self,
+        pad: String,
+        indent: usize,
+        ctor: FuncId,
+        members: abcd_ir::ConstId,
+        member_attrs: &'b [abcd_ir::op::MemberAttrs],
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         self.class_depth += 1;
-        // The constructor.
         out.push_str(&format!("{pad}  constructor("));
-        let rf = {
-            // Emit the ctor body into a scratch buffer to interleave
-            // the signature.
-            let mut body = String::new();
-            let rf = self.emit_function_body(ctor, indent + 2, &mut body);
-            // TS forbids a return annotation on a class constructor —
-            // drop it here regardless of the ctor's recorded kind (the
-            // class table's ctor slot is authoritative, not the kind).
-            let (params, _) = self.params_ret(&rf);
-            out.push_str(&format!("{params}) {{\n{body}"));
-            rf
-        };
-        let _ = rf;
-        out.push_str(&format!("{pad}  }}\n"));
-        // Private-name declarations (`#x;`) used by the ctor/members —
-        // node requires them declared in the class body (the IR gap:
-        // CreatePrivateNames buffers carry numeric slots, not strings,
-        // so names are the resolved/fallback ones — documented).
+
         let mut priv_names: BTreeSet<String> = BTreeSet::new();
         collect_private_names_with_index(self.module, self.index, ctor, &mut priv_names);
-        if let Some(Lit::Array(items)) = lit_of(self.module, members) {
-            for item in &items {
+        let member_items = lit_of(self.module, members).and_then(Lit::into_array);
+        if let Some(items) = &member_items {
+            for item in items {
                 if let Lit::MethodRef(f) = item {
                     collect_private_names_with_index(self.module, self.index, *f, &mut priv_names);
                 }
             }
         }
-        // B2 class-field fold: the instance initializer's constant
-        // private definitions print as `#name = <const>;` declarations
-        // (the ctor's initializer call is elided at recover). Folded
-        // names are EXCLUDED from the bare `#name;` set — a duplicate
-        // private declaration would be a SyntaxError.
         let fold = crate::classfold::plan_with_index(self.module, ctor, self.index);
         let folded_names: BTreeSet<&str> = fold
             .iter()
             .flat_map(|f| f.fields.iter().map(|(n, _)| n.as_str()))
             .collect();
-        for name in &priv_names {
-            if folded_names.contains(name.as_str()) {
+        let mut priv_text = String::new();
+        for pname in &priv_names {
+            if folded_names.contains(pname.as_str()) {
                 continue;
             }
-            out.push_str(&format!("{pad}  #{};\n", sanitize(name)));
+            priv_text.push_str(&format!("{pad}  #{};\n", sanitize(pname)));
         }
         if let Some(fold) = &fold {
             for (fname, cid) in &fold.fields {
                 let value = lit_of(self.module, *cid)
                     .map(|l| self.render_lit_js(&l))
                     .unwrap_or_else(|| "undefined /* non-literal field value */".to_string());
-                out.push_str(&format!(
+                priv_text.push_str(&format!(
                     "{pad}  #{} = {}; /* es2abc instance-initializer fold */\n",
                     sanitize(fname),
                     value
                 ));
             }
         }
-        // The member buffer: flat [name, MethodRef, …metadata…]; the
-        // B2 member_attrs projection (parallel to the MethodRef
-        // sequence) carries placement (static/instance) and the
-        // buffer-tag kind — empty = unknown (conservative instance
-        // placement, FunctionData kind).
-        if let Some(Lit::Array(items)) = lit_of(self.module, members) {
+
+        tasks.push(PrintTask::CloseClass { pad: pad.clone() });
+
+        if let Some(items) = member_items {
+            let mut methods: Vec<(String, FuncId, Option<&'b abcd_ir::op::MemberAttrs>)> =
+                Vec::new();
             let mut pending: Option<String> = None;
             let mut skipped = 0usize;
             let mut member_idx = 0usize;
-            for item in &items {
-                match item {
-                    Lit::String(s) => pending = Some(s.clone()),
+            for mut item in items {
+                match &mut item {
+                    Lit::String(s) => pending = Some(std::mem::take(s)),
                     Lit::MethodRef(f) => {
                         let mname = pending.take().unwrap_or_else(|| format!("m${}", f.index()));
                         let attrs = member_attrs.get(member_idx);
                         member_idx += 1;
-                        self.emit_class_method(pad, indent, &mname, *f, attrs, out);
+                        methods.push((mname, *f, attrs));
                     }
                     _ => skipped += 1,
                 }
             }
-            if skipped > 0 {
-                out.push_str(&format!(
-                    "{pad}  /* {skipped} member-buffer metadata entries skipped (name/method pairs consumed; numeric payloads are runtime metadata) */\n"
-                ));
-            }
+            tasks.push(PrintTask::ClassMethods {
+                pad: pad.clone(),
+                indent,
+                methods: methods.into_iter(),
+                skipped,
+            });
         } else {
-            out.push_str(&format!(
+            tasks.push(PrintTask::RawOwned(format!(
                 "{pad}  /* member buffer is not a literal array (data shape) */\n"
-            ));
+            )));
         }
-        self.class_depth -= 1;
-        out.push_str(&format!("{pad}}}\n"));
+
+        if !priv_text.is_empty() {
+            tasks.push(PrintTask::RawOwned(priv_text));
+        }
+
+        tasks.push(PrintTask::EnterInlineFunc {
+            func: ctor,
+            indent: indent + 2,
+            style: InlineHeaderStyle {
+                open_paren: false,
+                drop_ret_ty: true,
+                arrow: false,
+                closing: format!("{pad}  }}\n"),
+            },
+        });
     }
 
     pub(crate) fn emit_class_method(
@@ -257,30 +295,36 @@ impl<'m> Emitter<'m> {
         attrs: Option<&abcd_ir::op::MemberAttrs>,
         out: &mut String,
     ) {
+        self.run_print_tasks(
+            PrintRoot::ClassMethod {
+                pad,
+                indent,
+                name,
+                func: f,
+                attrs,
+            },
+            out,
+        );
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "class method emission threads indentation, name, func, attrs, and task stack"
+    )]
+    pub(in crate::emit) fn step_emit_class_method<'b>(
+        &mut self,
+        pad: &str,
+        indent: usize,
+        name: &str,
+        f: FuncId,
+        attrs: Option<&'b abcd_ir::op::MemberAttrs>,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         self.stats.class_methods += 1;
-        // B2: the buffer's own attribute payloads win when known —
-        // placement (static vs prototype) is ONLY carried by the
-        // buffer's trailing nonStaticNum count, and the callable kind
-        // by the entry's method-kind tag; the conservative fallback
-        // (attrs unknown) is instance placement + the lifted
-        // FunctionData kind (the pre-B2 behavior).
         let kind = attrs
             .map(|a| a.kind)
             .unwrap_or_else(|| crate::recover::effective_kind(self.module, f));
-        // N74-W4: the 24.0.0.0 member buffer tags generator and async
-        // methods as plain `method` (probe: methods-gen-yield-as-statement's
-        // buffer reads `method:#~A>#g1` while the function body carries
-        // `creategeneratorobj`), so a buffer `Function` kind must yield to
-        // the member function's own lifted kind when that is more specific
-        // — otherwise the `*`/`async` marker is lost (`yield` outside a
-        // generator is an es2abc SyntaxError; a plain method returns
-        // undefined where the source returned an iterator). Getter/Setter
-        // are accessor kinds the FUNCTION metadata does not carry — the
-        // buffer tag stays authoritative for them. The lifted kind here is
-        // the EVIDENCE kind (Bug A: 3.2-era files do not tag async
-        // functions in the metadata; the body's `AsyncFunctionEnter` is
-        // decisive — an `await` in a non-async body is the es2abc
-        // SyntaxError the wild smoke hit).
         let kind = if matches!(kind, FunctionKind::Function) {
             match crate::recover::effective_kind(self.module, f) {
                 k @ (FunctionKind::Generator
@@ -302,48 +346,17 @@ impl<'m> Emitter<'m> {
         } else {
             render_pool_string(self.module, name)
         };
-        let mut body = String::new();
-        let rf = self.emit_function_body(f, indent + 2, &mut body);
-        let (params, ret) = self.params_ret(&rf);
-        out.push_str(&format!(
-            "{pad}  {placement}{prefix}{key}({params}){ret} {{\n{body}"
-        ));
-        out.push_str(&format!("{pad}  }}\n"));
-    }
-}
-
-impl<'m> Emitter<'m> {
-    /// A concise object-literal member: `get [k]() {…}` / `*name() {…}`
-    /// (N74-W4). The ONLY member form carrying a [[HomeObject]] (super)
-    /// — and the only legal spelling for generator members.
-    pub(in crate::emit) fn concise_method(
-        &mut self,
-        prefix: &str,
-        key: &crate::expr::ObjKey,
-        body: FuncId,
-    ) -> String {
-        let mut s = String::from(prefix);
-        match key {
-            crate::expr::ObjKey::Name(n) => {
-                if is_legal_ident(n) {
-                    s.push_str(n);
-                } else {
-                    s.push_str(&render_pool_string(self.module, n));
-                }
-            }
-            crate::expr::ObjKey::Computed(e) => {
-                s.push('[');
-                let mut k = String::new();
-                self.expr(e, 0, &mut k);
-                s.push_str(&k);
-                s.push(']');
-            }
-        }
-        let mut text = String::new();
-        let rf = self.emit_function_body(body, 1, &mut text);
-        let (params, ret) = self.params_ret(&rf);
-        s.push_str(&format!("({params}){ret} {{\n{text}}}"));
-        s
+        out.push_str(&format!("{pad}  {placement}{prefix}{key}("));
+        tasks.push(PrintTask::EnterInlineFunc {
+            func: f,
+            indent: indent + 2,
+            style: InlineHeaderStyle {
+                open_paren: false,
+                drop_ret_ty: false,
+                arrow: false,
+                closing: format!("{pad}  }}\n"),
+            },
+        });
     }
 }
 
@@ -425,10 +438,10 @@ pub(in crate::emit) fn collect_private_names_with_index(
                     out.insert(name);
                 }
                 Op::CreatePrivateNames { names, .. } => {
-                    if let Some(Lit::Array(items)) = lit_of(module, *names) {
+                    if let Some(items) = lit_of(module, *names).and_then(Lit::into_array) {
                         for item in items {
-                            if let Lit::String(n) = item {
-                                out.insert(n.clone());
+                            if let Some(n) = item.into_string() {
+                                out.insert(n);
                             }
                         }
                     }

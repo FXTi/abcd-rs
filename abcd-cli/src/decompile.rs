@@ -5,7 +5,7 @@
 //! particular must never run before decompile.
 
 use std::io::{BufWriter, Write as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use abcd_decompile::{
     DecompiledModule, EmitOptions, SplitDecompiledModule, decompile_module, decompile_module_split,
@@ -98,7 +98,7 @@ pub fn decompile(
 }
 
 /// Stream one decompiled module directly to `out`, returning the number of
-/// emitted bytes.
+/// emitted bytes (`0` if `out` closes early with `BrokenPipe`).
 pub fn decompile_to_writer<W: std::io::Write>(
     module: &InputModule,
     opts: DecompileOptions,
@@ -118,8 +118,11 @@ pub fn decompile_to_writer<W: std::io::Write>(
             ))
         })?
     };
-    emit_counted(&ir, &opts.into(), out)
-        .map_err(|e| CliError::Tool(format!("cannot write to stdout: {e}")))
+    match emit_counted(&ir, &opts.into(), out) {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(CliError::Tool(format!("failed writing to stdout: {e}"))),
+    }
 }
 
 /// Stream one decompiled module to `path`, returning the number of emitted
@@ -216,18 +219,24 @@ pub fn write_split(
     Ok((total_files, total_bytes))
 }
 
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, CliError> {
-    let p = Path::new(rel);
+/// Join a POSIX-style relative split-module path (`a/b/c.js`) onto `root`,
+/// validating every segment with [`crate::input::is_safe_path_segment`] so
+/// traversal segments, backslashes, trailing dots/spaces, and Windows reserved
+/// device names are rejected identically on every host OS.
+pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf, CliError> {
+    if rel.is_empty() {
+        return Err(CliError::Tool(format!(
+            "refusing unsafe split output path {rel:?}"
+        )));
+    }
     let mut out = root.to_path_buf();
-    for c in p.components() {
-        match c {
-            Component::Normal(seg) => out.push(seg),
-            _ => {
-                return Err(CliError::Tool(format!(
-                    "refusing unsafe split output path {rel:?}"
-                )));
-            }
+    for seg in rel.split('/') {
+        if !crate::input::is_safe_path_segment(seg) {
+            return Err(CliError::Tool(format!(
+                "refusing unsafe split output path {rel:?}"
+            )));
         }
+        out.push(seg);
     }
     Ok(out)
 }

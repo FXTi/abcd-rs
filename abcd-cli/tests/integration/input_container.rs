@@ -180,3 +180,40 @@ fn load_from_disk_moves_bare_abc_and_enforces_selection() {
     assert_eq!(err.exit_code(), 1);
     assert!(err.to_string().contains("has no module named"), "{err}");
 }
+
+#[test]
+fn windows_reserved_device_names_and_trailing_dot_or_space_are_rejected() {
+    for bad_name in [
+        "CON",
+        "con.txt",
+        "aux.config",
+        "COM1",
+        "lpt9.json",
+        "CONIN$",
+        "CONOUT$",
+        "entry.",
+        "entry ",
+        "bad:name",
+        "bad*name",
+    ] {
+        let hap = common::hap(bad_name, &common::tiny_abc());
+        let err = input::load_bytes(&hap, "evil.hap", ModuleSelection::Single).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "bad_name={bad_name:?} -> {err}");
+        assert!(
+            err.to_string().contains("not a safe output path component"),
+            "bad_name={bad_name:?} -> {err}"
+        );
+    }
+}
+
+#[test]
+fn case_insensitive_module_collisions_disambiguate_while_preserving_case() {
+    let app = common::app(&[
+        ("Entry.hap", common::hap("Entry", &common::tiny_abc())),
+        ("entry.hap", common::hap("entry", &common::tiny_abc())),
+        ("ENTRY.hap", common::hap("ENTRY", &common::tiny_abc())),
+    ]);
+    let modules = input::load_bytes(&app, "bundle.app", ModuleSelection::All).unwrap();
+    let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["Entry", "entry__modules", "ENTRY__modules2"]);
+}

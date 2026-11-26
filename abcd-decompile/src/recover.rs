@@ -552,6 +552,185 @@ fn is_self_phi_assign(target: &str, value: &Expr) -> bool {
     matches!(value, Expr::Ident(n) | Expr::Temp { name: n, .. } if n == target)
 }
 
+fn decode_call_type_slots(
+    module: &Module,
+    func: &abcd_ir::function::FunctionData,
+) -> Option<abcd_ir::frame::FrameSlots> {
+    if let Some(slots) = abcd_ir::frame::FrameSlots::from_call_type_annotation(module, func) {
+        return Some(slots);
+    }
+    for ann in &func.annotations {
+        let is_call_type = module
+            .class(ann.class)
+            .and_then(|c| module.sym.resolve(c.descriptor))
+            == Some("L_ESCallTypeAnnotation;");
+        if !is_call_type {
+            continue;
+        }
+        for (name, value) in &ann.elements {
+            if module.sym.resolve(*name) != Some("callType") {
+                continue;
+            }
+            let abcd_ir::module::AnnValue::Const(cid) = value else {
+                continue;
+            };
+            let bits = match module.consts.get(*cid)? {
+                abcd_ir::Const::Int8(v) => u32::from(*v),
+                abcd_ir::Const::Int32(v) => *v,
+                abcd_ir::Const::Int64(v) => *v as u32,
+                abcd_ir::Const::UInt64(v) => *v as u32,
+                _ => continue,
+            };
+            return Some(abcd_ir::frame::FrameSlots {
+                func: bits & 0b1000 != 0,
+                new_target: bits & 0b0010 != 0,
+                this: bits & 0b0001 != 0,
+            });
+        }
+    }
+    None
+}
+
+fn mem_classes_overlap(a: abcd_ir::MemClasses, b: abcd_ir::MemClasses) -> bool {
+    const CLASSES: [abcd_ir::MemClasses; 6] = [
+        abcd_ir::MemClasses::HEAP,
+        abcd_ir::MemClasses::LEX_ENV,
+        abcd_ir::MemClasses::GLOBAL,
+        abcd_ir::MemClasses::MODULE,
+        abcd_ir::MemClasses::ITERATOR,
+        abcd_ir::MemClasses::PROTOTYPE,
+    ];
+    CLASSES.iter().any(|&c| a.contains(c) && b.contains(c))
+}
+
+/// Whether reordering two instructions with effects `a` and `b` can change
+/// observable runtime behavior (return value, memory state, or thrown error).
+fn effects_conflict(a: abcd_ir::Effects, b: abcd_ir::Effects) -> bool {
+    use abcd_ir::effects::CallEffect;
+    let a_calls = !matches!(a.may_call, CallEffect::None);
+    let b_calls = !matches!(b.may_call, CallEffect::None);
+    let a_mutates_or_throws = !a.writes.is_empty() || a.may_throw || a_calls;
+    let b_mutates_or_throws = !b.writes.is_empty() || b.may_throw || b_calls;
+
+    if a.may_throw && b_mutates_or_throws {
+        return true;
+    }
+    if b.may_throw && a_mutates_or_throws {
+        return true;
+    }
+    if mem_classes_overlap(a.writes, b.reads)
+        || mem_classes_overlap(a.reads, b.writes)
+        || mem_classes_overlap(a.writes, b.writes)
+    {
+        return true;
+    }
+    if a_calls && (!b.reads.is_empty() || b_mutates_or_throws) {
+        return true;
+    }
+    if b_calls && (!a.reads.is_empty() || a_mutates_or_throws) {
+        return true;
+    }
+    false
+}
+
+/// Operands of `op` in the exact left-to-right JS evaluation order produced
+/// by Stage A + Stage C (`N36`: `BinaryOp`/`Compare` emit `right OP left`).
+fn ordered_eval_operands(op: &Op) -> Vec<ValueId> {
+    match op {
+        Op::BinaryOp { left, right, .. } | Op::Compare { left, right, .. } => {
+            vec![*right, *left]
+        }
+        Op::TestProp { object, key } => match key {
+            PropKey::Name(_) => vec![*object],
+            PropKey::Index(k) | PropKey::Dynamic(k) => vec![*k, *object],
+        },
+        Op::Call {
+            callee,
+            this,
+            args,
+            kind,
+        } => match kind {
+            CallKind::Super
+            | CallKind::SuperArrow
+            | CallKind::SuperSpread
+            | CallKind::SuperForwardAllArgs => args.clone(),
+            CallKind::New | CallKind::NewSpread => {
+                let mut out = Vec::with_capacity(1 + args.len());
+                out.push(*callee);
+                out.extend_from_slice(args);
+                out
+            }
+            CallKind::Direct | CallKind::Dynamic | CallKind::Apply | CallKind::ClassInit => {
+                let mut out = Vec::with_capacity(2 + args.len());
+                out.push(*callee);
+                if let Some(t) = this {
+                    out.push(*t);
+                }
+                out.extend_from_slice(args);
+                out
+            }
+        },
+        Op::StoreProp { object, value, .. }
+        | Op::StoreOwnPropName { object, value, .. }
+        | Op::DefineMethod {
+            object,
+            func: value,
+            ..
+        }
+        | Op::StorePrivate {
+            obj: object, value, ..
+        }
+        | Op::DefinePrivate {
+            obj: object, value, ..
+        } => vec![*object, *value],
+        Op::StorePropIdx {
+            object,
+            index: key,
+            value,
+        }
+        | Op::StoreOwnPropIdx {
+            object,
+            index: key,
+            value,
+            ..
+        }
+        | Op::StorePropDyn { object, key, value }
+        | Op::StoreOwnPropDyn {
+            object, key, value, ..
+        } => vec![*object, *key, *value],
+        Op::StoreSuper { key, value, .. } => match key {
+            SuperKey::Name(_) => vec![*value],
+            SuperKey::Dynamic(k) => vec![*k, *value],
+        },
+        Op::LoadSuper { key, .. } => match key {
+            SuperKey::Name(_) => Vec::new(),
+            SuperKey::Dynamic(k) => vec![*k],
+        },
+        Op::DefineGetterSetterByValue {
+            obj,
+            key,
+            getter,
+            setter,
+            ..
+        } => vec![*obj, *key, *getter, *setter],
+        Op::CopyDataProps { dst, src } => vec![*dst, *src],
+        Op::SetObjectWithProto { proto, obj } => vec![*obj, *proto],
+        Op::ArraySpread { dst, index, src } => vec![*dst, *src, *index],
+        Op::DeleteProp { object, key }
+        | Op::LoadPropIdx {
+            object, index: key, ..
+        }
+        | Op::LoadPropDyn { object, key } => vec![*object, *key],
+        Op::CreateIterResultObj { value, done } => vec![*value, *done],
+        Op::AsyncGeneratorResolve {
+            genobj,
+            value,
+            done,
+        } => vec![*value, *genobj, *done],
+        _ => op.operands(),
+    }
+}
+
 /// Collect every identifier / temporary name read inside `e` using an
 /// explicit heap work-stack (no recursion).
 fn collect_expr_reads(e: &Expr) -> HashSet<String> {
@@ -586,9 +765,15 @@ struct Recover<'m> {
     /// Minted temporary names per SSA value.
     temp_names: HashMap<ValueId, String>,
     /// Legalized parameter names (`this` slot named `this`).
-    /// Hidden leading ABI slot count (es2abc `<static>`: 3).
     param_names: Vec<String>,
     hidden_params: usize,
+    /// Explicit leading ABI frame layout when [`abcd_ir::frame::FrameSlots`]
+    /// governs `func` (`None` on legacy unannotated non-static DynamicEcma IR).
+    frame_slots: Option<abcd_ir::frame::FrameSlots>,
+    /// Bare global/lexical/module/symbol names referenced in `func`, collected
+    /// before synthetic fallback `p{i}`/`e` names are minted so fallbacks never
+    /// shadow referenced bindings while explicit debug names keep their source spelling.
+    referenced_bare_names: HashSet<String>,
     /// `ExceptionParam` value → legalized catch binding name.
     catch_names: HashMap<ValueId, String>,
     /// Handler block → catch binding names (block-head markers).
@@ -619,6 +804,8 @@ impl<'m> Recover<'m> {
             alias: HashMap::new(),
             temp_names: HashMap::new(),
             param_names: Vec::new(),
+            frame_slots: None,
+            referenced_bare_names: HashSet::new(),
             catch_names: HashMap::new(),
             handler_binds: HashMap::new(),
             inst_pos: HashMap::new(),
@@ -691,6 +878,7 @@ impl<'m> Recover<'m> {
         let block_ids = f.blocks.clone();
 
         self.reserve_module_slot_names();
+        self.collect_referenced_bare_names();
         self.mint_params();
         self.mint_catch_names();
         self.reserve_names();
@@ -773,51 +961,76 @@ impl<'m> Recover<'m> {
             })
             .unwrap_or_default();
         let n = f.params.len();
-        // The calling convention's hidden leading slots: es2abc marks
-        // every function <static> and frames carry (funcobj, newtarget,
-        // this) — so for static functions with ≥3 params the user
-        // formals start at params[3] and params[2] is `this` (the
-        // vendored frame-slot model, abcd_ir::frame). Non-static
-        // functions (hand-crafted IR, the golden suites) keep the
-        // naming heuristic's single hidden slot: params[0] prints as
-        // `this`. (d-P4: the recompile gate found this —
-        // `add(20, 22)` read its args from the wrong slots.)
-        let hidden = if f.modifiers.contains(abcd_ir::Modifiers::STATIC) && n >= 3 {
-            3
+        let is_static_method = f.modifiers.contains(abcd_ir::Modifiers::STATIC);
+        let slots_opt = if self.module.func_dialect(f) == abcd_ir::Dialect::StaticArkTS {
+            Some(abcd_ir::frame::FrameSlots::for_static_arkts(
+                is_static_method,
+            ))
+        } else if let Some(ann_slots) = decode_call_type_slots(self.module, f) {
+            Some(ann_slots)
+        } else if is_static_method && n >= 3 {
+            Some(abcd_ir::frame::FrameSlots::DEFAULT)
         } else {
-            usize::from(n > 0)
+            None
         };
-        self.hidden_params = hidden;
-        for i in 0..n {
-            let this_idx = hidden - 1;
-            if i == this_idx && hidden == 1 {
-                // The naming heuristic's single hidden slot is `this`.
-                self.param_names.push("this".to_string());
-                continue;
-            }
-            if hidden == 3 && i < 3 {
-                // The hidden es2abc slots: funcobj/newtarget are nearly
-                // never read (bodies use LoadFunction/LoadNewTarget);
-                // `this` gets its JS name so ctor bodies read right.
-                let name = if i == 2 {
-                    "this".to_string()
+        self.frame_slots = slots_opt;
+
+        if let Some(slots) = slots_opt {
+            let hidden = slots.implicit_count().min(n);
+            self.hidden_params = hidden;
+            let this_idx = (n >= slots.implicit_count())
+                .then(|| slots.this_index())
+                .flatten();
+            for i in 0..n {
+                if i < hidden {
+                    let name = if this_idx == Some(i) {
+                        "this".to_string()
+                    } else {
+                        format!("p{i}")
+                    };
+                    self.param_names.push(name);
+                    continue;
+                }
+                let raw = if debug_param_names.len() == n {
+                    debug_param_names.get(i).cloned()
                 } else {
-                    format!("p{i}")
+                    debug_param_names.get(i - hidden).cloned()
+                };
+                let name = match raw {
+                    Some(explicit) => self.legal.mint(&explicit),
+                    None => {
+                        let fallback = format!("p{i}");
+                        self.legal
+                            .mint_avoiding(&fallback, &self.referenced_bare_names)
+                    }
                 };
                 self.param_names.push(name);
-                continue;
             }
-            // The debug param list may or may not include the hidden
-            // slots: equal length → direct index; otherwise assume it
-            // holds only the user formals (offset by `hidden`).
-            let raw = if debug_param_names.len() == n {
-                debug_param_names.get(i).cloned()
-            } else {
-                debug_param_names.get(i - hidden).cloned()
-            };
-            let fallback = format!("p{i}");
-            let name = self.legal.mint(raw.as_deref().unwrap_or(&fallback));
-            self.param_names.push(name);
+        } else {
+            // Hand-built non-static DynamicEcma IR with no `callType`
+            // annotation keeps the single-slot `params[0] = "this"` convention.
+            let hidden = usize::from(n > 0);
+            self.hidden_params = hidden;
+            for i in 0..n {
+                if i == 0 {
+                    self.param_names.push("this".to_string());
+                    continue;
+                }
+                let raw = if debug_param_names.len() == n {
+                    debug_param_names.get(i).cloned()
+                } else {
+                    debug_param_names.get(i - hidden).cloned()
+                };
+                let name = match raw {
+                    Some(explicit) => self.legal.mint(&explicit),
+                    None => {
+                        let fallback = format!("p{i}");
+                        self.legal
+                            .mint_avoiding(&fallback, &self.referenced_bare_names)
+                    }
+                };
+                self.param_names.push(name);
+            }
         }
     }
 
@@ -842,7 +1055,10 @@ impl<'m> Recover<'m> {
                         .and_then(|f| f.debug.as_ref())
                         .and_then(|d| local_name_in(self.module, d, first))
                 });
-            let name = self.legal.mint(hint.as_deref().unwrap_or("e"));
+            let name = match hint {
+                Some(explicit) => self.legal.mint(&explicit),
+                None => self.legal.mint_avoiding("e", &self.referenced_bare_names),
+            };
             self.catch_names.insert(exc, name.clone());
             self.handler_binds.entry(handler).or_default().push(name);
         }
@@ -920,6 +1136,52 @@ impl<'m> Recover<'m> {
             return n.clone();
         }
         namespace_fallback(index)
+    }
+
+    fn collect_referenced_bare_names(&mut self) {
+        let Some(f) = self.module.func(self.func) else {
+            return;
+        };
+        for &b in &f.blocks {
+            let Some(block) = self.module.block(b) else {
+                continue;
+            };
+            for &iid in &block.insts {
+                let Some(inst) = self.module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::TryGetGlobal { name, .. }
+                    | Op::StoreGlobal { name, .. }
+                    | Op::StoreGlobalRecord { name, .. }
+                    | Op::TryStoreGlobal { name, .. } => {
+                        let n = sym_str(self.module, *name);
+                        self.referenced_bare_names.insert(sanitize(&n));
+                    }
+                    Op::GetLexVar { .. } | Op::PutLexVar { .. } => {
+                        if let Some(n) = self.scopes.name_of(iid) {
+                            self.referenced_bare_names.insert(sanitize(n));
+                        }
+                    }
+                    Op::LoadModuleVar { index, kind } => {
+                        self.referenced_bare_names
+                            .insert(self.load_module_var_name(*index, *kind));
+                    }
+                    Op::StoreModuleVar { index, .. } => {
+                        self.referenced_bare_names
+                            .insert(self.module_slot_name(*index));
+                    }
+                    Op::GetModuleNamespace { index } => {
+                        self.referenced_bare_names
+                            .insert(self.module_namespace_name(*index));
+                    }
+                    Op::LoadSymbol => {
+                        self.referenced_bare_names.insert("Symbol".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Reserve every name that can appear as a bare identifier in an
@@ -1058,6 +1320,584 @@ impl<'m> Recover<'m> {
                 }
             }
         }
+        self.validate_inline_order();
+    }
+
+    /// Fixed-point soundness check (`D11`) over `self.inline`:
+    ///
+    /// 1. No absorbed node `a` (`pos_a < use_pos`) may cross a live instruction
+    ///    `m` (`pos_a < pos_m`) whose effective execution point precedes `use_pos`
+    ///    when `effects_conflict(eff(a), eff(m))` holds (for example, an
+    ///    un-inlined `+obj;` coercion statement between `saved = GetLexVar(x)`
+    ///    and `return saved`).
+    /// 2. Within a consumer's expression tree walked in exact JS evaluation
+    ///    order (`N36`: `BinaryOp`/`Compare` evaluate `right` BEFORE `left`),
+    ///    any pair `n_i` before `n_j` whose effects do not commute must have
+    ///    `pos(n_i) < pos(n_j)` (so `t1 = a + b; t2 = c + d; f(t2, t1)` evicts
+    ///    `t1` rather than reordering `a + b` and `c + d`).
+    fn validate_inline_order(&mut self) {
+        let Some(f) = self.module.func(self.func) else {
+            return;
+        };
+        let block_ids = f.blocks.clone();
+        for &b in &block_ids {
+            let Some(block) = self.module.block(b) else {
+                continue;
+            };
+            let inst_ids = block.insts.clone();
+            let block_len = inst_ids.len();
+
+            // Collect outgoing phi-edge groups `(to, exceptional) -> Vec<(phi_res, val)>`
+            // in deterministic target-block / inst order.
+            let mut phi_roots: Vec<Vec<(ValueId, ValueId)>> = Vec::new();
+            let mut phi_root_idx: HashMap<(BlockId, bool), usize> = HashMap::new();
+            for &tb in &block_ids {
+                let Some(tblock) = self.module.block(tb) else {
+                    continue;
+                };
+                for &tiid in &tblock.insts {
+                    let Some(tinst) = self.module.inst(tiid) else {
+                        continue;
+                    };
+                    let Op::Phi { entries } = &tinst.op else {
+                        break;
+                    };
+                    let Some(phi_res) = tinst.result else {
+                        continue;
+                    };
+                    for (edge, val) in entries {
+                        if edge.from != b {
+                            continue;
+                        }
+                        let key = (tb, edge.kind == EdgeKind::Exceptional);
+                        let gi = *phi_root_idx.entry(key).or_insert_with(|| {
+                            let idx = phi_roots.len();
+                            phi_roots.push(Vec::new());
+                            idx
+                        });
+                        phi_roots[gi].push((phi_res, *val));
+                    }
+                }
+            }
+
+            loop {
+                let mut evicted = false;
+
+                // Precompute effective JS execution position of every instruction
+                // in `b`: `None` when elided/dead-pure; `Some(root_pos)` otherwise.
+                let mut exec_pos: Vec<Option<usize>> = vec![None; block_len];
+                let mut eff_of: Vec<abcd_ir::Effects> = Vec::with_capacity(block_len);
+                for (pos, &iid) in inst_ids.iter().enumerate() {
+                    let Some(inst) = self.module.inst(iid) else {
+                        eff_of.push(abcd_ir::Effects::PURE);
+                        continue;
+                    };
+                    let eff = inst.op.effects_in(self.module);
+                    eff_of.push(eff);
+
+                    let is_elided = elision_reason(&inst.op).is_some()
+                        && !matches!(
+                            &inst.op,
+                            Op::ThrowUndefinedIfHoleWithName { value, .. }
+                                | Op::ThrowUndefinedIfHole { value, .. }
+                                if provably_hole(self.module, *value)
+                        );
+                    if is_elided {
+                        continue;
+                    }
+                    if is_statement_op(&inst.op) || inst.op.is_phi() {
+                        if !matches!(
+                            &inst.op,
+                            Op::Phi { .. }
+                                | Op::NewLexEnv { .. }
+                                | Op::NewLexEnvWithName { .. }
+                                | Op::PopLexEnv
+                                | Op::CreatePrivateNames { .. }
+                        ) {
+                            exec_pos[pos] = Some(pos);
+                        }
+                        continue;
+                    }
+                    let Some(mut cur_val) = inst.result else {
+                        exec_pos[pos] = Some(pos);
+                        continue;
+                    };
+                    if !self.inline.contains(&cur_val) && !self.alias.contains_key(&cur_val) {
+                        let dead_pure = self.chains.all_users(cur_val).is_empty()
+                            && inst.op.effects().is_removable_if_unused()
+                            && !matches!(inst.op, Op::CopyRestArgs { .. });
+                        if !dead_pure {
+                            exec_pos[pos] = Some(pos);
+                        }
+                        continue;
+                    }
+                    // Chase `inline`/`alias` chain to its root consumer in `b`.
+                    let mut root_pos = Some(pos);
+                    for _ in 0..block_len + 2 {
+                        if let Some(&aliased) = self.alias.get(&cur_val) {
+                            let Some(Value {
+                                def: ValueDef::Inst(aiid),
+                                ..
+                            }) = self.module.value(aliased)
+                            else {
+                                break;
+                            };
+                            if let Some(&(ab, apos)) = self.inst_pos.get(aiid)
+                                && ab == b
+                            {
+                                root_pos = Some(apos);
+                            }
+                            cur_val = aliased;
+                            continue;
+                        }
+                        if !self.inline.contains(&cur_val) {
+                            break;
+                        }
+                        if let Some(&use_iid) = self.chains.users_of(cur_val).first() {
+                            if let Some(&(ub, upos)) = self.inst_pos.get(&use_iid)
+                                && ub == b
+                            {
+                                root_pos = Some(upos);
+                                if let Some(uinst) = self.module.inst(use_iid)
+                                    && let Some(ures) = uinst.result
+                                {
+                                    cur_val = ures;
+                                    continue;
+                                }
+                            }
+                            break;
+                        } else if !self.chains.phi_users(cur_val).is_empty() {
+                            root_pos = Some(block_len);
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    exec_pos[pos] = root_pos;
+                }
+
+                // Helper closure: validate one root consumer at `use_pos` with
+                // ordered root operand `ValueId`s.
+                let check_root =
+                    |this: &mut Self, use_pos: usize, root_operands: &[ValueId]| -> bool {
+                        // Explicit post-order traversal of inlined expression tree.
+                        let mut eval_seq: Vec<(ValueId, usize)> = Vec::new();
+                        let mut stack: Vec<(ValueId, bool)> =
+                            root_operands.iter().rev().map(|&v| (v, false)).collect();
+                        while let Some((raw_v, expanded)) = stack.pop() {
+                            let mut v = raw_v;
+                            let mut guard = 0usize;
+                            while let Some(&target) = this.alias.get(&v) {
+                                v = target;
+                                guard += 1;
+                                if guard > 32 {
+                                    break;
+                                }
+                            }
+                            if !this.inline.contains(&v) {
+                                continue;
+                            }
+                            let Some(Value {
+                                def: ValueDef::Inst(ciid),
+                                ..
+                            }) = this.module.value(v)
+                            else {
+                                continue;
+                            };
+                            let Some(&(cb, cpos)) = this.inst_pos.get(ciid) else {
+                                continue;
+                            };
+                            if cb != b {
+                                continue;
+                            }
+                            if expanded {
+                                eval_seq.push((v, cpos));
+                            } else {
+                                stack.push((v, true));
+                                if let Some(cinst) = this.module.inst(*ciid) {
+                                    let ops = ordered_eval_operands(&cinst.op);
+                                    for child_v in ops.into_iter().rev() {
+                                        stack.push((child_v, false));
+                                    }
+                                }
+                            }
+                        }
+
+                        if eval_seq.is_empty() {
+                            return false;
+                        }
+
+                        let absorbed_pos: HashSet<usize> =
+                            eval_seq.iter().map(|&(_, pos)| pos).collect();
+
+                        // Check 1: moving `a` from `pos_a` to `use_pos` must commute
+                        // with every un-absorbed live instruction `m` (`pos_m > pos_a`)
+                        // that executes before (or on another phi edge at) `use_pos`.
+                        for &(vid_a, pos_a) in &eval_seq {
+                            let eff_a = eff_of[pos_a];
+                            for pos_m in (pos_a + 1)..block_len {
+                                if absorbed_pos.contains(&pos_m) || pos_m == use_pos {
+                                    continue;
+                                }
+                                let Some(ep_m) = exec_pos[pos_m] else {
+                                    continue;
+                                };
+                                let reordered =
+                                    ep_m < use_pos || (ep_m == use_pos && use_pos == block_len);
+                                if reordered && effects_conflict(eff_a, eff_of[pos_m]) {
+                                    this.inline.remove(&vid_a);
+                                    return true;
+                                }
+                            }
+                        }
+
+                        // Check 2: pairwise evaluation-order monotonicity inside `eval_seq`.
+                        for i in 0..eval_seq.len() {
+                            let (vid_i, pos_i) = eval_seq[i];
+                            let eff_i = eff_of[pos_i];
+                            for &(_vid_j, pos_j) in &eval_seq[(i + 1)..] {
+                                if pos_i > pos_j && effects_conflict(eff_i, eff_of[pos_j]) {
+                                    let victim = eval_seq[(i + 1)..]
+                                        .iter()
+                                        .find(|&&(_, p)| p == pos_j)
+                                        .map(|&(v, _)| v)
+                                        .unwrap_or(vid_i);
+                                    this.inline.remove(&victim);
+                                    return true;
+                                }
+                            }
+                        }
+
+                        false
+                    };
+
+                for (pos, &iid) in inst_ids.iter().enumerate() {
+                    let Some(inst) = self.module.inst(iid) else {
+                        continue;
+                    };
+                    if let Some(res) = inst.result
+                        && (self.inline.contains(&res) || self.alias.contains_key(&res))
+                    {
+                        continue;
+                    }
+                    // Guard against dropping effectful operands on `super(...)` calls
+                    // where `callee` / `this` are not printed.
+                    if let Op::Call {
+                        callee,
+                        this,
+                        kind:
+                            CallKind::Super
+                            | CallKind::SuperArrow
+                            | CallKind::SuperSpread
+                            | CallKind::SuperForwardAllArgs,
+                        ..
+                    } = &inst.op
+                    {
+                        for unprinted in std::iter::once(*callee).chain(this.iter().copied()) {
+                            if self.inline.contains(&unprinted)
+                                && let Some(Value {
+                                    def: ValueDef::Inst(uiid),
+                                    ..
+                                }) = self.module.value(unprinted)
+                                && let Some(uinst) = self.module.inst(*uiid)
+                                && !uinst.op.effects_in(self.module).is_removable_if_unused()
+                            {
+                                self.inline.remove(&unprinted);
+                                evicted = true;
+                            }
+                        }
+                        if evicted {
+                            break;
+                        }
+                    }
+                    let ops = ordered_eval_operands(&inst.op);
+                    if check_root(self, pos, &ops) {
+                        evicted = true;
+                        break;
+                    }
+                }
+
+                if !evicted {
+                    for group in &phi_roots {
+                        let ordered_vals = self.schedule_phi_eval_order(group);
+                        if check_root(self, block_len, &ordered_vals) {
+                            evicted = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !evicted {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Compute the exact evaluation order in which `flush_phi_tail` will
+    /// evaluate incoming `val` expressions for a single `(pred, to, exceptional)`
+    /// phi group `(phi_res, incoming_val)`.
+    fn schedule_phi_eval_order(&self, entries: &[(ValueId, ValueId)]) -> Vec<ValueId> {
+        let peel = |mut v: ValueId| -> ValueId {
+            let mut g = 0usize;
+            while let Some(&t) = self.alias.get(&v) {
+                v = t;
+                g += 1;
+                if g > 32 {
+                    break;
+                }
+            }
+            v
+        };
+        if entries.len() <= 1 || entries.iter().all(|&(p, v)| peel(v) == p) {
+            return entries.iter().map(|&(_, v)| v).collect();
+        }
+
+        let k = entries.len();
+        let mut target_id: HashMap<ValueId, usize> = HashMap::with_capacity(k);
+        let mut item_tid: Vec<usize> = Vec::with_capacity(k);
+        let mut writers_of_tid: Vec<Vec<usize>> = Vec::new();
+        for (j, &(phi_res, _)) in entries.iter().enumerate() {
+            let tid = *target_id.entry(phi_res).or_insert_with(|| {
+                let id = writers_of_tid.len();
+                writers_of_tid.push(Vec::new());
+                id
+            });
+            item_tid.push(tid);
+            writers_of_tid[tid].push(j);
+        }
+        let nt = writers_of_tid.len();
+        let mut writers_rem: Vec<usize> = writers_of_tid.iter().map(Vec::len).collect();
+
+        let mut read_tids: Vec<Vec<usize>> = Vec::with_capacity(k);
+        let mut readers_of_tid: Vec<Vec<usize>> = vec![Vec::new(); nt];
+        let mut total_readers_rem: Vec<usize> = vec![0; nt];
+        let mut self_reads: Vec<bool> = vec![false; k];
+        let mut is_self_noop_cand: Vec<bool> = Vec::with_capacity(k);
+
+        for (i, &(phi_res, val)) in entries.iter().enumerate() {
+            is_self_noop_cand.push(peel(val) == phi_res);
+            let mut r_tids: Vec<usize> = Vec::new();
+            let mut visited: HashSet<ValueId> = HashSet::new();
+            let mut stack: Vec<ValueId> = vec![val];
+            while let Some(raw) = stack.pop() {
+                let v = peel(raw);
+                if !visited.insert(v) {
+                    continue;
+                }
+                if self.inline.contains(&v) {
+                    if let Some(Value {
+                        def: ValueDef::Inst(ciid),
+                        ..
+                    }) = self.module.value(v)
+                        && let Some(cinst) = self.module.inst(*ciid)
+                    {
+                        stack.extend(ordered_eval_operands(&cinst.op));
+                    }
+                } else if let Some(&rtid) = target_id.get(&v) {
+                    r_tids.push(rtid);
+                }
+            }
+            r_tids.sort_unstable();
+            r_tids.dedup();
+            for &rtid in &r_tids {
+                if rtid == item_tid[i] {
+                    self_reads[i] = true;
+                }
+                readers_of_tid[rtid].push(i);
+                total_readers_rem[rtid] += 1;
+            }
+            read_tids.push(r_tids);
+        }
+
+        let mut done = vec![false; k];
+        let mut victim_cleared = vec![false; k];
+        let mut in_heap = vec![false; k];
+        let mut ready_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+            std::collections::BinaryHeap::new();
+        let is_ready = |j: usize,
+                        done: &[bool],
+                        is_self_noop_cand: &[bool],
+                        writers_rem: &[usize],
+                        total_readers_rem: &[usize],
+                        self_reads: &[bool],
+                        item_tid: &[usize]|
+         -> bool {
+            if done[j] {
+                return false;
+            }
+            let tid = item_tid[j];
+            (is_self_noop_cand[j] && writers_rem[tid] == 1)
+                || total_readers_rem[tid] == usize::from(self_reads[j])
+        };
+
+        for (j, in_h) in in_heap.iter_mut().enumerate().take(k) {
+            if is_ready(
+                j,
+                &done,
+                &is_self_noop_cand,
+                &writers_rem,
+                &total_readers_rem,
+                &self_reads,
+                &item_tid,
+            ) {
+                *in_h = true;
+                ready_heap.push(std::cmp::Reverse(j));
+            }
+        }
+
+        let mut remaining = k;
+        let mut scan_cursor = 0usize;
+        let mut reader_cursor = vec![0usize; nt];
+        let mut path_pos: Vec<Option<usize>> = vec![None; k];
+        let mut eval_order: Vec<ValueId> = Vec::with_capacity(k);
+
+        while remaining > 0 {
+            let mut next_ready = None;
+            while let Some(std::cmp::Reverse(j)) = ready_heap.pop() {
+                if !done[j] {
+                    next_ready = Some(j);
+                    break;
+                }
+            }
+
+            if let Some(j) = next_ready {
+                done[j] = true;
+                remaining -= 1;
+                if !victim_cleared[j] {
+                    eval_order.push(entries[j].1);
+                }
+                let wtid = item_tid[j];
+                writers_rem[wtid] -= 1;
+                if writers_rem[wtid] == 1 {
+                    for &w in &writers_of_tid[wtid] {
+                        if !in_heap[w]
+                            && is_ready(
+                                w,
+                                &done,
+                                &is_self_noop_cand,
+                                &writers_rem,
+                                &total_readers_rem,
+                                &self_reads,
+                                &item_tid,
+                            )
+                        {
+                            in_heap[w] = true;
+                            ready_heap.push(std::cmp::Reverse(w));
+                        }
+                    }
+                }
+                for rtid in std::mem::take(&mut read_tids[j]) {
+                    total_readers_rem[rtid] -= 1;
+                    if total_readers_rem[rtid] <= 1 {
+                        for &w in &writers_of_tid[rtid] {
+                            if !in_heap[w]
+                                && is_ready(
+                                    w,
+                                    &done,
+                                    &is_self_noop_cand,
+                                    &writers_rem,
+                                    &total_readers_rem,
+                                    &self_reads,
+                                    &item_tid,
+                                )
+                            {
+                                in_heap[w] = true;
+                                ready_heap.push(std::cmp::Reverse(w));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            while scan_cursor < k && (done[scan_cursor] || victim_cleared[scan_cursor]) {
+                scan_cursor += 1;
+            }
+            let start = if scan_cursor < k {
+                scan_cursor
+            } else {
+                match (0..k).find(|&i| !done[i]) {
+                    Some(i) => i,
+                    None => break,
+                }
+            };
+            let mut path: Vec<usize> = Vec::new();
+            let mut cur = start;
+            let victim = loop {
+                if let Some(pos) = path_pos[cur] {
+                    let v = path[pos..]
+                        .iter()
+                        .copied()
+                        .filter(|&x| !victim_cleared[x])
+                        .min()
+                        .unwrap_or_else(|| path[pos..].iter().copied().min().unwrap_or(cur));
+                    break v;
+                }
+                path_pos[cur] = Some(path.len());
+                path.push(cur);
+                let ctid = item_tid[cur];
+                let rlist = &readers_of_tid[ctid];
+                let cursor = &mut reader_cursor[ctid];
+                while *cursor < rlist.len() {
+                    let r = rlist[*cursor];
+                    if !done[r] && !victim_cleared[r] && r != cur {
+                        break;
+                    }
+                    *cursor += 1;
+                }
+                if *cursor < rlist.len() {
+                    cur = rlist[*cursor];
+                } else {
+                    break cur;
+                }
+            };
+            for &node in &path {
+                path_pos[node] = None;
+            }
+
+            eval_order.push(entries[victim].1);
+            is_self_noop_cand[victim] = false;
+            self_reads[victim] = false;
+            victim_cleared[victim] = true;
+            for rtid in std::mem::take(&mut read_tids[victim]) {
+                total_readers_rem[rtid] -= 1;
+                if total_readers_rem[rtid] <= 1 {
+                    for &w in &writers_of_tid[rtid] {
+                        if !in_heap[w]
+                            && is_ready(
+                                w,
+                                &done,
+                                &is_self_noop_cand,
+                                &writers_rem,
+                                &total_readers_rem,
+                                &self_reads,
+                                &item_tid,
+                            )
+                        {
+                            in_heap[w] = true;
+                            ready_heap.push(std::cmp::Reverse(w));
+                        }
+                    }
+                }
+            }
+            if !in_heap[victim]
+                && is_ready(
+                    victim,
+                    &done,
+                    &is_self_noop_cand,
+                    &writers_rem,
+                    &total_readers_rem,
+                    &self_reads,
+                    &item_tid,
+                )
+            {
+                in_heap[victim] = true;
+                ready_heap.push(std::cmp::Reverse(victim));
+            }
+        }
+
+        eval_order
     }
 
     /// Schedule parallel out-of-SSA `PhiAssign` copies per
@@ -1120,29 +1960,102 @@ impl<'m> Recover<'m> {
 
             let k = assigns.len();
             let mut items: Vec<(String, Expr)> = assigns;
-            let mut reads: Vec<HashSet<String>> = items
-                .iter()
-                .map(|(_, value)| collect_expr_reads(value))
-                .collect();
+
+            // Map every target name in this edge group to a dense target id `0..nt`.
+            let mut target_id: HashMap<String, usize> = HashMap::with_capacity(k);
+            let mut item_tid: Vec<usize> = Vec::with_capacity(k);
+            let mut writers_of_tid: Vec<Vec<usize>> = Vec::new();
+            for (j, (target, _)) in items.iter().enumerate() {
+                let tid = *target_id.entry(target.clone()).or_insert_with(|| {
+                    let id = writers_of_tid.len();
+                    writers_of_tid.push(Vec::new());
+                    id
+                });
+                item_tid.push(tid);
+                writers_of_tid[tid].push(j);
+            }
+            let nt = writers_of_tid.len();
+            let mut writers_rem: Vec<usize> = writers_of_tid.iter().map(Vec::len).collect();
+
+            // Per-copy read target IDs (`read_tids[i]`) and inverse reader lists.
+            let mut read_tids: Vec<Vec<usize>> = Vec::with_capacity(k);
+            let mut readers_of_tid: Vec<Vec<usize>> = vec![Vec::new(); nt];
+            let mut total_readers_rem: Vec<usize> = vec![0; nt];
+            let mut self_reads: Vec<bool> = vec![false; k];
+            let mut is_self_noop_cand: Vec<bool> = Vec::with_capacity(k);
+
+            for (i, (target, value)) in items.iter().enumerate() {
+                is_self_noop_cand.push(is_self_phi_assign(target, value));
+                let raw_reads = collect_expr_reads(value);
+                let mut r_tids: Vec<usize> = raw_reads
+                    .iter()
+                    .filter_map(|name| target_id.get(name).copied())
+                    .collect();
+                r_tids.sort_unstable();
+                r_tids.dedup();
+                for &rtid in &r_tids {
+                    if rtid == item_tid[i] {
+                        self_reads[i] = true;
+                    }
+                    readers_of_tid[rtid].push(i);
+                    total_readers_rem[rtid] += 1;
+                }
+                read_tids.push(r_tids);
+            }
+
             let mut done = vec![false; k];
+            let mut victim_cleared = vec![false; k];
+            let mut in_heap = vec![false; k];
+            let mut ready_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+                std::collections::BinaryHeap::new();
+            let is_ready = |j: usize,
+                            done: &[bool],
+                            is_self_noop_cand: &[bool],
+                            writers_rem: &[usize],
+                            total_readers_rem: &[usize],
+                            self_reads: &[bool],
+                            item_tid: &[usize]|
+             -> bool {
+                if done[j] {
+                    return false;
+                }
+                let tid = item_tid[j];
+                (is_self_noop_cand[j] && writers_rem[tid] == 1)
+                    || total_readers_rem[tid] == usize::from(self_reads[j])
+            };
+
+            for (j, in_h) in in_heap.iter_mut().enumerate().take(k) {
+                if is_ready(
+                    j,
+                    &done,
+                    &is_self_noop_cand,
+                    &writers_rem,
+                    &total_readers_rem,
+                    &self_reads,
+                    &item_tid,
+                ) {
+                    *in_h = true;
+                    ready_heap.push(std::cmp::Reverse(j));
+                }
+            }
+
             let mut remaining = k;
+            let mut scan_cursor = 0usize;
+            let mut reader_cursor = vec![0usize; nt];
+            let mut path_pos: Vec<Option<usize>> = vec![None; k];
             let mut emitted: Vec<Stmt> = Vec::with_capacity(k + 2);
             let mut decls: Vec<Stmt> = Vec::new();
 
             while remaining > 0 {
-                let ready = (0..k).find(|&j| {
-                    if done[j] {
-                        return false;
+                let mut next_ready = None;
+                while let Some(std::cmp::Reverse(j)) = ready_heap.pop() {
+                    if !done[j] {
+                        next_ready = Some(j);
+                        break;
                     }
-                    let self_noop = is_self_phi_assign(&items[j].0, &items[j].1)
-                        && !(0..k).any(|i| i != j && !done[i] && items[i].0 == items[j].0);
-                    if self_noop {
-                        return true;
-                    }
-                    !(0..k).any(|i| i != j && !done[i] && reads[i].contains(&items[j].0))
-                });
+                }
 
-                if let Some(j) = ready {
+                if let Some(j) = next_ready {
                     done[j] = true;
                     remaining -= 1;
                     emitted.push(Stmt::PhiAssign {
@@ -1151,28 +2064,96 @@ impl<'m> Recover<'m> {
                         to,
                         exceptional,
                     });
+                    let wtid = item_tid[j];
+                    writers_rem[wtid] -= 1;
+                    if writers_rem[wtid] == 1 {
+                        for &w in &writers_of_tid[wtid] {
+                            if !in_heap[w]
+                                && is_ready(
+                                    w,
+                                    &done,
+                                    &is_self_noop_cand,
+                                    &writers_rem,
+                                    &total_readers_rem,
+                                    &self_reads,
+                                    &item_tid,
+                                )
+                            {
+                                in_heap[w] = true;
+                                ready_heap.push(std::cmp::Reverse(w));
+                            }
+                        }
+                    }
+                    for rtid in std::mem::take(&mut read_tids[j]) {
+                        total_readers_rem[rtid] -= 1;
+                        if total_readers_rem[rtid] <= 1 {
+                            for &w in &writers_of_tid[rtid] {
+                                if !in_heap[w]
+                                    && is_ready(
+                                        w,
+                                        &done,
+                                        &is_self_noop_cand,
+                                        &writers_rem,
+                                        &total_readers_rem,
+                                        &self_reads,
+                                        &item_tid,
+                                    )
+                                {
+                                    in_heap[w] = true;
+                                    ready_heap.push(std::cmp::Reverse(w));
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
                 // Every unscheduled assignment's target is read by another
-                // unscheduled assignment; walk `cur -> reader(cur)` to locate
-                // a directed cycle and break at the smallest index on that cycle.
-                let Some(start) = (0..k).find(|&j| !done[j]) else {
+                // unscheduled assignment; walk `cur -> first active reader(cur)`
+                // to locate a directed cycle and break at the smallest index.
+                while scan_cursor < k && done[scan_cursor] {
+                    scan_cursor += 1;
+                }
+                if scan_cursor >= k {
                     break;
-                };
-                let mut path: Vec<usize> = Vec::with_capacity(remaining + 1);
-                let mut cur = start;
+                }
+                let mut path: Vec<usize> = Vec::new();
+                let mut cur = scan_cursor;
                 let victim = loop {
-                    if let Some(pos) = path.iter().position(|&p| p == cur) {
+                    if let Some(pos) = path_pos[cur] {
                         break path[pos..].iter().copied().min().unwrap_or(cur);
                     }
+                    path_pos[cur] = Some(path.len());
                     path.push(cur);
-                    match (0..k).find(|&i| i != cur && !done[i] && reads[i].contains(&items[cur].0))
-                    {
+
+                    let tid = item_tid[cur];
+                    let rlist = &readers_of_tid[tid];
+                    while reader_cursor[tid] < rlist.len() {
+                        let cand = rlist[reader_cursor[tid]];
+                        if done[cand] || victim_cleared[cand] {
+                            reader_cursor[tid] += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut found_reader = None;
+                    let mut idx = reader_cursor[tid];
+                    while idx < rlist.len() {
+                        let cand = rlist[idx];
+                        if !done[cand] && !victim_cleared[cand] && cand != cur {
+                            found_reader = Some(cand);
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    match found_reader {
                         Some(next) => cur = next,
                         None => break cur,
                     }
                 };
+                for &node in &path {
+                    path_pos[node] = None;
+                }
 
                 let tmp = self.legal.mint("phi");
                 let synth_vid = ValueId::new(u32::MAX.saturating_sub(synth_phi_seq));
@@ -1182,14 +2163,50 @@ impl<'m> Recover<'m> {
                     value_id: synth_vid,
                 });
                 let old_val = std::mem::replace(&mut items[victim].1, Expr::Ident(tmp.clone()));
-                reads[victim].clear();
-                reads[victim].insert(tmp.clone());
                 emitted.push(Stmt::PhiAssign {
                     target: tmp,
                     value: old_val,
                     to,
                     exceptional,
                 });
+                is_self_noop_cand[victim] = false;
+                self_reads[victim] = false;
+                victim_cleared[victim] = true;
+                for rtid in std::mem::take(&mut read_tids[victim]) {
+                    total_readers_rem[rtid] -= 1;
+                    if total_readers_rem[rtid] <= 1 {
+                        for &w in &writers_of_tid[rtid] {
+                            if !in_heap[w]
+                                && is_ready(
+                                    w,
+                                    &done,
+                                    &is_self_noop_cand,
+                                    &writers_rem,
+                                    &total_readers_rem,
+                                    &self_reads,
+                                    &item_tid,
+                                )
+                            {
+                                in_heap[w] = true;
+                                ready_heap.push(std::cmp::Reverse(w));
+                            }
+                        }
+                    }
+                }
+                if !in_heap[victim]
+                    && is_ready(
+                        victim,
+                        &done,
+                        &is_self_noop_cand,
+                        &writers_rem,
+                        &total_readers_rem,
+                        &self_reads,
+                        &item_tid,
+                    )
+                {
+                    in_heap[victim] = true;
+                    ready_heap.push(std::cmp::Reverse(victim));
+                }
             }
 
             if !decls.is_empty()
@@ -1233,7 +2250,7 @@ impl<'m> Recover<'m> {
         match op {
             Op::ThrowConstAssignment { name } => {
                 self.record(op, Outcome::Expressed);
-                let label = match self.expr_of(*name) {
+                let label = match &self.expr_of(*name) {
                     Expr::Lit(Lit::String(s)) => format!(" '{s}'"),
                     _ => String::new(),
                 };
@@ -1256,13 +2273,29 @@ impl<'m> Recover<'m> {
             }
             Op::ThrowUndefinedIfHole { name, value } if provably_hole(self.module, *value) => {
                 self.record(op, Outcome::Expressed);
-                let label = match self.expr_of(*name) {
-                    Expr::Lit(Lit::String(s)) => s,
+                let label = match &self.expr_of(*name) {
+                    Expr::Lit(Lit::String(s)) => s.clone(),
                     _ => "binding".to_string(),
                 };
                 out.push(Stmt::Throw(new_error(
                     "ReferenceError",
                     format!("Cannot access '{label}' before initialization"),
+                )));
+                return;
+            }
+            Op::ThrowNotExists => {
+                self.record(op, Outcome::Expressed);
+                out.push(Stmt::Throw(new_error(
+                    "ReferenceError",
+                    "Variable does not exist".to_string(),
+                )));
+                return;
+            }
+            Op::ThrowPatternNonCoercible => {
+                self.record(op, Outcome::Expressed);
+                out.push(Stmt::Throw(new_error(
+                    "TypeError",
+                    "Cannot destructure undefined or null".to_string(),
                 )));
                 return;
             }
@@ -1417,18 +2450,8 @@ impl<'m> Recover<'m> {
             } => {
                 self.record(op, Outcome::Expressed);
                 let mut names: Vec<Option<String>> = lit_of(self.module, *scope_names)
-                    .and_then(|lit| match lit {
-                        Lit::Array(items) => Some(
-                            items
-                                .into_iter()
-                                .map(|i| match i {
-                                    Lit::String(s) => Some(s),
-                                    _ => None,
-                                })
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
+                    .and_then(Lit::into_array)
+                    .map(|items| items.into_iter().map(Lit::into_string).collect())
                     .unwrap_or_default();
                 names.resize(*num_vars as usize, None);
                 out.push(Stmt::ScopePush { names });
@@ -1441,18 +2464,8 @@ impl<'m> Recover<'m> {
             Op::CreatePrivateNames { names, .. } => {
                 self.record(op, Outcome::Expressed);
                 let names = lit_of(self.module, *names)
-                    .and_then(|lit| match lit {
-                        Lit::Array(items) => Some(
-                            items
-                                .into_iter()
-                                .filter_map(|i| match i {
-                                    Lit::String(s) => Some(s),
-                                    _ => None,
-                                })
-                                .collect(),
-                        ),
-                        _ => None,
-                    })
+                    .and_then(Lit::into_array)
+                    .map(|items| items.into_iter().filter_map(Lit::into_string).collect())
                     .unwrap_or_default();
                 out.push(Stmt::PrivateNames { names });
             }
@@ -1732,77 +2745,665 @@ impl<'m> Recover<'m> {
 
     /// The expression for an SSA value: alias/inline/temp resolution.
     fn expr_of(&mut self, v: ValueId) -> Expr {
-        if let Some(&target) = self.alias.get(&v) {
-            return self.expr_of(target);
-        }
-        let Some(value) = self.module.value(v) else {
-            return Expr::Fallback {
-                op: "<value>",
-                note: "unknown ValueId (data, not a panic)",
-                operands: vec![],
-            };
-        };
-        match value.def {
-            ValueDef::Param(i) => {
-                let i = i as usize;
-                // Hidden es2abc ABI slots read directly (some es2abc
-                // versions read a1 via `mov` instead of ldnewtarget):
-                // map them to their JS surface forms. (Dream gate:
-                // newtarget-this referenced a dropped `p1`.)
-                if self.hidden_params == 3 && i == 1 {
-                    Expr::NewTarget
-                } else if self.hidden_params == 3 && i == 0 {
-                    Expr::Fallback {
-                        op: "Param(funcobj)",
-                        note: "the hidden function-object slot has no JS surface form",
-                        operands: vec![],
-                    }
-                } else {
-                    Expr::Ident(
-                        self.param_names
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| format!("p{i}")),
-                    )
+        self.run_expr_steps(RecStep::Val(v))
+    }
+
+    /// Build the expression tree of one instruction's op.
+    fn expr_for(&mut self, iid: InstId, op: &Op) -> Expr {
+        self.run_expr_steps(RecStep::Inst(iid, op.clone()))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "iterative Stage-A expression tree builder dispatches across all IR Op variants on an explicit heap workstack"
+    )]
+    fn run_expr_steps(&mut self, root: RecStep) -> Expr {
+        let pop_expr = |vals: &mut Vec<Expr>| vals.pop().unwrap_or(Expr::SuperMarker);
+        let mut steps: Vec<RecStep> = vec![root];
+        let mut vals: Vec<Expr> = Vec::new();
+        let mut active_inlines: HashSet<InstId> = HashSet::new();
+        let max_aliases = self.module.values.len().max(1);
+
+        while let Some(step) = steps.pop() {
+            match step {
+                RecStep::PopInline(iid) => {
+                    active_inlines.remove(&iid);
                 }
-            }
-            ValueDef::Const(cid) => match lit_of(self.module, cid) {
-                Some(lit) => Expr::Lit(lit),
-                None => Expr::Fallback {
-                    op: "<const>",
-                    note: "unknown ConstId (data, not a panic)",
-                    operands: vec![],
-                },
-            },
-            ValueDef::ExceptionParam(_) => {
-                let name = match self.catch_names.get(&v) {
-                    Some(n) => n.clone(),
-                    None => {
-                        let n = self.legal.mint("e");
-                        self.catch_names.insert(v, n.clone());
-                        n
+                RecStep::Val(mut v) => {
+                    for _ in 0..max_aliases {
+                        if let Some(&target) = self.alias.get(&v)
+                            && target != v
+                        {
+                            v = target;
+                        } else {
+                            break;
+                        }
                     }
-                };
-                Expr::Ident(name)
-            }
-            ValueDef::Inst(iid) => {
-                if self.inline.contains(&v) {
-                    match self.module.inst(iid).map(|i| i.op.clone()) {
-                        Some(op) => self.expr_for(iid, &op),
+                    let Some(value) = self.module.value(v) else {
+                        vals.push(Expr::Fallback {
+                            op: "<value>",
+                            note: "unknown ValueId (data, not a panic)",
+                            operands: vec![],
+                        });
+                        continue;
+                    };
+                    match value.def {
+                        ValueDef::Param(i) => {
+                            let i = i as usize;
+                            // Hidden ABI slots read directly: map `new.target` and `funcobj`
+                            // under the active `FrameSlots` layout (`#87.4`).
+                            if let Some(slots) = self.frame_slots
+                                && i < self.hidden_params
+                            {
+                                let func_idx = slots.func.then_some(0usize);
+                                let new_target_idx =
+                                    slots.new_target.then_some(slots.func as usize);
+                                if new_target_idx == Some(i) {
+                                    vals.push(Expr::NewTarget);
+                                    continue;
+                                }
+                                if func_idx == Some(i) {
+                                    vals.push(Expr::Fallback {
+                                        op: "Param(funcobj)",
+                                        note: "the hidden function-object slot has no JS surface form",
+                                        operands: vec![],
+                                    });
+                                    continue;
+                                }
+                            }
+                            vals.push(Expr::Ident(
+                                self.param_names
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("p{i}")),
+                            ));
+                        }
+                        ValueDef::Const(cid) => match lit_of(self.module, cid) {
+                            Some(lit) => vals.push(Expr::Lit(lit)),
+                            None => vals.push(Expr::Fallback {
+                                op: "<const>",
+                                note: "unknown ConstId (data, not a panic)",
+                                operands: vec![],
+                            }),
+                        },
+                        ValueDef::ExceptionParam(_) => {
+                            let name = match self.catch_names.get(&v) {
+                                Some(n) => n.clone(),
+                                None => {
+                                    let n =
+                                        self.legal.mint_avoiding("e", &self.referenced_bare_names);
+                                    self.catch_names.insert(v, n.clone());
+                                    n
+                                }
+                            };
+                            vals.push(Expr::Ident(name));
+                        }
+                        ValueDef::Inst(iid) => {
+                            if self.inline.contains(&v) && active_inlines.insert(iid) {
+                                match self.module.inst(iid).map(|i| i.op.clone()) {
+                                    Some(op) => {
+                                        steps.push(RecStep::PopInline(iid));
+                                        steps.push(RecStep::Inst(iid, op));
+                                    }
+                                    None => {
+                                        active_inlines.remove(&iid);
+                                        vals.push(Expr::Fallback {
+                                            op: "<inst>",
+                                            note: "unknown InstId (data, not a panic)",
+                                            operands: vec![],
+                                        });
+                                    }
+                                }
+                            } else {
+                                vals.push(Expr::Temp {
+                                    value: v,
+                                    name: self.mint_temp(v),
+                                });
+                            }
+                        }
+                    }
+                }
+                RecStep::Inst(iid, op) => match &op {
+                    Op::BinaryOp { op, left, right } => {
+                        // Operand order (N36): semantic expression is `right OP left`.
+                        steps.push(RecStep::BuildBinary(*op));
+                        steps.push(RecStep::Val(*left));
+                        steps.push(RecStep::Val(*right));
+                    }
+                    Op::UnaryOp { op, operand } => {
+                        steps.push(RecStep::BuildUnary(*op));
+                        steps.push(RecStep::Val(*operand));
+                    }
+                    Op::Compare { op, left, right } => {
+                        steps.push(RecStep::BuildCompare(*op));
+                        steps.push(RecStep::Val(*left));
+                        steps.push(RecStep::Val(*right));
+                    }
+                    Op::Mov { src } => steps.push(RecStep::Val(*src)),
+                    Op::LoadConst(cid) => vals.push(match lit_of(self.module, *cid) {
+                        Some(lit) => Expr::Lit(lit),
                         None => Expr::Fallback {
-                            op: "<inst>",
-                            note: "unknown InstId (data, not a panic)",
+                            op: "LoadConst",
+                            note: "unknown ConstId",
                             operands: vec![],
                         },
+                    }),
+                    Op::AllocObject { shape } => {
+                        let expr = match lit_of(self.module, *shape) {
+                            Some(mut lit) => match &mut lit {
+                                Lit::Object(entries) => Expr::ObjectLit {
+                                    entries: std::mem::take(entries),
+                                },
+                                Lit::Array(items) => match self.parse_shape_buffer(items) {
+                                    Some(expr) => expr,
+                                    None => Expr::Fallback {
+                                        op: "AllocObject",
+                                        note: "shape buffer is not a flat key/value array",
+                                        operands: vec![],
+                                    },
+                                },
+                                _ => Expr::Fallback {
+                                    op: "AllocObject",
+                                    note: "shape constant is not an ObjectLiteral",
+                                    operands: vec![],
+                                },
+                            },
+                            None => Expr::Fallback {
+                                op: "AllocObject",
+                                note: "shape constant is not an ObjectLiteral",
+                                operands: vec![],
+                            },
+                        };
+                        vals.push(expr);
                     }
-                } else {
-                    Expr::Temp {
-                        value: v,
-                        name: self.mint_temp(v),
+                    Op::AllocArray { shape } => {
+                        let expr = match shape {
+                            None => Expr::ArrayLit { elements: vec![] },
+                            Some(cid) => {
+                                match lit_of(self.module, *cid).and_then(Lit::into_array) {
+                                    Some(elements) => Expr::ArrayLit { elements },
+                                    None => Expr::Fallback {
+                                        op: "AllocArray",
+                                        note: "shape constant is not an ArrayLiteral",
+                                        operands: vec![],
+                                    },
+                                }
+                            }
+                        };
+                        vals.push(expr);
                     }
+                    Op::AllocRegExp { pattern, flags } => vals.push(Expr::RegExp {
+                        pattern: sym_regexp_pattern(self.module, *pattern),
+                        flags: render_regexp_flags(*flags),
+                    }),
+                    Op::AllocClosure { func } => self.push_closure_of_steps(*func, &mut steps),
+                    Op::LoadProp { object, name } => {
+                        if let Some(s) = self.module.sym.as_str(*name) {
+                            let raw = s.to_string();
+                            let dot_legal = is_legal_ident(&raw);
+                            steps.push(RecStep::BuildPropName {
+                                name: raw,
+                                dot_legal,
+                            });
+                            steps.push(RecStep::Val(*object));
+                        } else {
+                            let key = Expr::Lit(lit_of_sym(self.module, *name));
+                            steps.push(RecStep::BuildPropDynConstKey(Box::new(key)));
+                            steps.push(RecStep::Val(*object));
+                        }
+                    }
+                    Op::LoadPropIdx { object, index } => {
+                        steps.push(RecStep::BuildPropIndex);
+                        steps.push(RecStep::Val(*index));
+                        steps.push(RecStep::Val(*object));
+                    }
+                    Op::LoadPropDyn { object, key } => {
+                        steps.push(RecStep::BuildPropDyn);
+                        steps.push(RecStep::Val(*key));
+                        steps.push(RecStep::Val(*object));
+                    }
+                    Op::DeleteProp { object, key } => {
+                        steps.push(RecStep::BuildDeletePropDyn);
+                        steps.push(RecStep::Val(*key));
+                        steps.push(RecStep::Val(*object));
+                    }
+                    Op::TestProp { object, key } => match key {
+                        PropKey::Name(s) => {
+                            let key_expr = Expr::Lit(lit_of_sym(self.module, *s));
+                            steps.push(RecStep::BuildTestPropNamed(Box::new(key_expr)));
+                            steps.push(RecStep::Val(*object));
+                        }
+                        PropKey::Index(k) | PropKey::Dynamic(k) => {
+                            steps.push(RecStep::BuildCompare(CmpOp::In));
+                            steps.push(RecStep::Val(*object));
+                            steps.push(RecStep::Val(*k));
+                        }
+                    },
+                    Op::GetTemplateObject { literal } => {
+                        let (raw, cooked) = self.template_strings_of(*literal);
+                        vals.push(Expr::TemplateObject { raw, cooked });
+                    }
+                    Op::CreateIterResultObj { value, done } => {
+                        steps.push(RecStep::BuildIterResultObj);
+                        steps.push(RecStep::Val(*done));
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::GetIterator { obj } => {
+                        self.push_iter_step(IterOp::GetIterator, *obj, &mut steps)
+                    }
+                    Op::GetAsyncIterator { obj } => {
+                        self.push_iter_step(IterOp::GetAsyncIterator, *obj, &mut steps)
+                    }
+                    Op::IteratorNext { iterator } => {
+                        self.push_iter_step(IterOp::Next, *iterator, &mut steps)
+                    }
+                    Op::IteratorReturn { iterator } => {
+                        self.push_iter_step(IterOp::Return, *iterator, &mut steps)
+                    }
+                    Op::IteratorThrow { iterator } => {
+                        self.push_iter_step(IterOp::Throw, *iterator, &mut steps)
+                    }
+                    Op::GetPropIterator { obj } => {
+                        self.push_iter_step(IterOp::GetPropIterator, *obj, &mut steps)
+                    }
+                    Op::NextPropName { iterator } => {
+                        self.push_iter_step(IterOp::NextPropName, *iterator, &mut steps)
+                    }
+                    Op::GetLexVar { .. } => {
+                        let name = self
+                            .scopes
+                            .name_of(iid)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "v?".to_string());
+                        vals.push(Expr::Ident(sanitize(&name)));
+                    }
+                    Op::TryGetGlobal { name, .. } => {
+                        let expr = if let Some(s) = self.module.sym.as_str(*name) {
+                            let raw = s.to_string();
+                            if is_legal_ident(&raw) {
+                                Expr::Ident(raw)
+                            } else {
+                                Expr::PropIndex {
+                                    object: Box::new(Expr::GlobalThis),
+                                    index: Box::new(Expr::Lit(Lit::String(raw))),
+                                }
+                            }
+                        } else {
+                            Expr::PropIndex {
+                                object: Box::new(Expr::GlobalThis),
+                                index: Box::new(Expr::Lit(lit_of_sym(self.module, *name))),
+                            }
+                        };
+                        vals.push(expr);
+                    }
+                    Op::LoadModuleVar { index, kind } => {
+                        vals.push(Expr::Ident(self.load_module_var_name(*index, *kind)));
+                    }
+                    Op::GetModuleNamespace { index } => {
+                        let expr = if let Some(env) = self.record_env()
+                            && let Some(ns) = env.namespace_slots.get(index)
+                        {
+                            Expr::Ident(ns.clone())
+                        } else {
+                            Expr::ModuleNamespace { index: *index }
+                        };
+                        vals.push(expr);
+                    }
+                    Op::DynamicImport { specifier } => {
+                        steps.push(RecStep::BuildDynamicImport);
+                        steps.push(RecStep::Val(*specifier));
+                    }
+                    Op::Call {
+                        callee,
+                        this,
+                        args,
+                        kind,
+                    } => {
+                        let super_callee = matches!(
+                            kind,
+                            CallKind::Super
+                                | CallKind::SuperArrow
+                                | CallKind::SuperSpread
+                                | CallKind::SuperForwardAllArgs
+                        );
+                        steps.push(RecStep::BuildCall {
+                            has_this: this.is_some(),
+                            arg_count: args.len(),
+                            kind: *kind,
+                            super_callee,
+                        });
+                        for a in args.iter().rev() {
+                            steps.push(RecStep::Val(*a));
+                        }
+                        if let Some(t) = this {
+                            steps.push(RecStep::Val(*t));
+                        }
+                        if !super_callee {
+                            steps.push(RecStep::Val(*callee));
+                        }
+                    }
+                    Op::DefineFunc { body, captures, .. } => {
+                        self.push_closure_node_steps(*body, captures, &mut steps);
+                    }
+                    Op::DefineClass(cls) => {
+                        self.push_class_node_steps(
+                            cls.ctor,
+                            cls.heritage,
+                            cls.members,
+                            cls.member_attrs.clone(),
+                            false,
+                            &mut steps,
+                            &mut vals,
+                        );
+                    }
+                    Op::DefineSendableClass(cls) => {
+                        self.push_class_node_steps(
+                            cls.ctor,
+                            cls.heritage,
+                            cls.members,
+                            cls.member_attrs.clone(),
+                            true,
+                            &mut steps,
+                            &mut vals,
+                        );
+                    }
+                    Op::LoadPrivate { obj, .. } => {
+                        let name = self
+                            .scopes
+                            .name_of(iid)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "p?".to_string());
+                        steps.push(RecStep::BuildPrivate { name, test: false });
+                        steps.push(RecStep::Val(*obj));
+                    }
+                    Op::TestPrivate { obj, .. } => {
+                        let name = self
+                            .scopes
+                            .name_of(iid)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "p?".to_string());
+                        steps.push(RecStep::BuildPrivate { name, test: true });
+                        steps.push(RecStep::Val(*obj));
+                    }
+                    Op::CreateGenerator { func } | Op::CreateAsyncGenerator { func } => {
+                        steps.push(RecStep::BuildCreateGenerator);
+                        steps.push(RecStep::Val(*func));
+                    }
+                    Op::SuspendGenerator { value, .. } => {
+                        steps.push(RecStep::BuildYield);
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::ResumeGenerator { genobj } => {
+                        steps.push(RecStep::BuildGenDriver(true));
+                        steps.push(RecStep::Val(*genobj));
+                    }
+                    Op::GetResumeMode { genobj } => {
+                        steps.push(RecStep::BuildGenDriver(false));
+                        steps.push(RecStep::Val(*genobj));
+                    }
+                    Op::Await { value } => {
+                        steps.push(RecStep::BuildAwait(false));
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::AwaitUncaught { value, .. } => {
+                        steps.push(RecStep::BuildAwait(true));
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::AsyncResolve { value, .. } => {
+                        steps.push(RecStep::BuildAsyncDriver(true));
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::AsyncReject { value, .. } | Op::AsyncGeneratorReject { value, .. } => {
+                        steps.push(RecStep::BuildAsyncDriver(false));
+                        steps.push(RecStep::Val(*value));
+                    }
+                    Op::AsyncGeneratorResolve {
+                        genobj,
+                        value,
+                        done,
+                    } => {
+                        steps.push(RecStep::BuildAsyncGenResolve);
+                        steps.push(RecStep::Val(*done));
+                        steps.push(RecStep::Val(*value));
+                        steps.push(RecStep::Val(*genobj));
+                    }
+                    Op::LoadSymbol => vals.push(Expr::Ident("Symbol".to_string())),
+                    Op::LoadNewTarget => vals.push(Expr::NewTarget),
+                    Op::LoadGlobalObject => vals.push(Expr::GlobalThis),
+                    Op::LoadFunction => {
+                        let name = self
+                            .module
+                            .func(self.func)
+                            .map(|f| sym_str(self.module, f.name))
+                            .unwrap_or_default();
+                        vals.push(Expr::SelfFunction(name));
+                    }
+                    Op::GetUnmappedArgs => vals.push(Expr::Arguments),
+                    Op::CopyRestArgs { start_index } => vals.push(Expr::RestArgs {
+                        start_index: *start_index,
+                    }),
+                    Op::LoadSuper { key, .. } => match key {
+                        SuperKey::Name(s) => vals.push(Expr::SuperProp {
+                            name: Some(sym_str(self.module, *s)),
+                            key: None,
+                        }),
+                        SuperKey::Dynamic(k) => {
+                            steps.push(RecStep::BuildSuperDyn);
+                            steps.push(RecStep::Val(*k));
+                        }
+                    },
+                    Op::ArraySpread { dst, index, src } => {
+                        steps.push(RecStep::BuildArraySpread);
+                        steps.push(RecStep::Val(*src));
+                        steps.push(RecStep::Val(*index));
+                        steps.push(RecStep::Val(*dst));
+                    }
+                    Op::CreateObjectWithExcludedKeys { obj, keys } => {
+                        steps.push(RecStep::BuildRestObject(keys.len()));
+                        for k in keys.iter().rev() {
+                            steps.push(RecStep::Val(*k));
+                        }
+                        steps.push(RecStep::Val(*obj));
+                    }
+                    other => {
+                        let op_s = op_name(other);
+                        let note_s = fallback_note(other);
+                        let ops = other.operands();
+                        steps.push(RecStep::BuildFallback {
+                            op: op_s,
+                            note: note_s,
+                            count: ops.len(),
+                        });
+                        for v in ops.iter().rev() {
+                            steps.push(RecStep::Val(*v));
+                        }
+                    }
+                },
+                RecStep::BuildBinary(op) => {
+                    let right = Box::new(pop_expr(&mut vals));
+                    let left = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Binary { op, left, right });
+                }
+                RecStep::BuildUnary(op) => {
+                    let operand = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Unary { op, operand });
+                }
+                RecStep::BuildCompare(op) => {
+                    let right = Box::new(pop_expr(&mut vals));
+                    let left = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Compare { op, left, right });
+                }
+                RecStep::BuildPropName { name, dot_legal } => {
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::PropName {
+                        object,
+                        name,
+                        dot_legal,
+                    });
+                }
+                RecStep::BuildPropDynConstKey(key) => {
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::PropDyn { object, key });
+                }
+                RecStep::BuildPropIndex => {
+                    let index = Box::new(pop_expr(&mut vals));
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::PropIndex { object, index });
+                }
+                RecStep::BuildPropDyn => {
+                    let key = Box::new(pop_expr(&mut vals));
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::PropDyn { object, key });
+                }
+                RecStep::BuildDeletePropDyn => {
+                    let key = Box::new(pop_expr(&mut vals));
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Delete {
+                        target: Box::new(Expr::PropDyn { object, key }),
+                    });
+                }
+                RecStep::BuildTestPropNamed(left) => {
+                    let right = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Compare {
+                        op: CmpOp::In,
+                        left,
+                        right,
+                    });
+                }
+                RecStep::BuildIterResultObj => {
+                    let done = Box::new(pop_expr(&mut vals));
+                    let value = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::IterResultObj { value, done });
+                }
+                RecStep::BuildIter { op, status } => {
+                    let obj = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Iter { op, obj, status });
+                }
+                RecStep::BuildDynamicImport => {
+                    let specifier = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::DynamicImport { specifier });
+                }
+                RecStep::BuildCall {
+                    has_this,
+                    arg_count,
+                    kind,
+                    super_callee,
+                } => {
+                    let start = vals.len().saturating_sub(arg_count);
+                    let args = vals.split_off(start);
+                    let this = has_this.then(|| Box::new(pop_expr(&mut vals)));
+                    let callee = if super_callee {
+                        Box::new(Expr::SuperMarker)
+                    } else {
+                        Box::new(pop_expr(&mut vals))
+                    };
+                    vals.push(Expr::Call {
+                        callee,
+                        this,
+                        args,
+                        kind,
+                    });
+                }
+                RecStep::BuildClosure {
+                    body,
+                    name,
+                    kind,
+                    cap_names,
+                } => {
+                    let start = vals.len().saturating_sub(cap_names.len());
+                    let mut drain = vals.drain(start..);
+                    let mut captures = Vec::with_capacity(cap_names.len());
+                    for cname in cap_names {
+                        captures.push((cname, drain.next().unwrap_or(Expr::SuperMarker)));
+                    }
+                    drop(drain);
+                    vals.push(Expr::Closure {
+                        body,
+                        name,
+                        kind,
+                        captures,
+                    });
+                }
+                RecStep::BuildClassWithHeritage {
+                    ctor,
+                    name,
+                    members,
+                    member_attrs,
+                    sendable,
+                } => {
+                    let heritage = Some(Box::new(pop_expr(&mut vals)));
+                    vals.push(Expr::Class {
+                        ctor,
+                        name,
+                        heritage,
+                        members,
+                        member_attrs,
+                        sendable,
+                    });
+                }
+                RecStep::BuildPrivate { name, test } => {
+                    let object = Box::new(pop_expr(&mut vals));
+                    vals.push(if test {
+                        Expr::PrivateTest { object, name }
+                    } else {
+                        Expr::PrivateLoad { object, name }
+                    });
+                }
+                RecStep::BuildCreateGenerator => {
+                    let func = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::CreateGenerator { func });
+                }
+                RecStep::BuildYield => {
+                    let value = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Yield { value });
+                }
+                RecStep::BuildGenDriver(resume) => {
+                    let genobj = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::GeneratorDriver { resume, genobj });
+                }
+                RecStep::BuildAwait(uncaught) => {
+                    let value = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::Await { value, uncaught });
+                }
+                RecStep::BuildAsyncDriver(resolve) => {
+                    let value = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::AsyncDriver { resolve, value });
+                }
+                RecStep::BuildAsyncGenResolve => {
+                    let done = Box::new(pop_expr(&mut vals));
+                    let value = Box::new(pop_expr(&mut vals));
+                    let genobj = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::AsyncGeneratorResolve {
+                        genobj,
+                        value,
+                        done,
+                    });
+                }
+                RecStep::BuildSuperDyn => {
+                    let key = Some(Box::new(pop_expr(&mut vals)));
+                    vals.push(Expr::SuperProp { name: None, key });
+                }
+                RecStep::BuildArraySpread => {
+                    let src = Box::new(pop_expr(&mut vals));
+                    let index = Box::new(pop_expr(&mut vals));
+                    let dst = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::ArraySpread { dst, index, src });
+                }
+                RecStep::BuildRestObject(count) => {
+                    let start = vals.len().saturating_sub(count);
+                    let excluded = vals.split_off(start);
+                    let obj = Box::new(pop_expr(&mut vals));
+                    vals.push(Expr::RestObject { obj, excluded });
+                }
+                RecStep::BuildFallback { op, note, count } => {
+                    let start = vals.len().saturating_sub(count);
+                    let operands = vals.split_off(start);
+                    vals.push(Expr::Fallback { op, note, operands });
                 }
             }
         }
+
+        pop_expr(&mut vals)
     }
 
     /// Mint (once) the temporary name of an SSA value:
@@ -1913,335 +3514,18 @@ impl<'m> Recover<'m> {
         }
     }
 
-    /// Build the expression tree of one instruction's op.
-    fn expr_for(&mut self, iid: InstId, op: &Op) -> Expr {
-        match op {
-            Op::BinaryOp { op, left, right } => Expr::Binary {
-                op: *op,
-                // Operand order (N36): the IR stores `left` = the acc
-                // operand and `right` = the vreg operand, but the
-                // vendored two-address handlers compute `vreg OP acc` —
-                // the semantic expression is `right OP left`. (The d-P4
-                // dream gate caught this: `i > 0` decompiled to `0 > i`
-                // and local/decrement printed nothing.)
-                left: Box::new(self.expr_of(*right)),
-                right: Box::new(self.expr_of(*left)),
-            },
-            Op::UnaryOp { op, operand } => Expr::Unary {
-                op: *op,
-                operand: Box::new(self.expr_of(*operand)),
-            },
-            Op::Compare { op, left, right } => Expr::Compare {
-                op: *op,
-                // Operand order (N36) — same swap as BinaryOp.
-                left: Box::new(self.expr_of(*right)),
-                right: Box::new(self.expr_of(*left)),
-            },
-            Op::Mov { src } => self.expr_of(*src),
-            Op::LoadConst(cid) => match lit_of(self.module, *cid) {
-                Some(lit) => Expr::Lit(lit),
-                None => Expr::Fallback {
-                    op: "LoadConst",
-                    note: "unknown ConstId",
-                    operands: vec![],
-                },
-            },
-            Op::AllocObject { shape } => match lit_of(self.module, *shape) {
-                Some(Lit::Object(entries)) => Expr::ObjectLit { entries },
-                // `createobjectwithbuffer`'s vendor buffer is a FLAT
-                // array `[k0, v0, k1, v1, …]` (probe-verified on the
-                // corpus, e.g. 9.0.0.0 for-in); interpret pairwise.
-                // Method entries pack as `[name, MethodRef, attrs]` —
-                // the numeric attributes payload is runtime metadata
-                // (dropped, like the class member buffer's). (d-P4
-                // dream gate: local/proxy's handler object fell back to
-                // `undefined` — "ProxyCreate: handler is not Object".)
-                Some(Lit::Array(items)) => match self.parse_shape_buffer(&items) {
-                    Some(expr) => expr,
-                    None => Expr::Fallback {
-                        op: "AllocObject",
-                        note: "shape buffer is not a flat key/value array",
-                        operands: vec![],
-                    },
-                },
-                _ => Expr::Fallback {
-                    op: "AllocObject",
-                    note: "shape constant is not an ObjectLiteral",
-                    operands: vec![],
-                },
-            },
-            Op::AllocArray { shape } => match shape {
-                None => Expr::ArrayLit { elements: vec![] },
-                Some(cid) => match lit_of(self.module, *cid) {
-                    Some(Lit::Array(elements)) => Expr::ArrayLit { elements },
-                    _ => Expr::Fallback {
-                        op: "AllocArray",
-                        note: "shape constant is not an ArrayLiteral",
-                        operands: vec![],
-                    },
-                },
-            },
-            Op::AllocRegExp { pattern, flags } => Expr::RegExp {
-                pattern: sym_regexp_pattern(self.module, *pattern),
-                flags: render_regexp_flags(*flags),
-            },
-            Op::AllocClosure { func } => self.closure_of(*func),
-            Op::LoadProp { object, name } => {
-                if let Some(s) = self.module.sym.as_str(*name) {
-                    let raw = s.to_string();
-                    Expr::PropName {
-                        object: Box::new(self.expr_of(*object)),
-                        dot_legal: is_legal_ident(&raw),
-                        name: raw,
-                    }
-                } else {
-                    Expr::PropDyn {
-                        object: Box::new(self.expr_of(*object)),
-                        key: Box::new(Expr::Lit(lit_of_sym(self.module, *name))),
-                    }
-                }
-            }
-            Op::LoadPropIdx { object, index } => Expr::PropIndex {
-                object: Box::new(self.expr_of(*object)),
-                index: Box::new(self.expr_of(*index)),
-            },
-            Op::LoadPropDyn { object, key } => Expr::PropDyn {
-                object: Box::new(self.expr_of(*object)),
-                key: Box::new(self.expr_of(*key)),
-            },
-            Op::DeleteProp { object, key } => Expr::Delete {
-                target: Box::new(Expr::PropDyn {
-                    object: Box::new(self.expr_of(*object)),
-                    key: Box::new(self.expr_of(*key)),
-                }),
-            },
-            Op::TestProp { object, key } => {
-                let key_expr = match key {
-                    PropKey::Name(s) => Expr::Lit(lit_of_sym(self.module, *s)),
-                    PropKey::Index(k) | PropKey::Dynamic(k) => self.expr_of(*k),
-                };
-                Expr::Compare {
-                    op: CmpOp::In,
-                    left: Box::new(key_expr),
-                    right: Box::new(self.expr_of(*object)),
-                }
-            }
-            Op::GetTemplateObject { literal } => {
-                // G4 RESOLVED (d-P10): the literal operand is the vendor
-                // pair [rawStrings, cookedStrings] — resolve BOTH lists.
-                let (raw, cooked) = self.template_strings_of(*literal);
-                Expr::TemplateObject { raw, cooked }
-            }
-            Op::CreateIterResultObj { value, done } => Expr::IterResultObj {
-                value: Box::new(self.expr_of(*value)),
-                done: Box::new(self.expr_of(*done)),
-            },
-            Op::GetIterator { obj } => self.iter_node(IterOp::GetIterator, *obj),
-            Op::GetAsyncIterator { obj } => self.iter_node(IterOp::GetAsyncIterator, *obj),
-            Op::IteratorNext { iterator } => self.iter_node(IterOp::Next, *iterator),
-            Op::IteratorReturn { iterator } => self.iter_node(IterOp::Return, *iterator),
-            Op::IteratorThrow { iterator } => self.iter_node(IterOp::Throw, *iterator),
-            Op::GetPropIterator { obj } => self.iter_node(IterOp::GetPropIterator, *obj),
-            Op::NextPropName { iterator } => self.iter_node(IterOp::NextPropName, *iterator),
-            Op::GetLexVar { .. } => {
-                let name = self
-                    .scopes
-                    .name_of(iid)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "v?".to_string());
-                Expr::Ident(sanitize(&name))
-            }
-            Op::TryGetGlobal { name, .. } => {
-                if let Some(s) = self.module.sym.as_str(*name) {
-                    let raw = s.to_string();
-                    if is_legal_ident(&raw) {
-                        Expr::Ident(raw)
-                    } else {
-                        Expr::PropIndex {
-                            object: Box::new(Expr::GlobalThis),
-                            index: Box::new(Expr::Lit(Lit::String(raw))),
-                        }
-                    }
-                } else {
-                    Expr::PropIndex {
-                        object: Box::new(Expr::GlobalThis),
-                        index: Box::new(Expr::Lit(lit_of_sym(self.module, *name))),
-                    }
-                }
-            }
-            Op::LoadModuleVar { index, kind } => {
-                Expr::Ident(self.load_module_var_name(*index, *kind))
-            }
-            Op::GetModuleNamespace { index } => {
-                if let Some(env) = self.record_env()
-                    && let Some(ns) = env.namespace_slots.get(index)
-                {
-                    Expr::Ident(ns.clone())
-                } else {
-                    Expr::ModuleNamespace { index: *index }
-                }
-            }
-            Op::DynamicImport { specifier } => Expr::DynamicImport {
-                specifier: Box::new(self.expr_of(*specifier)),
-            },
-            Op::Call {
-                callee,
-                this,
-                args,
-                kind,
-            } => {
-                let callee_expr = if matches!(
-                    kind,
-                    CallKind::Super
-                        | CallKind::SuperArrow
-                        | CallKind::SuperSpread
-                        | CallKind::SuperForwardAllArgs
-                ) {
-                    Expr::SuperMarker
-                } else {
-                    self.expr_of(*callee)
-                };
-                Expr::Call {
-                    callee: Box::new(callee_expr),
-                    this: this.map(|t| Box::new(self.expr_of(t))),
-                    args: args.iter().map(|a| self.expr_of(*a)).collect(),
-                    kind: *kind,
-                }
-            }
-            Op::DefineFunc { body, captures, .. } => self.closure_node(*body, captures.clone()),
-            Op::DefineClass(cls) => self.class_node(
-                cls.ctor,
-                cls.heritage,
-                cls.members,
-                cls.member_attrs.clone(),
-                false,
-            ),
-            Op::DefineSendableClass(cls) => self.class_node(
-                cls.ctor,
-                cls.heritage,
-                cls.members,
-                cls.member_attrs.clone(),
-                true,
-            ),
-            Op::LoadPrivate { obj, .. } => Expr::PrivateLoad {
-                object: Box::new(self.expr_of(*obj)),
-                name: self
-                    .scopes
-                    .name_of(iid)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "p?".to_string()),
-            },
-            Op::TestPrivate { obj, .. } => Expr::PrivateTest {
-                object: Box::new(self.expr_of(*obj)),
-                name: self
-                    .scopes
-                    .name_of(iid)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "p?".to_string()),
-            },
-            Op::CreateGenerator { func } | Op::CreateAsyncGenerator { func } => {
-                Expr::CreateGenerator {
-                    func: Box::new(self.expr_of(*func)),
-                }
-            }
-            Op::SuspendGenerator { value, .. } => Expr::Yield {
-                value: Box::new(self.expr_of(*value)),
-            },
-            Op::ResumeGenerator { genobj } => Expr::GeneratorDriver {
-                resume: true,
-                genobj: Box::new(self.expr_of(*genobj)),
-            },
-            Op::GetResumeMode { genobj } => Expr::GeneratorDriver {
-                resume: false,
-                genobj: Box::new(self.expr_of(*genobj)),
-            },
-            Op::Await { value } => Expr::Await {
-                value: Box::new(self.expr_of(*value)),
-                uncaught: false,
-            },
-            Op::AwaitUncaught { value, .. } => Expr::Await {
-                // N68/G6: `value` is the accumulator-carried awaited
-                // value (the funcobj register operand is machinery,
-                // folded away with the async driver).
-                value: Box::new(self.expr_of(*value)),
-                uncaught: true,
-            },
-            Op::AsyncResolve { value, .. } => Expr::AsyncDriver {
-                resolve: true,
-                value: Box::new(self.expr_of(*value)),
-            },
-            Op::AsyncReject { value, .. } | Op::AsyncGeneratorReject { value, .. } => {
-                Expr::AsyncDriver {
-                    resolve: false,
-                    value: Box::new(self.expr_of(*value)),
-                }
-            }
-            Op::AsyncGeneratorResolve {
-                genobj,
-                value,
-                done,
-            } => Expr::AsyncGeneratorResolve {
-                genobj: Box::new(self.expr_of(*genobj)),
-                value: Box::new(self.expr_of(*value)),
-                done: Box::new(self.expr_of(*done)),
-            },
-            Op::LoadSymbol => Expr::Ident("Symbol".to_string()),
-            Op::LoadNewTarget => Expr::NewTarget,
-            Op::LoadGlobalObject => Expr::GlobalThis,
-            Op::LoadFunction => {
-                let name = self
-                    .module
-                    .func(self.func)
-                    .map(|f| sym_str(self.module, f.name))
-                    .unwrap_or_default();
-                Expr::SelfFunction(name)
-            }
-            Op::GetUnmappedArgs => Expr::Arguments,
-            Op::CopyRestArgs { start_index } => Expr::RestArgs {
-                start_index: *start_index,
-            },
-            Op::LoadSuper { key, .. } => match key {
-                SuperKey::Name(s) => Expr::SuperProp {
-                    name: Some(sym_str(self.module, *s)),
-                    key: None,
-                },
-                SuperKey::Dynamic(k) => Expr::SuperProp {
-                    name: None,
-                    key: Some(Box::new(self.expr_of(*k))),
-                },
-            },
-            Op::ArraySpread { dst, index, src } => Expr::ArraySpread {
-                dst: Box::new(self.expr_of(*dst)),
-                index: Box::new(self.expr_of(*index)),
-                src: Box::new(self.expr_of(*src)),
-            },
-            Op::CreateObjectWithExcludedKeys { obj, keys } => Expr::RestObject {
-                obj: Box::new(self.expr_of(*obj)),
-                excluded: keys.iter().map(|k| self.expr_of(*k)).collect(),
-            },
-            other => Expr::Fallback {
-                op: op_name(other),
-                note: fallback_note(other),
-                operands: other.operands().iter().map(|v| self.expr_of(*v)).collect(),
-            },
-        }
-    }
-
-    /// An iteration-plumbing node (hard-7 members flagged Fallback).
-    fn iter_node(&mut self, op: IterOp, obj: ValueId) -> Expr {
+    /// Push iteration-plumbing steps onto `steps` (hard-7 members flagged Fallback).
+    fn push_iter_step(&self, op: IterOp, obj: ValueId, steps: &mut Vec<RecStep>) {
         let status = match op {
             IterOp::Return | IterOp::Throw => NodeStatus::Fallback,
             _ => NodeStatus::Plumbing,
         };
-        Expr::Iter {
-            op,
-            obj: Box::new(self.expr_of(obj)),
-            status,
-        }
+        steps.push(RecStep::BuildIter { op, status });
+        steps.push(RecStep::Val(obj));
     }
 
     /// `AllocClosure`: pair with the `DefineFunc` def (through `Mov`s).
-    fn closure_of(&mut self, func: ValueId) -> Expr {
+    fn push_closure_of_steps(&self, func: ValueId, steps: &mut Vec<RecStep>) {
         let mut cur = func;
         for _ in 0..16 {
             let Some(value) = self.module.value(cur) else {
@@ -2254,73 +3538,90 @@ impl<'m> Recover<'m> {
                         continue;
                     }
                     Some(Op::DefineFunc { body, captures, .. }) => {
-                        return self.closure_node(body, captures);
+                        self.push_closure_node_steps(body, &captures, steps);
+                        return;
                     }
                     _ => break,
                 },
                 _ => break,
             }
         }
-        Expr::Fallback {
+        steps.push(RecStep::BuildFallback {
             op: "AllocClosure",
             note: "func operand is not a DefineFunc def-chain",
-            operands: vec![self.expr_of(func)],
-        }
+            count: 1,
+        });
+        steps.push(RecStep::Val(func));
     }
 
-    /// The deferred closure node.
-    fn closure_node(&mut self, body: FuncId, captures: Vec<(Sym, ValueId)>) -> Expr {
+    /// Push deferred closure steps onto `steps`.
+    fn push_closure_node_steps(
+        &self,
+        body: FuncId,
+        captures: &[(Sym, ValueId)],
+        steps: &mut Vec<RecStep>,
+    ) {
         let name = self
             .module
             .func(body)
             .map(|f| sym_str(self.module, f.name))
             .unwrap_or_else(|| format!("<fn#{}>", body.index()));
-        // Bug A: body evidence over the metadata gap.
         let kind = effective_kind(self.module, body);
-        Expr::Closure {
+        let cap_names: Vec<String> = captures
+            .iter()
+            .map(|(s, _)| sym_str(self.module, *s))
+            .collect();
+        steps.push(RecStep::BuildClosure {
             body,
             name,
             kind,
-            captures: captures
-                .into_iter()
-                .map(|(s, v)| (sym_str(self.module, s), self.expr_of(v)))
-                .collect(),
+            cap_names,
+        });
+        for (_, v) in captures.iter().rev() {
+            steps.push(RecStep::Val(*v));
         }
     }
 
-    /// The deferred class node.
-    fn class_node(
-        &mut self,
+    /// Push deferred class steps onto `steps` (or directly onto `vals` when no heritage).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "class recovery step helper threads ctor, heritage, member buffer, and workstacks"
+    )]
+    fn push_class_node_steps(
+        &self,
         ctor: FuncId,
         heritage: Option<ValueId>,
         members: ConstId,
         member_attrs: Vec<abcd_ir::op::MemberAttrs>,
         sendable: bool,
-    ) -> Expr {
+        steps: &mut Vec<RecStep>,
+        vals: &mut Vec<Expr>,
+    ) {
         let name = self
             .module
             .func(ctor)
             .map(|f| sym_str(self.module, f.name))
             .unwrap_or_else(|| format!("<fn#{}>", ctor.index()));
-        // N74-W4: es2abc loads the heritage register with the TDZ hole
-        // for a class WITHOUT `extends` (CreateClassWithBuffer treats
-        // the hole as "no parent"). Emitting `extends <hole-temp>` runs
-        // `extends undefined` — a runtime TypeError ("parent class is
-        // not constructor"). Suppress the hole; an explicit
-        // `extends undefined` (a real Undefined constant) is NOT the
-        // hole and must survive.
         let suppress = heritage.is_some_and(|h| provably_hole(self.module, h));
-        Expr::Class {
-            ctor,
-            name,
-            heritage: if suppress {
-                None
-            } else {
-                heritage.map(|h| Box::new(self.expr_of(h)))
-            },
-            members,
-            member_attrs,
-            sendable,
+        match heritage {
+            Some(h) if !suppress => {
+                steps.push(RecStep::BuildClassWithHeritage {
+                    ctor,
+                    name,
+                    members,
+                    member_attrs,
+                    sendable,
+                });
+                steps.push(RecStep::Val(h));
+            }
+            _ => vals.push(Expr::Class {
+                ctor,
+                name,
+                heritage: None,
+                members,
+                member_attrs,
+                sendable,
+            }),
         }
     }
 
@@ -2344,8 +3645,8 @@ impl<'m> Recover<'m> {
         let v = chase_mov(self.module, literal);
         // Const-pool form: the whole literal array is one constant.
         if let Some(cid) = const_id_of(self.module, v) {
-            return match lit_of(self.module, cid) {
-                Some(Lit::Array(items)) => {
+            return match lit_of(self.module, cid).and_then(Lit::into_array) {
+                Some(items) => {
                     // Vendor pair layout [raw, cooked]: both elements are
                     // themselves arrays. Anything else keeps the pre-d-P10
                     // interpretation (the flat list is the cooked list).
@@ -2356,7 +3657,7 @@ impl<'m> Recover<'m> {
                     }
                     (None, Some(items))
                 }
-                _ => (None, None),
+                None => (None, None),
             };
         }
         // Imperative form: slots 0 (raw) and 1 (cooked) of the literal
@@ -2414,10 +3715,7 @@ impl<'m> Recover<'m> {
     fn string_elems_of(&self, arr: ValueId) -> Option<Vec<Lit>> {
         let arr = chase_mov(self.module, arr);
         if let Some(cid) = const_id_of(self.module, arr) {
-            return match lit_of(self.module, cid)? {
-                Lit::Array(items) => Some(items),
-                _ => None,
-            };
+            return lit_of(self.module, cid)?.into_array();
         }
         // The array must be a fresh allocation we can fully account for.
         let is_alloc = matches!(
@@ -2501,6 +3799,67 @@ impl<'m> Recover<'m> {
         let cid = const_id_of(self.module, chase_mov(self.module, v))?;
         lit_of(self.module, cid)
     }
+}
+
+enum RecStep {
+    Val(ValueId),
+    Inst(InstId, Op),
+    PopInline(InstId),
+    BuildBinary(abcd_ir::op::BinOp),
+    BuildUnary(abcd_ir::op::UnOp),
+    BuildCompare(CmpOp),
+    BuildPropName {
+        name: String,
+        dot_legal: bool,
+    },
+    BuildPropDynConstKey(Box<Expr>),
+    BuildPropIndex,
+    BuildPropDyn,
+    BuildDeletePropDyn,
+    BuildTestPropNamed(Box<Expr>),
+    BuildIterResultObj,
+    BuildIter {
+        op: IterOp,
+        status: NodeStatus,
+    },
+    BuildDynamicImport,
+    BuildCall {
+        has_this: bool,
+        arg_count: usize,
+        kind: CallKind,
+        super_callee: bool,
+    },
+    BuildClosure {
+        body: FuncId,
+        name: String,
+        kind: FunctionKind,
+        cap_names: Vec<String>,
+    },
+    BuildClassWithHeritage {
+        ctor: FuncId,
+        name: String,
+        members: ConstId,
+        member_attrs: Vec<abcd_ir::op::MemberAttrs>,
+        sendable: bool,
+    },
+    BuildPrivate {
+        name: String,
+        test: bool,
+    },
+    BuildCreateGenerator,
+    BuildYield,
+    BuildGenDriver(bool),
+    BuildAwait(bool),
+    BuildAsyncDriver(bool),
+    BuildAsyncGenResolve,
+    BuildSuperDyn,
+    BuildArraySpread,
+    BuildRestObject(usize),
+    BuildFallback {
+        op: &'static str,
+        note: &'static str,
+        count: usize,
+    },
 }
 
 /// Chase `Mov` passthroughs to the underlying definition (bounded).

@@ -177,18 +177,21 @@ fn negate_forms() {
         (CmpOp::NotEq, CmpOp::Eq),
         (CmpOp::StrictEq, CmpOp::StrictNotEq),
         (CmpOp::StrictNotEq, CmpOp::StrictEq),
-        (CmpOp::Less, CmpOp::GreaterEq),
-        (CmpOp::GreaterEq, CmpOp::Less),
-        (CmpOp::Greater, CmpOp::LessEq),
-        (CmpOp::LessEq, CmpOp::Greater),
     ] {
         let Expr::Compare { op, .. } = negate(&cmp(from)) else {
             panic!("compare must stay a compare");
         };
         assert_eq!(op, to);
     }
-    // Irreversible comparisons wrap in `!(…)`.
-    for op in [CmpOp::In, CmpOp::InstanceOf] {
+    // Irreversible comparisons (including NaN-sensitive relational `<`/`<=`/`>`/`>=` — D4) wrap in `!(…)`.
+    for op in [
+        CmpOp::Less,
+        CmpOp::GreaterEq,
+        CmpOp::Greater,
+        CmpOp::LessEq,
+        CmpOp::In,
+        CmpOp::InstanceOf,
+    ] {
         assert_eq!(
             negate(&cmp(op)),
             Expr::Unary {

@@ -49,6 +49,8 @@ pub struct TaintCliReport {
     /// The alias rung the analysis actually ran at (rung 2 can degrade
     /// to rung 1 on the PTA step budget — loud, never silent).
     pub alias_rung_used: u8,
+    /// Whether Rung-2 pointer analysis ran in demand-driven root-sliced mode.
+    pub pta_root_sliced: bool,
 }
 
 /// The effective [`TaintConfig`], echoed for reproducibility.
@@ -68,6 +70,8 @@ pub struct ConfigReport {
     pub follow_returns_past_seeds: bool,
     /// Unknown-call identity heuristic toggle.
     pub native_identity: bool,
+    /// OpenHarmony Ability/Extension/ArkUI lifecycle harness toggle.
+    pub ohos_lifecycle: bool,
     /// Access-path k-limit.
     pub max_field_chain: usize,
     /// Requested alias rung.
@@ -308,6 +312,7 @@ fn build_report(
             seed_all_functions: config.seed_all_functions,
             follow_returns_past_seeds: config.follow_returns_past_seeds,
             native_identity: config.native_identity,
+            ohos_lifecycle: config.ohos_lifecycle,
             max_field_chain: config.max_field_chain,
             alias_rung: config.alias_rung,
             pta_step_budget: config.pta_step_budget,
@@ -334,6 +339,7 @@ fn build_report(
         gap_sites_resolved: report.gap_sites_resolved,
         gap_sites_unresolved: report.gap_sites_unresolved,
         alias_rung_used: report.alias_rung_used,
+        pta_root_sliced: report.pta_root_sliced,
     }
 }
 
@@ -415,6 +421,7 @@ pub fn render_text(report: &TaintCliReport) -> String {
     if let Some(budget) = c.pta_step_budget {
         out.push_str(&format!("pta budget:      {budget}\n"));
     }
+    out.push_str(&format!("pta root sliced: {}\n", report.pta_root_sliced));
     out.push_str(&format!("path edges:      {}\n", report.path_edges));
 
     out.push_str(&format!("\nhits: {}\n", report.hits.len()));

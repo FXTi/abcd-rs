@@ -200,10 +200,6 @@ pub fn elision_reason(op: &Op) -> Option<&'static str> {
         ThrowUndefinedIfHoleWithName { .. } => {
             "TDZ guard (compile-time name); emitted source has no TDZ-hole reads (§5 row 60)"
         }
-        ThrowNotExists => "ReferenceError guard; elided in normal-flow reconstruction (§5 row 61)",
-        ThrowPatternNonCoercible => {
-            "destructuring coercion guard; elided in destructuring reconstruction (§5 row 62)"
-        }
         ThrowConstAssignment { .. } => {
             "const-violation guard; elided — the const binding is reconstructed (§5 row 64)"
         }

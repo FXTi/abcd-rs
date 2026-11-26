@@ -193,3 +193,77 @@ fn streaming_decompile_matches_in_memory_and_preserves_target_on_error() {
         "lift failure must not truncate an existing output file"
     );
 }
+
+#[test]
+fn safe_join_enforces_portable_segment_rules_and_windows_device_names() {
+    let root = common::tempdir("decompile-safe-join");
+    for bad in [
+        "",
+        ".",
+        "..",
+        "a/../b.js",
+        "/abs/path.js",
+        "dir/",
+        "a//b.js",
+        "a\\b.js",
+        "C:/foo.js",
+        "pages/CON",
+        "pages/con.js",
+        "aux.config/index.js",
+        "pages/LPT1.ets",
+        "pages/COM9.ts",
+        "pages/CONIN$.js",
+        "pages/CONOUT$.js",
+        "pages/trailing./index.js",
+        "pages/trailing /index.js",
+        "pages/bad*name.js",
+        "pages/bad?name.js",
+        "pages/ctrl\x7fname.js",
+    ] {
+        let err = decompile::safe_join(&root, bad).expect_err("unsafe path must be rejected");
+        assert_eq!(err.exit_code(), 2, "bad={bad:?} -> {err}");
+        assert!(
+            err.to_string()
+                .contains("refusing unsafe split output path"),
+            "bad={bad:?} -> {err}"
+        );
+    }
+
+    let ok = decompile::safe_join(&root, "com.example.app/pages/Index.ets")
+        .expect("valid relative path must pass");
+    assert_eq!(
+        ok,
+        root.join("com.example.app").join("pages").join("Index.ets")
+    );
+}
+
+#[test]
+fn decompile_to_writer_handles_broken_pipe_cleanly_and_reports_other_io_errors() {
+    struct ErrWriter(std::io::ErrorKind);
+    impl std::io::Write for ErrWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "simulated stdout failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "simulated stdout failure"))
+        }
+    }
+
+    let m = module(&common::tiny_abc(), "modules.abc");
+    let opts = DecompileOptions::default();
+
+    assert_eq!(
+        decompile::decompile_to_writer(&m, opts, ErrWriter(std::io::ErrorKind::BrokenPipe))
+            .expect("BrokenPipe must return Ok"),
+        0
+    );
+
+    let err =
+        decompile::decompile_to_writer(&m, opts, ErrWriter(std::io::ErrorKind::PermissionDenied))
+            .expect_err("non-BrokenPipe writer failure must return Err");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("failed writing to stdout"),
+        "{err}"
+    );
+}

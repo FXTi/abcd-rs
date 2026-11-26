@@ -2,6 +2,7 @@
 name = "abcd-cli"
 description = "Command-line interface for the abcd-rs ArkCompiler bytecode toolkit (extract / info / dis / asm / decompile / rewrite / analyze / taint)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -36,3 +37,6 @@ workspace = true
 [dev-dependencies]
 # Synthetic-fixture construction for tests (zero binary fixtures rule).
 abcd-isa.workspace = true
+
+[lints]
+workspace = true

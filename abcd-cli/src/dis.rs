@@ -64,14 +64,17 @@ pub fn disassemble(module: &InputModule) -> Result<Vec<u8>, CliError> {
 }
 
 /// Stream disassembled pandasm text of `module` directly to `out`, returning
-/// the number of emitted bytes.
+/// the number of emitted bytes (`0` if `out` closes early with `BrokenPipe`).
 pub fn disassemble_to_writer<W: std::io::Write>(
     module: &InputModule,
     out: W,
 ) -> Result<usize, CliError> {
     let file = decode_module(module)?;
-    emit_counted(&file, &source_name(module), out)
-        .map_err(|e| CliError::Tool(format!("cannot write to stdout: {e}")))
+    match emit_counted(&file, &source_name(module), out) {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(CliError::Tool(format!("failed writing to stdout: {e}"))),
+    }
 }
 
 /// Stream disassembled pandasm text of `module` to `path`, returning the
@@ -120,8 +123,5 @@ pub fn write_all(
 
 /// Print raw bytes to stdout (the text may not be UTF-8).
 pub fn print_raw(bytes: &[u8]) -> Result<(), CliError> {
-    let mut out = std::io::stdout().lock();
-    out.write_all(bytes)
-        .and_then(|()| out.flush())
-        .map_err(|e| CliError::Tool(format!("cannot write to stdout: {e}")))
+    crate::write_stdout_bytes(bytes)
 }

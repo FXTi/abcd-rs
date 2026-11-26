@@ -3,7 +3,74 @@
 
 use super::*;
 
-type TryPrologue = (BTreeSet<BlockId>, Vec<RegionId>, Follow);
+pub(in crate::structure) type TryPrologue = (BTreeSet<BlockId>, Vec<RegionId>, Follow);
+
+pub(in crate::structure) struct DeabsorbState {
+    pub(in crate::structure) region: usize,
+    pub(in crate::structure) handlers: Vec<BlockId>,
+    pub(in crate::structure) chain: Vec<(usize, usize)>,
+    pub(in crate::structure) chain_prots: Vec<BTreeSet<BlockId>>,
+    pub(in crate::structure) prologues: Vec<TryPrologue>,
+    pub(in crate::structure) joins: Vec<Option<(BlockId, BTreeSet<BlockId>)>>,
+    pub(in crate::structure) enclosed: Vec<(BlockId, BlockId)>,
+    pub(in crate::structure) follow_chain: Vec<BlockId>,
+    pub(in crate::structure) join_union: BTreeSet<BlockId>,
+    pub(in crate::structure) pending_mark: usize,
+    pub(in crate::structure) joins_mark: usize,
+}
+
+pub(in crate::structure) struct LegacyWrapState {
+    pub(in crate::structure) region: usize,
+    pub(in crate::structure) handlers: Vec<BlockId>,
+    pub(in crate::structure) chain: Vec<(usize, usize)>,
+    pub(in crate::structure) chain_prots: Vec<BTreeSet<BlockId>>,
+    pub(in crate::structure) prologues: Vec<TryPrologue>,
+    pub(in crate::structure) pending_mark: usize,
+    pub(in crate::structure) verified_chain_len: usize,
+}
+
+pub(in crate::structure) struct CutTryPlan {
+    pub(in crate::structure) rejoin: usize,
+    pub(in crate::structure) hoisted: Vec<RegionId>,
+    pub(in crate::structure) handlers: Vec<BlockId>,
+}
+
+pub(in crate::structure) struct LoopCutState {
+    pub(in crate::structure) fallback: LoopCutFallback,
+    pub(in crate::structure) region0: usize,
+    pub(in crate::structure) handlers0: Vec<BlockId>,
+    pub(in crate::structure) p1: Option<usize>,
+    pub(in crate::structure) rejoin1: Option<BlockId>,
+    pub(in crate::structure) pre_try: Vec<RegionId>,
+    pub(in crate::structure) p0_first: RegionId,
+    pub(in crate::structure) prefix: Vec<RegionId>,
+    pub(in crate::structure) midtail: Vec<RegionId>,
+    pub(in crate::structure) test: BlockId,
+    pub(in crate::structure) kept_main: Vec<Stmt>,
+    pub(in crate::structure) while_cond: Expr,
+}
+
+fn schedule_dedup_handlers(
+    handlers: &[BlockId],
+    uniq: bool,
+    extra_continue: bool,
+    tasks: &mut Vec<StructTask>,
+) {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for &h in handlers {
+        if seen.insert(h) {
+            deduped.push(h);
+        }
+    }
+    for h in deduped.into_iter().rev() {
+        tasks.push(StructTask::EmitHandler {
+            h,
+            uniq,
+            extra_continue,
+        });
+    }
+}
 
 impl<'m> Ctx<'m> {
     // ── Handler shims ────────────────────────────────────────────────
@@ -170,15 +237,6 @@ impl<'m> Ctx<'m> {
                 }
             }
             chosen.sort_unstable();
-            if std::env::var_os("ABCD_SHIM_DEBUG").is_some() {
-                eprintln!(
-                    "SHIM B{} (fn {}): set={:?} chosen={:?}",
-                    h.index(),
-                    self.rf.func.index(),
-                    blocks.iter().map(|b| b.index()).collect::<Vec<_>>(),
-                    chosen
-                );
-            }
             let try_regions: Vec<_> = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
             let tree = structure_subgraph(
                 self.module,
@@ -205,7 +263,7 @@ impl<'m> Ctx<'m> {
             self.shim_sets.insert(h, set.clone());
             self.stats.handler_shims += 1;
         }
-        self.build_deabsorb(&approx_sets);
+        self.build_deabsorb(&handlers, &approx_sets);
     }
 
     /// N77: the continuation de-absorption analysis. The legacy handler
@@ -230,6 +288,7 @@ impl<'m> Ctx<'m> {
     /// (see [`Ctx::wrap_try_run`]).
     pub(in crate::structure) fn build_deabsorb(
         &mut self,
+        handlers: &[BlockId],
         approx_sets: &HashMap<BlockId, BTreeSet<BlockId>>,
     ) {
         let Some(f) = self.module.func(self.rf.func) else {
@@ -237,9 +296,11 @@ impl<'m> Ctx<'m> {
         };
         // J: blocks reachable from >= 2 handler entries.
         let mut reach_count: HashMap<BlockId, usize> = HashMap::new();
-        for set in approx_sets.values() {
-            for &b in set {
-                *reach_count.entry(b).or_default() += 1;
+        for &h in handlers {
+            if let Some(set) = approx_sets.get(&h) {
+                for &b in set {
+                    *reach_count.entry(b).or_default() += 1;
+                }
             }
         }
         let shared: BTreeSet<BlockId> = reach_count
@@ -251,7 +312,11 @@ impl<'m> Ctx<'m> {
             return;
         }
         self.shared_join = shared;
-        self.all_handlers = approx_sets.keys().copied().collect();
+        self.all_handlers = handlers
+            .iter()
+            .copied()
+            .filter(|h| approx_sets.contains_key(h))
+            .collect();
         self.handler_approx = approx_sets.clone();
         for (i, tr) in f.try_regions.iter().enumerate() {
             for c in &tr.catches {
@@ -266,15 +331,19 @@ impl<'m> Ctx<'m> {
         // set contains its handler. Unique sets are pairwise disjoint:
         // a block in two of them would be shared.
         let mut uniq: HashMap<BlockId, BTreeSet<BlockId>> = HashMap::new();
-        for (&h, set) in approx_sets {
-            uniq.insert(h, set.difference(&self.shared_join).copied().collect());
+        for &h in &self.all_handlers {
+            if let Some(set) = approx_sets.get(&h) {
+                uniq.insert(h, set.difference(&self.shared_join).copied().collect());
+            }
         }
         // Zero-copy unique-prefix subgraphs (#29): unique sets are pairwise
         // disjoint, so each unique block maps to at most one handler set.
         let mut uniq_owner: HashMap<BlockId, BlockId> = HashMap::new();
-        for (&h, set) in &uniq {
-            for &b in set {
-                uniq_owner.insert(b, h);
+        for &h in &self.all_handlers {
+            if let Some(set) = uniq.get(&h) {
+                for &b in set {
+                    uniq_owner.insert(b, h);
+                }
             }
         }
         let uniq_succs = |b: BlockId| -> Vec<BlockId> {
@@ -289,7 +358,10 @@ impl<'m> Ctx<'m> {
         };
         // Unique-handler subgraph trees (the same ride-along rule as the
         // legacy shims, with zero `Module` clones).
-        for (&h, set) in &uniq {
+        for &h in &self.all_handlers {
+            let Some(set) = uniq.get(&h) else {
+                continue;
+            };
             if !set.contains(&h) {
                 continue;
             }
@@ -347,88 +419,28 @@ impl<'m> Ctx<'m> {
         self.has_deabsorb = true;
     }
 
-    /// Wrap a node in `try { … } catch …` for plan `p`.
-    pub(in crate::structure) fn wrap_try(
+    /// Schedule wrapping `ids` in `p` while prepending optional outer-plan
+    /// prologue slices at matching `chain[k]` wrapper levels.
+    fn start_wrap_try_run(
         &mut self,
-        id: RegionId,
+        ids: Vec<RegionId>,
         p: usize,
+        prologues: Vec<TryPrologue>,
         follow: Follow,
-        out: &mut Vec<SNode>,
+        ts: &mut TaskState,
     ) {
-        self.wrap_try_run(&[id], p, follow, out);
-    }
-
-    /// Wrap a run of region nodes in ONE `try { … } catch …` (the
-    /// coalesced form — see `emit_seq_children`).
-    pub(in crate::structure) fn wrap_try_run(
-        &mut self,
-        ids: &[RegionId],
-        p: usize,
-        follow: Follow,
-        out: &mut Vec<SNode>,
-    ) {
-        self.wrap_try_run_prologues(ids, p, &[], follow, out);
-    }
-
-    /// Wrap `ids` in `p` while prepending optional outer-plan prologue
-    /// slices `(q_prot, pre_ids, next_fl)` at the matching `chain[k]`
-    /// wrapper levels (R2-C2: an outer finally's completion-slot init
-    /// before the inner `try_begin` sits in `q` directly preceding `p`).
-    pub(in crate::structure) fn wrap_try_run_prologues(
-        &mut self,
-        ids: &[RegionId],
-        p: usize,
-        prologues: &[TryPrologue],
-        follow: Follow,
-        out: &mut Vec<SNode>,
-    ) {
-        // N77: the de-absorbed tower path (handler unique prefixes +
-        // joins emitted once per level). Falls through to the legacy
-        // absorbed emission whenever a guard fails.
-        if self.emit_deabsorb_tower(ids, p, prologues, follow, out) {
+        if self.try_start_deabsorb_tower(&ids, p, &prologues, follow, ts) {
             return;
         }
         let (region, cuts, handlers) = {
             let plan = &self.f().plans[p];
             (plan.region, plan.cuts, plan.handlers.clone())
         };
-        // Handlers protected by an OUTER plan (nested try regions whose
-        // protected range includes the inner handler — the es2abc
-        // finally idiom: the inner catch body can itself throw, and the
-        // outer handler runs the finally + rethrow): the whole
-        // try/catch must be wrapped in the outer plan's try, or
-        // exceptions from the inner handler escape unhandled and the
-        // outer handler's body (and its phi temporaries) is silently
-        // dropped (dream gate: local/exception-finally). Laminar plans
-        // form a chain; walk it outward.
-        //
-        // Two phases: SELECT the whole outward chain first (pure
-        // analysis — the pending state is unchanged by the body
-        // emission), then EMIT the handler bodies with the entire chain
-        // on `self.pending_wraps`/`self.suppress_wraps`. Every
-        // construct emitted while the chain is pending lands
-        // physically inside these wrappers, so nested emissions must
-        // NOT re-wrap the same plans — otherwise each handler body
-        // re-wraps the chain around its own inner trys and the output
-        // grows exponentially (N76 try/S12.14_A7_T2). N77 extends the
-        // coverage to `p`'s OWN handlers (their clauses sit inside
-        // every chain try body — without it, an absorbed handler body
-        // re-wraps a chain plan around its chain-protected blocks and
-        // re-emits the chain's handlers, the second-cascade wart).
         let chain = self.select_wrap_chain(p, &handlers);
         let chain_prots: Vec<BTreeSet<BlockId>> = chain
             .iter()
             .map(|&(fq, q)| self.frames[fq].plans[q].protected.clone())
             .collect();
-        // When the physical continuation after this try/catch is a
-        // known block, handler cut edges to it are sound plain
-        // fall-outs (the catch clause ends exactly where the
-        // continuation begins) — record it for the run-fold /
-        // shim-tail-duplication decisions inside the handler bodies.
-        // Pure trampolines are transparent to a fall-out: an empty
-        // block that only branches runs nothing, so the whole chain is
-        // the continuation (test262 if/S12.5_A3: the handler's cut edge
-        // targets B75 past the empty B72 jump block).
         let mut verified_chain: Vec<BlockId> = Vec::new();
         if let Follow::Entry(fb) = follow {
             let mut cur = fb;
@@ -445,7 +457,7 @@ impl<'m> Ctx<'m> {
                     _ => break,
                 }
                 if verified_chain.len() > 16 {
-                    break; // defensive bound
+                    break;
                 }
             }
             for &b in &verified_chain {
@@ -476,43 +488,35 @@ impl<'m> Ctx<'m> {
                 "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
             )));
         }
-        for &id in ids {
-            self.emit_content(id, Some(p), follow, &mut body);
+        let st = Box::new(LegacyWrapState {
+            region,
+            handlers,
+            chain,
+            chain_prots,
+            prologues,
+            pending_mark: 0,
+            verified_chain_len: verified_chain.len(),
+        });
+        ts.sinks.push(body);
+        ts.tasks.push(StructTask::LegacyWrapAfterBody(st));
+        for &id in ids.iter().rev() {
+            ts.tasks.push(StructTask::EmitContent {
+                id,
+                active: Some(p),
+                follow,
+            });
         }
-        // `p`'s handlers: emitted with the whole chain pending (their
-        // clauses land inside every chain try body — chain-protected
-        // blocks in the handler body need no re-wrap; N77).
-        let pending_mark = self.pending_wraps.len();
-        let suppress_mark = self.suppress_wraps.len();
-        for cp in &chain_prots {
-            self.pending_wraps.push(cp.clone());
-            self.suppress_wraps.push(cp.clone());
-        }
-        let mut catches = Vec::new();
-        let mut seen = HashSet::new();
-        for h in &handlers {
-            if seen.insert(*h) {
-                catches.push(self.emit_handler(*h));
-            }
-        }
-        self.suppress_wraps.truncate(suppress_mark);
-        let note = if catches.len() > 1 {
-            self.stats.multi_catch += 1;
-            Some(format!(
-                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                catches.len()
-            ))
-        } else {
-            None
-        };
-        let mut node = SNode::Try {
-            body,
-            catches,
-            note,
-            finally: None,
-        };
-        for (k, (fq, q)) in chain.iter().enumerate() {
-            let (fq, q) = (*fq, *q);
+    }
+
+    fn advance_legacy_wrap_chain(
+        &mut self,
+        st: Box<LegacyWrapState>,
+        k: usize,
+        node: SNode,
+        ts: &mut TaskState,
+    ) {
+        if k < st.chain.len() {
+            let (fq, q) = st.chain[k];
             let (qregion, qhandlers) = {
                 let plan = &self.frames[fq].plans[q];
                 (plan.region, plan.handlers.clone())
@@ -527,52 +531,29 @@ impl<'m> Ctx<'m> {
                 self.stats.try_splits += 1;
             }
             self.stats.try_catches += 1;
-            let mut qcatches = Vec::new();
-            let mut seen = HashSet::new();
-            // Chain step k's handlers: their clauses land inside the
-            // try bodies of the steps ABOVE k only — suppress those
-            // (and only those) primary re-wraps (N77).
             let qsuppress_mark = self.suppress_wraps.len();
-            for cp in &chain_prots[k + 1..] {
+            for cp in &st.chain_prots[k + 1..] {
                 self.suppress_wraps.push(cp.clone());
             }
-            for h in &qhandlers {
-                if seen.insert(*h) {
-                    qcatches.push(self.emit_handler(*h));
-                }
+            ts.catch_lists.push(Vec::new());
+            ts.tasks.push(StructTask::LegacyWrapAfterQCatches {
+                st,
+                k,
+                node,
+                qregion,
+                wraps,
+                qsuppress_mark,
+            });
+            schedule_dedup_handlers(&qhandlers, false, false, &mut ts.tasks);
+        } else {
+            self.pending_wraps.truncate(st.pending_mark);
+            for _ in 0..st.verified_chain_len {
+                self.verified_fallout.pop();
             }
-            self.suppress_wraps.truncate(qsuppress_mark);
-            let mut qbody = Vec::new();
-            if let Some((_, pre_ids, next_fl)) =
-                prologues.iter().find(|(qp, _, _)| *qp == chain_prots[k])
-            {
-                let active_q = self
-                    .f()
-                    .plans
-                    .iter()
-                    .position(|pl| pl.protected == chain_prots[k]);
-                let psuppress = self.suppress_wraps.len();
-                for cp in &chain_prots[k + 1..] {
-                    self.suppress_wraps.push(cp.clone());
-                }
-                self.emit_seq_children(pre_ids, active_q, *next_fl, &mut qbody);
-                self.suppress_wraps.truncate(psuppress);
+            if let Some(sink) = ts.sinks.last_mut() {
+                sink.push(node);
             }
-            qbody.push(node);
-            node = SNode::Try {
-                body: qbody,
-                catches: qcatches,
-                note: Some(format!(
-                    "try region {qregion}: handler-protecting outer try (finally idiom) — wrapped around region {region}'s try/catch (wrapper #{wraps})"
-                )),
-                finally: None,
-            };
         }
-        self.pending_wraps.truncate(pending_mark);
-        for _ in &verified_chain {
-            self.verified_fallout.pop();
-        }
-        out.push(node);
     }
 
     /// The next outer plan whose try must wrap a construct whose
@@ -606,7 +587,6 @@ impl<'m> Ctx<'m> {
         visited: &HashSet<BTreeSet<BlockId>>,
         protected_handlers: &[BlockId],
     ) -> Option<(usize, usize)> {
-        let debug = std::env::var_os("ABCD_WRAP_DEBUG").is_some();
         let cur = self.frames.len() - 1;
         // Current frame first, then the root frame (skip when equal).
         let frame_ids = if cur == 0 { &[0][..] } else { &[cur, 0][..] };
@@ -655,14 +635,6 @@ impl<'m> Ctx<'m> {
                 })
             {
                 outer = Some((fi, q));
-            }
-            if debug {
-                eprintln!(
-                    "WRAP fn={} handler=B{} cand={:?}",
-                    self.frames[cur].tree.func.index(),
-                    h.index(),
-                    cand.map(|(fi, q)| (fi, self.frames[fi].plans[q].region)),
-                );
             }
         }
         outer
@@ -911,57 +883,18 @@ impl<'m> Ctx<'m> {
         Some((tree, plans))
     }
 
-    /// Emit one verified tower-join level through its join shim tree.
-    pub(in crate::structure) fn emit_join_level(
-        &mut self,
-        head: BlockId,
-        set: &BTreeSet<BlockId>,
-        out: &mut Vec<SNode>,
-    ) {
-        if std::env::var_os("ABCD_DEAB_DEBUG").is_some() {
-            eprintln!(
-                "DEAB-JOIN fn={} head=B{} set={:?}",
-                self.rf.func.index(),
-                head.index(),
-                set.iter().map(|b| b.index()).collect::<Vec<_>>()
-            );
-        }
-        let Some((tree, plans)) = self.join_tree(head, set) else {
-            out.push(SNode::Honest(
-                "N77: tower-join tree vanished between analysis and emission (defensive)".into(),
-            ));
-            return;
-        };
-        let mut frame = Frame::new(tree, plans);
-        frame.join_shim = true;
-        self.frames.push(frame);
-        if let Some(root) = self.f().tree.root {
-            self.emit_node(root, None, Follow::Tail, out);
-        }
-        self.frames.pop();
-    }
-
-    /// The de-absorbed tower fast path. Returns false (the caller takes
-    /// the legacy absorbed path) unless every guard holds.
-    pub(in crate::structure) fn emit_deabsorb_tower(
+    /// De-absorbed tower analysis + iterative task scheduling.
+    fn try_start_deabsorb_tower(
         &mut self,
         ids: &[RegionId],
         p: usize,
         prologues: &[TryPrologue],
         follow: Follow,
-        out: &mut Vec<SNode>,
+        ts: &mut TaskState,
     ) -> bool {
-        let debug = std::env::var_os("ABCD_DEAB_DEBUG").is_some();
         macro_rules! bail {
             ($($arg:tt)*) => {{
-                if debug {
-                    eprintln!(
-                        "DEAB-BAIL fn={} region={}: {}",
-                        self.rf.func.index(),
-                        self.f().plans[p].region,
-                        format!($($arg)*)
-                    );
-                }
+                let _ = format_args!($($arg)*);
                 self.stats.deabsorb_bails += 1;
                 return false;
             }};
@@ -973,16 +906,6 @@ impl<'m> Ctx<'m> {
         let chain = self.select_wrap_chain(p, &handlers);
         if chain.is_empty() {
             return false; // v1: towers (handler-protecting chains) only
-        }
-        if debug {
-            eprintln!(
-                "DEAB-TRY fn={} region={} chain={} shim={:?} join={}",
-                self.rf.func.index(),
-                self.f().plans[p].region,
-                chain.len(),
-                self.f().shim_of.map(|h| h.index()),
-                self.f().join_shim
-            );
         }
         let m = chain.len();
         let chain_prots: Vec<BTreeSet<BlockId>> = chain
@@ -1241,12 +1164,6 @@ impl<'m> Ctx<'m> {
                         .any(|e| e.kind == abcd_ir::EdgeKind::Normal && !set.contains(&e.from))
                 });
                 if has_external_pred && !top.contains(&b) {
-                    if debug {
-                        eprintln!("JOIN-TREE head=B{} set={:?}:", head.index(), set);
-                        for (j, node) in tree.nodes().iter().enumerate() {
-                            eprintln!("  R{j}: {node:?}");
-                        }
-                    }
                     bail!(
                         "rejoin target B{} buried below the join tree's top level",
                         b.index()
@@ -1306,7 +1223,7 @@ impl<'m> Ctx<'m> {
             }
         }
 
-        // ── Emission ────────────────────────────────────────────────
+        // ── Emission (iterative via TaskState) ──────────────────────
         let (region, cuts_flag) = {
             let plan = &self.f().plans[p];
             (plan.region, plan.cuts)
@@ -1321,359 +1238,281 @@ impl<'m> Ctx<'m> {
         self.stats.try_catches += 1;
         self.stats.tower_deabsorbs += 1;
         self.stats.deabsorb_join_blocks += join_blocks_total;
-        if debug {
-            eprintln!(
-                "DEAB-OK fn={} region={} chain={} joins={}",
-                self.rf.func.index(),
-                region,
-                m,
-                join_blocks_total
-            );
-        }
         let mut body = Vec::new();
         if cuts_flag {
             body.push(SNode::Honest(format!(
                 "try region {region}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
             )));
         }
-        for &id in ids {
-            self.emit_content(id, Some(p), follow, &mut body);
-        }
-        let pending_mark = self.pending_wraps.len();
-        let joins_mark = self.pending_joins.len();
-        for cp in &chain_prots {
-            self.pending_wraps.push(cp.clone());
-        }
-        for j in joins.iter().flatten() {
-            self.pending_joins.push(j.1.clone());
-        }
-        for &b in &follow_chain {
-            self.verified_fallout.push(b);
-        }
-        // The fall-out head for a clause level: the first non-empty
-        // join level at or above it. Pure trampolines past the head
-        // are transparent to a fall-out (the legacy verified-chain
-        // rule), so the whole chain is verified — a handler guard
-        // whose cut targets the chain end (A7_T2's B116 → B118 past
-        // the B115 trampoline) keeps its conditional.
-        let chain_at = |ctx: &Self, c: usize| -> Vec<BlockId> {
-            let Some(lvl_x) = (c..=m).find(|&lvl_x| non_empty(lvl_x)) else {
-                return Vec::new();
-            };
-            let Some((head, set)) = &joins[lvl_x] else {
-                return Vec::new();
-            };
-            let mut out = vec![*head];
-            let mut cur = *head;
-            loop {
-                let parts = ctx.block_parts(cur);
-                if !parts.main.is_empty() || !parts.phi.is_empty() {
-                    break;
-                }
-                match parts.term {
-                    Term::Branch(d) if set.contains(&d) && !out.contains(&d) => {
-                        out.push(d);
-                        cur = d;
-                    }
-                    _ => break,
-                }
-                if out.len() > 16 {
-                    break;
-                }
-            }
-            out
-        };
-        // p's handlers (clause level 0): suppressed wraps are the whole
-        // chain (their clauses sit inside every chain try body).
-        let mut catches = Vec::new();
-        {
-            let suppress_mark = self.suppress_wraps.len();
-            for cp in &chain_prots {
-                self.suppress_wraps.push(cp.clone());
-            }
-            let vf = chain_at(self, 0);
-            for &b in &vf {
-                self.verified_fallout.push(b);
-            }
-            let encl: Vec<BlockId> = enclosed
-                .iter()
-                .filter(|(x, _)| handlers.contains(x))
-                .map(|&(_, s)| s)
-                .collect();
-            for &s in &encl {
-                self.verified_fallout.push(s);
-            }
-            let mut seen = HashSet::new();
-            for h in &handlers {
-                if seen.insert(*h) {
-                    catches.push(self.emit_handler_unique(*h));
-                }
-            }
-            for _ in &encl {
-                self.verified_fallout.pop();
-            }
-            for _ in &vf {
-                self.verified_fallout.pop();
-            }
-            self.suppress_wraps.truncate(suppress_mark);
-        }
-        let note = if catches.len() > 1 {
-            self.stats.multi_catch += 1;
-            Some(format!(
-                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                catches.len()
-            ))
-        } else {
-            None
-        };
-        let mut node = SNode::Try {
-            body,
-            catches,
-            note,
-            finally: None,
-        };
-        for (k, &(fq, q)) in chain.iter().enumerate() {
-            let (qregion, qhandlers) = {
-                let plan = &self.frames[fq].plans[q];
-                (plan.region, plan.handlers.clone())
-            };
-            {
-                let f = &mut self.frames[fq];
-                *f.wrap_counts.entry(q).or_insert(0) += 1;
-            }
-            self.stats.try_catches += 1;
-            // The join for this level lands inside chain[k]'s try body,
-            // right after the inner construct (both the inner node's
-            // fall-outs and its normal completion reach it). Any R2-C2
-            // outer-plan prologue for `q` precedes `node`.
-            let mut inner = Vec::new();
-            if let Some((_, pre_ids, next_fl)) =
-                prologues.iter().find(|(qp, _, _)| *qp == chain_prots[k])
-            {
-                let active_q = self
-                    .f()
-                    .plans
-                    .iter()
-                    .position(|pl| pl.protected == chain_prots[k]);
-                let psuppress = self.suppress_wraps.len();
-                for cp in &chain_prots[k + 1..] {
-                    self.suppress_wraps.push(cp.clone());
-                }
-                self.emit_seq_children(pre_ids, active_q, *next_fl, &mut inner);
-                self.suppress_wraps.truncate(psuppress);
-            }
-            inner.push(node);
-            if let Some((jhead, jset)) = &joins[k] {
-                self.emit_join_level(*jhead, jset, &mut inner);
-            }
-            let mut qcatches = Vec::new();
-            {
-                let suppress_mark = self.suppress_wraps.len();
-                for cp in &chain_prots[k + 1..] {
-                    self.suppress_wraps.push(cp.clone());
-                }
-                let vf = chain_at(self, k + 1);
-                for &b in &vf {
-                    self.verified_fallout.push(b);
-                }
-                let encl: Vec<BlockId> = enclosed
-                    .iter()
-                    .filter(|(x, _)| qhandlers.contains(x))
-                    .map(|&(_, s)| s)
-                    .collect();
-                for &s in &encl {
-                    self.verified_fallout.push(s);
-                }
-                let mut seen = HashSet::new();
-                for h in &qhandlers {
-                    if seen.insert(*h) {
-                        qcatches.push(self.emit_handler_unique(*h));
-                    }
-                }
-                for _ in &encl {
-                    self.verified_fallout.pop();
-                }
-                for _ in &vf {
-                    self.verified_fallout.pop();
-                }
-                self.suppress_wraps.truncate(suppress_mark);
-            }
-            let qnote = if qcatches.len() > 1 {
-                self.stats.multi_catch += 1;
-                Some(format!(
-                    "try region {qregion}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                    qcatches.len()
-                ))
-            } else {
-                None
-            };
-            node = SNode::Try {
-                body: inner,
-                catches: qcatches,
-                note: qnote,
-                finally: None,
-            };
-        }
-        self.pending_wraps.truncate(pending_mark);
-        out.push(node);
-        // The unprotected continuation: emitted once, after the
-        // outermost try/catch.
-        if let Some((ahead, aset)) = &joins[m] {
-            self.emit_join_level(*ahead, aset, out);
-        }
-        self.pending_joins.truncate(joins_mark);
-        for _ in &follow_chain {
-            self.verified_fallout.pop();
-        }
-        // Record the emitted joins: a re-wrapped plan's tower must not
-        // emit them twice (its analysis bails to the legacy path).
-        for s in join_union {
-            self.emitted_joins.insert(s);
+        let st = Box::new(DeabsorbState {
+            region,
+            handlers,
+            chain,
+            chain_prots,
+            prologues: prologues.to_vec(),
+            joins,
+            enclosed,
+            follow_chain,
+            join_union,
+            pending_mark: 0,
+            joins_mark: 0,
+        });
+        ts.sinks.push(body);
+        ts.tasks.push(StructTask::DeabsorbAfterBody(st));
+        for &id in ids.iter().rev() {
+            ts.tasks.push(StructTask::EmitContent {
+                id,
+                active: Some(p),
+                follow,
+            });
         }
         true
     }
 
-    //
-    // A Mixed-coverage `If` whose head is protected is wrapped whole by
-    // the generic path (the condition evaluation must stay protected).
-    // But when one arm is terminal (throw/return), the acyclic region
-    // tree absorbs the try's CONTINUATION — the join the handlers also
-    // rejoin — into the other arm's sequence, and wrapping whole makes
-    // the join unreachable from the catch path (dream gate:
-    // branch-elimination/test-under-try-catch printed "true" for want
-    // "true\ngood1"; opt-try-catch-func/test-passes-under-try-catch
-    // lost the post-try print the same way). The VM's PC-range
-    // dispatch rejoins the handler at the continuation, so the correct
-    // projection is `try { <protected skeleton> } catch { … }` with
-    // the unprotected tail emitted AFTER the try/catch.
-
-    /// The innermost plan of the first protected block in emission
-    /// order (the candidate plan a mixed `Seq`'s join hoist wraps).
-    /// `None` when the node carries no protected content.
-    pub(in crate::structure) fn leading_plan(&mut self, id: RegionId) -> Option<usize> {
-        match self.f().node(id).clone() {
-            RegionNode::Block(b) => self.f_mut().plan_of(b),
-            RegionNode::Seq(children) | RegionNode::Alternates(children) => {
-                children.iter().find_map(|&c| self.leading_plan(c))
+    fn deabsorb_chain_at(
+        &self,
+        joins: &[Option<(BlockId, BTreeSet<BlockId>)>],
+        c: usize,
+    ) -> Vec<BlockId> {
+        let m = joins.len().saturating_sub(1);
+        let Some(lvl_x) = (c..=m).find(|&lvl_x| joins[lvl_x].is_some()) else {
+            return Vec::new();
+        };
+        let Some((head, set)) = &joins[lvl_x] else {
+            return Vec::new();
+        };
+        let mut out = vec![*head];
+        let mut cur = *head;
+        loop {
+            let parts = self.block_parts(cur);
+            if !parts.main.is_empty() || !parts.phi.is_empty() {
+                break;
             }
-            RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
-                self.leading_plan(body)
+            match parts.term {
+                Term::Branch(d) if set.contains(&d) && !out.contains(&d) => {
+                    out.push(d);
+                    cur = d;
+                }
+                _ => break,
             }
-            RegionNode::If { head, .. } => self.f_mut().plan_of(head),
-            RegionNode::Irreducible { blocks, .. } => {
-                blocks.iter().find_map(|&b| self.f_mut().plan_of(b))
+            if out.len() > 16 {
+                break;
             }
         }
+        out
+    }
+
+    /// The innermost plan of the first protected block in emission
+    /// order (iterative pre-order stack).
+    pub(in crate::structure) fn leading_plan(&mut self, id: RegionId) -> Option<usize> {
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            match self.f().node(cur).clone() {
+                RegionNode::Block(b) => {
+                    if let Some(p) = self.f_mut().plan_of(b) {
+                        return Some(p);
+                    }
+                }
+                RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                    for &c in children.iter().rev() {
+                        stack.push(c);
+                    }
+                }
+                RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                    stack.push(body);
+                }
+                RegionNode::If { head, .. } => {
+                    if let Some(p) = self.f_mut().plan_of(head) {
+                        return Some(p);
+                    }
+                }
+                RegionNode::Irreducible { blocks, .. } => {
+                    if let Some(p) = blocks.iter().find_map(|&b| self.f_mut().plan_of(b)) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Phase 1: classify a Mixed node into protected skeleton +
-    /// deferred tail for plan `p` (no emission, no mutation).
+    /// deferred tail for plan `p` (iterative spine walk, zero recursion).
     pub(in crate::structure) fn cut_classify(
         &mut self,
-        id: RegionId,
+        root_id: RegionId,
         p: usize,
     ) -> Option<CutSplit> {
-        match self.f_mut().cov(id) {
-            Cov::Uniform(Some(q)) if q == p => Some(CutSplit::Prot),
-            Cov::Uniform(None) => Some(CutSplit::Defer),
-            Cov::Uniform(Some(_)) => None, // a different plan — not splittable
-            Cov::Mixed => {
-                let node = self.f().node(id).clone();
-                match node {
-                    RegionNode::Seq(children) => {
-                        // Protected prefix, then at most one recursively
-                        // splitting child, then a fully-unprotected tail.
-                        let mut i = 0;
-                        let mut inner = None;
-                        while i < children.len() {
-                            match self.f_mut().cov(children[i]) {
-                                Cov::Uniform(Some(q)) if q == p => i += 1,
-                                Cov::Mixed => {
-                                    let s = self.cut_classify(children[i], p)?;
-                                    if matches!(s, CutSplit::Prot) {
-                                        return None;
+        enum CutSpine {
+            Seq { split_at: usize },
+            IfThen { otherwise: Option<ArmCut> },
+            IfElse { then: Option<ArmCut> },
+        }
+        enum ArmKind {
+            NonMixed(Option<ArmCut>),
+            Mixed(RegionId),
+        }
+        let mut spine: Vec<CutSpine> = Vec::new();
+        let mut cur = root_id;
+        let mut acc = loop {
+            match self.f_mut().cov(cur) {
+                Cov::Uniform(Some(q)) if q == p => break CutSplit::Prot,
+                Cov::Uniform(None) => break CutSplit::Defer,
+                Cov::Uniform(Some(_)) => return None,
+                Cov::Mixed => {
+                    let node = self.f().node(cur).clone();
+                    match node {
+                        RegionNode::Seq(children) => {
+                            let mut i = 0;
+                            let mut mixed_child = None;
+                            while i < children.len() {
+                                match self.f_mut().cov(children[i]) {
+                                    Cov::Uniform(Some(q)) if q == p => i += 1,
+                                    Cov::Mixed => {
+                                        mixed_child = Some(children[i]);
+                                        i += 1;
+                                        break;
                                     }
-                                    inner = Some(Box::new(s));
-                                    i += 1;
-                                    break;
+                                    _ => break,
                                 }
-                                _ => break,
                             }
-                        }
-                        for &c in &children[i..] {
-                            if self.f_mut().cov(c) != Cov::Uniform(None) {
+                            for &c in &children[i..] {
+                                if self.f_mut().cov(c) != Cov::Uniform(None) {
+                                    return None;
+                                }
+                            }
+                            if let Some(mc) = mixed_child {
+                                spine.push(CutSpine::Seq { split_at: i - 1 });
+                                cur = mc;
+                                continue;
+                            }
+                            if i >= children.len() {
                                 return None;
                             }
+                            if i == 0 {
+                                break CutSplit::Defer;
+                            }
+                            break CutSplit::Seq {
+                                split_at: i,
+                                inner: None,
+                            };
                         }
-                        if inner.is_none() && i >= children.len() {
-                            return None; // no tail at all (not Mixed — defensive)
+                        RegionNode::If {
+                            head,
+                            then,
+                            otherwise,
+                            ..
+                        } => {
+                            if self.f_mut().plan_of(head) != Some(p) {
+                                return None;
+                            }
+                            let classify_non_mixed =
+                                |ctx: &mut Self, arm: Option<RegionId>| -> Option<ArmKind> {
+                                    let Some(a) = arm else {
+                                        return Some(ArmKind::NonMixed(None));
+                                    };
+                                    match ctx.f_mut().cov(a) {
+                                        Cov::Uniform(Some(q)) if q == p => {
+                                            if ctx.arm_exits_terminal(a) {
+                                                Some(ArmKind::NonMixed(Some(ArmCut::Terminal)))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        Cov::Mixed => Some(ArmKind::Mixed(a)),
+                                        _ => None,
+                                    }
+                                };
+                            let tk = classify_non_mixed(self, then)?;
+                            let ok = classify_non_mixed(self, otherwise)?;
+                            match (tk, ok) {
+                                (ArmKind::Mixed(ta), ArmKind::NonMixed(oc)) => {
+                                    spine.push(CutSpine::IfThen { otherwise: oc });
+                                    cur = ta;
+                                }
+                                (ArmKind::NonMixed(tc), ArmKind::Mixed(oa)) => {
+                                    spine.push(CutSpine::IfElse { then: tc });
+                                    cur = oa;
+                                }
+                                _ => return None,
+                            }
                         }
-                        if inner.is_none() && i == 0 {
-                            return Some(CutSplit::Defer); // whole sequence defers
-                        }
-                        let split_at = if inner.is_some() { i - 1 } else { i };
-                        Some(CutSplit::Seq { split_at, inner })
+                        _ => return None,
                     }
-                    RegionNode::If {
-                        head,
-                        then,
-                        otherwise,
-                        ..
-                    } => {
-                        // The condition evaluation must stay protected.
-                        if self.f_mut().plan_of(head) != Some(p) {
-                            return None;
-                        }
-                        let mut has_split = false;
-                        let then = self.cut_classify_arm(then, p, &mut has_split)?;
-                        let otherwise = self.cut_classify_arm(otherwise, p, &mut has_split)?;
-                        if !has_split {
-                            return None;
-                        }
-                        Some(CutSplit::If { then, otherwise })
-                    }
-                    // Loops, labels, alternates, irreducible cores:
-                    // beyond the v1 hoist — the generic wrap applies.
-                    _ => None,
                 }
             }
+        };
+        for step in spine.into_iter().rev() {
+            if matches!(acc, CutSplit::Prot) {
+                return None;
+            }
+            acc = match step {
+                CutSpine::Seq { split_at } => CutSplit::Seq {
+                    split_at,
+                    inner: Some(Box::new(acc)),
+                },
+                CutSpine::IfThen { otherwise } => CutSplit::If {
+                    then: Some(ArmCut::Splits(Box::new(acc))),
+                    otherwise,
+                },
+                CutSpine::IfElse { then } => CutSplit::If {
+                    then,
+                    otherwise: Some(ArmCut::Splits(Box::new(acc))),
+                },
+            };
         }
+        Some(acc)
     }
 
-    /// Classify one `If` arm for the join hoist: fully-protected arms
-    /// must be terminal-only (falling out would incorrectly route
-    /// through the hoisted tail); at most one arm may split.
-    pub(in crate::structure) fn cut_classify_arm(
+    /// Collect the deferred tail's region nodes in emission order (iterative).
+    pub(in crate::structure) fn collect_defers(
         &mut self,
-        arm: Option<RegionId>,
-        p: usize,
-        has_split: &mut bool,
-    ) -> Option<Option<ArmCut>> {
-        let Some(a) = arm else {
-            return Some(None);
-        };
-        match self.f_mut().cov(a) {
-            Cov::Uniform(Some(q)) if q == p => {
-                if self.arm_exits_terminal(a) {
-                    Some(Some(ArmCut::Terminal))
-                } else {
-                    None
-                }
+        root_id: RegionId,
+        root_split: &CutSplit,
+        out: &mut Vec<RegionId>,
+    ) {
+        enum DeferStep<'a> {
+            Visit(RegionId, &'a CutSplit),
+            PushSlice(Vec<RegionId>),
+        }
+        let mut stack = vec![DeferStep::Visit(root_id, root_split)];
+        while let Some(step) = stack.pop() {
+            match step {
+                DeferStep::PushSlice(tail) => out.extend(tail),
+                DeferStep::Visit(id, split) => match split {
+                    CutSplit::Prot => {}
+                    CutSplit::Defer => out.push(id),
+                    CutSplit::Seq { split_at, inner } => {
+                        let children = match self.f().node(id) {
+                            RegionNode::Seq(c) => c.clone(),
+                            _ => unreachable!("cut split shape mirrors the region node"),
+                        };
+                        if let Some(inner) = inner {
+                            if *split_at + 1 < children.len() {
+                                stack
+                                    .push(DeferStep::PushSlice(children[*split_at + 1..].to_vec()));
+                            }
+                            stack.push(DeferStep::Visit(children[*split_at], inner));
+                        } else {
+                            out.extend_from_slice(&children[*split_at..]);
+                        }
+                    }
+                    CutSplit::If { then, otherwise } => {
+                        let (t, o) = match self.f().node(id) {
+                            RegionNode::If {
+                                then, otherwise, ..
+                            } => (*then, *otherwise),
+                            _ => unreachable!("cut split shape mirrors the region node"),
+                        };
+                        if let (Some(a), Some(ArmCut::Splits(s))) = (o, otherwise) {
+                            stack.push(DeferStep::Visit(a, s));
+                        }
+                        if let (Some(a), Some(ArmCut::Splits(s))) = (t, then) {
+                            stack.push(DeferStep::Visit(a, s));
+                        }
+                    }
+                },
             }
-            Cov::Mixed => {
-                if *has_split {
-                    return None; // two tails cannot merge into one rejoin
-                }
-                let s = self.cut_classify(a, p)?;
-                if matches!(s, CutSplit::Prot) {
-                    return None;
-                }
-                *has_split = true;
-                Some(Some(ArmCut::Splits(Box::new(s))))
-            }
-            // A whole-arm defer (unprotected arm behind a protected
-            // condition) or a foreign plan: beyond the v1 hoist.
-            _ => None,
         }
     }
 
@@ -1712,47 +1551,6 @@ impl<'m> Ctx<'m> {
             }
         }
         true
-    }
-
-    /// Collect the deferred tail's region nodes, in emission order.
-    pub(in crate::structure) fn collect_defers(
-        &mut self,
-        id: RegionId,
-        split: &CutSplit,
-        out: &mut Vec<RegionId>,
-    ) {
-        match split {
-            CutSplit::Prot => {}
-            CutSplit::Defer => out.push(id),
-            CutSplit::Seq { split_at, inner } => {
-                let children = match self.f().node(id) {
-                    RegionNode::Seq(c) => c.clone(),
-                    _ => unreachable!("cut split shape mirrors the region node"),
-                };
-                let start = if let Some(inner) = inner {
-                    self.collect_defers(children[*split_at], inner, out);
-                    split_at + 1
-                } else {
-                    *split_at
-                };
-                for &c in &children[start..] {
-                    out.push(c);
-                }
-            }
-            CutSplit::If { then, otherwise } => {
-                let (t, o) = match self.f().node(id) {
-                    RegionNode::If {
-                        then, otherwise, ..
-                    } => (*then, *otherwise),
-                    _ => unreachable!("cut split shape mirrors the region node"),
-                };
-                for (arm, cut) in [(t, then), (o, otherwise)] {
-                    if let (Some(a), Some(ArmCut::Splits(s))) = (arm, cut) {
-                        self.collect_defers(a, s, out);
-                    }
-                }
-            }
-        }
     }
 
     /// The join-hoist correctness condition, generalized: every
@@ -1884,47 +1682,35 @@ impl<'m> Ctx<'m> {
         true
     }
 
-    /// Sub-sequence join hoist (R2-C2 extension of N69): `slice` is a
-    /// contiguous `Cov::Uniform(Some(p))` prefix followed by one
-    /// `Cov::Mixed` node `last` whose unprotected continuation is hoisted
-    /// after the single `try/catch` wrapper.
-    pub(in crate::structure) fn emit_cut_try_slice(
+    /// Sub-sequence join hoist pre-analysis (R2-C2 extension of N69).
+    pub(in crate::structure) fn plan_cut_try_slice(
         &mut self,
         slice: &[RegionId],
         p: usize,
-        active: Option<usize>,
-        follow: Follow,
-        out: &mut Vec<SNode>,
-    ) -> bool {
+    ) -> Option<CutTryPlan> {
         if slice.len() < 2 {
-            return false;
+            return None;
         }
-        let last = *slice.last().expect("len >= 2");
+        let last = *slice.last()?;
         let prefix_slice = &slice[..slice.len() - 1];
         if !self.slice_falls_cleanly(prefix_slice, last) {
-            return false;
+            return None;
         }
-        let Some(split) = self.cut_classify(last, p) else {
-            return false;
-        };
+        let split = self.cut_classify(last, p)?;
         if matches!(split, CutSplit::Prot | CutSplit::Defer) {
-            return false;
+            return None;
         }
         let mut defers = Vec::new();
         self.collect_defers(last, &split, &mut defers);
-        let Some(&first) = defers.first() else {
-            return false;
-        };
+        let &first = defers.first()?;
         if !matches!(self.entry_of(first), Follow::Entry(_)) {
-            return false;
+            return None;
         }
-        let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
-            return false;
-        };
+        let rejoin = self.handler_rejoin_index(p, &defers)?;
         if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
-            return false;
+            return None;
         }
-        let hoisted = &defers[rejoin..];
+        let hoisted = defers[rejoin..].to_vec();
         let handlers = self.f().plans[p].handlers.clone();
         if self
             .outer_wrap_plan(
@@ -1933,164 +1719,37 @@ impl<'m> Ctx<'m> {
             )
             .is_some()
         {
-            return false;
+            return None;
         }
-        let (region, cuts) = {
-            let plan = &self.f().plans[p];
-            (plan.region, plan.cuts)
-        };
-        let wraps = {
-            let f = self.f_mut();
-            let n = f.wrap_counts.entry(p).or_insert(0);
-            *n += 1;
-            *n
-        };
-        if wraps > 1 {
-            self.stats.try_splits += 1;
-        }
-        if cuts {
-            self.stats.try_cuts += 1;
-        }
-        self.stats.try_catches += 1;
-        self.stats.try_join_hoists += 1;
-        let mut body = Vec::new();
-        if cuts {
-            body.push(SNode::Honest(format!(
-                "try region {region}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
-            )));
-        }
-        if wraps > 1 {
-            body.push(SNode::Honest(format!(
-                "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
-            )));
-        }
-        let buried = "nested below the protected run in the region tree";
-        if rejoin > 0 {
-            body.push(SNode::Honest(format!(
-                "try region {region}: the handler continuation (the try's join) is {buried} — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
-            )));
-        } else {
-            body.push(SNode::Honest(format!(
-                "try region {region}: the handler continuation (the try's join) is {buried} — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
-            )));
-        }
-        let defer_ids: HashSet<RegionId> = hoisted.iter().copied().collect();
-        self.f_mut().cut_defer = Some(CutDefer { ids: defer_ids });
-        let skel_fl = self.entry_of(hoisted[0]);
-        self.emit_seq_children(slice, Some(p), skel_fl, &mut body);
-        let leftover = match self.f_mut().cut_defer.take() {
-            Some(cd) => !cd.ids.is_empty(),
-            None => false,
-        };
-        if leftover {
-            body.push(SNode::Honest(format!(
-                "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
-            )));
-        }
-        let rejoin_entry = hoisted.first().and_then(|&d| match self.entry_of(d) {
-            Follow::Entry(b) => Some(b),
-            _ => None,
-        });
-        if let Some(b) = rejoin_entry {
-            self.hoist_rejoins.push(b);
-        }
-        let mut catches = Vec::new();
-        let mut seen = HashSet::new();
-        for h in &handlers {
-            if seen.insert(*h) {
-                catches.push(self.emit_handler(*h));
-            }
-        }
-        if rejoin_entry.is_some() {
-            self.hoist_rejoins.pop();
-        }
-        let note = if catches.len() > 1 {
-            self.stats.multi_catch += 1;
-            Some(format!(
-                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                catches.len()
-            ))
-        } else {
-            None
-        };
-        out.push(SNode::Try {
-            body,
-            catches,
-            note,
-            finally: None,
-        });
-        for (i, &d) in hoisted.iter().enumerate() {
-            let fl = if i + 1 < hoisted.len() {
-                self.entry_of(hoisted[i + 1])
-            } else {
-                follow
-            };
-            self.emit_node(d, active, fl, out);
-        }
-        true
+        Some(CutTryPlan {
+            rejoin,
+            hoisted,
+            handlers,
+        })
     }
 
-    /// The join-hoist driver: split the cut node, emit
-    /// `try { skeleton } catch { … }`, then the hoisted tail. Returns
-    /// false (the caller falls back to the generic whole-wrap) unless
-    /// every guard holds.
-    pub(in crate::structure) fn emit_cut_try(
+    /// Single-node join hoist pre-analysis.
+    pub(in crate::structure) fn plan_cut_try(
         &mut self,
         id: RegionId,
         p: usize,
-        active: Option<usize>,
-        follow: Follow,
-        out: &mut Vec<SNode>,
-    ) -> bool {
-        let debug = std::env::var_os("ABCD_CUT_DEBUG").is_some();
-        // Phase 1 — pure analysis.
-        let Some(split) = self.cut_classify(id, p) else {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: classify failed");
-            }
-            return false;
-        };
+    ) -> Option<CutTryPlan> {
+        let split = self.cut_classify(id, p)?;
         if matches!(split, CutSplit::Prot) {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: all-protected");
-            }
-            return false;
+            return None;
         }
         let mut defers = Vec::new();
         self.collect_defers(id, &split, &mut defers);
-        let Some(&first) = defers.first() else {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: no defers");
-            }
-            return false;
-        };
+        let &first = defers.first()?;
         if !matches!(self.entry_of(first), Follow::Entry(_)) {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: tail entry unknown");
-            }
-            return false;
+            return None;
         }
-        // The handlers' rejoin point within the tail. A nonzero index
-        // means the handlers rejoin LATER in the tail; the skipped
-        // prefix stays inline in the try body (try-path-only) and must
-        // be pure phi wiring (it would otherwise be over-protected).
-        let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: handler rejoin not in the tail");
-            }
-            return false;
-        };
+        let rejoin = self.handler_rejoin_index(p, &defers)?;
         if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: try-path prefix can throw");
-            }
-            return false;
+            return None;
         }
-        let hoisted = &defers[rejoin..];
+        let hoisted = defers[rejoin..].to_vec();
         let handlers = self.f().plans[p].handlers.clone();
-        // v1: no outer finally-chain around this plan (the hoisted
-        // tail's placement relative to chain wraps needs the generic
-        // path).
         if self
             .outer_wrap_plan(
                 &[self.f().plans[p].protected.clone()].into_iter().collect(),
@@ -2098,17 +1757,28 @@ impl<'m> Ctx<'m> {
             )
             .is_some()
         {
-            if debug {
-                eprintln!("CUT-BAIL plan={p}: outer finally-chain present");
-            }
-            return false;
+            return None;
         }
+        Some(CutTryPlan {
+            rejoin,
+            hoisted,
+            handlers,
+        })
+    }
 
-        // Phase 2 — `try { skeleton } catch { … }` (the same
-        // bookkeeping as `wrap_try_run`, plus the hoist note).
+    /// Schedule emission of a verified `CutTryPlan` (node or slice).
+    pub(in crate::structure) fn start_cut_try(
+        &mut self,
+        plan: CutTryPlan,
+        input: CutTryInput,
+        p: usize,
+        active: Option<usize>,
+        follow: Follow,
+        ts: &mut TaskState,
+    ) {
         let (region, cuts) = {
-            let plan = &self.f().plans[p];
-            (plan.region, plan.cuts)
+            let pl = &self.f().plans[p];
+            (pl.region, pl.cuts)
         };
         let wraps = {
             let f = self.f_mut();
@@ -2135,17 +1805,13 @@ impl<'m> Ctx<'m> {
                 "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
             )));
         }
-        // The note wording names where the join was buried: a
-        // protected conditional arm (the d-P5 `If` case) or below the
-        // protected run in the region tree (the N69 `Seq` case — the
-        // try range spans a loop and its post-loop statements while
-        // the unprotected continuation is nested one level down).
-        let buried = if matches!(self.f().node(id), RegionNode::If { .. }) {
-            "nested inside a protected conditional arm"
-        } else {
-            "nested below the protected run in the region tree"
+        let buried = match &input {
+            CutTryInput::Node(id) if matches!(self.f().node(*id), RegionNode::If { .. }) => {
+                "nested inside a protected conditional arm"
+            }
+            _ => "nested below the protected run in the region tree",
         };
-        if rejoin > 0 {
+        if plan.rejoin > 0 {
             body.push(SNode::Honest(format!(
                 "try region {region}: the handler continuation (the try's join) is {buried} — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
             )));
@@ -2154,69 +1820,33 @@ impl<'m> Ctx<'m> {
                 "try region {region}: the handler continuation (the try's join) is {buried} — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
             )));
         }
-        let defer_ids: HashSet<RegionId> = hoisted.iter().copied().collect();
+        let defer_ids: HashSet<RegionId> = plan.hoisted.iter().copied().collect();
         self.f_mut().cut_defer = Some(CutDefer { ids: defer_ids });
-        self.emit_content(id, Some(p), follow, &mut body);
-        let leftover = match self.f_mut().cut_defer.take() {
-            Some(cd) => !cd.ids.is_empty(),
-            None => false,
+        let skel_fl = match &input {
+            CutTryInput::Slice(_) => self.entry_of(plan.hoisted[0]),
+            CutTryInput::Node(_) => follow,
         };
-        if leftover {
-            // Defensive: analysis/emission mismatch — a deferred node
-            // was never intercepted. It is emitted in the tail below
-            // (phase 3 walks the full list), so nothing is dropped.
-            body.push(SNode::Honest(format!(
-                "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
-            )));
-        }
-        // While the catch clauses are emitted, the hoisted tail's entry
-        // is the verified physical fall-out target of every handler cut
-        // edge (handler_rejoin_index proved it) — record it so the
-        // shim-tail duplication stands down for those edges.
-        let rejoin_entry = hoisted.first().and_then(|&d| match self.entry_of(d) {
-            Follow::Entry(b) => Some(b),
-            _ => None,
+        ts.sinks.push(body);
+        ts.tasks.push(StructTask::CutTryAfterSkel {
+            region,
+            hoisted: plan.hoisted,
+            handlers: plan.handlers,
+            active,
+            follow,
         });
-        if let Some(b) = rejoin_entry {
-            self.hoist_rejoins.push(b);
+        match input {
+            CutTryInput::Node(id) => ts.tasks.push(StructTask::EmitContent {
+                id,
+                active: Some(p),
+                follow: skel_fl,
+            }),
+            CutTryInput::Slice(children) => ts.tasks.push(StructTask::SeqStep {
+                children,
+                idx: 0,
+                active: Some(p),
+                follow: skel_fl,
+            }),
         }
-        let mut catches = Vec::new();
-        let mut seen = HashSet::new();
-        for h in &handlers {
-            if seen.insert(*h) {
-                catches.push(self.emit_handler(*h));
-            }
-        }
-        if rejoin_entry.is_some() {
-            self.hoist_rejoins.pop();
-        }
-        let note = if catches.len() > 1 {
-            self.stats.multi_catch += 1;
-            Some(format!(
-                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                catches.len()
-            ))
-        } else {
-            None
-        };
-        out.push(SNode::Try {
-            body,
-            catches,
-            note,
-            finally: None,
-        });
-
-        // Phase 3 — the hoisted tail: emitted with the caller's active
-        // plan, follows threaded through the tail's own entries.
-        for (i, &d) in hoisted.iter().enumerate() {
-            let fl = if i + 1 < hoisted.len() {
-                self.entry_of(hoisted[i + 1])
-            } else {
-                follow
-            };
-            self.emit_node(d, active, fl, out);
-        }
-        true
     }
 
     /// N78 (test262 try/S12.14_A9_T5): a try range CUTS a loop — the
@@ -2255,25 +1885,23 @@ impl<'m> Ctx<'m> {
     /// wiring (over-protection is then impossible). All guards are
     /// structural; any deviation returns false and the caller keeps
     /// the legacy whole-loop wrap.
-    pub(in crate::structure) fn try_loop_cut_do_while(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "loop-cut analysis and scheduling threads loop header/body, cut plan, active plan, follow, fallback, and task state"
+    )]
+    pub(in crate::structure) fn try_start_loop_cut_do_while(
         &mut self,
         header: BlockId,
         body_r: RegionId,
         p0: usize,
         active: Option<usize>,
         follow: Follow,
-        out: &mut Vec<SNode>,
+        fallback: LoopCutFallback,
+        ts: &mut TaskState,
     ) -> bool {
-        let debug = std::env::var_os("ABCD_LOOPCUT_DEBUG").is_some();
         macro_rules! bail {
             ($($arg:tt)*) => {{
-                if debug {
-                    eprintln!(
-                        "LOOPCUT-BAIL fn={} plan={p0}: {}",
-                        self.rf.func.index(),
-                        format!($($arg)*)
-                    );
-                }
+                let _ = format_args!($($arg)*);
                 self.stats.loop_cut_bails += 1;
                 return false;
             }};
@@ -2398,7 +2026,9 @@ impl<'m> Ctx<'m> {
                     }
                 }
             }
-            let r1 = rejoin1.expect("checked non-empty handlers");
+            let Some(r1) = rejoin1 else {
+                bail!("chain handlers do not rejoin");
+            };
             if r1 == test || !body_blocks.contains(&r1) {
                 bail!("chain rejoin B{} not a distinct in-loop block", r1.index());
             }
@@ -2484,10 +2114,10 @@ impl<'m> Ctx<'m> {
                 continue;
             }
             match class {
-                EdgeClass::Continue { labeled: false, .. } => {
-                    if !(to == header && from == latch_from) {
-                        bail!("extra unlabeled continue B{}→B{}", from.index(), to.index());
-                    }
+                EdgeClass::Continue { labeled: false, .. }
+                    if !(to == header && from == latch_from) =>
+                {
+                    bail!("extra unlabeled continue B{}→B{}", from.index(), to.index());
                 }
                 EdgeClass::Break {
                     labeled: false,
@@ -2725,11 +2355,11 @@ impl<'m> Ctx<'m> {
                 _ => kept_main.push(s.clone()),
             }
         }
-        if !clean_while_main_ok(&kept_main, &cond) {
+        if !cond_avoids_main_decls(&kept_main, &cond) {
             bail!("the test condition reads a body-scoped temporary");
         }
 
-        // ── Emission ────────────────────────────────────────────────
+        // ── Emission (iterative via TaskState) ──────────────────────
         let (region0, cuts0) = {
             let plan = &self.f().plans[p0];
             (plan.region, plan.cuts)
@@ -2761,8 +2391,6 @@ impl<'m> Ctx<'m> {
         skel.push(SNode::Honest(format!(
             "try region {region0}: the protected range cuts a do-while loop — the try/catch is placed INSIDE the loop body and the catch's `continue` targets the in-loop test (the handlers' bytecode rejoin)"
         )));
-        // The skeleton with the tail deferred (intercepted in
-        // `emit_node`, emitted below by this driver).
         let skeleton_follow = prefix
             .first()
             .or_else(|| midtail.first())
@@ -2771,157 +2399,42 @@ impl<'m> Ctx<'m> {
         self.f_mut().cut_defer = Some(CutDefer {
             ids: defer_roots.iter().copied().collect(),
         });
-        if pre_try.is_empty() {
-            self.emit_content(body_r, Some(p0), skeleton_follow, &mut skel);
-        } else {
-            self.emit_seq_children(&p0_roots, Some(p0), skeleton_follow, &mut skel);
-        }
-        let leftover = match self.f_mut().cut_defer.take() {
-            Some(cd) => !cd.ids.is_empty(),
-            None => false,
-        };
-        if leftover {
-            // Defensive: the deferred tail was never intercepted (the
-            // spine walk above proved the path is If-arms all the way,
-            // so this cannot happen). Nothing was pushed to `out`.
-            bail!("the deferred tail stayed inline (analysis/emission mismatch)");
-        }
-        // p0's handlers: emitted with the chain pending/suppressed
-        // (legacy parity — their clauses sit inside the chain's try
-        // body), each gaining the `continue` that targets the loop test
-        // (in a do-while the test is exactly what `continue` runs next).
-        let pending_mark = self.pending_wraps.len();
-        let suppress_mark = self.suppress_wraps.len();
-        if let Some(q1) = p1 {
-            let prot = self.f().plans[q1].protected.clone();
-            self.pending_wraps.push(prot.clone());
-            self.suppress_wraps.push(prot);
-        }
-        let mut catches0 = Vec::new();
-        let mut seen = HashSet::new();
-        for &h in &handlers0 {
-            if seen.insert(h) {
-                let mut c = self.emit_handler(h);
-                c.body.push(SNode::Continue { label: None });
-                catches0.push(c);
-            }
-        }
-        self.suppress_wraps.truncate(suppress_mark);
-        let note0 = if catches0.len() > 1 {
-            self.stats.multi_catch += 1;
-            Some(format!(
-                "try region {region0}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                catches0.len()
-            ))
-        } else {
-            None
-        };
-        let node0 = SNode::Try {
-            body: skel,
-            catches: catches0,
-            note: note0,
-            finally: None,
-        };
-        let mut loop_body: Vec<SNode> = Vec::new();
-        if !pre_try.is_empty() {
-            let p0_fl = self.entry_of(p0_roots[0]);
-            self.emit_seq_children(&pre_try, None, p0_fl, &mut loop_body);
-        }
-        if let Some(q1) = p1 {
-            let (region1, cuts1) = {
-                let plan = &self.f().plans[q1];
-                (plan.region, plan.cuts)
-            };
-            let wraps = {
-                let f = self.f_mut();
-                let n = f.wrap_counts.entry(q1).or_insert(0);
-                *n += 1;
-                *n
-            };
-            if wraps > 1 {
-                self.stats.try_splits += 1;
-            }
-            if cuts1 {
-                self.stats.try_cuts += 1;
-            }
-            self.stats.try_catches += 1;
-            let mut p1_body = Vec::new();
-            if cuts1 {
-                p1_body.push(SNode::Honest(format!(
-                    "try region {region1}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
-                )));
-            }
-            p1_body.push(SNode::Honest(format!(
-                "try region {region1}: handler-protecting outer try (finally idiom) — wrapped around region {region0}'s in-loop try/catch"
-            )));
-            p1_body.push(node0);
-            // The normal-path-only prefix (chain-protected or pure phi
-            // wiring — verified above): the chain plan's catch must NOT
-            // run it, so it sits inside the chain try body and the
-            // catch's fall-out is the mid tail's head.
-            for (i, &item) in prefix.iter().enumerate() {
-                let fl = if i + 1 < prefix.len() {
-                    self.entry_of(prefix[i + 1])
-                } else {
-                    self.entry_of(midtail[0])
-                };
-                self.emit_node(item, Some(q1), fl, &mut p1_body);
-            }
-            // The chain plan's handlers fall out at the mid tail's head
-            // (verified: it is emitted right after this try/catch).
-            let r1 = rejoin1.expect("p1 implies rejoin1");
-            self.hoist_rejoins.push(r1);
-            let handlers1 = self.f().plans[q1].handlers.clone();
-            let mut catches1 = Vec::new();
-            let mut seen = HashSet::new();
-            for &h in &handlers1 {
-                if seen.insert(h) {
-                    catches1.push(self.emit_handler(h));
-                }
-            }
-            self.hoist_rejoins.pop();
-            let note1 = if catches1.len() > 1 {
-                self.stats.multi_catch += 1;
-                Some(format!(
-                    "try region {region1}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
-                    catches1.len()
-                ))
-            } else {
-                None
-            };
-            loop_body.push(SNode::Try {
-                body: p1_body,
-                catches: catches1,
-                note: note1,
-                finally: None,
-            });
-        } else {
-            loop_body.push(node0);
-        }
-        self.pending_wraps.truncate(pending_mark);
-        // The unprotected mid tail (headed by the chain handler's
-        // rejoin), then the test block's statements.
-        for (i, &item) in midtail.iter().enumerate() {
-            let fl = if i + 1 < midtail.len() {
-                self.entry_of(midtail[i + 1])
-            } else {
-                Follow::Entry(test)
-            };
-            self.emit_node(item, None, fl, &mut loop_body);
-        }
-        Self::push_stmts(&mut loop_body, Self::stmts_leaves(&kept_main));
         let while_cond = if cond_true_continues {
             cond
         } else {
             negate(&cond)
         };
-        self.stats.loops_do_while += 1;
-        self.stats.loop_cut_rewrites += 1;
-        out.push(SNode::DoWhile {
-            label: None,
-            body: loop_body,
-            cond: while_cond,
+        let p0_first = p0_roots[0];
+        let st = Box::new(LoopCutState {
+            fallback,
+            region0,
+            handlers0,
+            p1,
+            rejoin1,
+            pre_try: pre_try.clone(),
+            p0_first,
+            prefix: prefix.to_vec(),
+            midtail: midtail.to_vec(),
+            test,
+            kept_main,
+            while_cond,
         });
+        ts.sinks.push(skel);
+        ts.tasks.push(StructTask::LoopCutAfterSkel(st));
+        if pre_try.is_empty() {
+            ts.tasks.push(StructTask::EmitContent {
+                id: body_r,
+                active: Some(p0),
+                follow: skeleton_follow,
+            });
+        } else {
+            ts.tasks.push(StructTask::SeqStep {
+                children: p0_roots,
+                idx: 0,
+                active: Some(p0),
+                follow: skeleton_follow,
+            });
+        }
         true
     }
 
@@ -3054,31 +2567,17 @@ impl<'m> Ctx<'m> {
         Some((cur_start, cur_end, cur_p, prologues))
     }
 
-    /// A mixed-coverage node: descend (or wrap whole when the head is
-    /// protected — the documented cut approximation).
-    pub(in crate::structure) fn emit_mixed(
+    /// Mixed-coverage node task step.
+    pub(in crate::structure) fn step_emit_mixed(
         &mut self,
         id: RegionId,
         active: Option<usize>,
         follow: Follow,
-        out: &mut Vec<SNode>,
+        ts: &mut TaskState,
     ) {
         let node = self.f().node(id).clone();
         match node {
             RegionNode::Seq(children) => {
-                // N69: a try range spanning nested sequence levels (a
-                // protected prefix at THIS level whose continuation
-                // plan keeps going inside a nested child — e.g. a try
-                // over a loop and its post-loop statements while the
-                // unprotected join sits one level down) would fragment
-                // into per-level wrappers, with the catch path falling
-                // through into protected statements. When the cut
-                // split has a protected prefix here AND a nested split
-                // below, route the whole node through the join hoist
-                // (one try/catch; the unprotected tail emitted after
-                // it). Flat protected-prefix + flat-tail sequences are
-                // already handled correctly by the run coalescing in
-                // `emit_seq_children`, so they keep the legacy path.
                 let p = children.iter().find_map(|&c| self.leading_plan(c));
                 if let Some(p) = p
                     && Some(p) != active
@@ -3086,11 +2585,17 @@ impl<'m> Ctx<'m> {
                         self.cut_classify(id, p),
                         Some(CutSplit::Seq { inner: Some(_), .. })
                     )
-                    && self.emit_cut_try(id, p, active, follow, out)
+                    && let Some(plan) = self.plan_cut_try(id, p)
                 {
+                    self.start_cut_try(plan, CutTryInput::Node(id), p, active, follow, ts);
                     return;
                 }
-                self.emit_seq_children(&children, active, follow, out)
+                ts.tasks.push(StructTask::SeqStep {
+                    children,
+                    idx: 0,
+                    active,
+                    follow,
+                });
             }
             RegionNode::If { head, .. } => {
                 let hp = self.f_mut().plan_of(head);
@@ -3098,14 +2603,18 @@ impl<'m> Ctx<'m> {
                     && active != Some(p)
                     && !self.is_suppressed(p)
                 {
-                    // The d-P5 join hoist: when the try's continuation
-                    // is buried in an arm, split instead of wrapping
-                    // whole; otherwise the generic wrap.
-                    if !self.emit_cut_try(id, p, active, follow, out) {
-                        self.wrap_try(id, p, follow, out);
+                    if let Some(plan) = self.plan_cut_try(id, p) {
+                        self.start_cut_try(plan, CutTryInput::Node(id), p, active, follow, ts);
+                    } else {
+                        ts.tasks.push(StructTask::WrapTryRun {
+                            ids: vec![id],
+                            p,
+                            prologues: Vec::new(),
+                            follow,
+                        });
                     }
                 } else {
-                    self.emit_if(id, active, follow, out);
+                    ts.tasks.push(StructTask::EmitIf { id, active, follow });
                 }
             }
             RegionNode::Loop { header, kind, body } => {
@@ -3114,37 +2623,723 @@ impl<'m> Ctx<'m> {
                     && active != Some(p)
                     && !self.is_suppressed(p)
                 {
-                    // N78: a try range cutting the loop whose handlers
-                    // rejoin at the in-loop test emits as the source
-                    // do-while (the try/catch inside the body, the
-                    // catch's `continue` targeting the test). Any guard
-                    // failure keeps the legacy whole-loop wrap.
-                    if self.try_loop_cut_do_while(header, body, p, active, follow, out) {
-                        return;
+                    let fallback = LoopCutFallback::WrapWhole { id, p, follow };
+                    if !self
+                        .try_start_loop_cut_do_while(header, body, p, active, follow, fallback, ts)
+                    {
+                        ts.tasks.push(StructTask::WrapTryRun {
+                            ids: vec![id],
+                            p,
+                            prologues: Vec::new(),
+                            follow,
+                        });
                     }
-                    self.wrap_try(id, p, follow, out);
                 } else if hp.is_none()
                     && let Some(p) = self.pre_try_loop_cut_plan(header, body, active)
-                    && self.try_loop_cut_do_while(header, body, p, active, follow, out)
                 {
+                    let fallback = LoopCutFallback::PlainLoop {
+                        id,
+                        header,
+                        kind,
+                        body,
+                        active,
+                        follow,
+                    };
+                    if !self
+                        .try_start_loop_cut_do_while(header, body, p, active, follow, fallback, ts)
+                    {
+                        ts.tasks.push(StructTask::EmitLoop {
+                            id,
+                            header,
+                            kind,
+                            body_r: body,
+                            active,
+                            follow,
+                        });
+                    }
                 } else {
-                    self.emit_loop(id, header, kind, body, active, follow, out);
+                    ts.tasks.push(StructTask::EmitLoop {
+                        id,
+                        header,
+                        kind,
+                        body_r: body,
+                        active,
+                        follow,
+                    });
                 }
             }
             RegionNode::Labeled { label, body } => {
-                let mut inner = Vec::new();
-                self.emit_node(body, active, follow, &mut inner);
-                out.push(SNode::Labeled {
+                ts.sinks.push(Vec::new());
+                ts.tasks.push(StructTask::FinishLabeled {
                     label: format!("L${}", label.index()),
-                    body: inner,
+                });
+                ts.tasks.push(StructTask::EmitNode {
+                    id: body,
+                    active,
+                    follow,
                 });
             }
-            RegionNode::Irreducible { .. } => self.emit_irreducible(id, active, out),
-            RegionNode::Block(b) => self.emit_leaf(b, follow, out),
-            RegionNode::Alternates(_) => {
-                // Reached only through the sequence handler; defensive.
-                self.emit_alternates_wrapped(id, Vec::new(), active, out);
+            RegionNode::Irreducible { .. } => {
+                if let Some(mut sink) = ts.sinks.pop() {
+                    self.emit_irreducible(id, active, &mut sink);
+                    ts.sinks.push(sink);
+                }
             }
+            RegionNode::Block(b) => {
+                if let Some(mut sink) = ts.sinks.pop() {
+                    self.emit_leaf(b, follow, &mut sink);
+                    ts.sinks.push(sink);
+                }
+            }
+            RegionNode::Alternates(_) => {
+                ts.tasks.push(StructTask::AlternatesStart {
+                    id,
+                    prefix: Vec::new(),
+                    active,
+                });
+            }
+        }
+    }
+
+    /// Execute try/tower/cut-try/loop-cut continuation tasks.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "handles all iterative continuation states for TryPlan projection"
+    )]
+    pub(in crate::structure) fn step_try_task(&mut self, task: StructTask, ts: &mut TaskState) {
+        match task {
+            StructTask::WrapTryRun {
+                ids,
+                p,
+                prologues,
+                follow,
+            } => {
+                self.start_wrap_try_run(ids, p, prologues, follow, ts);
+            }
+            StructTask::DeabsorbAfterBody(mut st) => {
+                let body = ts.sinks.pop().unwrap_or_default();
+                st.pending_mark = self.pending_wraps.len();
+                st.joins_mark = self.pending_joins.len();
+                for cp in &st.chain_prots {
+                    self.pending_wraps.push(cp.clone());
+                }
+                for j in st.joins.iter().flatten() {
+                    self.pending_joins.push(j.1.clone());
+                }
+                for &b in &st.follow_chain {
+                    self.verified_fallout.push(b);
+                }
+                let suppress_mark = self.suppress_wraps.len();
+                for cp in &st.chain_prots {
+                    self.suppress_wraps.push(cp.clone());
+                }
+                let vf = self.deabsorb_chain_at(&st.joins, 0);
+                for &b in &vf {
+                    self.verified_fallout.push(b);
+                }
+                let encl: Vec<BlockId> = st
+                    .enclosed
+                    .iter()
+                    .filter(|(x, _)| st.handlers.contains(x))
+                    .map(|&(_, s)| s)
+                    .collect();
+                for &s in &encl {
+                    self.verified_fallout.push(s);
+                }
+                let vf_pop = vf.len() + encl.len();
+                let handlers = st.handlers.clone();
+                let region = st.region;
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::DeabsorbStep {
+                    st,
+                    k: 0,
+                    prev_body: body,
+                    prev_region: region,
+                    suppress_mark,
+                    vf_pop,
+                });
+                schedule_dedup_handlers(&handlers, true, false, &mut ts.tasks);
+            }
+            StructTask::DeabsorbStep {
+                st,
+                k,
+                prev_body,
+                prev_region,
+                suppress_mark,
+                vf_pop,
+            } => {
+                for _ in 0..vf_pop {
+                    self.verified_fallout.pop();
+                }
+                self.suppress_wraps.truncate(suppress_mark);
+                let catches = ts.catch_lists.pop().unwrap_or_default();
+                let note = if catches.len() > 1 {
+                    self.stats.multi_catch += 1;
+                    Some(format!(
+                        "try region {prev_region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                        catches.len()
+                    ))
+                } else {
+                    None
+                };
+                let node = SNode::Try {
+                    body: prev_body,
+                    catches,
+                    note,
+                    finally: None,
+                };
+                if k < st.chain.len() {
+                    let (fq, q) = st.chain[k];
+                    let (qregion, qhandlers) = {
+                        let plan = &self.frames[fq].plans[q];
+                        (plan.region, plan.handlers.clone())
+                    };
+                    {
+                        let f = &mut self.frames[fq];
+                        *f.wrap_counts.entry(q).or_insert(0) += 1;
+                    }
+                    self.stats.try_catches += 1;
+                    let prologue_match = st
+                        .prologues
+                        .iter()
+                        .find(|(qp, _, _)| *qp == st.chain_prots[k])
+                        .cloned();
+                    let join_k = st.joins[k].clone();
+                    let extra_suppress: Vec<BTreeSet<BlockId>> = st.chain_prots[k + 1..].to_vec();
+                    ts.sinks.push(Vec::new());
+                    ts.tasks.push(StructTask::DeabsorbChainAfterInner {
+                        st,
+                        k,
+                        qregion,
+                        qhandlers,
+                    });
+                    if let Some((jhead, jset)) = join_k {
+                        ts.tasks.push(StructTask::EmitJoinLevel {
+                            head: jhead,
+                            set: jset,
+                        });
+                    }
+                    ts.tasks.push(StructTask::PushNodeToSink(node));
+                    if let Some((qp, pre_ids, next_fl)) = prologue_match {
+                        let active_q = self.f().plans.iter().position(|pl| pl.protected == qp);
+                        let psuppress = self.suppress_wraps.len();
+                        for cp in extra_suppress {
+                            self.suppress_wraps.push(cp);
+                        }
+                        ts.tasks.push(StructTask::TruncateSuppress(psuppress));
+                        ts.tasks.push(StructTask::SeqStep {
+                            children: pre_ids,
+                            idx: 0,
+                            active: active_q,
+                            follow: next_fl,
+                        });
+                    }
+                } else {
+                    let m = st.chain.len();
+                    self.pending_wraps.truncate(st.pending_mark);
+                    if let Some(sink) = ts.sinks.last_mut() {
+                        sink.push(node);
+                    }
+                    let after_join = st.joins[m].clone();
+                    ts.tasks.push(StructTask::DeabsorbFinish {
+                        joins_mark: st.joins_mark,
+                        follow_chain_len: st.follow_chain.len(),
+                        join_union: st.join_union,
+                    });
+                    if let Some((ahead, aset)) = after_join {
+                        ts.tasks.push(StructTask::EmitJoinLevel {
+                            head: ahead,
+                            set: aset,
+                        });
+                    }
+                }
+            }
+            StructTask::DeabsorbChainAfterInner {
+                st,
+                k,
+                qregion,
+                qhandlers,
+            } => {
+                let inner = ts.sinks.pop().unwrap_or_default();
+                let suppress_mark = self.suppress_wraps.len();
+                for cp in &st.chain_prots[k + 1..] {
+                    self.suppress_wraps.push(cp.clone());
+                }
+                let vf = self.deabsorb_chain_at(&st.joins, k + 1);
+                for &b in &vf {
+                    self.verified_fallout.push(b);
+                }
+                let encl: Vec<BlockId> = st
+                    .enclosed
+                    .iter()
+                    .filter(|(x, _)| qhandlers.contains(x))
+                    .map(|&(_, s)| s)
+                    .collect();
+                for &s in &encl {
+                    self.verified_fallout.push(s);
+                }
+                let vf_pop = vf.len() + encl.len();
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::DeabsorbStep {
+                    st,
+                    k: k + 1,
+                    prev_body: inner,
+                    prev_region: qregion,
+                    suppress_mark,
+                    vf_pop,
+                });
+                schedule_dedup_handlers(&qhandlers, true, false, &mut ts.tasks);
+            }
+            StructTask::DeabsorbFinish {
+                joins_mark,
+                follow_chain_len,
+                join_union,
+            } => {
+                self.pending_joins.truncate(joins_mark);
+                for _ in 0..follow_chain_len {
+                    self.verified_fallout.pop();
+                }
+                for s in join_union {
+                    self.emitted_joins.insert(s);
+                }
+            }
+            StructTask::LegacyWrapAfterBody(mut st) => {
+                let body = ts.sinks.pop().unwrap_or_default();
+                st.pending_mark = self.pending_wraps.len();
+                let suppress_mark = self.suppress_wraps.len();
+                for cp in &st.chain_prots {
+                    self.pending_wraps.push(cp.clone());
+                    self.suppress_wraps.push(cp.clone());
+                }
+                let handlers = st.handlers.clone();
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::LegacyWrapAfterPCatches {
+                    st,
+                    body,
+                    suppress_mark,
+                });
+                schedule_dedup_handlers(&handlers, false, false, &mut ts.tasks);
+            }
+            StructTask::LegacyWrapAfterPCatches {
+                st,
+                body,
+                suppress_mark,
+            } => {
+                self.suppress_wraps.truncate(suppress_mark);
+                let catches = ts.catch_lists.pop().unwrap_or_default();
+                let region = st.region;
+                let note = if catches.len() > 1 {
+                    self.stats.multi_catch += 1;
+                    Some(format!(
+                        "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                        catches.len()
+                    ))
+                } else {
+                    None
+                };
+                let node = SNode::Try {
+                    body,
+                    catches,
+                    note,
+                    finally: None,
+                };
+                self.advance_legacy_wrap_chain(st, 0, node, ts);
+            }
+            StructTask::LegacyWrapAfterQCatches {
+                st,
+                k,
+                node,
+                qregion,
+                wraps,
+                qsuppress_mark,
+            } => {
+                self.suppress_wraps.truncate(qsuppress_mark);
+                let qcatches = ts.catch_lists.pop().unwrap_or_default();
+                let prologue_match = st
+                    .prologues
+                    .iter()
+                    .find(|(qp, _, _)| *qp == st.chain_prots[k])
+                    .cloned();
+                let extra_suppress: Vec<BTreeSet<BlockId>> = st.chain_prots[k + 1..].to_vec();
+                ts.sinks.push(Vec::new());
+                ts.tasks.push(StructTask::LegacyWrapFinishStep {
+                    st,
+                    k,
+                    qregion,
+                    wraps,
+                    qcatches,
+                });
+                ts.tasks.push(StructTask::PushNodeToSink(node));
+                if let Some((qp, pre_ids, next_fl)) = prologue_match {
+                    let active_q = self.f().plans.iter().position(|pl| pl.protected == qp);
+                    let psuppress = self.suppress_wraps.len();
+                    for cp in extra_suppress {
+                        self.suppress_wraps.push(cp);
+                    }
+                    ts.tasks.push(StructTask::TruncateSuppress(psuppress));
+                    ts.tasks.push(StructTask::SeqStep {
+                        children: pre_ids,
+                        idx: 0,
+                        active: active_q,
+                        follow: next_fl,
+                    });
+                }
+            }
+            StructTask::LegacyWrapFinishStep {
+                st,
+                k,
+                qregion,
+                wraps,
+                qcatches,
+            } => {
+                let qbody = ts.sinks.pop().unwrap_or_default();
+                let region = st.region;
+                let node = SNode::Try {
+                    body: qbody,
+                    catches: qcatches,
+                    note: Some(format!(
+                        "try region {qregion}: handler-protecting outer try (finally idiom) — wrapped around region {region}'s try/catch (wrapper #{wraps})"
+                    )),
+                    finally: None,
+                };
+                self.advance_legacy_wrap_chain(st, k + 1, node, ts);
+            }
+            StructTask::CutTryAfterSkel {
+                region,
+                hoisted,
+                handlers,
+                active,
+                follow,
+            } => {
+                let mut body = ts.sinks.pop().unwrap_or_default();
+                let leftover = match self.f_mut().cut_defer.take() {
+                    Some(cd) => !cd.ids.is_empty(),
+                    None => false,
+                };
+                if leftover {
+                    body.push(SNode::Honest(format!(
+                        "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
+                    )));
+                }
+                let rejoin_entry = hoisted.first().and_then(|&d| match self.entry_of(d) {
+                    Follow::Entry(b) => Some(b),
+                    _ => None,
+                });
+                if let Some(b) = rejoin_entry {
+                    self.hoist_rejoins.push(b);
+                }
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::CutTryAfterCatches {
+                    region,
+                    body,
+                    rejoin_pushed: rejoin_entry.is_some(),
+                    hoisted,
+                    active,
+                    follow,
+                });
+                schedule_dedup_handlers(&handlers, false, false, &mut ts.tasks);
+            }
+            StructTask::CutTryAfterCatches {
+                region,
+                body,
+                rejoin_pushed,
+                hoisted,
+                active,
+                follow,
+            } => {
+                if rejoin_pushed {
+                    self.hoist_rejoins.pop();
+                }
+                let catches = ts.catch_lists.pop().unwrap_or_default();
+                let note = if catches.len() > 1 {
+                    self.stats.multi_catch += 1;
+                    Some(format!(
+                        "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                        catches.len()
+                    ))
+                } else {
+                    None
+                };
+                if let Some(sink) = ts.sinks.last_mut() {
+                    sink.push(SNode::Try {
+                        body,
+                        catches,
+                        note,
+                        finally: None,
+                    });
+                }
+                for (i, &d) in hoisted.iter().enumerate().rev() {
+                    let fl = if i + 1 < hoisted.len() {
+                        self.entry_of(hoisted[i + 1])
+                    } else {
+                        follow
+                    };
+                    ts.tasks.push(StructTask::EmitNode {
+                        id: d,
+                        active,
+                        follow: fl,
+                    });
+                }
+            }
+            StructTask::LoopCutAfterSkel(st) => {
+                let skel = ts.sinks.pop().unwrap_or_default();
+                let leftover = match self.f_mut().cut_defer.take() {
+                    Some(cd) => !cd.ids.is_empty(),
+                    None => false,
+                };
+                if leftover {
+                    self.stats.loop_cut_bails += 1;
+                    match st.fallback {
+                        LoopCutFallback::WrapWhole { id, p, follow } => {
+                            ts.tasks.push(StructTask::WrapTryRun {
+                                ids: vec![id],
+                                p,
+                                prologues: Vec::new(),
+                                follow,
+                            });
+                        }
+                        LoopCutFallback::PlainLoop {
+                            id,
+                            header,
+                            kind,
+                            body,
+                            active,
+                            follow,
+                        } => {
+                            ts.tasks.push(StructTask::EmitLoop {
+                                id,
+                                header,
+                                kind,
+                                body_r: body,
+                                active,
+                                follow,
+                            });
+                        }
+                    }
+                    return;
+                }
+                let pending_mark = self.pending_wraps.len();
+                let suppress_mark = self.suppress_wraps.len();
+                if let Some(q1) = st.p1 {
+                    let prot = self.f().plans[q1].protected.clone();
+                    self.pending_wraps.push(prot.clone());
+                    self.suppress_wraps.push(prot);
+                }
+                let handlers0 = st.handlers0.clone();
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::LoopCutAfterCatches0 {
+                    st,
+                    skel,
+                    pending_mark,
+                    suppress_mark,
+                });
+                schedule_dedup_handlers(&handlers0, false, true, &mut ts.tasks);
+            }
+            StructTask::LoopCutAfterCatches0 {
+                st,
+                skel,
+                pending_mark,
+                suppress_mark,
+            } => {
+                self.suppress_wraps.truncate(suppress_mark);
+                let catches0 = ts.catch_lists.pop().unwrap_or_default();
+                let region0 = st.region0;
+                let note0 = if catches0.len() > 1 {
+                    self.stats.multi_catch += 1;
+                    Some(format!(
+                        "try region {region0}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                        catches0.len()
+                    ))
+                } else {
+                    None
+                };
+                let node0 = SNode::Try {
+                    body: skel,
+                    catches: catches0,
+                    note: note0,
+                    finally: None,
+                };
+                let pre_try = st.pre_try.clone();
+                let p0_fl = self.entry_of(st.p0_first);
+                ts.sinks.push(Vec::new());
+                ts.tasks.push(StructTask::LoopCutAfterPreTry {
+                    st,
+                    node0,
+                    pending_mark,
+                });
+                if !pre_try.is_empty() {
+                    ts.tasks.push(StructTask::SeqStep {
+                        children: pre_try,
+                        idx: 0,
+                        active: None,
+                        follow: p0_fl,
+                    });
+                }
+            }
+            StructTask::LoopCutAfterPreTry {
+                st,
+                node0,
+                pending_mark,
+            } => {
+                if let Some(q1) = st.p1 {
+                    let (region1, cuts1) = {
+                        let plan = &self.f().plans[q1];
+                        (plan.region, plan.cuts)
+                    };
+                    let wraps = {
+                        let f = self.f_mut();
+                        let n = f.wrap_counts.entry(q1).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    if wraps > 1 {
+                        self.stats.try_splits += 1;
+                    }
+                    if cuts1 {
+                        self.stats.try_cuts += 1;
+                    }
+                    self.stats.try_catches += 1;
+                    let mut p1_body = Vec::new();
+                    if cuts1 {
+                        p1_body.push(SNode::Honest(format!(
+                            "try region {region1}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+                        )));
+                    }
+                    let region0 = st.region0;
+                    p1_body.push(SNode::Honest(format!(
+                        "try region {region1}: handler-protecting outer try (finally idiom) — wrapped around region {region0}'s in-loop try/catch"
+                    )));
+                    p1_body.push(node0);
+                    let prefix = st.prefix.clone();
+                    let mid0 = st.midtail[0];
+                    ts.sinks.push(p1_body);
+                    ts.tasks.push(StructTask::LoopCutAfterPrefix {
+                        st,
+                        q1,
+                        region1,
+                        pending_mark,
+                    });
+                    for (i, &item) in prefix.iter().enumerate().rev() {
+                        let fl = if i + 1 < prefix.len() {
+                            self.entry_of(prefix[i + 1])
+                        } else {
+                            self.entry_of(mid0)
+                        };
+                        ts.tasks.push(StructTask::EmitNode {
+                            id: item,
+                            active: Some(q1),
+                            follow: fl,
+                        });
+                    }
+                } else {
+                    if let Some(loop_body) = ts.sinks.last_mut() {
+                        loop_body.push(node0);
+                    }
+                    self.pending_wraps.truncate(pending_mark);
+                    let midtail = st.midtail;
+                    let test = st.test;
+                    ts.tasks.push(StructTask::LoopCutFinish {
+                        kept_main: st.kept_main,
+                        while_cond: st.while_cond,
+                    });
+                    for (i, &item) in midtail.iter().enumerate().rev() {
+                        let fl = if i + 1 < midtail.len() {
+                            self.entry_of(midtail[i + 1])
+                        } else {
+                            Follow::Entry(test)
+                        };
+                        ts.tasks.push(StructTask::EmitNode {
+                            id: item,
+                            active: None,
+                            follow: fl,
+                        });
+                    }
+                }
+            }
+            StructTask::LoopCutAfterPrefix {
+                st,
+                q1,
+                region1,
+                pending_mark,
+            } => {
+                let p1_body = ts.sinks.pop().unwrap_or_default();
+                if let Some(r1) = st.rejoin1 {
+                    self.hoist_rejoins.push(r1);
+                }
+                let handlers1 = self.f().plans[q1].handlers.clone();
+                ts.catch_lists.push(Vec::new());
+                ts.tasks.push(StructTask::LoopCutAfterCatches1 {
+                    st,
+                    region1,
+                    p1_body,
+                    pending_mark,
+                });
+                schedule_dedup_handlers(&handlers1, false, false, &mut ts.tasks);
+            }
+            StructTask::LoopCutAfterCatches1 {
+                st,
+                region1,
+                p1_body,
+                pending_mark,
+            } => {
+                if st.rejoin1.is_some() {
+                    self.hoist_rejoins.pop();
+                }
+                let catches1 = ts.catch_lists.pop().unwrap_or_default();
+                let note1 = if catches1.len() > 1 {
+                    self.stats.multi_catch += 1;
+                    Some(format!(
+                        "try region {region1}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                        catches1.len()
+                    ))
+                } else {
+                    None
+                };
+                if let Some(loop_body) = ts.sinks.last_mut() {
+                    loop_body.push(SNode::Try {
+                        body: p1_body,
+                        catches: catches1,
+                        note: note1,
+                        finally: None,
+                    });
+                }
+                self.pending_wraps.truncate(pending_mark);
+                let midtail = st.midtail;
+                let test = st.test;
+                ts.tasks.push(StructTask::LoopCutFinish {
+                    kept_main: st.kept_main,
+                    while_cond: st.while_cond,
+                });
+                for (i, &item) in midtail.iter().enumerate().rev() {
+                    let fl = if i + 1 < midtail.len() {
+                        self.entry_of(midtail[i + 1])
+                    } else {
+                        Follow::Entry(test)
+                    };
+                    ts.tasks.push(StructTask::EmitNode {
+                        id: item,
+                        active: None,
+                        follow: fl,
+                    });
+                }
+            }
+            StructTask::LoopCutFinish {
+                kept_main,
+                while_cond,
+            } => {
+                let mut loop_body = ts.sinks.pop().unwrap_or_default();
+                Self::push_stmts(&mut loop_body, Self::stmts_leaves(&kept_main));
+                self.stats.loops_do_while += 1;
+                self.stats.loop_cut_rewrites += 1;
+                if let Some(sink) = ts.sinks.last_mut() {
+                    sink.push(SNode::DoWhile {
+                        label: None,
+                        body: loop_body,
+                        cond: while_cond,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }

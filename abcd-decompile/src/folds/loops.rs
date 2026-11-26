@@ -29,129 +29,234 @@ pub(in crate::folds) const FLOW_FALLTHROUGH: SeqFlow = SeqFlow {
 /// Sequence flow: nodes after a diverging node are statically dead —
 /// their breaks do not count as live.
 pub(in crate::folds) fn seq_flow(nodes: &[SNode]) -> SeqFlow {
-    let mut out = FLOW_FALLTHROUGH;
-    for n in nodes {
-        if out.diverges {
-            continue;
-        }
-        let f = node_flow(n);
-        out.live_break |= f.live_break;
-        out.diverges = f.diverges;
-    }
-    out
+    run_flow_steps(FlowStep::Seq {
+        slice: nodes,
+        idx: 0,
+        acc: FLOW_FALLTHROUGH,
+        awaiting_child: false,
+    })
 }
 
+#[cfg(test)]
 pub(in crate::folds) fn node_flow(n: &SNode) -> SeqFlow {
-    match n {
-        SNode::Stmts(run) => SeqFlow {
-            live_break: false,
-            // A `throw`/`return` leaf diverges (later leaves in the run
-            // are dead); a bare `unreachable` marker denotes dead code —
-            // control never passes it either.
-            diverges: run
-                .iter()
-                .any(|l| matches!(l, Leaf::Raw(Stmt::Throw(_) | Stmt::Return(_))))
-                || (!run.is_empty()
-                    && run
+    run_flow_steps(FlowStep::Node(n))
+}
+
+enum FlowStep<'a> {
+    Seq {
+        slice: &'a [SNode],
+        idx: usize,
+        acc: SeqFlow,
+        awaiting_child: bool,
+    },
+    Node(&'a SNode),
+    FinishIf {
+        non_empty: bool,
+    },
+    FinishInfiniteWhile,
+    FinishTry {
+        count: usize,
+    },
+}
+
+fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
+    let mut steps: Vec<FlowStep<'_>> = vec![initial];
+    let mut vals: Vec<SeqFlow> = Vec::new();
+    while let Some(step) = steps.pop() {
+        match step {
+            FlowStep::Seq {
+                slice,
+                idx,
+                mut acc,
+                awaiting_child,
+            } => {
+                if awaiting_child {
+                    let f = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
+                    acc.live_break |= f.live_break;
+                    acc.diverges = f.diverges;
+                }
+                if acc.diverges || idx >= slice.len() {
+                    vals.push(acc);
+                } else {
+                    steps.push(FlowStep::Seq {
+                        slice,
+                        idx: idx + 1,
+                        acc,
+                        awaiting_child: true,
+                    });
+                    steps.push(FlowStep::Node(&slice[idx]));
+                }
+            }
+            FlowStep::Node(n) => match n {
+                SNode::Stmts(run) => vals.push(SeqFlow {
+                    live_break: false,
+                    diverges: run
                         .iter()
-                        .all(|l| matches!(l, Leaf::Raw(Stmt::Unreachable)))),
-        },
-        SNode::Break { .. } => SeqFlow {
-            live_break: true,
-            diverges: true,
-        },
-        SNode::Continue { .. } => SeqFlow {
-            live_break: false,
-            diverges: true,
-        },
-        SNode::Honest(_) => FLOW_FALLTHROUGH,
-        SNode::If {
-            then, otherwise, ..
-        } => {
-            let t = seq_flow(then);
-            let o = seq_flow(otherwise);
-            SeqFlow {
-                live_break: t.live_break || o.live_break,
-                diverges: !then.is_empty() && !otherwise.is_empty() && t.diverges && o.diverges,
+                        .any(|l| matches!(l, Leaf::Raw(Stmt::Throw(_) | Stmt::Return(_))))
+                        || (!run.is_empty()
+                            && run
+                                .iter()
+                                .all(|l| matches!(l, Leaf::Raw(Stmt::Unreachable)))),
+                }),
+                SNode::Break { .. } => vals.push(SeqFlow {
+                    live_break: true,
+                    diverges: true,
+                }),
+                SNode::Continue { .. } => vals.push(SeqFlow {
+                    live_break: false,
+                    diverges: true,
+                }),
+                SNode::Honest(_) => vals.push(FLOW_FALLTHROUGH),
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    steps.push(FlowStep::FinishIf {
+                        non_empty: !then.is_empty() && !otherwise.is_empty(),
+                    });
+                    steps.push(FlowStep::Seq {
+                        slice: otherwise,
+                        idx: 0,
+                        acc: FLOW_FALLTHROUGH,
+                        awaiting_child: false,
+                    });
+                    steps.push(FlowStep::Seq {
+                        slice: then,
+                        idx: 0,
+                        acc: FLOW_FALLTHROUGH,
+                        awaiting_child: false,
+                    });
+                }
+                SNode::While {
+                    cond: None, body, ..
+                } => {
+                    steps.push(FlowStep::FinishInfiniteWhile);
+                    steps.push(FlowStep::Seq {
+                        slice: body,
+                        idx: 0,
+                        acc: FLOW_FALLTHROUGH,
+                        awaiting_child: false,
+                    });
+                }
+                SNode::While { .. }
+                | SNode::DoWhile { .. }
+                | SNode::ForOf { .. }
+                | SNode::ForIn { .. }
+                | SNode::Switch { .. } => vals.push(FLOW_FALLTHROUGH),
+                SNode::Labeled { body, .. } => steps.push(FlowStep::Seq {
+                    slice: body,
+                    idx: 0,
+                    acc: FLOW_FALLTHROUGH,
+                    awaiting_child: false,
+                }),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    let count = 1 + catches.len() + usize::from(finally.is_some());
+                    steps.push(FlowStep::FinishTry { count });
+                    if let Some(f) = finally {
+                        steps.push(FlowStep::Seq {
+                            slice: f,
+                            idx: 0,
+                            acc: FLOW_FALLTHROUGH,
+                            awaiting_child: false,
+                        });
+                    }
+                    for c in catches.iter().rev() {
+                        steps.push(FlowStep::Seq {
+                            slice: &c.body,
+                            idx: 0,
+                            acc: FLOW_FALLTHROUGH,
+                            awaiting_child: false,
+                        });
+                    }
+                    steps.push(FlowStep::Seq {
+                        slice: body,
+                        idx: 0,
+                        acc: FLOW_FALLTHROUGH,
+                        awaiting_child: false,
+                    });
+                }
+            },
+            FlowStep::FinishIf { non_empty } => {
+                let o = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
+                let t = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
+                vals.push(SeqFlow {
+                    live_break: t.live_break || o.live_break,
+                    diverges: non_empty && t.diverges && o.diverges,
+                });
             }
-        }
-        // A nested `while (true)` never completes when its own body has
-        // no live break; its unlabeled breaks are ITS exits (inner
-        // scope), not the analyzed loop's.
-        SNode::While {
-            cond: None, body, ..
-        } => SeqFlow {
-            live_break: false,
-            diverges: !seq_flow(body).live_break,
-        },
-        // Conditional loops / for-of / for-in / do-while / switch may
-        // complete normally; their unlabeled breaks are inner-scoped.
-        SNode::While { .. }
-        | SNode::DoWhile { .. }
-        | SNode::ForOf { .. }
-        | SNode::ForIn { .. }
-        | SNode::Switch { .. } => FLOW_FALLTHROUGH,
-        // A labeled block does not capture UNLABELED breaks (labeled
-        // jumps are pre-bailed by the caller), so it is transparent.
-        SNode::Labeled { body, .. } => seq_flow(body),
-        // Exceptional edges: a break in the body, any catch, or the
-        // finally is live when reachable there (an exception can
-        // transfer control at any point, so catch/finally sequences
-        // are analyzed from their own entry). The try as a whole may
-        // complete normally — conservative: never diverges.
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            let mut live = seq_flow(body).live_break;
-            for c in catches {
-                live |= seq_flow(&c.body).live_break;
+            FlowStep::FinishInfiniteWhile => {
+                let b = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
+                vals.push(SeqFlow {
+                    live_break: false,
+                    diverges: !b.live_break,
+                });
             }
-            if let Some(f) = finally {
-                live |= seq_flow(f).live_break;
-            }
-            SeqFlow {
-                live_break: live,
-                diverges: false,
+            FlowStep::FinishTry { count } => {
+                let start = vals.len().saturating_sub(count);
+                let live = vals.drain(start..).any(|f| f.live_break);
+                vals.push(SeqFlow {
+                    live_break: live,
+                    diverges: false,
+                });
             }
         }
     }
+    vals.pop().unwrap_or(FLOW_FALLTHROUGH)
 }
 
 /// Any labeled break/continue anywhere in the subtree → the caller
 /// bails (a labeled jump could target a label between the loop and the
 /// residue in shapes this pass does not model — doubt keeps the block).
 pub(in crate::folds) fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
-    nodes.iter().any(|n| match n {
-        SNode::Break { label: Some(_) } | SNode::Continue { label: Some(_) } => true,
-        SNode::If {
-            then, otherwise, ..
-        } => subtree_has_labeled_jump(then) || subtree_has_labeled_jump(otherwise),
-        SNode::While { body, .. }
-        | SNode::DoWhile { body, .. }
-        | SNode::Labeled { body, .. }
-        | SNode::ForOf { body, .. }
-        | SNode::ForIn { body, .. } => subtree_has_labeled_jump(body),
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            subtree_has_labeled_jump(body)
-                || catches.iter().any(|c| subtree_has_labeled_jump(&c.body))
-                || finally
-                    .as_ref()
-                    .is_some_and(|f| subtree_has_labeled_jump(f))
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Break { label: Some(_) } | SNode::Continue { label: Some(_) } => {
+                    return true;
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Stmts(_)
+                | SNode::Break { label: None }
+                | SNode::Continue { label: None }
+                | SNode::Honest(_) => {}
+            }
         }
-        SNode::Switch { cases, .. } => cases.iter().any(|c| subtree_has_labeled_jump(&c.body)),
-        SNode::Stmts(_)
-        | SNode::Break { label: None }
-        | SNode::Continue { label: None }
-        | SNode::Honest(_) => false,
-    })
+    }
+    false
 }
 
 /// Sweep the dead loop-exit dispatch throws. A trailing `throw <t>`
@@ -624,29 +729,47 @@ pub(in crate::folds) fn match_single_pass_for_in(
 /// A `continue` anywhere in the subtree (the degenerate for-in's body
 /// must not grow one — see the matcher's guard).
 pub(in crate::folds) fn subtree_has_continue(nodes: &[SNode]) -> bool {
-    nodes.iter().any(|n| match n {
-        SNode::Continue { .. } => true,
-        SNode::If {
-            then, otherwise, ..
-        } => subtree_has_continue(then) || subtree_has_continue(otherwise),
-        // A nested loop's continues target THAT loop — stop the walk.
-        SNode::While { .. } | SNode::DoWhile { .. } | SNode::ForOf { .. } | SNode::ForIn { .. } => {
-            false
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Continue { .. } => return true,
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                // A nested loop's continues target THAT loop — stop the walk.
+                SNode::While { .. }
+                | SNode::DoWhile { .. }
+                | SNode::ForOf { .. }
+                | SNode::ForIn { .. } => {}
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Stmts(_) | SNode::Break { .. } | SNode::Honest(_) => {}
+            }
         }
-        SNode::Labeled { body, .. } => subtree_has_continue(body),
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            subtree_has_continue(body)
-                || catches.iter().any(|c| subtree_has_continue(&c.body))
-                || finally.as_ref().is_some_and(|f| subtree_has_continue(f))
-        }
-        SNode::Switch { cases, .. } => cases.iter().any(|c| subtree_has_continue(&c.body)),
-        SNode::Stmts(_) | SNode::Break { .. } | SNode::Honest(_) => false,
-    })
+    }
+    false
 }
 
 /// The concatenated leaf run of the adjacent `Stmts` nodes immediately
@@ -896,7 +1019,7 @@ pub(in crate::folds) fn match_for_in(
     if wiring.len() != phi_names.len() {
         return None;
     }
-    let obj = match wiring.remove(&it_phi) {
+    let obj = match &wiring.remove(&it_phi) {
         Some(Leaf::Raw(Stmt::PhiAssign {
             value:
                 Expr::Iter {
@@ -1091,9 +1214,10 @@ pub(in crate::folds) fn rebuild_loop_body(
     let binding = binding?;
     if let Some(ti) = splice_idx {
         // Replace the cleanup try with its body (loudly).
-        let Some(SNode::Try { body: inner, .. }) = out.get(ti).cloned() else {
+        let Some(SNode::Try { body: inner, .. }) = out.get(ti) else {
             unreachable!()
         };
+        let inner = inner.clone();
         let mut replacement: Vec<SNode> = vec![SNode::Honest(
             "iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5)"
                 .to_string(),
@@ -1486,9 +1610,10 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
     if let Some(bi) = splice_idx {
         // Replace the cleanup try with its body (loudly) — the
         // for-await protocol runs IteratorClose implicitly.
-        let Some(SNode::Try { body: inner, .. }) = body_nodes.get(bi).cloned() else {
+        let Some(SNode::Try { body: inner, .. }) = body_nodes.get(bi) else {
             unreachable!()
         };
+        let inner = inner.clone();
         let mut replacement: Vec<SNode> = vec![SNode::Honest(
             "iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5)"
                 .to_string(),
@@ -1622,12 +1747,15 @@ pub(in crate::folds) fn apply_for_await_driver(
 /// Substitute every reference to temp `vid` by a clone of
 /// `replacement` (value positions only — binding sites are names).
 pub(in crate::folds) fn subst_temp_in_expr(e: &mut Expr, vid: ValueId, replacement: &Expr) {
-    if temp_value(e) == Some(vid) {
-        *e = replacement.clone();
-        return;
-    }
-    for c in expr_children_mut(e) {
-        subst_temp_in_expr(c, vid, replacement);
+    let mut stack: Vec<&mut Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        if temp_value(cur) == Some(vid) {
+            *cur = replacement.clone();
+            continue;
+        }
+        for c in expr_children_mut(cur).into_iter().rev() {
+            stack.push(c);
+        }
     }
 }
 
@@ -1688,65 +1816,68 @@ pub(in crate::folds) fn subst_temp_in_leaf(l: &mut Leaf, vid: ValueId, replaceme
 }
 
 pub(in crate::folds) fn subst_temp_in_nodes(nodes: &mut [SNode], vid: ValueId, replacement: &Expr) {
-    for n in nodes {
-        match n {
-            SNode::Stmts(run) => {
-                for l in run {
-                    subst_temp_in_leaf(l, vid, replacement);
-                }
-            }
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                subst_temp_in_expr(cond, vid, replacement);
-                subst_temp_in_nodes(then, vid, replacement);
-                subst_temp_in_nodes(otherwise, vid, replacement);
-            }
-            SNode::While { cond, body, .. } => {
-                if let Some(c) = cond {
-                    subst_temp_in_expr(c, vid, replacement);
-                }
-                subst_temp_in_nodes(body, vid, replacement);
-            }
-            SNode::DoWhile { body, cond, .. } => {
-                subst_temp_in_nodes(body, vid, replacement);
-                subst_temp_in_expr(cond, vid, replacement);
-            }
-            SNode::Labeled { body, .. } => subst_temp_in_nodes(body, vid, replacement),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                subst_temp_in_nodes(body, vid, replacement);
-                for c in catches {
-                    subst_temp_in_nodes(&mut c.body, vid, replacement);
-                }
-                if let Some(f) = finally {
-                    subst_temp_in_nodes(f, vid, replacement);
-                }
-            }
-            SNode::ForOf { iter, body, .. } => {
-                subst_temp_in_expr(iter, vid, replacement);
-                subst_temp_in_nodes(body, vid, replacement);
-            }
-            SNode::ForIn { obj, body, .. } => {
-                subst_temp_in_expr(obj, vid, replacement);
-                subst_temp_in_nodes(body, vid, replacement);
-            }
-            SNode::Switch { disc, cases } => {
-                subst_temp_in_expr(disc, vid, replacement);
-                for c in cases {
-                    for t in &mut c.tests {
-                        subst_temp_in_expr(t, vid, replacement);
+    let mut stack: Vec<&mut [SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(run) => {
+                    for l in run {
+                        subst_temp_in_leaf(l, vid, replacement);
                     }
-                    subst_temp_in_nodes(&mut c.body, vid, replacement);
                 }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    subst_temp_in_expr(cond, vid, replacement);
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        subst_temp_in_expr(c, vid, replacement);
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    subst_temp_in_expr(cond, vid, replacement);
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter_mut().rev() {
+                        stack.push(&mut c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    subst_temp_in_expr(iter, vid, replacement);
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    subst_temp_in_expr(obj, vid, replacement);
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    subst_temp_in_expr(disc, vid, replacement);
+                    for c in cases.iter_mut().rev() {
+                        for t in &mut c.tests {
+                            subst_temp_in_expr(t, vid, replacement);
+                        }
+                        stack.push(&mut c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
 }
@@ -1912,105 +2043,112 @@ pub(in crate::folds) fn strip_internal_phi_plumbing(
     roots: &BTreeSet<&str>,
     copies: &BTreeSet<&str>,
 ) {
-    out.retain_mut(|n| match n {
-        SNode::Stmts(run) => {
-            run.retain(|l| match l {
-                Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
-                    !(copies.contains(target.as_str())
-                        || roots.contains(target.as_str())
-                            && temp_name(value) == Some(target.as_str()))
-                }
-                Leaf::Raw(Stmt::PhiDecl { name, .. }) => !copies.contains(name.as_str()),
-                _ => true,
-            });
-            !run.is_empty()
-        }
-        SNode::If {
-            then, otherwise, ..
-        } => {
-            strip_internal_phi_plumbing(then, roots, copies);
-            strip_internal_phi_plumbing(otherwise, roots, copies);
-            true
-        }
-        SNode::While { body, .. }
-        | SNode::DoWhile { body, .. }
-        | SNode::Labeled { body, .. }
-        | SNode::ForOf { body, .. }
-        | SNode::ForIn { body, .. } => {
-            strip_internal_phi_plumbing(body, roots, copies);
-            true
-        }
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            strip_internal_phi_plumbing(body, roots, copies);
-            for c in catches {
-                strip_internal_phi_plumbing(&mut c.body, roots, copies);
+    fold_snode_vecs_postorder(out, |seq| {
+        seq.retain_mut(|n| match n {
+            SNode::Stmts(run) => {
+                run.retain(|l| match l {
+                    Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
+                        !(copies.contains(target.as_str())
+                            || roots.contains(target.as_str())
+                                && temp_name(value) == Some(target.as_str()))
+                    }
+                    Leaf::Raw(Stmt::PhiDecl { name, .. }) => !copies.contains(name.as_str()),
+                    _ => true,
+                });
+                !run.is_empty()
             }
-            if let Some(f) = finally {
-                strip_internal_phi_plumbing(f, roots, copies);
-            }
-            true
-        }
-        SNode::Switch { cases, .. } => {
-            for c in cases {
-                strip_internal_phi_plumbing(&mut c.body, roots, copies);
-            }
-            true
-        }
-        SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => true,
+            _ => true,
+        });
     });
 }
 
 /// Whether any node mentions any of the temp names.
 pub(in crate::folds) fn nodes_use_any(nodes: &[SNode], names: &[String]) -> bool {
-    nodes.iter().any(|n| node_uses_any(n, names))
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(leaves) => {
+                    if names.iter().any(|nm| leaves_use_name(leaves, nm)) {
+                        return true;
+                    }
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    if names.iter().any(|nm| expr_uses_name(cond, nm)) {
+                        return true;
+                    }
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if cond
+                        .as_ref()
+                        .is_some_and(|c| names.iter().any(|nm| expr_uses_name(c, nm)))
+                    {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    if names.iter().any(|nm| expr_uses_name(cond, nm)) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    if names.iter().any(|nm| expr_uses_name(iter, nm)) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    if names.iter().any(|nm| expr_uses_name(obj, nm)) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    if names.iter().any(|nm| expr_uses_name(disc, nm)) {
+                        return true;
+                    }
+                    for c in cases.iter().rev() {
+                        if c.tests
+                            .iter()
+                            .any(|t| names.iter().any(|nm| expr_uses_name(t, nm)))
+                        {
+                            return true;
+                        }
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    false
 }
 
 pub(in crate::folds) fn node_uses_any(n: &SNode, names: &[String]) -> bool {
-    match n {
-        SNode::Stmts(leaves) => names.iter().any(|n| leaves_use_name(leaves, n)),
-        SNode::If {
-            cond,
-            then,
-            otherwise,
-        } => {
-            names.iter().any(|n| expr_uses_name(cond, n))
-                || nodes_use_any(then, names)
-                || nodes_use_any(otherwise, names)
-        }
-        SNode::While { cond, body, .. } => {
-            cond.as_ref()
-                .is_some_and(|c| names.iter().any(|n| expr_uses_name(c, n)))
-                || nodes_use_any(body, names)
-        }
-        SNode::DoWhile { body, cond, .. } => {
-            names.iter().any(|n| expr_uses_name(cond, n)) || nodes_use_any(body, names)
-        }
-        SNode::Labeled { body, .. } => nodes_use_any(body, names),
-        SNode::Try { body, catches, .. } => {
-            nodes_use_any(body, names) || catches.iter().any(|c| nodes_use_any(&c.body, names))
-        }
-        SNode::ForOf { iter, body, .. } => {
-            names.iter().any(|n| expr_uses_name(iter, n)) || nodes_use_any(body, names)
-        }
-        SNode::ForIn { obj, body, .. } => {
-            names.iter().any(|n| expr_uses_name(obj, n)) || nodes_use_any(body, names)
-        }
-        SNode::Switch { disc, cases } => {
-            names.iter().any(|n| expr_uses_name(disc, n))
-                || cases.iter().any(|c| {
-                    c.tests
-                        .iter()
-                        .any(|t| names.iter().any(|n| expr_uses_name(t, n)))
-                        || nodes_use_any(&c.body, names)
-                })
-        }
-        SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
-    }
+    nodes_use_any(std::slice::from_ref(n), names)
 }
 
 /// The iterator-cleanup handler check (loose, documented): every
@@ -2049,45 +2187,64 @@ pub(in crate::folds) fn walk_cleanup(
         grew = false;
         collect_aliases(nodes, &mut aliases, &mut grew);
     }
-    for n in nodes {
-        match n {
-            SNode::Stmts(leaves) => {
-                for l in leaves {
-                    match l {
-                        Leaf::Raw(Stmt::Throw(e))
-                            if temp_name(e).is_some_and(|n| aliases.iter().any(|a| a == n)) =>
-                        {
-                            *rethrow = true
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        match l {
+                            Leaf::Raw(Stmt::Throw(e))
+                                if temp_name(e)
+                                    .is_some_and(|nm| aliases.iter().any(|a| a == nm)) =>
+                            {
+                                *rethrow = true;
+                            }
+                            Leaf::Raw(Stmt::Throw(_)) => *bad = true,
+                            Leaf::Raw(Stmt::Declare { value, .. })
+                                if expr_has_return_load(value) =>
+                            {
+                                *return_load = true;
+                            }
+                            Leaf::Raw(
+                                Stmt::StoreProp { .. }
+                                | Stmt::StoreIndex { .. }
+                                | Stmt::StoreDyn { .. }
+                                | Stmt::StorePrivate { .. }
+                                | Stmt::StoreSuper { .. }
+                                | Stmt::LexStore { .. }
+                                | Stmt::GlobalStore { .. }
+                                | Stmt::ModuleStore { .. },
+                            ) => *bad = true,
+                            _ => {}
                         }
-                        Leaf::Raw(Stmt::Throw(_)) => *bad = true,
-                        Leaf::Raw(Stmt::Declare { value, .. }) if expr_has_return_load(value) => {
-                            *return_load = true
-                        }
-                        Leaf::Raw(
-                            Stmt::StoreProp { .. }
-                            | Stmt::StoreIndex { .. }
-                            | Stmt::StoreDyn { .. }
-                            | Stmt::StorePrivate { .. }
-                            | Stmt::StoreSuper { .. }
-                            | Stmt::LexStore { .. }
-                            | Stmt::GlobalStore { .. }
-                            | Stmt::ModuleStore { .. },
-                        ) => *bad = true,
-                        _ => {}
                     }
                 }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                _ => {}
             }
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                walk_cleanup(then, binding, rethrow, return_load, bad);
-                walk_cleanup(otherwise, binding, rethrow, return_load, bad);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. } => walk_cleanup(body, binding, rethrow, return_load, bad),
-            SNode::Try { body, .. } => walk_cleanup(body, binding, rethrow, return_load, bad),
-            _ => {}
         }
     }
 }
@@ -2098,46 +2255,67 @@ pub(in crate::folds) fn collect_aliases(
     aliases: &mut Vec<String>,
     grew: &mut bool,
 ) {
-    for n in nodes {
-        match n {
-            SNode::Stmts(leaves) => {
-                for l in leaves {
-                    let (target, value) = match l {
-                        Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => (target, value),
-                        Leaf::Raw(Stmt::Declare { name, value, .. }) => (name, value),
-                        _ => continue,
-                    };
-                    if temp_name(value).is_some_and(|v| aliases.iter().any(|a| a == v))
-                        && !aliases.iter().any(|a| a == target)
-                    {
-                        aliases.push(target.clone());
-                        *grew = true;
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        let (target, value) = match l {
+                            Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => (target, value),
+                            Leaf::Raw(Stmt::Declare { name, value, .. }) => (name, value),
+                            _ => continue,
+                        };
+                        if temp_name(value).is_some_and(|v| aliases.iter().any(|a| a == v))
+                            && !aliases.iter().any(|a| a == target)
+                        {
+                            aliases.push(target.clone());
+                            *grew = true;
+                        }
                     }
                 }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                _ => {}
             }
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                collect_aliases(then, aliases, grew);
-                collect_aliases(otherwise, aliases, grew);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            | SNode::Try { body, .. } => collect_aliases(body, aliases, grew),
-            _ => {}
         }
     }
 }
 
 /// Whether the expression contains a `"return"`-keyed load.
 pub(in crate::folds) fn expr_has_return_load(e: &Expr) -> bool {
-    match e {
-        Expr::PropDyn { key, .. } | Expr::PropIndex { index: key, .. } => {
-            matches!(key.as_ref(), Expr::Lit(Lit::String(s)) if s == "return")
-                || expr_children(e).into_iter().any(expr_has_return_load)
+    let mut stack: Vec<&Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::PropDyn { key, .. } | Expr::PropIndex { index: key, .. } if matches!(key.as_ref(), Expr::Lit(Lit::String(s)) if s == "return") =>
+            {
+                return true;
+            }
+            Expr::PropName { name, .. } if name == "return" => return true,
+            _ => {}
         }
-        Expr::PropName { name, .. } if name == "return" => true,
-        _ => expr_children(e).into_iter().any(expr_has_return_load),
+        stack.extend(expr_children(cur));
     }
+    false
 }

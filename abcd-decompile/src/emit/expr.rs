@@ -4,27 +4,23 @@ use super::decl::{closure_prefix, fn_uses_super, method_prefix};
 use super::*;
 
 impl<'m> Emitter<'m> {
-    // ── Expressions (precedence-correct) ─────────────────────────────
+    // ── Expressions (precedence-correct, iterative) ──────────────────
 
-    /// Print an expression; parenthesize when its precedence is below
-    /// `prec`.
+    /// Print an expression; parenthesize when its precedence is below `prec`.
     pub(in crate::emit) fn expr(&mut self, e: &Expr, prec: u8, out: &mut String) {
-        if e.precedence() < prec {
-            out.push('(');
-            self.expr_inner(e, out);
-            out.push(')');
-        } else {
-            self.expr_inner(e, out);
-        }
+        self.run_print_tasks(PrintRoot::Expr(e, prec), out);
     }
 
-    /// A sub-expression at context precedence `prec`.
-    pub(in crate::emit) fn sub(&mut self, e: &Expr, prec: u8, out: &mut String) {
-        self.expr(e, prec, out);
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub(in crate::emit) fn expr_inner(&mut self, e: &Expr, out: &mut String) {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "central expression pretty-printer dispatches across all Stage-A/B Expr variants"
+    )]
+    pub(in crate::emit) fn step_print_expr_inner<'b>(
+        &mut self,
+        e: &'b Expr,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         match e {
             Expr::Lit(lit) => out.push_str(&self.render_lit_js(lit)),
             Expr::Ident(name) => out.push_str(name),
@@ -34,23 +30,36 @@ impl<'m> Emitter<'m> {
                 name,
                 dot_legal,
             } => {
-                self.sub(object, 19, out);
-                if *dot_legal {
-                    out.push_str(&format!(".{name}"));
+                let suffix = if *dot_legal {
+                    format!(".{name}")
                 } else {
-                    out.push_str(&format!("[{}]", render_pool_string(self.module, name)));
-                }
+                    format!("[{}]", render_pool_string(self.module, name))
+                };
+                tasks.push(PrintTask::RawOwned(suffix));
+                tasks.push(PrintTask::Expr {
+                    expr: object,
+                    prec: 19,
+                });
             }
             Expr::PropIndex { object, index } | Expr::PropDyn { object, key: index } => {
-                self.sub(object, 19, out);
-                out.push('[');
-                self.sub(index, 0, out);
-                out.push(']');
+                tasks.push(PrintTask::Raw("]"));
+                tasks.push(PrintTask::Expr {
+                    expr: index,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::Raw("["));
+                tasks.push(PrintTask::Expr {
+                    expr: object,
+                    prec: 19,
+                });
             }
             Expr::PrivateLoad { object, name } => {
                 if self.class_depth > 0 {
-                    self.sub(object, 19, out);
-                    out.push_str(&format!(".#{name}"));
+                    tasks.push(PrintTask::RawOwned(format!(".#{name}")));
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 19,
+                    });
                 } else {
                     *self
                         .stats
@@ -58,17 +67,23 @@ impl<'m> Emitter<'m> {
                         .entry("LoadPrivate(out-of-class)")
                         .or_insert(0) += 1;
                     self.current_fn_has_fallback = true;
-                    self.sub(object, 19, out);
-                    out.push_str(&format!(
+                    tasks.push(PrintTask::RawOwned(format!(
                         "[{}] /*private #{name} — out-of-class*/",
                         render_pool_string(self.module, name)
-                    ));
+                    )));
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 19,
+                    });
                 }
             }
             Expr::PrivateTest { object, name } => {
                 if self.class_depth > 0 {
                     out.push_str(&format!("#{name} in "));
-                    self.sub(object, 12, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 12,
+                    });
                 } else {
                     *self
                         .stats
@@ -77,16 +92,19 @@ impl<'m> Emitter<'m> {
                         .or_insert(0) += 1;
                     self.current_fn_has_fallback = true;
                     out.push_str(&format!("({} in ", render_pool_string(self.module, name)));
-                    self.sub(object, 0, out);
-                    out.push_str(") /*private test — out-of-class*/");
+                    tasks.push(PrintTask::Raw(") /*private test — out-of-class*/"));
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 0,
+                    });
                 }
             }
             Expr::SuperProp { name, key } => match (name, key) {
                 (Some(n), None) => out.push_str(&format!("super.{n}")),
                 (None, Some(k)) => {
                     out.push_str("super[");
-                    self.sub(k, 0, out);
-                    out.push(']');
+                    tasks.push(PrintTask::Raw("]"));
+                    tasks.push(PrintTask::Expr { expr: k, prec: 0 });
                 }
                 _ => out.push_str("super[?]"),
             },
@@ -95,157 +113,83 @@ impl<'m> Emitter<'m> {
                 this,
                 args,
                 kind,
-            } => self.emit_call(callee, this.as_deref(), args, *kind, out),
+            } => self.step_print_call(callee, this.as_deref(), args, *kind, tasks, out),
             Expr::SuperMarker => out.push_str("super"),
             Expr::DynamicImport { specifier } => {
                 out.push_str("import(");
-                self.sub(specifier, 0, out);
-                out.push(')');
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::Expr {
+                    expr: specifier,
+                    prec: 0,
+                });
             }
-            Expr::Unary { op, operand } => self.emit_unary(*op, operand, out),
+            Expr::Unary { op, operand } => self.step_print_unary(*op, operand, tasks, out),
             Expr::Delete { target } => {
                 out.push_str("delete ");
-                self.sub(target, 17, out);
+                tasks.push(PrintTask::Expr {
+                    expr: target,
+                    prec: 17,
+                });
             }
             Expr::Binary { op, left, right } => {
                 let prec = e.precedence();
-                // `**` is right-associative; a unary left operand of
-                // `**` is a JS syntax error (always parenthesized).
                 let left_prec = if *op == BinOp::Exp { 17 } else { prec };
                 let right_prec = if *op == BinOp::Exp { prec } else { prec + 1 };
-                let force_left_parens =
-                    *op == BinOp::Exp && matches!(left.as_ref(), Expr::Unary { .. });
+                let force_left_parens = *op == BinOp::Exp && is_emitted_unary_lhs(left);
+                tasks.push(PrintTask::Expr {
+                    expr: right,
+                    prec: right_prec,
+                });
+                tasks.push(PrintTask::RawOwned(format!(" {} ", binop_sym(*op))));
                 if force_left_parens {
-                    out.push('(');
-                    self.expr_inner(left, out);
-                    out.push(')');
+                    tasks.push(PrintTask::Raw(")"));
+                    tasks.push(PrintTask::ExprInner(left));
+                    tasks.push(PrintTask::Raw("("));
                 } else {
-                    self.sub(left, left_prec, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: left,
+                        prec: left_prec,
+                    });
                 }
-                out.push_str(&format!(" {} ", binop_sym(*op)));
-                self.sub(right, right_prec, out);
             }
             Expr::Compare { op, left, right } => {
                 let prec = e.precedence();
-                self.sub(left, prec, out);
-                out.push_str(&format!(" {} ", cmpop_sym(*op)));
-                self.sub(right, prec + 1, out);
+                tasks.push(PrintTask::Expr {
+                    expr: right,
+                    prec: prec + 1,
+                });
+                tasks.push(PrintTask::RawOwned(format!(" {} ", cmpop_sym(*op))));
+                tasks.push(PrintTask::Expr { expr: left, prec });
             }
             Expr::RegExp { pattern, flags } => {
-                let body = pattern.replace('/', "\\/");
+                let body = crate::consts::escape_regexp_body(pattern);
                 out.push_str(&format!("/{body}/{flags}"));
             }
             Expr::ObjectLit { entries } => {
-                out.push_str(&render_lit_m(self.module, &Lit::Object(entries.clone())));
+                out.push_str(&self.render_lit_js(&Lit::Object(entries.clone())));
             }
             Expr::ArrayLit { elements } => {
-                out.push_str(&render_lit_m(self.module, &Lit::Array(elements.clone())));
+                out.push_str(&self.render_lit_js(&Lit::Array(elements.clone())));
             }
             Expr::ObjectBuild { entries } => {
                 out.push('{');
-                let parts: Vec<String> = entries
-                    .iter()
-                    .map(|en| {
-                        let mut s = String::new();
-                        match en {
-                            ObjEntry::KeyValue(k, v) => {
-                                s.push_str(&render_lit_key_pub(self.module, k));
-                                s.push_str(": ");
-                                self.expr(v, 0, &mut s);
-                            }
-                            ObjEntry::Computed(k, v) => {
-                                s.push('[');
-                                self.expr(k, 0, &mut s);
-                                s.push_str("]: ");
-                                self.expr(v, 0, &mut s);
-                            }
-                            ObjEntry::Spread(x) => {
-                                s.push_str("...");
-                                self.expr(x, 0, &mut s);
-                            }
-                            ObjEntry::Proto(x) => {
-                                s.push_str("__proto__: ");
-                                self.expr(x, 0, &mut s);
-                            }
-                            ObjEntry::Method(n, f) => {
-                                // N74-W4: a `key: function` property
-                                // value has NO [[HomeObject]] — a body
-                                // referencing `super` is a SyntaxError
-                                // there (es2abc: "Unexpected super
-                                // keyword"), and a generator body loses
-                                // its `yield` legality the same way.
-                                // Both MUST print as the concise method
-                                // form (`key() {…}` / `*key() {…}`),
-                                // which carries both.
-                                let concise = match f {
-                                    Expr::Closure { body, kind, .. } => {
-                                        matches!(
-                                            kind,
-                                            FunctionKind::Generator | FunctionKind::AsyncGenerator
-                                        ) || fn_uses_super(self.module, *body)
-                                    }
-                                    _ => false,
-                                };
-                                if concise {
-                                    let Expr::Closure { body, kind, .. } = f else {
-                                        unreachable!()
-                                    };
-                                    s.push_str(&self.concise_method(
-                                        method_prefix(*kind),
-                                        &crate::expr::ObjKey::Name(n.clone()),
-                                        *body,
-                                    ));
-                                } else {
-                                    if is_legal_ident(n) {
-                                        s.push_str(n);
-                                    } else {
-                                        s.push_str(&render_pool_string(self.module, n));
-                                    }
-                                    s.push_str(": ");
-                                    self.expr(f, 0, &mut s);
-                                }
-                            }
-                            // N74-W4: accessors folded from
-                            // `DefineGetterSetterByValue` (folds.rs) —
-                            // always the concise form (HomeObject,
-                            // enumerability).
-                            ObjEntry::Getter(k, f) => {
-                                if let Expr::Closure { body, .. } = f {
-                                    s.push_str(&self.concise_method("get ", k, *body));
-                                } else {
-                                    s.push_str("/* getter: non-closure (data shape) */");
-                                }
-                            }
-                            ObjEntry::Setter(k, f) => {
-                                if let Expr::Closure { body, .. } = f {
-                                    s.push_str(&self.concise_method("set ", k, *body));
-                                } else {
-                                    s.push_str("/* setter: non-closure (data shape) */");
-                                }
-                            }
-                        }
-                        s
-                    })
-                    .collect();
-                out.push_str(&parts.join(", "));
-                out.push('}');
+                tasks.push(PrintTask::Raw("}"));
+                if !entries.is_empty() {
+                    tasks.push(PrintTask::ObjEntries {
+                        slice: entries,
+                        first: true,
+                    });
+                }
             }
             Expr::ArrayBuild { elements } => {
-                let parts: Vec<String> = elements
-                    .iter()
-                    .map(|el| {
-                        let mut s = String::new();
-                        match el {
-                            ArrayElem::Item(x) => self.expr(x, 0, &mut s),
-                            ArrayElem::Spread(x) => {
-                                s.push_str("...");
-                                self.expr(x, 0, &mut s);
-                            }
-                        }
-                        s
-                    })
-                    .collect();
-                out.push_str(&format!("[{}]", parts.join(", ")));
+                out.push('[');
+                tasks.push(PrintTask::Raw("]"));
+                if !elements.is_empty() {
+                    tasks.push(PrintTask::ArrElems {
+                        slice: elements,
+                        first: true,
+                    });
+                }
             }
             Expr::Closure {
                 body, name, kind, ..
@@ -257,9 +201,6 @@ impl<'m> Emitter<'m> {
                 let named = !display.is_empty() && display != "_" && is_legal_ident(&display);
                 let arrow = matches!(kind, FunctionKind::Arrow | FunctionKind::AsyncArrow);
                 if arrow {
-                    // The arrow signal IS recoverable (the file's
-                    // NC_FUNCTION kind — d-P8); arrows are anonymous,
-                    // the binding name comes from the context.
                     let prefix = if kind == FunctionKind::AsyncArrow {
                         "async ("
                     } else {
@@ -274,17 +215,16 @@ impl<'m> Emitter<'m> {
                         out.push_str(&format!("{keyword} ("));
                     }
                 }
-                let mut text = String::new();
-                let rf = self.emit_function_body(body, 1, &mut text);
-                let (params, ret) = self.params_ret(&rf);
-                if arrow {
-                    out.push_str(&format!("{params}){ret} => {{\n{text}}}"));
-                } else {
-                    // `FunctionKind::Function` closures ARE function
-                    // expressions (the file marks arrows NC — d-P8), so
-                    // no arrow/function caveat applies.
-                    out.push_str(&format!("{params}){ret} {{\n{text}}}"));
-                }
+                tasks.push(PrintTask::EnterInlineFunc {
+                    func: body,
+                    indent: 1,
+                    style: InlineHeaderStyle {
+                        open_paren: false,
+                        drop_ret_ty: false,
+                        arrow,
+                        closing: "}".to_string(),
+                    },
+                });
             }
             Expr::Class {
                 ctor,
@@ -294,28 +234,20 @@ impl<'m> Emitter<'m> {
                 member_attrs,
                 sendable,
             } => {
-                // Class expression form.
-                let (ctor, name, heritage, members, member_attrs, sendable) = (
-                    *ctor,
-                    name.clone(),
-                    heritage.clone(),
-                    *members,
-                    member_attrs.clone(),
-                    *sendable,
-                );
-                let mut s = String::new();
-                self.emit_class(
+                let start = out.len();
+                tasks.push(PrintTask::TrimEndSince(start));
+                self.step_start_class(
                     "",
                     0,
-                    &sanitize(&name),
-                    ctor,
-                    heritage,
-                    members,
-                    &member_attrs,
-                    sendable,
-                    &mut s,
+                    &sanitize(name),
+                    *ctor,
+                    heritage.as_deref(),
+                    *members,
+                    member_attrs,
+                    *sendable,
+                    tasks,
+                    out,
                 );
-                out.push_str(s.trim_end());
             }
             Expr::Yield { value } => {
                 if matches!(
@@ -323,26 +255,29 @@ impl<'m> Emitter<'m> {
                     FunctionKind::Generator | FunctionKind::AsyncGenerator
                 ) {
                     out.push_str("yield ");
-                    self.sub(value, 0, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
                 } else {
-                    // `SuspendGenerator` inside a plain-async function is
-                    // the async suspension machinery (R4), not a source
-                    // `yield` — `yield` would not parse here.
                     *self
                         .stats
                         .fallback_comments
                         .entry("SuspendGenerator(async-machinery)")
                         .or_insert(0) += 1;
                     out.push_str("/*async-machinery suspend (R4; not a source yield)*/ ");
-                    self.sub(value, 0, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
                 }
             }
             Expr::YieldStar { value } => {
-                // Produced only by the YieldStar fold (d-P15), which is
-                // kind-gated to Generator/AsyncGenerator — `yield*`
-                // always parses here.
                 out.push_str("yield* ");
-                self.sub(value, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Expr::Await { value, .. } => {
                 if matches!(
@@ -350,16 +285,11 @@ impl<'m> Emitter<'m> {
                     FunctionKind::Async | FunctionKind::AsyncArrow | FunctionKind::AsyncGenerator
                 ) {
                     out.push_str("await ");
-                    self.sub(value, 17, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 17,
+                    });
                 } else {
-                    // Defensive (Bug A residual): `await` parses only in
-                    // an async body. The effective-kind evidence upgrade
-                    // makes this unreachable for the vendor shape
-                    // (`AwaitUncaught` always pairs with
-                    // `AsyncFunctionEnter`); a stray await in a
-                    // metadata-plain body degrades LOUDLY to its operand
-                    // instead of emitting unparseable text (mirrors the
-                    // `SuspendGenerator` arm above).
                     *self
                         .stats
                         .fallback_comments
@@ -367,7 +297,10 @@ impl<'m> Emitter<'m> {
                         .or_insert(0) += 1;
                     self.current_fn_has_fallback = true;
                     out.push_str("/*await outside async context (operand kept)*/ ");
-                    self.sub(value, 0, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
                 }
             }
             Expr::NewTarget => out.push_str("new.target"),
@@ -380,19 +313,6 @@ impl<'m> Emitter<'m> {
                 ));
             }
             Expr::TemplateObject { raw, cooked } => {
-                // G4 RESOLVED (d-P10): with the raw strings recovered the
-                // node emits as a real backtick literal carrying the raw
-                // text verbatim — an identity tag `(_=>_)` reconstructs
-                // the (frozen, `.raw`-bearing) template object the
-                // runtime would build, and es2abc re-derives the cooked
-                // strings from the raw source text per spec. Multi-quasi
-                // templates get inert `${0}` separators (a no-substitution
-                // template has exactly one quasi; the tag ignores the
-                // dummy values). The junction is safe: appending `${0}`
-                // after any valid raw text cannot create a spurious
-                // interpolation (only an exact `${` opens one, and raw
-                // ending in `$` yields `…$` + `${0}` = `…$${0}` which
-                // still terminates the quasi at the appended marker).
                 let raw_strings: Option<Vec<&str>> = raw.as_ref().and_then(|lits| {
                     lits.iter()
                         .map(|l| match l {
@@ -408,11 +328,6 @@ impl<'m> Emitter<'m> {
                         out.push_str("`)");
                     }
                     _ => {
-                        // Cooked-only fallback — documented per case: raw
-                        // is genuinely absent (unresolved literal operand
-                        // or non-string quasi). The cooked text is
-                        // emitted as a plain string (its raw form is
-                        // unrecoverable from cooked text).
                         *self
                             .stats
                             .fallback_comments
@@ -441,48 +356,54 @@ impl<'m> Emitter<'m> {
                 }
             }
             Expr::TaggedTemplate { tag, quasis, exprs } => {
-                self.sub(tag, 19, out);
-                out.push('`');
-                for (i, q) in quasis.iter().enumerate() {
-                    out.push_str(q);
-                    if let Some(arg) = exprs.get(i) {
-                        out.push_str("${");
-                        self.expr(arg, 0, out);
-                        out.push('}');
-                    }
-                }
-                out.push('`');
+                tasks.push(PrintTask::Raw("`"));
+                tasks.push(PrintTask::TaggedParts {
+                    quasis,
+                    exprs,
+                    idx: 0,
+                });
+                tasks.push(PrintTask::Raw("`"));
+                tasks.push(PrintTask::Expr {
+                    expr: tag,
+                    prec: 19,
+                });
             }
             Expr::IterResultObj { value, done } => {
                 out.push_str("{ value: ");
-                self.sub(value, 0, out);
-                out.push_str(", done: ");
-                self.sub(done, 0, out);
-                out.push_str(" } /*iter-result*/");
+                tasks.push(PrintTask::Raw(" } /*iter-result*/"));
+                tasks.push(PrintTask::Expr {
+                    expr: done,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::Raw(", done: "));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Expr::Iter {
                 op: IterOp::GetIterator,
                 obj,
                 ..
             } => {
-                // The real protocol call (dream gate: the passthrough
-                // left arrays without `.next` — destructuring failed
-                // with "undefined is not callable"). The for-of fold
-                // consumes the AST node pre-print, so only direct
-                // protocol uses (destructuring, spread) land here.
-                self.sub(obj, 19, out);
-                out.push_str("[Symbol.iterator]()");
+                tasks.push(PrintTask::Raw("[Symbol.iterator]()"));
+                tasks.push(PrintTask::Expr {
+                    expr: obj,
+                    prec: 19,
+                });
             }
             Expr::Iter {
                 op: IterOp::GetAsyncIterator,
                 obj,
                 ..
             } => {
-                // Vendor falls back to Symbol.iterator when no async
-                // iterator exists — elided here (comment); corpus
-                // coverage for for-await is via the fold anyway.
-                self.sub(obj, 19, out);
-                out.push_str("[Symbol.asyncIterator]() /*sync-fallback elided*/");
+                tasks.push(PrintTask::Raw(
+                    "[Symbol.asyncIterator]() /*sync-fallback elided*/",
+                ));
+                tasks.push(PrintTask::Expr {
+                    expr: obj,
+                    prec: 19,
+                });
             }
             Expr::Iter { op, obj, status } => {
                 let name = iter_op_name(*op);
@@ -497,11 +418,14 @@ impl<'m> Emitter<'m> {
                     }
                     NodeStatus::Expressed => {}
                 }
-                self.sub(obj, 0, out);
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             Expr::CreateGenerator { func } => {
                 out.push_str("/*CreateGenerator plumbing*/ ");
-                self.sub(func, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: func,
+                    prec: 0,
+                });
             }
             Expr::GeneratorDriver { resume, genobj } => {
                 let name = if *resume {
@@ -512,7 +436,10 @@ impl<'m> Emitter<'m> {
                 *self.stats.fallback_comments.entry(name).or_insert(0) += 1;
                 self.current_fn_has_fallback = true;
                 out.push_str(&format!("/*hard-fallback {name} (generator driver, R4)*/ "));
-                self.sub(genobj, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: genobj,
+                    prec: 0,
+                });
             }
             Expr::AsyncDriver { resolve, value } => {
                 let name = if *resolve {
@@ -523,7 +450,10 @@ impl<'m> Emitter<'m> {
                 *self.stats.fallback_comments.entry(name).or_insert(0) += 1;
                 self.current_fn_has_fallback = true;
                 out.push_str(&format!("/*hard-fallback {name} (async driver, R4)*/ "));
-                self.sub(value, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Expr::AsyncGeneratorResolve { value, .. } => {
                 *self
@@ -535,31 +465,42 @@ impl<'m> Emitter<'m> {
                 out.push_str(
                     "/*hard-fallback AsyncGeneratorResolve (async-generator driver, R4)*/ ",
                 );
-                self.sub(value, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Expr::CopyDataProps { dst, src } => {
                 out.push_str("Object.assign(");
-                self.sub(dst, 0, out);
-                out.push_str(", ");
-                self.sub(src, 0, out);
-                out.push_str(") /*CopyDataProps: approximate outside a literal*/");
+                tasks.push(PrintTask::Raw(
+                    ") /*CopyDataProps: approximate outside a literal*/",
+                ));
+                tasks.push(PrintTask::Expr { expr: src, prec: 0 });
+                tasks.push(PrintTask::Raw(", "));
+                tasks.push(PrintTask::Expr { expr: dst, prec: 0 });
             }
             Expr::SetObjectWithProto { obj, proto } => {
                 out.push_str("Object.setPrototypeOf(");
-                self.sub(obj, 0, out);
-                out.push_str(", ");
-                self.sub(proto, 0, out);
-                out.push_str(") /*NOT identical: no-setter semantics*/");
+                tasks.push(PrintTask::Raw(") /*NOT identical: no-setter semantics*/"));
+                tasks.push(PrintTask::Expr {
+                    expr: proto,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::Raw(", "));
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             Expr::ArraySpread { dst, src, .. } => {
-                self.sub(dst, 19, out);
-                out.push_str(".push(...");
-                self.sub(src, 0, out);
-                out.push_str(") /*ArraySpread: result=new-index*/");
+                tasks.push(PrintTask::Raw(") /*ArraySpread: result=new-index*/"));
+                tasks.push(PrintTask::Expr { expr: src, prec: 0 });
+                tasks.push(PrintTask::Raw(".push(..."));
+                tasks.push(PrintTask::Expr {
+                    expr: dst,
+                    prec: 19,
+                });
             }
             Expr::RestObject { obj, .. } => {
                 out.push_str("/*CreateObjectWithExcludedKeys plumbing*/ ");
-                self.sub(obj, 0, out);
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             Expr::DefineGetterSetter {
                 obj,
@@ -567,33 +508,30 @@ impl<'m> Emitter<'m> {
                 getter,
                 setter,
             } => {
-                // defineProperty with only the PRESENT accessor: an
-                // explicit `get: undefined` would clobber an existing
-                // getter (dream gate: local/class-accessors' setter
-                // definition wiped the getter → NaN).
                 let g = matches!(getter.as_ref(), Expr::Lit(Lit::Undefined));
                 let s = matches!(setter.as_ref(), Expr::Lit(Lit::Undefined));
                 out.push_str("Object.defineProperty(");
-                self.sub(obj, 0, out);
-                out.push_str(", ");
-                self.sub(key, 0, out);
-                out.push_str(", {");
-                if !g {
-                    out.push_str(" get: ");
-                    self.sub(getter, 0, out);
-                }
+                tasks.push(PrintTask::Raw(
+                    ", configurable: true }) /*DefineGetterSetterByValue: approximate*/",
+                ));
                 if !s {
-                    if !g {
-                        out.push(',');
-                    }
-                    out.push_str(" set: ");
-                    self.sub(setter, 0, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: setter,
+                        prec: 0,
+                    });
+                    tasks.push(PrintTask::Raw(if !g { ", set: " } else { " set: " }));
                 }
-                // Class accessors are configurable — without it the
-                // getter/setter pair can't be defined in two steps
-                // (dream gate: class-accessors on 12.x, "Cannot define
-                // property").
-                out.push_str(", configurable: true }) /*DefineGetterSetterByValue: approximate*/");
+                if !g {
+                    tasks.push(PrintTask::Expr {
+                        expr: getter,
+                        prec: 0,
+                    });
+                    tasks.push(PrintTask::Raw(" get: "));
+                }
+                tasks.push(PrintTask::Raw(", {"));
+                tasks.push(PrintTask::Expr { expr: key, prec: 0 });
+                tasks.push(PrintTask::Raw(", "));
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             Expr::ModuleNamespace { index } => {
                 out.push_str(&crate::names::namespace_fallback(*index));
@@ -606,141 +544,288 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    fn emit_call(
+    pub(in crate::emit) fn step_print_obj_entries<'b>(
         &mut self,
-        callee: &Expr,
-        this: Option<&Expr>,
-        args: &[Expr],
+        slice: &'b [ObjEntry],
+        first: bool,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
+        let Some((en, rest)) = slice.split_first() else {
+            return;
+        };
+        if !first {
+            out.push_str(", ");
+        }
+        if !rest.is_empty() {
+            tasks.push(PrintTask::ObjEntries {
+                slice: rest,
+                first: false,
+            });
+        }
+        match en {
+            ObjEntry::KeyValue(k, v) => {
+                out.push_str(&render_lit_key_pub(self.module, k));
+                out.push_str(": ");
+                tasks.push(PrintTask::Expr { expr: v, prec: 0 });
+            }
+            ObjEntry::Computed(k, v) => {
+                out.push('[');
+                tasks.push(PrintTask::Expr { expr: v, prec: 0 });
+                tasks.push(PrintTask::Raw("]: "));
+                tasks.push(PrintTask::Expr { expr: k, prec: 0 });
+            }
+            ObjEntry::Spread(x) => {
+                out.push_str("...");
+                tasks.push(PrintTask::Expr { expr: x, prec: 0 });
+            }
+            ObjEntry::Proto(x) => {
+                out.push_str("__proto__: ");
+                tasks.push(PrintTask::Expr { expr: x, prec: 0 });
+            }
+            ObjEntry::Method(n, f) => {
+                let concise = match f {
+                    Expr::Closure { body, kind, .. } => {
+                        matches!(kind, FunctionKind::Generator | FunctionKind::AsyncGenerator)
+                            || fn_uses_super(self.module, *body)
+                    }
+                    _ => false,
+                };
+                if concise {
+                    let Expr::Closure { body, kind, .. } = f else {
+                        unreachable!()
+                    };
+                    out.push_str(method_prefix(*kind));
+                    if is_legal_ident(n) {
+                        out.push_str(n);
+                    } else {
+                        out.push_str(&render_pool_string(self.module, n));
+                    }
+                    tasks.push(PrintTask::EnterInlineFunc {
+                        func: *body,
+                        indent: 1,
+                        style: InlineHeaderStyle {
+                            open_paren: true,
+                            drop_ret_ty: false,
+                            arrow: false,
+                            closing: "}".to_string(),
+                        },
+                    });
+                } else {
+                    if is_legal_ident(n) {
+                        out.push_str(n);
+                    } else {
+                        out.push_str(&render_pool_string(self.module, n));
+                    }
+                    out.push_str(": ");
+                    tasks.push(PrintTask::Expr { expr: f, prec: 0 });
+                }
+            }
+            ObjEntry::Getter(k, f) => {
+                if let Expr::Closure { body, .. } = f {
+                    self.push_concise_accessor("get ", k, *body, tasks, out);
+                } else {
+                    out.push_str("/* getter: non-closure (data shape) */");
+                }
+            }
+            ObjEntry::Setter(k, f) => {
+                if let Expr::Closure { body, .. } = f {
+                    self.push_concise_accessor("set ", k, *body, tasks, out);
+                } else {
+                    out.push_str("/* setter: non-closure (data shape) */");
+                }
+            }
+        }
+    }
+
+    fn push_concise_accessor<'b>(
+        &self,
+        prefix: &str,
+        key: &'b crate::expr::ObjKey,
+        body: FuncId,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
+        out.push_str(prefix);
+        let inline_task = PrintTask::EnterInlineFunc {
+            func: body,
+            indent: 1,
+            style: InlineHeaderStyle {
+                open_paren: true,
+                drop_ret_ty: false,
+                arrow: false,
+                closing: "}".to_string(),
+            },
+        };
+        match key {
+            crate::expr::ObjKey::Name(n) => {
+                if is_legal_ident(n) {
+                    out.push_str(n);
+                } else {
+                    out.push_str(&render_pool_string(self.module, n));
+                }
+                tasks.push(inline_task);
+            }
+            crate::expr::ObjKey::Computed(e) => {
+                out.push('[');
+                tasks.push(inline_task);
+                tasks.push(PrintTask::Raw("]"));
+                tasks.push(PrintTask::Expr { expr: e, prec: 0 });
+            }
+        }
+    }
+
+    fn step_print_call<'b>(
+        &self,
+        callee: &'b Expr,
+        this: Option<&'b Expr>,
+        args: &'b [Expr],
         kind: CallKind,
+        tasks: &mut Vec<PrintTask<'b>>,
         out: &mut String,
     ) {
         match kind {
             CallKind::Direct | CallKind::Dynamic => {
-                // `callthis*`: the receiver matters. Method form when
-                // the callee is a property load of the SAME receiver
-                // (`obj.m(…)`); otherwise `.call(this, …)` — dropping
-                // the receiver silently is a bug (dream gate:
-                // destructuring's `iterator.next()` became `next()` —
-                // "undefined is not callable"/wrong this).
-                let mut done = false;
                 if let Some(t) = this {
-                    // Reachability note (coverage audit): at HEAD no
-                    // producer can place a `PropName`/`PropIndex`/
-                    // `PropDyn` in `callee` with `object == this` —
-                    // recover builds call callees only via `expr_of`, and
-                    // the receiver-load ops (`LoadProp`/`LoadPropIdx`/
-                    // `LoadPropDyn`) are observable (effects: may_throw +
-                    // may_call), so `compute_inline` never inlines them
-                    // and the callee always arrives as a `Temp`/`Ident`/
-                    // `Lit`; neither folds nor structure rewrites
-                    // `Call.callee`. The three reunification arms below
-                    // are kept as defense-in-depth for future producers.
                     match callee {
                         Expr::PropName {
                             object,
                             name,
                             dot_legal: true,
                         } if object.as_ref() == t => {
-                            self.sub(t, 19, out);
-                            out.push_str(&format!(".{name}"));
-                            self.emit_args(args, out);
-                            done = true;
+                            tasks.push(PrintTask::Raw(")"));
+                            tasks.push(PrintTask::CallArgs {
+                                args,
+                                idx: 0,
+                                leading_comma: false,
+                            });
+                            tasks.push(PrintTask::RawOwned(format!(".{name}(")));
+                            tasks.push(PrintTask::Expr { expr: t, prec: 19 });
                         }
-                        Expr::PropIndex { object, index } if object.as_ref() == t => {
-                            self.sub(t, 19, out);
-                            out.push('[');
-                            self.sub(index, 0, out);
-                            out.push(']');
-                            self.emit_args(args, out);
-                            done = true;
-                        }
-                        Expr::PropDyn { object, key } if object.as_ref() == t => {
-                            self.sub(t, 19, out);
-                            out.push('[');
-                            self.sub(key, 0, out);
-                            out.push(']');
-                            self.emit_args(args, out);
-                            done = true;
+                        Expr::PropIndex { object, index: k } | Expr::PropDyn { object, key: k }
+                            if object.as_ref() == t =>
+                        {
+                            tasks.push(PrintTask::Raw(")"));
+                            tasks.push(PrintTask::CallArgs {
+                                args,
+                                idx: 0,
+                                leading_comma: false,
+                            });
+                            tasks.push(PrintTask::Raw("]("));
+                            tasks.push(PrintTask::Expr { expr: k, prec: 0 });
+                            tasks.push(PrintTask::Raw("["));
+                            tasks.push(PrintTask::Expr { expr: t, prec: 19 });
                         }
                         _ => {
-                            self.sub(callee, 19, out);
-                            out.push_str(".call(");
-                            self.sub(t, 0, out);
-                            for a in args {
-                                out.push_str(", ");
-                                self.sub(a, 0, out);
-                            }
-                            out.push(')');
-                            done = true;
+                            tasks.push(PrintTask::Raw(")"));
+                            tasks.push(PrintTask::CallArgs {
+                                args,
+                                idx: 0,
+                                leading_comma: true,
+                            });
+                            tasks.push(PrintTask::Expr { expr: t, prec: 0 });
+                            tasks.push(PrintTask::Raw(".call("));
+                            tasks.push(PrintTask::Expr {
+                                expr: callee,
+                                prec: 19,
+                            });
                         }
                     }
-                }
-                if !done {
-                    self.sub(callee, 19, out);
-                    self.emit_args(args, out);
+                } else {
+                    tasks.push(PrintTask::Raw(")"));
+                    tasks.push(PrintTask::CallArgs {
+                        args,
+                        idx: 0,
+                        leading_comma: false,
+                    });
+                    tasks.push(PrintTask::Raw("("));
+                    tasks.push(PrintTask::Expr {
+                        expr: callee,
+                        prec: 19,
+                    });
                 }
             }
             CallKind::New => {
                 out.push_str("new ");
-                self.sub(callee, 19, out);
-                self.emit_args(args, out);
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: false,
+                });
+                tasks.push(PrintTask::Raw("("));
+                tasks.push(PrintTask::Expr {
+                    expr: callee,
+                    prec: 19,
+                });
             }
             CallKind::NewSpread => {
                 out.push_str("new ");
-                self.sub(callee, 19, out);
-                out.push_str("(...");
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    self.sub(a, 0, out);
-                }
-                out.push(')');
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: false,
+                });
+                tasks.push(PrintTask::Raw("(..."));
+                tasks.push(PrintTask::Expr {
+                    expr: callee,
+                    prec: 19,
+                });
             }
             CallKind::Apply => {
-                self.sub(callee, 19, out);
-                out.push_str(".apply(");
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: true,
+                });
                 match this {
-                    Some(t) => self.sub(t, 0, out),
-                    None => out.push_str("undefined"),
+                    Some(t) => tasks.push(PrintTask::Expr { expr: t, prec: 0 }),
+                    None => tasks.push(PrintTask::Raw("undefined")),
                 }
-                for a in args {
-                    out.push_str(", ");
-                    self.sub(a, 0, out);
-                }
-                out.push(')');
+                tasks.push(PrintTask::Raw(".apply("));
+                tasks.push(PrintTask::Expr {
+                    expr: callee,
+                    prec: 19,
+                });
             }
             CallKind::ClassInit => {
-                self.sub(callee, 19, out);
-                out.push_str(".call(");
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: true,
+                });
                 match this {
-                    Some(t) => self.sub(t, 0, out),
-                    None => out.push_str("this"),
+                    Some(t) => tasks.push(PrintTask::Expr { expr: t, prec: 0 }),
+                    None => tasks.push(PrintTask::Raw("this")),
                 }
-                for a in args {
-                    out.push_str(", ");
-                    self.sub(a, 0, out);
-                }
-                out.push(')');
+                tasks.push(PrintTask::Raw(".call("));
+                tasks.push(PrintTask::Expr {
+                    expr: callee,
+                    prec: 19,
+                });
             }
             CallKind::Super | CallKind::SuperArrow => {
-                out.push_str("super");
-                self.emit_args(args, out);
+                out.push_str("super(");
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: false,
+                });
             }
             CallKind::SuperSpread => {
                 out.push_str("super(...");
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(", ");
-                    }
-                    self.sub(a, 0, out);
-                }
-                out.push(')');
+                tasks.push(PrintTask::Raw(")"));
+                tasks.push(PrintTask::CallArgs {
+                    args,
+                    idx: 0,
+                    leading_comma: false,
+                });
             }
             CallKind::SuperForwardAllArgs => {
-                // `args` is not a real binding — the op forwards the
-                // actual arguments object (dream gate: super-properties
-                // hit "args is not defined").
                 out.push_str(
                     "super(...arguments) /*forward-all: default derived ctor elision pending*/",
                 );
@@ -748,114 +833,133 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    fn emit_args(&mut self, args: &[Expr], out: &mut String) {
-        out.push('(');
-        for (i, a) in args.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            self.sub(a, 0, out);
-        }
-        out.push(')');
-    }
-
-    fn emit_unary(&mut self, op: UnOp, operand: &Expr, out: &mut String) {
+    fn step_print_unary<'b>(
+        &self,
+        op: UnOp,
+        operand: &'b Expr,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         match op {
             UnOp::IsTrue | UnOp::JumpNez => {
-                // Truthiness / raw jnez predicate feeding a condition:
-                // the bare operand prints cleanly at context precedence
-                // without noisy helper wrappers (R3-X1).
-                self.sub(operand, 0, out);
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 0,
+                });
             }
-            UnOp::IsFalse | UnOp::JumpEqz => {
+            UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot => {
                 out.push('!');
-                self.sub(operand, 17, out);
-            }
-            UnOp::LogicalNot => {
-                out.push('!');
-                self.sub(operand, 17, out);
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 17,
+                });
             }
             UnOp::TypeOf => {
                 out.push_str("typeof ");
-                self.sub(operand, 17, out);
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 17,
+                });
             }
             UnOp::Void => {
                 out.push_str("void ");
-                self.sub(operand, 17, out);
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 17,
+                });
             }
             UnOp::BitNot => {
                 out.push('~');
-                self.sub(operand, 17, out);
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 17,
+                });
             }
             UnOp::ToNumber => {
                 out.push('+');
-                // `++x`-style ambiguity (N74-W4: `+(+1)` printed as
-                // `++1.0` — an invalid pre-increment LHS): parenthesize
-                // unary operands, the same rule as `Minus` below.
-                if matches!(operand, Expr::Unary { .. }) {
+                if needs_unary_pm_parens(operand) {
                     out.push('(');
-                    self.expr_inner(operand, out);
-                    out.push(')');
+                    tasks.push(PrintTask::Raw(")"));
+                    tasks.push(PrintTask::ExprInner(operand));
                 } else {
-                    self.sub(operand, 17, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: operand,
+                        prec: 17,
+                    });
                 }
             }
             UnOp::ToNumeric => {
-                out.push('+');
-                if matches!(operand, Expr::Unary { .. }) {
-                    out.push('(');
-                    self.expr_inner(operand, out);
-                    out.push(')');
+                if matches!(operand, Expr::Lit(Lit::BigInt(_))) {
+                    tasks.push(PrintTask::Expr {
+                        expr: operand,
+                        prec: 17,
+                    });
                 } else {
-                    self.sub(operand, 17, out);
+                    out.push('+');
+                    tasks.push(PrintTask::Raw(" /*ToNumeric*/"));
+                    if needs_unary_pm_parens(operand) {
+                        out.push('(');
+                        tasks.push(PrintTask::Raw(")"));
+                        tasks.push(PrintTask::ExprInner(operand));
+                    } else {
+                        tasks.push(PrintTask::Expr {
+                            expr: operand,
+                            prec: 17,
+                        });
+                    }
                 }
-                out.push_str(" /*ToNumeric*/");
             }
             UnOp::ToPropertyKey => {
                 out.push_str("Reflect.ownKeys({ [");
-                self.sub(operand, 0, out);
-                out.push_str("]: 0 })[0]");
+                tasks.push(PrintTask::Raw("]: 0 })[0]"));
+                tasks.push(PrintTask::Expr {
+                    expr: operand,
+                    prec: 0,
+                });
             }
             UnOp::Minus => {
                 out.push('-');
-                // `--x`-style ambiguity: parenthesize unary operands.
-                if matches!(operand, Expr::Unary { .. }) {
+                if needs_unary_pm_parens(operand) {
                     out.push('(');
-                    self.expr_inner(operand, out);
-                    out.push(')');
+                    tasks.push(PrintTask::Raw(")"));
+                    tasks.push(PrintTask::ExprInner(operand));
                 } else {
-                    self.sub(operand, 17, out);
+                    tasks.push(PrintTask::Expr {
+                        expr: operand,
+                        prec: 17,
+                    });
                 }
             }
             UnOp::Inc | UnOp::Dec => {
-                // The vendored inc/dec are VALUE-pure (`acc ± 1` — the
-                // store-back is a separate op); JS `--x` would mutate a
-                // const temporary (dream gate: "Assignment to const
-                // variable") and double-fire property setters. Emit the
-                // pure arithmetic form, keeping the ToNumber coercion:
-                // N74-W4 — a bare `x + 1` STRING-concatenates a
-                // non-number operand (test262 S8.6_A3_T1: `++{foo:'bar'}
-                // .foo` must be NaN, never "bar1"); the unary `+` first
-                // restores the vendor's ToNumber. Corner: vendor bigint
-                // inc/dec polymorphism (`5n--` → `4n`) is not expressible
-                // purely (`+5n` throws) — no corpus fixture exercises it
-                // (registered).
-                out.push('(');
-                out.push('+');
-                // Same `++x` ambiguity rule as `ToNumber` above.
-                if matches!(operand, Expr::Unary { .. }) {
+                if matches!(operand, Expr::Lit(Lit::BigInt(_))) {
                     out.push('(');
-                    self.expr_inner(operand, out);
-                    out.push(')');
+                    tasks.push(PrintTask::Raw(if matches!(op, UnOp::Inc) {
+                        " + 1n)"
+                    } else {
+                        " - 1n)"
+                    }));
+                    tasks.push(PrintTask::Expr {
+                        expr: operand,
+                        prec: 14,
+                    });
                 } else {
-                    self.sub(operand, 17, out);
+                    out.push_str("(+");
+                    tasks.push(PrintTask::Raw(if matches!(op, UnOp::Inc) {
+                        " + 1)"
+                    } else {
+                        " - 1)"
+                    }));
+                    if needs_unary_pm_parens(operand) {
+                        out.push('(');
+                        tasks.push(PrintTask::Raw(")"));
+                        tasks.push(PrintTask::ExprInner(operand));
+                    } else {
+                        tasks.push(PrintTask::Expr {
+                            expr: operand,
+                            prec: 17,
+                        });
+                    }
                 }
-                out.push_str(if matches!(op, UnOp::Inc) {
-                    " + 1"
-                } else {
-                    " - 1"
-                });
-                out.push(')');
             }
         }
     }
@@ -864,6 +968,37 @@ impl<'m> Emitter<'m> {
     pub(crate) fn render_lit_js(&self, lit: &Lit) -> String {
         crate::consts::render_lit_ex(lit, true)
     }
+}
+
+fn peel_truthiness(mut e: &Expr) -> &Expr {
+    while let Expr::Unary {
+        op: UnOp::IsTrue | UnOp::JumpNez,
+        operand,
+    } = e
+    {
+        e = operand;
+    }
+    e
+}
+
+fn is_emitted_unary_lhs(e: &Expr) -> bool {
+    let cur = peel_truthiness(e);
+    match cur {
+        Expr::Unary {
+            op: UnOp::Inc | UnOp::Dec | UnOp::ToPropertyKey,
+            ..
+        } => false,
+        Expr::Unary {
+            op: UnOp::ToNumeric,
+            operand,
+        } if matches!(operand.as_ref(), Expr::Lit(Lit::BigInt(s)) if !s.starts_with('-')) => false,
+        Expr::Unary { .. } | Expr::Delete { .. } | Expr::Await { .. } => true,
+        _ => cur.is_negative_numeric_lit(),
+    }
+}
+
+fn needs_unary_pm_parens(e: &Expr) -> bool {
+    is_emitted_unary_lhs(e)
 }
 
 pub(in crate::emit) fn iter_op_name(op: IterOp) -> &'static str {
@@ -878,23 +1013,33 @@ pub(in crate::emit) fn iter_op_name(op: IterOp) -> &'static str {
     }
 }
 
-/// Object-literal key rendering (identifier form when legal).
+/// Object-literal key rendering (identifier form when legal; `"__proto__"`,
+/// negative numeric literals, and BigInt keys render in computed `[...]` form).
 pub(in crate::emit) fn render_lit_key_pub(module: &Module, lit: &Lit) -> String {
-    if let Lit::String(s) = lit
-        && is_legal_ident(s)
-    {
-        return s.clone();
+    let _ = module;
+    if let Lit::String(s) = lit {
+        if s == "__proto__" {
+            return format!("[{}]", crate::consts::render_string(s));
+        }
+        if is_legal_ident(s) {
+            return s.clone();
+        }
     }
-    render_lit_m(module, lit)
+    let rendered = crate::consts::render_lit_ex(lit, true);
+    if rendered.starts_with('-') || rendered.ends_with('n') {
+        format!("[{rendered}]")
+    } else {
+        rendered
+    }
 }
 
 pub(in crate::emit) fn fmt_loc(loc: Option<Loc>) -> String {
     match loc {
-        Some(l) => match l.column {
+        Some(l) if l.line != u32::MAX => match l.column {
             Some(c) => format!(" @{}:{}", l.line, c),
             None => format!(" @{}", l.line),
         },
-        None => String::new(),
+        _ => String::new(),
     }
 }
 

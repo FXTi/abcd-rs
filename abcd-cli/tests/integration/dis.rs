@@ -124,3 +124,33 @@ fn streaming_disassemble_matches_in_memory_and_preserves_target_on_decode_error(
         "decode failure must not truncate an existing output file"
     );
 }
+
+#[test]
+fn disassemble_to_writer_handles_broken_pipe_cleanly_and_reports_other_io_errors() {
+    struct ErrWriter(std::io::ErrorKind);
+    impl std::io::Write for ErrWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "simulated stdout failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "simulated stdout failure"))
+        }
+    }
+
+    let modules =
+        input::load_bytes(&common::tiny_abc(), "tiny.abc", ModuleSelection::Single).expect("load");
+    assert_eq!(
+        dis::disassemble_to_writer(&modules[0], ErrWriter(std::io::ErrorKind::BrokenPipe))
+            .expect("BrokenPipe must return Ok"),
+        0
+    );
+
+    let err =
+        dis::disassemble_to_writer(&modules[0], ErrWriter(std::io::ErrorKind::PermissionDenied))
+            .expect_err("non-BrokenPipe writer failure must return Err");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("failed writing to stdout"),
+        "{err}"
+    );
+}

@@ -7,7 +7,7 @@ Format-independent SSA IR → JavaScript / TypeScript / ArkTS decompiler ([`desi
 `abcd-decompile` consumes a lifted `abcd_ir::Module` and emits readable, semantics-preserving JS/TS/ArkTS source code.
 
 - **Strict crate-graph boundary**: the library depends **only** on `abcd-ir` and `abcd-analysis` (plus `rayon` for deterministic parallel per-function preparation). It never depends on container or ISA crates (`abcd-file*`, `abcd-isa*`), nor on `abcd-lift`, `abcd-lower`, or `abcd-opt`.
-- **Pipeline contract (`design/decompile.md` §3.2)**: **never run `abcd-opt::inline` before decompilation**. Function inlining erases source call boundaries — the primary structural unit readers rely on — and expression recovery expects pre-inlined SSA definitions and `[func][new.target][this]` frame conventions ([`design/ir.md`](../design/ir.md)).
+- **Pipeline contract (`design/decompile.md` §3.2)**: **never run `abcd-opt::inline` before decompilation**. Function inlining erases source call boundaries — the primary structural unit readers rely on — and expression recovery expects pre-inlined SSA definitions and `FunctionData::frame_slots` (`[func][new.target][this]`) frame conventions ([`design/ir.md`](../design/ir.md)).
 
 ## Three-Stage Pipeline & Presentation Modes
 
@@ -44,9 +44,9 @@ Format-independent SSA IR → JavaScript / TypeScript / ArkTS decompiler ([`desi
 
 Core invariants (see [`design/decompile.md`](../design/decompile.md) and [`design/decisions.md`](../design/decisions.md)):
 
-1. **Loud fallbacks, never silent omission**: unrecovered ops and unfolded state-machine residuals render as explicit `Expr::Fallback` / `Stmt::Fallback` comments naming the op and source location, counted in `DecompileStats::fallback_comments`. The seven fitness-class-`H` ops (`IteratorReturn`, `IteratorThrow`, `DefineSendableClass`, `ResumeGenerator`, `GetResumeMode`, `AsyncResolve`, `AsyncReject`) and `ThrowDeleteSuperProperty` are never silently dropped; intentional `Throw*` / `AsyncFunctionEnter` guard elisions record `Stmt::Elided` markers (`DecompileStats::elided_comments`).
+1. **Loud fallbacks, never silent omission**: unrecovered ops and unfolded state-machine residuals render as explicit `Expr::Fallback` / `Stmt::Fallback` comments naming the op and source location, counted in `DecompileStats::fallback_comments`. The nine fitness-class-`H` ops (`IteratorReturn`, `IteratorThrow`, `DefineSendableClass`, `ResumeGenerator`, `GetResumeMode`, `AsyncResolve`, `AsyncReject`, `AsyncGeneratorResolve`, `AsyncGeneratorReject`) and `ThrowDeleteSuperProperty` are never silently dropped; intentional `Throw*` / `AsyncFunctionEnter` guard elisions record `Stmt::Elided` markers (`DecompileStats::elided_comments`).
 2. **Self-cleaning divergence ledgers**: corpus and wild divergence manifests act as exact-set ratchets — newly passing fixtures or reduced fallback counts fail the gate until stale entries are removed.
-3. **Zero input-depth recursion**: AST/expression read walkers and CFG/region analyses over untrusted bytecode use explicit heap work-stacks so adversarial nesting cannot overflow the call stack.
+3. **Zero input-depth recursion**: all AST/expression/region walkers, formatters/printers, and recursive-AST `Drop`/`Clone`/`PartialEq` implementations run iteratively on explicit heap workstacks within a `256 KiB` thread stack.
 4. **Byte-for-byte determinism (`N20`)**: ordered maps/sets (`BTreeMap` / `BTreeSet`), canonical tie-breaking, and index-ordered Rayon collection guarantee identical output across runs and thread counts.
 
 ## Verification Gates & Quick Start

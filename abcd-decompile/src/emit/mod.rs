@@ -188,6 +188,7 @@ pub fn decompile_module_to_writer<W: Write>(
         class_depth: 0,
         hoisted: BTreeSet::new(),
         prepared: BTreeMap::new(),
+        emitting_funcs: HashSet::new(),
     };
     out.write_all(
         "// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n".as_bytes(),
@@ -203,7 +204,8 @@ pub fn decompile_module_to_writer<W: Write>(
         )?;
     }
 
-    // Imports (1:1 enum mapping).
+    // Imports (1:1 enum mapping, plus side-effect-only module requests).
+    let mut referenced_requests = BTreeSet::new();
     for imp in &module.imports {
         match imp {
             ImportDecl::Regular {
@@ -211,11 +213,14 @@ pub fn decompile_module_to_writer<W: Write>(
                 import_name,
                 module_request,
             } => {
+                referenced_requests.insert(*module_request);
                 let local = sanitize(&sym_str(module, *local_name));
                 let import = module_facing_name(&sym_str(module, *import_name));
                 let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
-                if local == import {
+                if import == "default" && crate::legalize::is_legal_ident(&local) {
+                    writeln!(out, "import {local} from {spec};")?;
+                } else if local == import {
                     writeln!(out, "import {{ {local} }} from {spec};")?;
                 } else {
                     writeln!(out, "import {{ {import} as {local} }} from {spec};")?;
@@ -225,11 +230,25 @@ pub fn decompile_module_to_writer<W: Write>(
                 local_name,
                 module_request,
             } => {
+                referenced_requests.insert(*module_request);
                 let local = sanitize(&sym_str(module, *local_name));
                 let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
                 writeln!(out, "import * as {local} from {spec};")?;
             }
+        }
+    }
+    for exp in &module.exports {
+        match exp {
+            ExportDecl::Indirect { module_request, .. } | ExportDecl::Star { module_request } => {
+                referenced_requests.insert(*module_request);
+            }
+            ExportDecl::Local { .. } => {}
+        }
+    }
+    for req in &module.module_requests {
+        if !referenced_requests.contains(&req.specifier) {
+            writeln!(out, "import {};", render_sym_string(module, req.specifier))?;
         }
     }
 
@@ -293,25 +312,52 @@ pub fn decompile_module_to_writer<W: Write>(
     // keeps the output strict-mode-parseable AND gives the trailing
     // `export { name }` records a binding to reference.
     let slot_names = &index.slot_names;
-    let mut slots = BTreeSet::new();
+    let record_env = index
+        .per_class_env
+        .as_ref()
+        .and_then(|m| m.get(&abcd_ir::ClassId::new(0)));
+    let mut local_slots = BTreeSet::new();
+    let mut unresolved_ns_slots = BTreeSet::new();
     for inst in &module.insts {
         match &inst.op {
-            Op::LoadModuleVar { index, .. } | Op::StoreModuleVar { index, .. } => {
-                slots.insert(*index);
+            Op::LoadModuleVar {
+                index: sidx,
+                kind:
+                    abcd_ir::ModuleVarKind::Local
+                    | abcd_ir::ModuleVarKind::SendableLocal
+                    | abcd_ir::ModuleVarKind::SendableClass,
             }
-            Op::GetModuleNamespace { index } => {
-                slots.insert(*index);
+            | Op::StoreModuleVar { index: sidx, .. } => {
+                local_slots.insert(*sidx);
+            }
+            Op::GetModuleNamespace { index: ns_idx }
+                if record_env
+                    .and_then(|env| env.namespace_slots.get(ns_idx))
+                    .is_none() =>
+            {
+                unresolved_ns_slots.insert(*ns_idx);
             }
             _ => {}
         }
     }
-    for s in &slots {
-        let name = slot_names
-            .get(s)
+    let mut declared_module_locals = BTreeSet::new();
+    for s in &local_slots {
+        let name = record_env
+            .and_then(|env| env.local_slots.get(s))
+            .or_else(|| slot_names.get(s))
             .cloned()
             .unwrap_or_else(|| crate::names::module_slot_fallback(*s));
         em.fn_names.reserve(&name);
-        writeln!(out, "let {name};")?;
+        if declared_module_locals.insert(name.clone()) {
+            writeln!(out, "let {name};")?;
+        }
+    }
+    for ns_idx in &unresolved_ns_slots {
+        let name = crate::names::namespace_fallback(*ns_idx);
+        em.fn_names.reserve(&name);
+        if declared_module_locals.insert(name.clone()) {
+            writeln!(out, "let {name};")?;
+        }
     }
 
     // Orphan lexical-slot predeclarations (G1; see
@@ -394,7 +440,12 @@ pub fn decompile_module_to_writer<W: Write>(
                 local_name,
                 export_name,
             } => {
-                let local = sanitize(&sym_str(module, *local_name));
+                let local = resolve_export_local_ident(
+                    module,
+                    &module.exports,
+                    record_env,
+                    &sym_str(module, *local_name),
+                );
                 let export = module_facing_name(&sym_str(module, *export_name));
                 if local == export {
                     writeln!(out, "export {{ {local} }};")?;
@@ -435,31 +486,147 @@ pub(crate) fn module_facing_name(raw: &str) -> String {
     }
 }
 
-/// The functions a module emits INLINE (closure bodies, class ctors,
-/// and MethodRefs in DefineClass member buffers) — everything else
-/// emits top-level. Exposed for the corpus gate's per-function
-/// coverage assertion. (Orphan MethodRefs in the const pool — buffers
-/// no DefineClass references — do NOT consume: their functions emit
-/// top-level rather than being dropped.)
-pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId> {
-    let mut consumed = std::collections::BTreeSet::new();
-    for inst in &module.insts {
-        match &inst.op {
-            Op::DefineFunc { body, .. } => {
-                consumed.insert(*body);
+/// Resolve an `ExportDecl::Local` binding's emitted identifier: when `raw_local`
+/// is a compiler-synthetic default export tag (such as `*default*`) whose local
+/// module slot already resolved to a concrete binding in `record_env`, bind the
+/// export clause to that resolved slot identifier instead of declaring a second
+/// uninitialized `let _default_;`.
+pub(crate) fn resolve_export_local_ident(
+    module: &Module,
+    exports: &[ExportDecl],
+    record_env: Option<&crate::names::RecordModuleEnv>,
+    raw_local: &str,
+) -> String {
+    let sanitized = sanitize(raw_local);
+    let Some(env) = record_env else {
+        return sanitized;
+    };
+    if env.local_slots.values().any(|v| v == &sanitized) {
+        return sanitized;
+    }
+    let mut distinct_locals = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut all_sanitized = BTreeSet::new();
+    for exp in exports {
+        if let ExportDecl::Local { local_name, .. } = exp {
+            let r = sym_str(module, *local_name);
+            all_sanitized.insert(sanitize(&r));
+            if seen.insert(r.clone()) {
+                distinct_locals.push(r);
             }
-            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
-                consumed.insert(cls.ctor);
-                collect_method_refs(module, cls.members, &mut consumed);
-            }
-            // Method entries in object shape buffers emit inline too
-            // (`{name: function …}`) — never top-level.
-            Op::AllocObject { shape } => {
-                collect_method_refs(module, *shape, &mut consumed);
-            }
-            _ => {}
         }
     }
+    if let Some(slot_idx) = distinct_locals.iter().position(|r| r == raw_local)
+        && let Some(resolved) = env.local_slots.get(&(slot_idx as u32))
+        && !all_sanitized.contains(resolved)
+    {
+        return resolved.clone();
+    }
+    sanitized
+}
+
+/// The functions a module emits INLINE (closure bodies, class ctors,
+/// and MethodRefs in DefineClass member buffers) — everything else
+/// emits top-level. Self-referential `DefineFunc(f)` inside `f` and
+/// unreachable mutual `DefineFunc` cycles keep a deterministic cycle-entry
+/// root top-level so no function is ever dropped (`#87.5`).
+pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId> {
+    let n = module.functions.len();
+    let mut block_owner: std::collections::HashMap<abcd_ir::BlockId, FuncId> =
+        std::collections::HashMap::new();
+    for (fi, fd) in module.functions.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        for &bid in &fd.blocks {
+            block_owner.entry(bid).or_insert(fid);
+        }
+    }
+
+    let mut edges: Vec<BTreeSet<FuncId>> = vec![BTreeSet::new(); n];
+    let mut orphan_consumed: BTreeSet<FuncId> = BTreeSet::new();
+    let mut tmp_refs: BTreeSet<FuncId> = BTreeSet::new();
+
+    for inst in &module.insts {
+        tmp_refs.clear();
+        match &inst.op {
+            Op::DefineFunc { body, .. } => {
+                tmp_refs.insert(*body);
+            }
+            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                tmp_refs.insert(cls.ctor);
+                collect_method_refs(module, cls.members, &mut tmp_refs);
+            }
+            Op::AllocObject { shape } => {
+                collect_method_refs(module, *shape, &mut tmp_refs);
+            }
+            _ => continue,
+        }
+        if let Some(&owner) = block_owner.get(&inst.block) {
+            for &target in &tmp_refs {
+                if target != owner && target.index() < n {
+                    edges[owner.index()].insert(target);
+                } else if target.index() >= n {
+                    orphan_consumed.insert(target);
+                }
+            }
+        } else {
+            orphan_consumed.extend(tmp_refs.iter().copied());
+        }
+    }
+
+    let mut in_degree = vec![0usize; n];
+    for children in &edges {
+        for &c in children {
+            in_degree[c.index()] += 1;
+        }
+    }
+
+    let mut consumed: BTreeSet<FuncId> = orphan_consumed.clone();
+    let mut visited = vec![false; n];
+    let mut stack: Vec<FuncId> = Vec::new();
+
+    for &oc in &orphan_consumed {
+        if oc.index() < n && !visited[oc.index()] {
+            visited[oc.index()] = true;
+            stack.push(oc);
+        }
+    }
+    for (fi, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 && !visited[fi] {
+            visited[fi] = true;
+            stack.push(FuncId::new(fi as u32));
+        }
+    }
+
+    let drain_stack =
+        |stack: &mut Vec<FuncId>, visited: &mut [bool], consumed: &mut BTreeSet<FuncId>| {
+            while let Some(cur) = stack.pop() {
+                let Some(children) = edges.get(cur.index()) else {
+                    continue;
+                };
+                for &child in children {
+                    let ci = child.index();
+                    if ci < n && !visited[ci] {
+                        visited[ci] = true;
+                        consumed.insert(child);
+                        stack.push(child);
+                    }
+                }
+            }
+        };
+
+    drain_stack(&mut stack, &mut visited, &mut consumed);
+
+    // Any remaining unvisited functions belong to pure inline cycles with no
+    // external non-cycle parent: keep the smallest `FuncId` of each component
+    // top-level (`!consumed`) and mark the rest `consumed`.
+    for fi in 0..n {
+        if !visited[fi] {
+            visited[fi] = true;
+            stack.push(FuncId::new(fi as u32));
+            drain_stack(&mut stack, &mut visited, &mut consumed);
+        }
+    }
+
     consumed
 }
 
@@ -660,6 +827,9 @@ pub(crate) struct Emitter<'m> {
     /// dropped immediately after each function finishes emitting; the `< 0.1%`
     /// tail-duplicated inline closures re-run `prepare_func_only` on demand.
     pub(crate) prepared: BTreeMap<FuncId, PreparedFunc>,
+    /// Active function emission stack to break cyclic `DefineFunc` / `MethodRef`
+    /// inline chains without stack overflow (`#87.5`).
+    pub(crate) emitting_funcs: HashSet<FuncId>,
 }
 
 #[derive(Clone)]
@@ -749,10 +919,10 @@ pub(crate) fn func_may_have_orphan_lexenv(
             };
             match &inst.op {
                 Op::GetLexVar { .. } | Op::PutLexVar { .. } => has_lexvar = true,
-                Op::TryGetGlobal { name, .. } => {
-                    if is_fallback_lexenv_name(&sanitize(&sym_str(module, *name))) {
-                        return true;
-                    }
+                Op::TryGetGlobal { name, .. }
+                    if is_fallback_lexenv_name(&sanitize(&sym_str(module, *name))) =>
+                {
+                    return true;
                 }
                 Op::LoadModuleVar { .. } | Op::GetModuleNamespace { .. }
                     if has_fallback_module_slot =>
@@ -977,72 +1147,741 @@ impl<'m> Emitter<'m> {
     }
 }
 
-impl<'m> Emitter<'m> {
-    // ── Statements ───────────────────────────────────────────────────
+pub(in crate::emit) enum PrintRoot<'a> {
+    Nodes(&'a [SNode], usize),
+    Node(&'a SNode, usize),
+    Leaf(&'a Leaf, usize),
+    Stmt(&'a Stmt, usize),
+    Expr(&'a Expr, u8),
+    ClassMethod {
+        pad: &'a str,
+        indent: usize,
+        name: &'a str,
+        func: FuncId,
+        attrs: Option<&'a abcd_ir::op::MemberAttrs>,
+    },
+}
 
-    fn emit_nodes(&mut self, nodes: &[SNode], indent: usize, out: &mut String) {
-        for n in nodes {
-            self.emit_node(n, indent, out);
+#[derive(Clone)]
+pub(in crate::emit) struct InlineHeaderStyle {
+    pub(in crate::emit) open_paren: bool,
+    pub(in crate::emit) drop_ret_ty: bool,
+    pub(in crate::emit) arrow: bool,
+    pub(in crate::emit) closing: String,
+}
+
+pub(in crate::emit) enum PrintTask<'b> {
+    Raw(&'static str),
+    RawOwned(String),
+    TrimEndSince(usize),
+    Nodes {
+        slice: &'b [SNode],
+        indent: usize,
+    },
+    Node {
+        node: &'b SNode,
+        indent: usize,
+    },
+    Leaves {
+        slice: &'b [Leaf],
+        indent: usize,
+    },
+    Leaf {
+        leaf: &'b Leaf,
+        indent: usize,
+    },
+    Stmt {
+        stmt: &'b Stmt,
+        indent: usize,
+    },
+    SwitchCases {
+        cases: &'b [crate::structure::SwitchCase],
+        indent: usize,
+    },
+    SwitchCaseTests {
+        tests: &'b [Expr],
+        body: &'b [SNode],
+        indent: usize,
+    },
+    ExtraCatches {
+        catches: &'b [crate::structure::CatchClause],
+        primary_binding: String,
+        indent: usize,
+    },
+    Expr {
+        expr: &'b Expr,
+        prec: u8,
+    },
+    ExprInner(&'b Expr),
+    ObjEntries {
+        slice: &'b [ObjEntry],
+        first: bool,
+    },
+    ArrElems {
+        slice: &'b [ArrayElem],
+        first: bool,
+    },
+    TaggedParts {
+        quasis: &'b [String],
+        exprs: &'b [Expr],
+        idx: usize,
+    },
+    CallArgs {
+        args: &'b [Expr],
+        idx: usize,
+        leading_comma: bool,
+    },
+    EnterInlineFunc {
+        func: FuncId,
+        indent: usize,
+        style: InlineHeaderStyle,
+    },
+    ExitInlineFunc {
+        func: FuncId,
+        prev_kind: FunctionKind,
+        prev_hoisted: BTreeSet<String>,
+        closing: String,
+    },
+    StartClassBody {
+        pad: String,
+        indent: usize,
+        ctor: FuncId,
+        members: abcd_ir::ConstId,
+        member_attrs: &'b [abcd_ir::op::MemberAttrs],
+    },
+    ClassMethods {
+        pad: String,
+        indent: usize,
+        methods: std::vec::IntoIter<(String, FuncId, Option<&'b abcd_ir::op::MemberAttrs>)>,
+        skipped: usize,
+    },
+    EmitClassMethod {
+        pad: String,
+        indent: usize,
+        name: String,
+        func: FuncId,
+        attrs: Option<&'b abcd_ir::op::MemberAttrs>,
+    },
+    CloseClass {
+        pad: String,
+    },
+}
+
+fn scan_expr_inline_funcs(module: &Module, root: &Expr, out: &mut Vec<FuncId>) {
+    let mut stack: Vec<&Expr> = vec![root];
+    let mut mrefs = BTreeSet::new();
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Closure { body, .. } => out.push(*body),
+            Expr::Class { ctor, members, .. } => {
+                out.push(*ctor);
+                mrefs.clear();
+                collect_method_refs(module, *members, &mut mrefs);
+                out.extend(mrefs.iter().copied());
+            }
+            _ => {}
+        }
+        stack.extend(crate::folds::expr_children(cur));
+    }
+}
+
+fn scan_stmt_inline_funcs(module: &Module, stmt: &Stmt, out: &mut Vec<FuncId>) {
+    for e in stmt_exprs(stmt) {
+        scan_expr_inline_funcs(module, e, out);
+    }
+}
+
+fn scan_leaf_inline_funcs(module: &Module, leaf: &Leaf, out: &mut Vec<FuncId>) {
+    match leaf {
+        Leaf::Raw(s) => scan_stmt_inline_funcs(module, s, out),
+        Leaf::Destructure { obj, .. } => scan_expr_inline_funcs(module, obj, out),
+        Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
+            scan_expr_inline_funcs(module, v, out);
+        }
+        Leaf::Decl { value: None, .. } => {}
+    }
+}
+
+fn scan_nodes_inline_funcs(module: &Module, nodes: &[SNode], out: &mut Vec<FuncId>) {
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        scan_leaf_inline_funcs(module, l, out);
+                    }
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    scan_expr_inline_funcs(module, cond, out);
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        scan_expr_inline_funcs(module, c, out);
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    scan_expr_inline_funcs(module, cond, out);
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    scan_expr_inline_funcs(module, iter, out);
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    scan_expr_inline_funcs(module, obj, out);
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    scan_expr_inline_funcs(module, disc, out);
+                    for c in cases.iter().rev() {
+                        for t in &c.tests {
+                            scan_expr_inline_funcs(module, t, out);
+                        }
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+}
+
+fn collect_negated_ifs_in_nodes(
+    nodes: &[SNode],
+    out: &mut std::collections::HashMap<*const SNode, Expr>,
+) {
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    if then.is_empty() && !otherwise.is_empty() {
+                        out.insert(std::ptr::from_ref(n), crate::structure::negate(cond));
+                    }
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
+        }
+    }
+}
+
+impl<'m> Emitter<'m> {
+    // ── Statements & Iterative Printer Driver ────────────────────────
+
+    fn take_or_prepare_inline(&mut self, func: FuncId) -> PreparedFunc {
+        if self.opts.arkui {
+            return self.peek_prepared(func, false).into_owned();
+        }
+        match self.prepared.remove(&func) {
+            Some(pre) if !pre.top_level => pre,
+            Some(other) => {
+                self.prepared.insert(func, other);
+                prepare_func_only(self.module, self.index, func, false)
+            }
+            None => prepare_func_only(self.module, self.index, func, false),
         }
     }
 
+    pub(in crate::emit) fn run_print_tasks(&mut self, root: PrintRoot<'_>, out: &mut String) {
+        let mut queue: Vec<FuncId> = Vec::new();
+        match &root {
+            PrintRoot::Nodes(s, _) => scan_nodes_inline_funcs(self.module, s, &mut queue),
+            PrintRoot::Node(n, _) => {
+                scan_nodes_inline_funcs(self.module, std::slice::from_ref(*n), &mut queue);
+            }
+            PrintRoot::Leaf(l, _) => scan_leaf_inline_funcs(self.module, l, &mut queue),
+            PrintRoot::Stmt(s, _) => scan_stmt_inline_funcs(self.module, s, &mut queue),
+            PrintRoot::Expr(e, _) => scan_expr_inline_funcs(self.module, e, &mut queue),
+            PrintRoot::ClassMethod { func, .. } => queue.push(*func),
+        }
+
+        let mut inline_pool: BTreeMap<FuncId, PreparedFunc> = BTreeMap::new();
+        while let Some(fid) = queue.pop() {
+            if self.emitting_funcs.contains(&fid) || inline_pool.contains_key(&fid) {
+                continue;
+            }
+            let pre = self.take_or_prepare_inline(fid);
+            scan_nodes_inline_funcs(self.module, &pre.body, &mut queue);
+            inline_pool.insert(fid, pre);
+        }
+
+        let mut negated_ifs: std::collections::HashMap<*const SNode, Expr> =
+            std::collections::HashMap::new();
+        match &root {
+            PrintRoot::Nodes(s, _) => collect_negated_ifs_in_nodes(s, &mut negated_ifs),
+            PrintRoot::Node(n, _) => {
+                collect_negated_ifs_in_nodes(std::slice::from_ref(*n), &mut negated_ifs);
+            }
+            _ => {}
+        }
+        for pre in inline_pool.values() {
+            collect_negated_ifs_in_nodes(&pre.body, &mut negated_ifs);
+        }
+
+        let mut tasks: Vec<PrintTask<'_>> = Vec::new();
+        match root {
+            PrintRoot::Nodes(slice, indent) => tasks.push(PrintTask::Nodes { slice, indent }),
+            PrintRoot::Node(node, indent) => tasks.push(PrintTask::Node { node, indent }),
+            PrintRoot::Leaf(leaf, indent) => tasks.push(PrintTask::Leaf { leaf, indent }),
+            PrintRoot::Stmt(stmt, indent) => tasks.push(PrintTask::Stmt { stmt, indent }),
+            PrintRoot::Expr(expr, prec) => tasks.push(PrintTask::Expr { expr, prec }),
+            PrintRoot::ClassMethod {
+                pad,
+                indent,
+                name,
+                func,
+                attrs,
+            } => tasks.push(PrintTask::EmitClassMethod {
+                pad: pad.to_string(),
+                indent,
+                name: name.to_string(),
+                func,
+                attrs,
+            }),
+        }
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                PrintTask::Raw(s) => out.push_str(s),
+                PrintTask::RawOwned(s) => out.push_str(&s),
+                PrintTask::TrimEndSince(start) => {
+                    if start <= out.len() {
+                        let trimmed = out[start..].trim_end().len();
+                        out.truncate(start + trimmed);
+                    }
+                }
+                PrintTask::Nodes { slice, indent } => {
+                    if let Some((first, rest)) = slice.split_first() {
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::Nodes {
+                                slice: rest,
+                                indent,
+                            });
+                        }
+                        tasks.push(PrintTask::Node {
+                            node: first,
+                            indent,
+                        });
+                    }
+                }
+                PrintTask::Node { node, indent } => {
+                    self.step_print_node(node, indent, &negated_ifs, &mut tasks, out);
+                }
+                PrintTask::Leaves { slice, indent } => {
+                    if let Some((first, rest)) = slice.split_first() {
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::Leaves {
+                                slice: rest,
+                                indent,
+                            });
+                        }
+                        tasks.push(PrintTask::Leaf {
+                            leaf: first,
+                            indent,
+                        });
+                    }
+                }
+                PrintTask::Leaf { leaf, indent } => {
+                    self.step_print_leaf(leaf, indent, &mut tasks, out);
+                }
+                PrintTask::Stmt { stmt, indent } => {
+                    self.step_print_stmt(stmt, indent, &mut tasks, out);
+                }
+                PrintTask::SwitchCases { cases, indent } => {
+                    if let Some((case, rest)) = cases.split_first() {
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::SwitchCases {
+                                cases: rest,
+                                indent,
+                            });
+                        }
+                        let pad = "  ".repeat(indent);
+                        if case.tests.is_empty() {
+                            out.push_str(&format!("{pad}default: {{\n"));
+                            tasks.push(PrintTask::RawOwned(format!("{pad}  }}\n")));
+                            tasks.push(PrintTask::Nodes {
+                                slice: &case.body,
+                                indent: indent + 2,
+                            });
+                        } else {
+                            tasks.push(PrintTask::SwitchCaseTests {
+                                tests: &case.tests,
+                                body: &case.body,
+                                indent,
+                            });
+                        }
+                    }
+                }
+                PrintTask::SwitchCaseTests {
+                    tests,
+                    body,
+                    indent,
+                } => {
+                    let pad = "  ".repeat(indent);
+                    if let Some((first_test, rest_tests)) = tests.split_first() {
+                        if rest_tests.is_empty() {
+                            tasks.push(PrintTask::RawOwned(format!("{pad}  }}\n")));
+                            tasks.push(PrintTask::Nodes {
+                                slice: body,
+                                indent: indent + 2,
+                            });
+                        } else {
+                            tasks.push(PrintTask::SwitchCaseTests {
+                                tests: rest_tests,
+                                body,
+                                indent,
+                            });
+                        }
+                        out.push_str(&format!("{pad}case "));
+                        tasks.push(PrintTask::Raw(": {\n"));
+                        tasks.push(PrintTask::Expr {
+                            expr: first_test,
+                            prec: 0,
+                        });
+                    }
+                }
+                PrintTask::ExtraCatches {
+                    catches,
+                    primary_binding,
+                    indent,
+                } => {
+                    if let Some((extra, rest)) = catches.split_first() {
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::ExtraCatches {
+                                catches: rest,
+                                primary_binding: primary_binding.clone(),
+                                indent,
+                            });
+                        }
+                        let pad = "  ".repeat(indent);
+                        out.push_str(&format!(
+                            "{pad}  /* additional typed-catch handler (no JS surface) — body merged: */\n"
+                        ));
+                        if let Some(b) = &extra.binding
+                            && *b != primary_binding
+                        {
+                            out.push_str(&format!(
+                                "{pad}  const {b} = {primary_binding}; /* merged typed-catch binding */\n"
+                            ));
+                        }
+                        tasks.push(PrintTask::Nodes {
+                            slice: &extra.body,
+                            indent: indent + 1,
+                        });
+                    }
+                }
+                PrintTask::Expr { expr, prec } => {
+                    if expr.precedence() < prec {
+                        out.push('(');
+                        tasks.push(PrintTask::Raw(")"));
+                        tasks.push(PrintTask::ExprInner(expr));
+                    } else {
+                        tasks.push(PrintTask::ExprInner(expr));
+                    }
+                }
+                PrintTask::ExprInner(expr) => {
+                    self.step_print_expr_inner(expr, &mut tasks, out);
+                }
+                PrintTask::ObjEntries { slice, first } => {
+                    self.step_print_obj_entries(slice, first, &mut tasks, out);
+                }
+                PrintTask::ArrElems { slice, first } => {
+                    if let Some((el, rest)) = slice.split_first() {
+                        if !first {
+                            out.push_str(", ");
+                        }
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::ArrElems {
+                                slice: rest,
+                                first: false,
+                            });
+                        }
+                        match el {
+                            ArrayElem::Item(x) => tasks.push(PrintTask::Expr { expr: x, prec: 0 }),
+                            ArrayElem::Spread(x) => {
+                                out.push_str("...");
+                                tasks.push(PrintTask::Expr { expr: x, prec: 0 });
+                            }
+                        }
+                    }
+                }
+                PrintTask::TaggedParts { quasis, exprs, idx } => {
+                    if let Some(q) = quasis.get(idx) {
+                        out.push_str(q);
+                        if idx + 1 < quasis.len() {
+                            tasks.push(PrintTask::TaggedParts {
+                                quasis,
+                                exprs,
+                                idx: idx + 1,
+                            });
+                        }
+                        if let Some(arg) = exprs.get(idx) {
+                            out.push_str("${");
+                            tasks.push(PrintTask::Raw("}"));
+                            tasks.push(PrintTask::Expr { expr: arg, prec: 0 });
+                        }
+                    }
+                }
+                PrintTask::CallArgs {
+                    args,
+                    idx,
+                    leading_comma,
+                } => {
+                    if let Some(arg) = args.get(idx) {
+                        if leading_comma || idx > 0 {
+                            out.push_str(", ");
+                        }
+                        if idx + 1 < args.len() {
+                            tasks.push(PrintTask::CallArgs {
+                                args,
+                                idx: idx + 1,
+                                leading_comma,
+                            });
+                        }
+                        tasks.push(PrintTask::Expr { expr: arg, prec: 0 });
+                    }
+                }
+                PrintTask::EnterInlineFunc {
+                    func,
+                    indent,
+                    style,
+                } => {
+                    self.step_enter_inline_func(func, indent, style, &inline_pool, &mut tasks, out);
+                }
+                PrintTask::ExitInlineFunc {
+                    func,
+                    prev_kind,
+                    prev_hoisted,
+                    closing,
+                } => {
+                    self.emitting_funcs.remove(&func);
+                    self.current_kind = prev_kind;
+                    self.hoisted = prev_hoisted;
+                    out.push_str(&closing);
+                }
+                PrintTask::StartClassBody {
+                    pad,
+                    indent,
+                    ctor,
+                    members,
+                    member_attrs,
+                } => {
+                    self.step_start_class_body(
+                        pad,
+                        indent,
+                        ctor,
+                        members,
+                        member_attrs,
+                        &mut tasks,
+                        out,
+                    );
+                }
+                PrintTask::ClassMethods {
+                    pad,
+                    indent,
+                    mut methods,
+                    skipped,
+                } => {
+                    if let Some((mname, f, attrs)) = methods.next() {
+                        tasks.push(PrintTask::ClassMethods {
+                            pad: pad.clone(),
+                            indent,
+                            methods,
+                            skipped,
+                        });
+                        tasks.push(PrintTask::EmitClassMethod {
+                            pad,
+                            indent,
+                            name: mname,
+                            func: f,
+                            attrs,
+                        });
+                    } else if skipped > 0 {
+                        out.push_str(&format!(
+                            "{pad}  /* {skipped} member-buffer metadata entries skipped (name/method pairs consumed; numeric payloads are runtime metadata) */\n"
+                        ));
+                    }
+                }
+                PrintTask::EmitClassMethod {
+                    pad,
+                    indent,
+                    name,
+                    func,
+                    attrs,
+                } => {
+                    self.step_emit_class_method(&pad, indent, &name, func, attrs, &mut tasks, out);
+                }
+                PrintTask::CloseClass { pad } => {
+                    self.class_depth -= 1;
+                    out.push_str(&format!("{pad}}}\n"));
+                }
+            }
+        }
+    }
+
+    pub(in crate::emit) fn emit_nodes(&mut self, nodes: &[SNode], indent: usize, out: &mut String) {
+        self.run_print_tasks(PrintRoot::Nodes(nodes, indent), out);
+    }
+
     pub(crate) fn emit_node(&mut self, n: &SNode, indent: usize, out: &mut String) {
+        self.run_print_tasks(PrintRoot::Node(n, indent), out);
+    }
+
+    pub(crate) fn emit_leaf(&mut self, l: &Leaf, indent: usize, out: &mut String) {
+        self.run_print_tasks(PrintRoot::Leaf(l, indent), out);
+    }
+
+    pub(crate) fn emit_stmt(&mut self, s: &Stmt, indent: usize, out: &mut String) {
+        self.run_print_tasks(PrintRoot::Stmt(s, indent), out);
+    }
+
+    /// An expression printed at statement (precedence-0) context.
+    pub(crate) fn estr(&mut self, e: &Expr) -> String {
+        let mut s = String::new();
+        self.expr(e, 0, &mut s);
+        s
+    }
+
+    fn step_print_node<'b>(
+        &mut self,
+        n: &'b SNode,
+        indent: usize,
+        negated_ifs: &'b std::collections::HashMap<*const SNode, Expr>,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         let pad = "  ".repeat(indent);
         match n {
             SNode::Stmts(leaves) => {
-                for l in leaves {
-                    self.emit_leaf(l, indent, out);
-                }
+                tasks.push(PrintTask::Leaves {
+                    slice: leaves,
+                    indent,
+                });
             }
             SNode::If {
                 cond,
                 then,
                 otherwise,
             } => {
-                // Presentation: an empty then arm becomes `if (!c)` —
-                // never `if (c) {} else {…}` (readability).
-                let negated;
-                let (cond, then, otherwise) = if then.is_empty() && !otherwise.is_empty() {
-                    negated = crate::structure::negate(cond);
-                    (&negated, otherwise, then)
+                let (cond_ref, then_arm, else_arm) = if then.is_empty() && !otherwise.is_empty() {
+                    let neg = negated_ifs.get(&std::ptr::from_ref(n)).unwrap_or(cond);
+                    (neg, otherwise, then)
                 } else {
                     (cond, then, otherwise)
                 };
-                let mut c = String::new();
-                self.expr(cond, 0, &mut c);
-                if otherwise.is_empty() {
-                    out.push_str(&format!("{pad}if ({c}) {{\n"));
-                    self.emit_nodes(then, indent + 1, out);
-                    out.push_str(&format!("{pad}}}\n"));
+                out.push_str(&format!("{pad}if ("));
+                if else_arm.is_empty() {
+                    tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                    tasks.push(PrintTask::Nodes {
+                        slice: then_arm,
+                        indent: indent + 1,
+                    });
+                    tasks.push(PrintTask::Raw(") {\n"));
+                    tasks.push(PrintTask::Expr {
+                        expr: cond_ref,
+                        prec: 0,
+                    });
                 } else {
-                    out.push_str(&format!("{pad}if ({c}) {{\n"));
-                    self.emit_nodes(then, indent + 1, out);
-                    out.push_str(&format!("{pad}}} else {{\n"));
-                    self.emit_nodes(otherwise, indent + 1, out);
-                    out.push_str(&format!("{pad}}}\n"));
+                    tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                    tasks.push(PrintTask::Nodes {
+                        slice: else_arm,
+                        indent: indent + 1,
+                    });
+                    tasks.push(PrintTask::RawOwned(format!("{pad}}} else {{\n")));
+                    tasks.push(PrintTask::Nodes {
+                        slice: then_arm,
+                        indent: indent + 1,
+                    });
+                    tasks.push(PrintTask::Raw(") {\n"));
+                    tasks.push(PrintTask::Expr {
+                        expr: cond_ref,
+                        prec: 0,
+                    });
                 }
             }
             SNode::While { label, cond, body } => {
-                let c = match cond {
-                    Some(c) => {
-                        let mut s = String::new();
-                        self.expr(c, 0, &mut s);
-                        s
-                    }
-                    None => "true".to_string(),
-                };
                 let lbl = label.as_ref().map(|l| format!("{l}: ")).unwrap_or_default();
-                out.push_str(&format!("{pad}{lbl}while ({c}) {{\n"));
-                self.emit_nodes(body, indent + 1, out);
-                out.push_str(&format!("{pad}}}\n"));
+                out.push_str(&format!("{pad}{lbl}while ("));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
+                tasks.push(PrintTask::Raw(") {\n"));
+                match cond {
+                    Some(c) => tasks.push(PrintTask::Expr { expr: c, prec: 0 }),
+                    None => tasks.push(PrintTask::Raw("true")),
+                }
             }
             SNode::DoWhile { label, body, cond } => {
                 let lbl = label.as_ref().map(|l| format!("{l}: ")).unwrap_or_default();
                 out.push_str(&format!("{pad}{lbl}do {{\n"));
-                self.emit_nodes(body, indent + 1, out);
-                let mut c = String::new();
-                self.expr(cond, 0, &mut c);
-                out.push_str(&format!("{pad}}} while ({c});\n"));
+                tasks.push(PrintTask::Raw(");\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: cond,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::RawOwned(format!("{pad}}} while (")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
             }
             SNode::Break { label } => {
                 let l = label.as_ref().map(|l| format!(" {l}")).unwrap_or_default();
@@ -1054,8 +1893,11 @@ impl<'m> Emitter<'m> {
             }
             SNode::Labeled { label, body } => {
                 out.push_str(&format!("{pad}{label}: {{\n"));
-                self.emit_nodes(body, indent + 1, out);
-                out.push_str(&format!("{pad}}}\n"));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
             }
             SNode::Try {
                 body,
@@ -1067,50 +1909,44 @@ impl<'m> Emitter<'m> {
                     out.push_str(&format!("{pad}/* {note} */\n"));
                 }
                 out.push_str(&format!("{pad}try {{\n"));
-                self.emit_nodes(body, indent + 1, out);
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                if let Some(fbody) = finally {
+                    tasks.push(PrintTask::Nodes {
+                        slice: fbody,
+                        indent: indent + 1,
+                    });
+                    tasks.push(PrintTask::RawOwned(format!("{pad}}} finally {{\n")));
+                }
                 match catches.split_first() {
                     Some((first, rest)) => {
                         let binding = first.binding.clone().unwrap_or_else(|| "e".to_string());
-                        out.push_str(&format!("{pad}}} catch ({binding}) {{\n"));
-                        self.emit_nodes(&first.body, indent + 1, out);
-                        for extra in rest {
-                            // JS has ONE catch clause: the typed-catch
-                            // handlers merge into it in dispatch order.
-                            // The extra handler's exception param is
-                            // bound to the clause's binding (a typed
-                            // dispatch is unrecoverable — the file's
-                            // type table does not reach the IR — so the
-                            // merge is unconditional and says so).
-                            out.push_str(&format!(
-                                "{pad}  /* additional typed-catch handler (no JS surface) — body merged: */\n"
-                            ));
-                            if let Some(b) = &extra.binding
-                                && *b != binding
-                            {
-                                out.push_str(&format!(
-                                    "{pad}  const {b} = {binding}; /* merged typed-catch binding */\n"
-                                ));
-                            }
-                            self.emit_nodes(&extra.body, indent + 1, out);
+                        if !rest.is_empty() {
+                            tasks.push(PrintTask::ExtraCatches {
+                                catches: rest,
+                                primary_binding: binding.clone(),
+                                indent,
+                            });
                         }
+                        tasks.push(PrintTask::Nodes {
+                            slice: &first.body,
+                            indent: indent + 1,
+                        });
+                        tasks.push(PrintTask::RawOwned(format!(
+                            "{pad}}} catch ({binding}) {{\n"
+                        )));
                     }
                     None => {
-                        // A `finally` clause needs no catch (`try/finally`
-                        // is valid JS); without either, keep the honesty
-                        // empty-catch form.
                         if finally.is_none() {
-                            out.push_str(&format!("{pad}}} catch (e) {{\n"));
-                            out.push_str(&format!("{pad}  /* handler body unavailable */\n"));
+                            tasks.push(PrintTask::RawOwned(format!(
+                                "{pad}}} catch (e) {{\n{pad}  /* handler body unavailable */\n"
+                            )));
                         }
                     }
                 }
-                if let Some(fbody) = finally {
-                    // The `} finally {` line closes the try (no catch) or
-                    // the last catch clause.
-                    out.push_str(&format!("{pad}}} finally {{\n"));
-                    self.emit_nodes(fbody, indent + 1, out);
-                }
-                out.push_str(&format!("{pad}}}\n"));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
             }
             SNode::ForOf {
                 is_await,
@@ -1118,43 +1954,40 @@ impl<'m> Emitter<'m> {
                 iter,
                 body,
             } => {
-                let mut it = String::new();
-                self.expr(iter, 0, &mut it);
                 let kw = if *is_await { "for await" } else { "for" };
-                out.push_str(&format!("{pad}{kw} (const {binding} of {it}) {{\n"));
-                self.emit_nodes(body, indent + 1, out);
-                out.push_str(&format!("{pad}}}\n"));
+                out.push_str(&format!("{pad}{kw} (const {binding} of "));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
+                tasks.push(PrintTask::Raw(") {\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: iter,
+                    prec: 0,
+                });
             }
             SNode::ForIn { binding, obj, body } => {
-                let mut o = String::new();
-                self.expr(obj, 0, &mut o);
-                out.push_str(&format!("{pad}for (const {binding} in {o}) {{\n"));
-                self.emit_nodes(body, indent + 1, out);
-                out.push_str(&format!("{pad}}}\n"));
+                out.push_str(&format!("{pad}for (const {binding} in "));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
+                tasks.push(PrintTask::Raw(") {\n"));
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             SNode::Switch { disc, cases } => {
-                let mut d = String::new();
-                self.expr(disc, 0, &mut d);
-                out.push_str(&format!("{pad}switch ({d}) {{\n"));
-                for case in cases {
-                    if case.tests.is_empty() {
-                        out.push_str(&format!("{pad}default: {{\n"));
-                    } else {
-                        for t in &case.tests {
-                            let mut ts = String::new();
-                            self.expr(t, 0, &mut ts);
-                            out.push_str(&format!("{pad}case {ts}: {{\n"));
-                        }
-                    }
-                    // Braced: switch cases share ONE block scope in JS,
-                    // but the fold's arms can carry same-named temporaries
-                    // (cross-arm tail duplication) — `const x` twice in one
-                    // scope is a SyntaxError (dream gate: es2abc rejected
-                    // super-properties with "already declared").
-                    self.emit_nodes(&case.body, indent + 2, out);
-                    out.push_str(&format!("{pad}  }}\n"));
+                out.push_str(&format!("{pad}switch ("));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                if !cases.is_empty() {
+                    tasks.push(PrintTask::SwitchCases { cases, indent });
                 }
-                out.push_str(&format!("{pad}}}\n"));
+                tasks.push(PrintTask::Raw(") {\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: disc,
+                    prec: 0,
+                });
             }
             SNode::Honest(text) => {
                 out.push_str(&format!("{pad}/* {text} */\n"));
@@ -1162,13 +1995,17 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    pub(crate) fn emit_leaf(&mut self, l: &Leaf, indent: usize, out: &mut String) {
+    fn step_print_leaf<'b>(
+        &mut self,
+        l: &'b Leaf,
+        indent: usize,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         match l {
-            Leaf::Raw(s) => self.emit_stmt(s, indent, out),
+            Leaf::Raw(s) => tasks.push(PrintTask::Stmt { stmt: s, indent }),
             Leaf::Destructure { obj, keys, rest } => {
                 let pad = "  ".repeat(indent);
-                let mut o = String::new();
-                self.expr(obj, 0, &mut o);
                 let mut parts: Vec<String> = keys
                     .iter()
                     .map(|(k, t)| {
@@ -1180,7 +2017,9 @@ impl<'m> Emitter<'m> {
                     })
                     .collect();
                 parts.push(format!("...{rest}"));
-                out.push_str(&format!("{pad}const {{{}}} = {o};\n", parts.join(", ")));
+                out.push_str(&format!("{pad}const {{{}}} = ", parts.join(", ")));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
             }
             Leaf::Decl {
                 name,
@@ -1191,24 +2030,36 @@ impl<'m> Emitter<'m> {
                 let kw = if *mutable { "let" } else { "const" };
                 match value {
                     Some(v) => {
-                        let mut e = String::new();
-                        self.expr(v, 0, &mut e);
-                        out.push_str(&format!("{pad}{kw} {name} = {e};\n"));
+                        out.push_str(&format!("{pad}{kw} {name} = "));
+                        tasks.push(PrintTask::Raw(";\n"));
+                        tasks.push(PrintTask::Expr { expr: v, prec: 0 });
                     }
                     None => out.push_str(&format!("{pad}{kw} {name};\n")),
                 }
             }
             Leaf::Assign { target, value } => {
                 let pad = "  ".repeat(indent);
-                let mut e = String::new();
-                self.expr(value, 0, &mut e);
-                out.push_str(&format!("{pad}{target} = {e};\n"));
+                out.push_str(&format!("{pad}{target} = "));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn emit_stmt(&mut self, s: &Stmt, indent: usize, out: &mut String) {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "statement emitter dispatches across all Stage-A Stmt variants"
+    )]
+    fn step_print_stmt<'b>(
+        &mut self,
+        s: &'b Stmt,
+        indent: usize,
+        tasks: &mut Vec<PrintTask<'b>>,
+        out: &mut String,
+    ) {
         let pad = "  ".repeat(indent);
         match s {
             Stmt::Declare {
@@ -1223,74 +2074,62 @@ impl<'m> Emitter<'m> {
                     out.push_str(&format!("{pad}{anchor}\n"));
                 }
                 let kw = if *mutable { "let" } else { "const" };
-                // Hoisted escapee: the `var` declaration is at the
-                // function top; here a plain assignment.
                 let hoisted = self.hoisted.contains(name);
-                // Class declaration form.
                 if let Expr::Class {
                     ctor,
-                    name: class_name,
                     heritage,
                     members,
                     member_attrs,
                     sendable,
+                    ..
                 } = value
                 {
-                    let _ = class_name;
-                    let ctor = *ctor;
-                    let heritage = heritage.clone();
-                    let members = *members;
-                    let member_attrs = member_attrs.clone();
-                    let sendable = *sendable;
-                    if hoisted {
-                        self.emit_class_assign(
-                            &pad,
-                            indent,
-                            name,
-                            ctor,
-                            heritage,
-                            members,
-                            &member_attrs,
-                            sendable,
-                            out,
-                        );
-                    } else {
-                        self.emit_class(
-                            &pad,
-                            indent,
-                            name,
-                            ctor,
-                            heritage,
-                            members,
-                            &member_attrs,
-                            sendable,
-                            out,
-                        );
-                    }
+                    self.step_start_class(
+                        &pad,
+                        indent,
+                        name,
+                        *ctor,
+                        heritage.as_deref(),
+                        *members,
+                        member_attrs,
+                        *sendable,
+                        tasks,
+                        out,
+                    );
                     return;
                 }
                 if hoisted {
-                    out.push_str(&format!("{pad}{name} = {};\n", self.estr(value)));
+                    out.push_str(&format!("{pad}{name} = "));
                 } else {
-                    out.push_str(&format!("{pad}{kw} {name} = {};\n", self.estr(value)));
+                    out.push_str(&format!("{pad}{kw} {name} = "));
                 }
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Stmt::PhiDecl { name, .. } => {
-                // `var`, not `let`: per-edge phi assignments can
-                // precede the join textually in the structured output
-                // (TDZ-safety; documented phi-lowering trade-off).
                 out.push_str(&format!("{pad}var {name}; /* phi */\n"));
             }
             Stmt::PhiAssign { target, value, .. } => {
-                out.push_str(&format!("{pad}{target} = {};\n", self.estr(value)));
+                out.push_str(&format!("{pad}{target} = "));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Stmt::Expr(expr) => {
-                let mut text = self.estr(expr);
-                // A statement starting with `{` parses as a block.
-                if matches!(expr, Expr::ObjectLit { .. } | Expr::ObjectBuild { .. }) {
-                    text = format!("({text})");
+                let wrap = matches!(expr, Expr::ObjectLit { .. } | Expr::ObjectBuild { .. });
+                out.push_str(&pad);
+                if wrap {
+                    out.push('(');
+                    tasks.push(PrintTask::Raw(");\n"));
+                } else {
+                    tasks.push(PrintTask::Raw(";\n"));
                 }
-                out.push_str(&format!("{pad}{text};\n"));
+                tasks.push(PrintTask::Expr { expr, prec: 0 });
             }
             Stmt::StoreProp {
                 object,
@@ -1305,11 +2144,17 @@ impl<'m> Emitter<'m> {
                     format!("[{}]", render_pool_string(self.module, name))
                 };
                 let tag = if *own { " /*own*/" } else { "" };
-                out.push_str(&format!(
-                    "{pad}{}{member} = {};{tag}\n",
-                    self.member_base(object),
-                    self.estr(value)
-                ));
+                out.push_str(&pad);
+                tasks.push(PrintTask::RawOwned(format!(";{tag}\n")));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::RawOwned(format!("{member} = ")));
+                tasks.push(PrintTask::Expr {
+                    expr: object,
+                    prec: 19,
+                });
             }
             Stmt::StoreIndex {
                 object,
@@ -1324,12 +2169,22 @@ impl<'m> Emitter<'m> {
                 own,
             } => {
                 let tag = if *own { " /*own*/" } else { "" };
-                out.push_str(&format!(
-                    "{pad}{}[{}] = {};{tag}\n",
-                    self.member_base(object),
-                    self.estr(index),
-                    self.estr(value)
-                ));
+                out.push_str(&pad);
+                tasks.push(PrintTask::RawOwned(format!(";{tag}\n")));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::Raw("] = "));
+                tasks.push(PrintTask::Expr {
+                    expr: index,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::Raw("["));
+                tasks.push(PrintTask::Expr {
+                    expr: object,
+                    prec: 19,
+                });
             }
             Stmt::DefineMethod {
                 object,
@@ -1342,11 +2197,19 @@ impl<'m> Emitter<'m> {
                 } else {
                     format!("[{}]", render_pool_string(self.module, name))
                 };
-                out.push_str(&format!(
-                    "{pad}{}{member} = {}; /*method (length={length})*/\n",
-                    self.member_base(object),
-                    self.estr(func)
-                ));
+                out.push_str(&pad);
+                tasks.push(PrintTask::RawOwned(format!(
+                    "; /*method (length={length})*/\n"
+                )));
+                tasks.push(PrintTask::Expr {
+                    expr: func,
+                    prec: 0,
+                });
+                tasks.push(PrintTask::RawOwned(format!("{member} = ")));
+                tasks.push(PrintTask::Expr {
+                    expr: object,
+                    prec: 19,
+                });
             }
             Stmt::StorePrivate {
                 object,
@@ -1354,45 +2217,78 @@ impl<'m> Emitter<'m> {
                 value,
                 define,
             } => {
+                out.push_str(&pad);
                 if self.class_depth > 0 {
                     let tag = if *define { " /*define*/" } else { "" };
-                    out.push_str(&format!(
-                        "{pad}{}.#{name} = {};{tag}\n",
-                        self.member_base(object),
-                        self.estr(value)
-                    ));
+                    tasks.push(PrintTask::RawOwned(format!(";{tag}\n")));
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
+                    tasks.push(PrintTask::RawOwned(format!(".#{name} = ")));
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 19,
+                    });
                 } else {
-                    // Out-of-class instance initializer (es2abc class-
-                    // field lowering): `#x` does not parse outside a
-                    // class body — loud string-key form.
                     *self
                         .stats
                         .fallback_comments
                         .entry("StorePrivate(out-of-class)")
                         .or_insert(0) += 1;
                     self.current_fn_has_fallback = true;
-                    out.push_str(&format!(
-                        "{pad}{}[{}] = {}; /*private #{name} — out-of-class instance initializer (class-field fold pending)*/\n",
-                        self.member_base(object),
-                        render_pool_string(self.module, name),
-                        self.estr(value)
-                    ));
+                    tasks.push(PrintTask::RawOwned(format!(
+                        "; /*private #{name} — out-of-class instance initializer (class-field fold pending)*/\n"
+                    )));
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
+                    tasks.push(PrintTask::RawOwned(format!(
+                        "[{}] = ",
+                        render_pool_string(self.module, name)
+                    )));
+                    tasks.push(PrintTask::Expr {
+                        expr: object,
+                        prec: 19,
+                    });
                 }
             }
-            Stmt::StoreSuper { name, key, value } => {
-                let target = match (name, key) {
-                    (Some(n), None) => format!("super.{n}"),
-                    (None, Some(k)) => format!("super[{}]", self.estr(k)),
-                    _ => "super[?]".to_string(),
-                };
-                out.push_str(&format!("{pad}{target} = {};\n", self.estr(value)));
-            }
+            Stmt::StoreSuper { name, key, value } => match (name, key) {
+                (Some(n), None) => {
+                    out.push_str(&format!("{pad}super.{n} = "));
+                    tasks.push(PrintTask::Raw(";\n"));
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
+                }
+                (None, Some(k)) => {
+                    out.push_str(&format!("{pad}super["));
+                    tasks.push(PrintTask::Raw(";\n"));
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
+                    tasks.push(PrintTask::Raw("] = "));
+                    tasks.push(PrintTask::Expr { expr: k, prec: 0 });
+                }
+                _ => {
+                    out.push_str(&format!("{pad}super[?] = "));
+                    tasks.push(PrintTask::Raw(";\n"));
+                    tasks.push(PrintTask::Expr {
+                        expr: value,
+                        prec: 0,
+                    });
+                }
+            },
             Stmt::LexStore { name, value, .. } => {
-                out.push_str(&format!(
-                    "{pad}{} = {};\n",
-                    sanitize(name),
-                    self.estr(value)
-                ));
+                out.push_str(&format!("{pad}{} = ", sanitize(name)));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Stmt::GlobalStore { name, value, .. } => {
                 let target = if is_legal_ident(name) {
@@ -1400,10 +2296,20 @@ impl<'m> Emitter<'m> {
                 } else {
                     format!("globalThis[{}]", render_pool_string(self.module, name))
                 };
-                out.push_str(&format!("{pad}{target} = {};\n", self.estr(value)));
+                out.push_str(&format!("{pad}{target} = "));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Stmt::ModuleStore { name, value, .. } => {
-                out.push_str(&format!("{pad}{name} = {};\n", self.estr(value)));
+                out.push_str(&format!("{pad}{name} = "));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr {
+                    expr: value,
+                    prec: 0,
+                });
             }
             Stmt::ScopePush { names } => {
                 let slots: Vec<String> = names
@@ -1423,10 +2329,16 @@ impl<'m> Emitter<'m> {
                 out.push_str(&format!("{pad}/* private names {} */\n", ns.join(", ")));
             }
             Stmt::Throw(v) => {
-                out.push_str(&format!("{pad}throw {};\n", self.estr(v)));
+                out.push_str(&format!("{pad}throw "));
+                tasks.push(PrintTask::Raw(";\n"));
+                tasks.push(PrintTask::Expr { expr: v, prec: 0 });
             }
             Stmt::Return(v) => match v {
-                Some(v) => out.push_str(&format!("{pad}return {};\n", self.estr(v))),
+                Some(v) => {
+                    out.push_str(&format!("{pad}return "));
+                    tasks.push(PrintTask::Raw(";\n"));
+                    tasks.push(PrintTask::Expr { expr: v, prec: 0 });
+                }
                 None => out.push_str(&format!("{pad}return;\n")),
             },
             Stmt::Branch { dest } => {
@@ -1475,26 +2387,15 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// An expression printed at statement (precedence-0) context.
-    pub(crate) fn estr(&mut self, e: &Expr) -> String {
-        let mut s = String::new();
-        self.expr(e, 0, &mut s);
-        s
-    }
-
-    /// A member-expression base, parenthesized when needed.
-    fn member_base(&mut self, e: &Expr) -> String {
-        let mut s = String::new();
-        self.expr(e, 19, &mut s);
-        s
-    }
-
     fn line_anchor(&self, v: abcd_ir::ValueId) -> Option<String> {
         let value = self.module.value(v)?;
         let ValueDef::Inst(iid) = value.def else {
             return None;
         };
         let loc = self.module.inst(iid)?.loc?;
+        if loc.line == u32::MAX {
+            return None;
+        }
         Some(format!("// line {}", loc.line))
     }
 }
@@ -1558,7 +2459,15 @@ pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
                 | SNode::ForIn { body, .. } => {
                     stack.push(body.iter());
                 }
-                SNode::Try { body, catches, .. } => {
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        stack.push(fin.iter());
+                    }
                     for c in catches.iter().rev() {
                         stack.push(c.body.iter());
                     }
@@ -1632,7 +2541,6 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
         EnterNodes { nodes: &'a [SNode], idx: usize },
         PushPath(usize),
         PopPath,
-        DoWhileCond(&'a Expr),
     }
     fn collect_uses(root: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos)>) {
         let mut stack: Vec<&Expr> = vec![root];
@@ -1660,9 +2568,6 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                 EscapeFrame::PushPath(p) => path.push(p),
                 EscapeFrame::PopPath => {
                     path.pop();
-                }
-                EscapeFrame::DoWhileCond(cond) => {
-                    collect_uses(cond, &(path.clone(), usize::MAX, usize::MAX), uses);
                 }
                 EscapeFrame::EnterNodes { nodes, idx } => {
                     if idx >= nodes.len() {
@@ -1734,12 +2639,13 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                             frames.push(EscapeFrame::PushPath(i));
                         }
                         SNode::DoWhile { body, cond, .. } => {
-                            // JS scope: the do-while condition is INSIDE the
-                            // loop body's block (`do { const x … } while (x)`
-                            // is legal), after the last body position.
+                            // `D3`: in JS, `while (cond)` in `do { … } while (cond)`
+                            // executes in the ENCLOSING scope outside the `{ … }`
+                            // body block, so any `const`/`let` declared inside `body`
+                            // and referenced in `cond` escapes `body` and hoists to `var`.
+                            collect_uses(cond, &(path.clone(), i, usize::MAX), uses);
                             frames.push(EscapeFrame::PopPath);
                             frames.push(EscapeFrame::PopPath);
-                            frames.push(EscapeFrame::DoWhileCond(cond));
                             frames.push(EscapeFrame::EnterNodes {
                                 nodes: body,
                                 idx: 0,
@@ -1762,8 +2668,18 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                             });
                             frames.push(EscapeFrame::PushPath(i));
                         }
-                        SNode::Try { body, catches, .. } => {
+                        SNode::Try {
+                            body,
+                            catches,
+                            finally,
+                            ..
+                        } => {
                             frames.push(EscapeFrame::PopPath);
+                            if let Some(fin) = finally {
+                                frames.push(EscapeFrame::PopPath);
+                                frames.push(EscapeFrame::EnterNodes { nodes: fin, idx: 0 });
+                                frames.push(EscapeFrame::PushPath(1 + catches.len()));
+                            }
                             for (k, c) in catches.iter().enumerate().rev() {
                                 frames.push(EscapeFrame::PopPath);
                                 frames.push(EscapeFrame::EnterNodes {

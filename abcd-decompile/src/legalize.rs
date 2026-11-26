@@ -29,7 +29,7 @@
 //! Special forms (`this`, `super`, `new.target`, `globalThis`) never pass
 //! through here — they are not declared names.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The reserved-word set: ES2022 keywords, future reserved words,
 /// strict-mode reserved words, and the shadow-hostile-but-legal trio
@@ -182,6 +182,7 @@ pub fn sanitize(raw: &str) -> String {
 #[derive(Default, Debug)]
 pub struct Legalizer {
     used: HashSet<String>,
+    next_suffix: HashMap<String, u32>,
 }
 
 impl Legalizer {
@@ -197,13 +198,34 @@ impl Legalizer {
         if self.used.insert(base.clone()) {
             return base;
         }
-        for n in 1u32.. {
+        let next = self.next_suffix.entry(base.clone()).or_insert(1);
+        loop {
+            let n = *next;
+            *next = n.saturating_add(1);
             let candidate = format!("{base}${n}");
             if self.used.insert(candidate.clone()) {
                 return candidate;
             }
         }
-        unreachable!()
+    }
+
+    /// Mint a legal, collision-free identifier from `raw` that also avoids
+    /// every name in `avoid` (used for synthetic fallback names so they
+    /// never shadow referenced bare globals or outer bindings).
+    pub(crate) fn mint_avoiding(&mut self, raw: &str, avoid: &HashSet<String>) -> String {
+        let base = sanitize(raw);
+        if !avoid.contains(&base) && self.used.insert(base.clone()) {
+            return base;
+        }
+        let next = self.next_suffix.entry(base.clone()).or_insert(1);
+        loop {
+            let n = *next;
+            *next = n.saturating_add(1);
+            let candidate = format!("{base}${n}");
+            if !avoid.contains(&candidate) && self.used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 
     /// Reserve a name WITHOUT minting it (e.g. `this` must never be

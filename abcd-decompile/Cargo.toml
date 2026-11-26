@@ -2,6 +2,7 @@
 name = "abcd-decompile"
 description = "Bytecode → JS/TS decompiler on the SSA IR: expression recovery, pattern-independent structuring, JS/TS emission"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
@@ -24,3 +25,6 @@ rayon = { workspace = true }
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
 abcd-lift = { workspace = true }
+
+[lints]
+workspace = true

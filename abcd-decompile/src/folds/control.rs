@@ -112,22 +112,45 @@ pub(in crate::folds) fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<Switc
 /// reinterpret as a switch exit. Nested loops/switches intercept their
 /// own breaks, so the walk does not descend into them.
 pub(in crate::folds) fn arm_has_loop_break(nodes: &[SNode]) -> bool {
-    nodes.iter().any(|n| match n {
-        SNode::Break { label: None } => true,
-        SNode::If {
-            then, otherwise, ..
-        } => arm_has_loop_break(then) || arm_has_loop_break(otherwise),
-        SNode::Labeled { body, .. } => arm_has_loop_break(body),
-        SNode::Try { body, catches, .. } => {
-            arm_has_loop_break(body) || catches.iter().any(|c| arm_has_loop_break(&c.body))
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Break { label: None } => return true,
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::While { .. }
+                | SNode::DoWhile { .. }
+                | SNode::ForOf { .. }
+                | SNode::ForIn { .. }
+                | SNode::Switch { .. }
+                | SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
         }
-        SNode::While { .. }
-        | SNode::DoWhile { .. }
-        | SNode::ForOf { .. }
-        | SNode::ForIn { .. }
-        | SNode::Switch { .. } => false,
-        SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
-    })
+    }
+    false
 }
 
 /// The `(discriminant, case-literal)` of a POSITIVE `x === lit`
@@ -301,16 +324,19 @@ pub(in crate::folds) fn canon_name(
 /// SSA provenance of temp references (copies sit at different SSA
 /// values; their NAMES carry the identity).
 pub(in crate::folds) fn canon_expr(e: &mut Expr, map: &std::collections::HashMap<String, String>) {
-    match e {
-        Expr::Temp { value, name } => {
-            canon_name(name, map);
-            *value = abcd_ir::ValueId::new(0);
+    let mut stack: Vec<&mut Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Temp { value, name } => {
+                canon_name(name, map);
+                *value = abcd_ir::ValueId::new(0);
+            }
+            Expr::Ident(name) => canon_name(name, map),
+            _ => {}
         }
-        Expr::Ident(name) => canon_name(name, map),
-        _ => {}
-    }
-    for c in expr_children_mut(e) {
-        canon_expr(c, map);
+        for c in expr_children_mut(cur).into_iter().rev() {
+            stack.push(c);
+        }
     }
 }
 
@@ -696,48 +722,98 @@ pub(in crate::folds) fn ft_rethrow_temp(
 /// follows)? Conservative: any doubt answers `true` (the fold then
 /// REQUIRES the normal-completion finally copy — absence bails).
 pub(in crate::folds) fn ft_list_fallthrough(nodes: &[SNode]) -> bool {
-    nodes.iter().all(ft_node_fallthrough)
+    run_ft_steps(FtStep::List(nodes))
 }
 
+#[cfg(test)]
 pub(in crate::folds) fn ft_node_fallthrough(n: &SNode) -> bool {
-    match n {
-        SNode::Stmts(ls) => !ls.iter().any(|l| {
-            matches!(
-                l,
-                Leaf::Raw(Stmt::Return(_))
-                    | Leaf::Raw(Stmt::Throw(_))
-                    | Leaf::Raw(Stmt::Branch { .. })
-                    | Leaf::Raw(Stmt::CondBranch { .. })
-            )
-        }),
-        SNode::If {
-            then, otherwise, ..
-        } => ft_list_fallthrough(then) && ft_list_fallthrough(otherwise),
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            let body_ft = ft_list_fallthrough(body);
-            let catch_ft =
-                catches.is_empty() || catches.iter().any(|c| ft_list_fallthrough(&c.body));
-            // An exceptional path is not a NORMAL completion; a
-            // finally clause runs either way and changes nothing.
-            let _ = finally;
-            body_ft || catch_ft && !catches.is_empty()
+    run_ft_steps(FtStep::Node(n))
+}
+
+enum FtStep<'a> {
+    List(&'a [SNode]),
+    Node(&'a SNode),
+    All(usize),
+    Any(usize),
+}
+
+fn run_ft_steps(initial: FtStep<'_>) -> bool {
+    let mut steps: Vec<FtStep<'_>> = vec![initial];
+    let mut vals: Vec<bool> = Vec::new();
+    while let Some(step) = steps.pop() {
+        match step {
+            FtStep::List(slice) => {
+                if slice.is_empty() {
+                    vals.push(true);
+                } else {
+                    steps.push(FtStep::All(slice.len()));
+                    for n in slice.iter().rev() {
+                        steps.push(FtStep::Node(n));
+                    }
+                }
+            }
+            FtStep::Node(n) => match n {
+                SNode::Stmts(ls) => {
+                    vals.push(!ls.iter().any(|l| {
+                        matches!(
+                            l,
+                            Leaf::Raw(Stmt::Return(_))
+                                | Leaf::Raw(Stmt::Throw(_))
+                                | Leaf::Raw(Stmt::Branch { .. })
+                                | Leaf::Raw(Stmt::CondBranch { .. })
+                        )
+                    }));
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    steps.push(FtStep::All(2));
+                    steps.push(FtStep::List(otherwise));
+                    steps.push(FtStep::List(then));
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    // An exceptional path is not a NORMAL completion; a
+                    // finally clause runs either way and changes nothing.
+                    let _ = finally;
+                    if catches.is_empty() {
+                        steps.push(FtStep::List(body));
+                    } else {
+                        steps.push(FtStep::Any(1 + catches.len()));
+                        for c in catches.iter().rev() {
+                            steps.push(FtStep::List(&c.body));
+                        }
+                        steps.push(FtStep::List(body));
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } => vals.push(false),
+                // Loops, switches, labeled blocks, honesty comments: may
+                // complete (a loop can break out, a comment says nothing).
+                SNode::While { .. }
+                | SNode::DoWhile { .. }
+                | SNode::ForOf { .. }
+                | SNode::ForIn { .. }
+                | SNode::Switch { .. }
+                | SNode::Labeled { .. }
+                | SNode::Honest(_) => vals.push(true),
+            },
+            FtStep::All(k) => {
+                let start = vals.len().saturating_sub(k);
+                let r = vals.drain(start..).all(|x| x);
+                vals.push(r);
+            }
+            FtStep::Any(k) => {
+                let start = vals.len().saturating_sub(k);
+                let r = vals.drain(start..).any(|x| x);
+                vals.push(r);
+            }
         }
-        SNode::Break { .. } | SNode::Continue { .. } => false,
-        // Loops, switches, labeled blocks, honesty comments: may
-        // complete (a loop can break out, a comment says nothing).
-        SNode::While { .. }
-        | SNode::DoWhile { .. }
-        | SNode::ForOf { .. }
-        | SNode::ForIn { .. }
-        | SNode::Switch { .. }
-        | SNode::Labeled { .. }
-        | SNode::Honest(_) => true,
     }
+    vals.pop().unwrap_or(true)
 }
 
 /// Loop/switch nesting context for exit classification within the
@@ -751,84 +827,127 @@ pub(in crate::folds) struct FtCtx {
     pub(in crate::folds) breakables: usize,
 }
 
-/// Strip the inlined finally copies preceding every exit of the
-/// protected construct. `Err(())` = an exit without its copy — the
-/// fold bails and the duplicated form stays (honesty rule).
-pub(in crate::folds) fn ft_strip_exits(
+fn take_ft_child(
+    n: &mut SNode,
+    slot: usize,
+    ctx: FtCtx,
+) -> Option<(Vec<SNode>, FtCtx, Option<String>)> {
+    match n {
+        SNode::If {
+            then, otherwise, ..
+        } => match slot {
+            0 => Some((std::mem::take(then), ctx, None)),
+            1 => Some((std::mem::take(otherwise), ctx, None)),
+            _ => None,
+        },
+        SNode::While { label, body, .. } | SNode::DoWhile { label, body, .. } => {
+            (slot == 0).then(|| {
+                (
+                    std::mem::take(body),
+                    FtCtx {
+                        loops: ctx.loops + 1,
+                        breakables: ctx.breakables + 1,
+                    },
+                    label.clone(),
+                )
+            })
+        }
+        SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => (slot == 0).then(|| {
+            (
+                std::mem::take(body),
+                FtCtx {
+                    loops: ctx.loops + 1,
+                    breakables: ctx.breakables + 1,
+                },
+                None,
+            )
+        }),
+        SNode::Switch { cases, .. } => cases.get_mut(slot).map(|c| {
+            (
+                std::mem::take(&mut c.body),
+                FtCtx {
+                    loops: ctx.loops,
+                    breakables: ctx.breakables + 1,
+                },
+                None,
+            )
+        }),
+        SNode::Labeled { label, body } => {
+            (slot == 0).then(|| (std::mem::take(body), ctx, Some(label.clone())))
+        }
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            if slot == 0 {
+                Some((std::mem::take(body), ctx, None))
+            } else if slot <= catches.len() {
+                Some((std::mem::take(&mut catches[slot - 1].body), ctx, None))
+            } else if slot == 1 + catches.len() {
+                finally.as_mut().map(|f| (std::mem::take(f), ctx, None))
+            } else {
+                None
+            }
+        }
+        SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => None,
+    }
+}
+
+fn put_ft_child(n: &mut SNode, slot: usize, child: Vec<SNode>) {
+    match n {
+        SNode::If {
+            then, otherwise, ..
+        } => match slot {
+            0 => *then = child,
+            1 => *otherwise = child,
+            _ => {}
+        },
+        SNode::While { body, .. }
+        | SNode::DoWhile { body, .. }
+        | SNode::ForOf { body, .. }
+        | SNode::ForIn { body, .. }
+        | SNode::Labeled { body, .. } => {
+            if slot == 0 {
+                *body = child;
+            }
+        }
+        SNode::Switch { cases, .. } => {
+            if let Some(c) = cases.get_mut(slot) {
+                c.body = child;
+            }
+        }
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            if slot == 0 {
+                *body = child;
+            } else if slot <= catches.len() {
+                catches[slot - 1].body = child;
+            } else if slot == 1 + catches.len()
+                && let Some(f) = finally
+            {
+                *f = child;
+            }
+        }
+        SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+    }
+}
+
+fn ft_strip_exits_flat(
     nodes: &mut Vec<SNode>,
     idiom: &FinallyIdiom,
     ctx: FtCtx,
-    labels: &mut Vec<String>,
+    labels: &[String],
     strips: &mut usize,
 ) -> Result<(), ()> {
-    // Recurse into nested constructs first (their internal exits are
-    // classified against the ADJUSTED context).
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                ft_strip_exits(then, idiom, ctx, labels, strips)?;
-                ft_strip_exits(otherwise, idiom, ctx, labels, strips)?;
-            }
-            SNode::While { label, body, .. } | SNode::DoWhile { label, body, .. } => {
-                let inner = FtCtx {
-                    loops: ctx.loops + 1,
-                    breakables: ctx.breakables + 1,
-                };
-                let pushed = label.is_some();
-                if let Some(l) = label {
-                    labels.push(l.clone());
-                }
-                let r = ft_strip_exits(body, idiom, inner, labels, strips);
-                if pushed {
-                    labels.pop();
-                }
-                r?;
-            }
-            SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => {
-                let inner = FtCtx {
-                    loops: ctx.loops + 1,
-                    breakables: ctx.breakables + 1,
-                };
-                ft_strip_exits(body, idiom, inner, labels, strips)?;
-            }
-            SNode::Switch { cases, .. } => {
-                let inner = FtCtx {
-                    loops: ctx.loops,
-                    breakables: ctx.breakables + 1,
-                };
-                for c in cases {
-                    ft_strip_exits(&mut c.body, idiom, inner, labels, strips)?;
-                }
-            }
-            SNode::Labeled { label, body } => {
-                labels.push(label.clone());
-                let r = ft_strip_exits(body, idiom, ctx, labels, strips);
-                labels.pop();
-                r?;
-            }
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                ft_strip_exits(body, idiom, ctx, labels, strips)?;
-                for c in catches {
-                    ft_strip_exits(&mut c.body, idiom, ctx, labels, strips)?;
-                }
-                if let Some(f) = finally {
-                    ft_strip_exits(f, idiom, ctx, labels, strips)?;
-                }
-            }
-            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
-    // Flatten this level and strip the copies preceding its own exits.
     let k = idiom.canon.len();
     let toks = ft_flatten(nodes);
-    let mut remove: Vec<usize> = Vec::new(); // token indices
+    let mut remove: Vec<usize> = Vec::new();
     for j in 0..toks.len() {
         let needs = match &toks[j] {
             FTok::Leaf(Leaf::Raw(Stmt::Return(_))) => true,
@@ -846,15 +965,12 @@ pub(in crate::folds) fn ft_strip_exits(
             continue;
         }
         if j < k {
-            return Err(()); // an exit without room for its copy
+            return Err(());
         }
         let cand = &toks[j - k..j];
         if ft_canon(cand) != idiom.canon {
-            return Err(()); // an exit whose copy is missing/different
+            return Err(());
         }
-        // The return-value guard: in `F; return v` F runs BEFORE v is
-        // read; in `try { return v } finally { F }` v is read first.
-        // Equivalent only when F cannot rebind anything v mentions.
         if let FTok::Leaf(Leaf::Raw(Stmt::Return(Some(v)))) = &toks[j] {
             let mut assigned: Vec<&str> = Vec::new();
             for t in cand {
@@ -881,6 +997,107 @@ pub(in crate::folds) fn ft_strip_exits(
         .filter_map(|(i, t)| (!remove.contains(&i)).then_some(t))
         .collect();
     *nodes = ft_regroup(kept);
+    Ok(())
+}
+
+/// Strip the inlined finally copies preceding every exit of the
+/// protected construct. `Err(())` = an exit without its copy — the
+/// fold bails and the duplicated form stays (honesty rule).
+pub(in crate::folds) fn ft_strip_exits(
+    nodes: &mut Vec<SNode>,
+    idiom: &FinallyIdiom,
+    ctx: FtCtx,
+    labels: &mut Vec<String>,
+    strips: &mut usize,
+) -> Result<(), ()> {
+    struct Frame {
+        seq: Vec<SNode>,
+        idx: usize,
+        next_slot: usize,
+        has_detached_child: bool,
+        ctx: FtCtx,
+        pop_label: bool,
+    }
+
+    let mut stack = vec![Frame {
+        seq: std::mem::take(nodes),
+        idx: 0,
+        next_slot: 0,
+        has_detached_child: false,
+        ctx,
+        pop_label: false,
+    }];
+    let mut completed_child: Option<Vec<SNode>> = None;
+
+    while let Some(top) = stack.last_mut() {
+        if let Some(child_seq) = completed_child.take() {
+            put_ft_child(&mut top.seq[top.idx], top.next_slot - 1, child_seq);
+            top.has_detached_child = false;
+        }
+        if top.idx < top.seq.len() {
+            let slot = top.next_slot;
+            if let Some((child_seq, child_ctx, push_lbl)) =
+                take_ft_child(&mut top.seq[top.idx], slot, top.ctx)
+            {
+                top.next_slot = slot + 1;
+                top.has_detached_child = true;
+                let pop_label = push_lbl.is_some();
+                if let Some(l) = push_lbl {
+                    labels.push(l);
+                }
+                stack.push(Frame {
+                    seq: child_seq,
+                    idx: 0,
+                    next_slot: 0,
+                    has_detached_child: false,
+                    ctx: child_ctx,
+                    pop_label,
+                });
+            } else {
+                top.idx += 1;
+                top.next_slot = 0;
+            }
+            continue;
+        }
+
+        let res = ft_strip_exits_flat(&mut top.seq, idiom, top.ctx, labels, strips);
+        if res.is_err() {
+            while stack.len() > 1 {
+                let Some(child_frame) = stack.pop() else {
+                    break;
+                };
+                if child_frame.pop_label {
+                    labels.pop();
+                }
+                if let Some(parent) = stack.last_mut()
+                    && parent.has_detached_child
+                {
+                    put_ft_child(
+                        &mut parent.seq[parent.idx],
+                        parent.next_slot - 1,
+                        child_frame.seq,
+                    );
+                    parent.has_detached_child = false;
+                }
+            }
+            if let Some(root) = stack.pop() {
+                *nodes = root.seq;
+            }
+            return Err(());
+        }
+
+        let Some(done) = stack.pop() else {
+            break;
+        };
+        if done.pop_label {
+            labels.pop();
+        }
+        if stack.is_empty() {
+            *nodes = done.seq;
+            return Ok(());
+        }
+        completed_child = Some(done.seq);
+    }
     Ok(())
 }
 
@@ -936,11 +1153,15 @@ pub(in crate::folds) fn ft_fold_at(nodes: &[SNode], i: usize) -> Option<Vec<SNod
         ) {
         match stripped_body.pop() {
             Some(SNode::Try {
-                body: ibody,
-                catches: icatches,
-                note: inote,
+                body: ref mut ibody,
+                catches: ref mut icatches,
+                note: ref mut inote,
                 finally: None,
-            }) => Some((ibody, icatches, inote)),
+            }) => Some((
+                std::mem::take(ibody),
+                std::mem::take(icatches),
+                inote.take(),
+            )),
             _ => None,
         }
     } else {

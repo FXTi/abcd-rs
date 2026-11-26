@@ -5,6 +5,7 @@
 //! failure, write failure). Clap's own parse errors — which would exit 2
 //! by default — are remapped to 1 to fit that contract.
 
+#![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 
 use std::process::ExitCode;
@@ -28,7 +29,10 @@ fn main() -> ExitCode {
                 eprint!("{e}");
                 return ExitCode::from(1);
             }
-            print!("{e}");
+            if let Err(io_err) = abcd_cli::write_stdout_fmt(format_args!("{e}")) {
+                eprintln!("error: {io_err}");
+                return ExitCode::from(io_err.exit_code());
+            }
             return ExitCode::SUCCESS;
         }
     };

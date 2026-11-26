@@ -130,6 +130,15 @@ fn push_const_frame<'a>(
     }
 }
 
+/// Maximum number of expanded [`Lit`] nodes permitted when unfolding a single
+/// [`Const`] entry (guards against `O(2^N)` tree blowup on shared DAGs in
+/// untrusted constant pools; exceeding this cap returns `None` so Stage A
+/// emits a documented fallback instead of exhausting memory).
+pub(crate) const MAX_LIT_NODES: usize = 16_384;
+
+/// Maximum exact safe integer magnitude in IEEE-754 `f64` (`2^53 - 1`).
+const MAX_SAFE_INTEGER_MAGNITUDE: u64 = 9_007_199_254_740_991;
+
 fn const_to_lit_with_active(
     module: &Module,
     root: &Const,
@@ -138,6 +147,7 @@ fn const_to_lit_with_active(
     if let Some(lit) = scalar_const_to_lit(module, root) {
         return Some(lit);
     }
+    let mut expanded_nodes: usize = 1;
     let mut frames: Vec<ConstBuildFrame<'_>> = Vec::new();
     push_const_frame(root, None, &mut frames);
     let mut completed: Option<Lit> = None;
@@ -156,6 +166,10 @@ fn const_to_lit_with_active(
                 if *idx < items.len() {
                     let cid = items[*idx];
                     *idx += 1;
+                    expanded_nodes += 1;
+                    if expanded_nodes > MAX_LIT_NODES {
+                        return None;
+                    }
                     let child = module.consts.get(cid)?;
                     if let Some(lit) = scalar_const_to_lit(module, child) {
                         out.push(lit);
@@ -194,6 +208,10 @@ fn const_to_lit_with_active(
                     }
                 }
                 if let Some(k_lit) = pending_key.take() {
+                    expanded_nodes += 1;
+                    if expanded_nodes > MAX_LIT_NODES {
+                        return None;
+                    }
                     let vcid = values[*idx - 1];
                     let vchild = module.consts.get(vcid)?;
                     if let Some(vlit) = scalar_const_to_lit(module, vchild) {
@@ -206,6 +224,10 @@ fn const_to_lit_with_active(
                         push_const_frame(vchild, Some(vcid), &mut frames);
                     }
                 } else if *idx < len {
+                    expanded_nodes += 1;
+                    if expanded_nodes > MAX_LIT_NODES {
+                        return None;
+                    }
                     let kcid = keys[*idx];
                     *idx += 1;
                     let kchild = module.consts.get(kcid)?;
@@ -246,6 +268,10 @@ fn const_to_lit_with_active(
                     completed = Some(done);
                 } else {
                     *resolved = true;
+                    expanded_nodes += 1;
+                    if expanded_nodes > MAX_LIT_NODES {
+                        return None;
+                    }
                     let tcid = *target;
                     let child = module.consts.get(tcid)?;
                     if let Some(lit) = scalar_const_to_lit(module, child) {
@@ -291,8 +317,10 @@ pub fn render_number(bits: u64) -> String {
 pub fn render_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        push_js_char(&mut out, c);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let next_is_digit = chars.peek().is_some_and(char::is_ascii_digit);
+        push_js_char(&mut out, c, next_is_digit);
     }
     out.push('"');
     out
@@ -301,7 +329,11 @@ pub fn render_string(s: &str) -> String {
 /// One scalar value inside a JS double-quoted string literal, per
 /// [`render_string`]'s escaping contract (shared with the raw-bytes
 /// renderer below so both spellings stay in lockstep).
-fn push_js_char(out: &mut String, c: char) {
+///
+/// When `c == '\0'` is followed by an ASCII digit (`'0'..='9'`), `\x00`
+/// is emitted instead of `\0` because `\01` is a legacy octal escape and
+/// a `SyntaxError` in strict mode / ES modules / template strings.
+fn push_js_char(out: &mut String, c: char, next_is_digit: bool) {
     match c {
         '"' => out.push_str("\\\""),
         '\\' => out.push_str("\\\\"),
@@ -311,6 +343,7 @@ fn push_js_char(out: &mut String, c: char) {
         '\u{08}' => out.push_str("\\b"),
         '\u{0C}' => out.push_str("\\f"),
         '\u{0B}' => out.push_str("\\v"),
+        '\0' if next_is_digit => out.push_str("\\x00"),
         '\0' => out.push_str("\\0"),
         c if (c as u32) < 0x20 || (0x7F..0xA0).contains(&(c as u32)) => {
             out.push_str(&format!("\\u{{{:X}}}", c as u32));
@@ -383,18 +416,20 @@ fn push_units_string_body(out: &mut String, units: &[u16]) {
             && (0xDC00..0xE000).contains(&units[i + 1])
         {
             let cp = 0x10000 + (((u as u32) - 0xD800) << 10) + ((units[i + 1] as u32) - 0xDC00);
+            let next_is_digit = units.get(i + 2).is_some_and(|n| (0x30..=0x39).contains(n));
             // A well-formed pair always decodes to a scalar value.
             if let Some(c) = char::from_u32(cp) {
-                push_js_char(out, c);
+                push_js_char(out, c, next_is_digit);
             }
             i += 2;
         } else if (0xD800..0xE000).contains(&u) {
             out.push_str(&format!("\\u{u:04X}"));
             i += 1;
         } else {
+            let next_is_digit = units.get(i + 1).is_some_and(|n| (0x30..=0x39).contains(n));
             // A BMP unit is always a scalar value.
             if let Some(c) = char::from_u32(u as u32) {
-                push_js_char(out, c);
+                push_js_char(out, c, next_is_digit);
             }
             i += 1;
         }
@@ -417,12 +452,84 @@ pub fn render_mutf8_string(raw: &[u8]) -> String {
     render_utf16_string(&mutf8_units(raw))
 }
 
-/// Render raw MUTF-8 bytes of a REGEXP pattern: no quotes, `/` escaped,
-/// lone surrogates as `\uXXXX` escapes.
+/// Escape a RegExp pattern body for `/pattern/flags` literal emission:
+/// an empty pattern becomes `(?:)` (so `//` never turns into a line comment),
+/// `/` is escaped as `\/` ONLY when preceded by an even number of `\`
+/// characters (preserving already-escaped `\/` while escaping `\\/`), and
+/// line terminators are escaped.
+pub(crate) fn escape_regexp_body(pattern: &str) -> String {
+    if pattern.is_empty() {
+        return "(?:)".to_string();
+    }
+    let mut out = String::with_capacity(pattern.len() + 2);
+    let mut backslashes = 0usize;
+    for c in pattern.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '/' => {
+                if backslashes.is_multiple_of(2) {
+                    out.push_str("\\/");
+                } else {
+                    out.push('/');
+                }
+                backslashes = 0;
+            }
+            '\n' => {
+                backslashes = 0;
+                out.push_str("\\n");
+            }
+            '\r' => {
+                backslashes = 0;
+                out.push_str("\\r");
+            }
+            '\u{2028}' => {
+                backslashes = 0;
+                out.push_str("\\u2028");
+            }
+            '\u{2029}' => {
+                backslashes = 0;
+                out.push_str("\\u2029");
+            }
+            _ => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Render raw MUTF-8 bytes of a REGEXP pattern: no quotes, unescaped `/`
+/// escaped as `\/`, lone surrogates as `\uXXXX` escapes.
 pub fn render_mutf8_regexp(raw: &[u8]) -> String {
-    let mut body = String::new();
-    push_units_string_body(&mut body, &mutf8_units(raw));
-    body.replace('/', "\\/")
+    let units = mutf8_units(raw);
+    let mut body = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..0xDC00).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..0xE000).contains(&units[i + 1])
+        {
+            let cp = 0x10000 + (((u as u32) - 0xD800) << 10) + ((units[i + 1] as u32) - 0xDC00);
+            if let Some(c) = char::from_u32(cp) {
+                body.push(c);
+            }
+            i += 2;
+        } else if (0xD800..0xE000).contains(&u) {
+            body.push_str(&format!("\\u{u:04X}"));
+            i += 1;
+        } else {
+            if let Some(c) = char::from_u32(u as u32) {
+                body.push(c);
+            }
+            i += 1;
+        }
+    }
+    escape_regexp_body(&body)
 }
 
 /// Resolve a [`Sym`] for an `AllocRegExp` pattern (#30): valid UTF-8 passes
@@ -517,8 +624,20 @@ pub(crate) fn render_lit_ex(root: &Lit, js_method_ref: bool) -> String {
             Lit::Null => "null".to_string(),
             Lit::Bool(b) => b.to_string(),
             Lit::Number(bits) => render_number(*bits),
-            Lit::Int64(v) => v.to_string(),
-            Lit::UInt64(v) => v.to_string(),
+            Lit::Int64(v) => {
+                if v.unsigned_abs() > MAX_SAFE_INTEGER_MAGNITUDE {
+                    format!("{v}n")
+                } else {
+                    v.to_string()
+                }
+            }
+            Lit::UInt64(v) => {
+                if *v > MAX_SAFE_INTEGER_MAGNITUDE {
+                    format!("{v}n")
+                } else {
+                    v.to_string()
+                }
+            }
             Lit::String(s) => render_string(s),
             Lit::Utf16(units) => render_utf16_string(units),
             Lit::BigInt(s) => format!("{s}n"),
@@ -622,12 +741,21 @@ pub(crate) fn render_lit_ex(root: &Lit, js_method_ref: bool) -> String {
                 } else if *idx < entries.len() {
                     let (k, _) = &entries[*idx];
                     *idx += 1;
-                    if let Lit::String(s) = k
+                    if js_method_ref
+                        && let Lit::String(s) = k
+                        && s == "__proto__"
+                    {
+                        *pending_key = Some(format!("[{}]", render_string(s)));
+                    } else if let Lit::String(s) = k
                         && crate::legalize::is_legal_ident(s)
                     {
                         *pending_key = Some(s.clone());
                     } else if let Some(ks) = scalar(k) {
-                        *pending_key = Some(ks);
+                        if js_method_ref && (ks.starts_with('-') || ks.ends_with('n')) {
+                            *pending_key = Some(format!("[{ks}]"));
+                        } else {
+                            *pending_key = Some(ks);
+                        }
                     } else if let Lit::Array(sub) = k {
                         stack.push(RenderFrame::Array {
                             items: sub,
@@ -812,7 +940,7 @@ mod tests {
         let lit = lit_of(&m, arr).expect("resolve flat ConstPool graph");
         assert_eq!(
             render_lit(&lit),
-            format!("[{{id: {}}}, {}]", i64::MIN, u64::MAX)
+            format!("[{{id: {}n}}, {}n]", i64::MIN, u64::MAX)
         );
 
         let mut deep_cid = cu;
@@ -828,10 +956,7 @@ mod tests {
                     let deep_lit = lit_of(&m, deep_cid).expect("deep array literal");
                     let rendered = render_lit(&deep_lit);
                     assert!(rendered.starts_with("[[["));
-                    let mut cur = deep_lit;
-                    while let Lit::Array(mut v) = cur {
-                        cur = v.pop().unwrap_or(Lit::Null);
-                    }
+                    drop(deep_lit);
                 })
                 .expect("spawn 256k thread");
             handle.join().expect("256k thread must not stack-overflow");

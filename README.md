@@ -41,7 +41,7 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
 
 ## Building & Quick Start
 
-Requires a stable Rust toolchain (`1.85+`, Edition 2024) and a standard host C++17 compiler (`clang++`, `g++`, or MSVC)—no Git submodules, Ruby, `bindgen`, or `libclang` are needed at build time.
+Requires a stable Rust toolchain (`1.88+`, Edition 2024) and a standard host C++17 compiler (`clang++`, `g++`, or MSVC)—no Git submodules, Ruby, `bindgen`, or `libclang` are needed at build time.
 
 ```sh
 cargo build --release -p abcd-cli

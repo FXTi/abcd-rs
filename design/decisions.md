@@ -1,17 +1,17 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-20`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-21`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-20`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-21`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
 - **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; `Catch::type_class: Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-lower`.
 
 ### ADR-02 — Single-Point `Op` Semantics & Two-Tier Derived Effects (`N48`, `N50`, `R2-D2`)
-- **Ruling**: `abcd_ir::Op` is a closed semantic enum (`88` variants, with cold `DefineClass` / `DefineSendableClass` payloads boxed in `DefineClassData`). Every pass, verifier rule, expression recoverer, and taint transfer function queries `Op::for_each_operand()`, `Op::for_each_operand_mut()`, `Op::effects()` / `Op::effects_in(module)`, `Op::has_result()`, and `Op::is_terminator()`. Baseline `Op::effects()` conservatively over-approximates untyped dynamic JS coercion/proxy traps (`BinaryOp`, coercing `UnaryOp`, relational/`In`/`InstanceOf` `Compare`, `TryGetGlobal`, `TryStoreGlobal`, `StoreGlobal`), while `Op::effects_in(module)` refines operations on proven primitive operands back to `Effects::PURE`, and `Effects::is_removable_if_unused()` drives `abcd-opt::Adce`.
+- **Ruling**: `abcd_ir::Op` is a closed semantic enum (`94` variants, with cold `DefineClass` / `DefineSendableClass` payloads boxed in `DefineClassData`). Every pass, verifier rule, expression recoverer, and taint transfer function queries `Op::for_each_operand()`, `Op::for_each_operand_mut()`, `Op::effects()` / `Op::effects_in(module)`, `Op::has_result()`, and `Op::is_terminator()`. Baseline `Op::effects()` conservatively over-approximates untyped dynamic JS coercion/proxy traps (`BinaryOp`, coercing `UnaryOp`, relational/`In`/`InstanceOf` `Compare`, `TryGetGlobal`, `TryStoreGlobal`, `StoreGlobal`), while `Op::effects_in(module)` refines operations on proven primitive operands back to `Effects::PURE`, and `Effects::is_removable_if_unused()` drives `abcd-opt::Adce`.
 - **Crates**: `abcd-ir`, `abcd-opt`, `abcd-analysis`, `abcd-decompile`.
 
 ### ADR-03 — Accumulator-as-Cache Lowering (`B4`)
@@ -118,6 +118,13 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   3. **Guaranteed-terminating dual-env PTA & `Obj::Unknown` completeness (`R4-D4`, `#81`, `#82`)**: `abcd-analysis::pta` runs a finite-height monotonic `Plain` + `Sendable` lexical-environment prepass accounted against `step_budget`, seeds `Obj::Unknown` on unmodeled/escaped values and incomplete calls (`!resolution_complete`), retains `ctx == None` base-activation answers for externally-invocable functions, and models spread/rest/generator/super/global-object IR operations end-to-end.
   4. **Shared `DomTree` / `IndexedDom` & pruned K3 surface (`R4-D5`, `#83`)**: `abcd-analysis` delegates dominance to `abcd_ir::cfg::{DomTree, IndexedDom}` and removes dead unconsumed `MonotoneFramework` / `AnalysisStore` / `VecSet` / `EmptyCallGraph` / `inject_calling_context` scaffolding.
 - **Crates**: `abcd-ir`, `abcd-analysis`, `abcd-taint`.
+
+### ADR-21 — Sound Decompiler Control/Evaluation Semantics, Iterative `256 KiB` AST Walkers & Portable CLI Contracts (`R5-D1`, `R5-D2`, `#86`–`#89`)
+- **Ruling**:
+  1. **Evaluation-order & control-flow fidelity (`#86`, `#87`)**: `abcd-decompile` flushes exceptional-edge `PhiAssign`s before each block's first throwing statement, restricts `clean_while` header promotion to pure non-escaping temporaries, evaluates `do...while` conditions in outer scope prior to clobbering back-edge phi updates, wraps relational `<`/`<=`/`>`/`>=` negations in `!(...)` (`NaN`-sound), materializes unconditional `ThrowNotExists`/`ThrowPatternNonCoercible` throws, enforces `Op::effects_in(module)` + left-to-right JS operand monotonicity during Stage-A inlining, counts whole-function temp uses (including condition headers and `finally`) before literal/machine declaration elimination, emits `["__proto__"]` own properties as computed keys, derives parameter ABI roles from `abcd_ir::frame::FrameSlots`, and keeps readable `+x` / `(+x ± 1)` for untyped JS (`R5-D1` Option B, emitting `± 1n` on known `BigInt`s).
+  2. **Iterative `256 KiB` stack budget, linear helpers & library purity (`#88`)**: Expression recovery, region/try structuring, AST folds, JS/TS/ArkUI printers, and deep AST `Drop` teardown run on explicit heap workstacks with zero `stderr` / `std::env::var_os` side effects, `O(1)` `Legalizer::mint` cursors, `O(k)` phi-copy worklists, `Arc`-shared `NameScopes`, and bounded shared-literal DAG expansion.
+  3. **CLI verification, telemetry & portable path containment (`#89`, `R5-D2`)**: `abcd rewrite --check` runs full `decode + lift_file + verify_module`, `abcd analyze` / `abcd taint` surface `root_sliced` / `pta_root_sliced` / `ohos_lifecycle` and `"any_param_from:N"` summaries while rejecting contradictory `--pta` / `--alias-rung < 2` flags (`exit 1`), `stdout` `BrokenPipe` exits cleanly (`0`), `PK\x05\x06` empty ZIPs are sniffed as containers, and both `abcd-cli` and `split.rs` enforce Windows device-stem rejection plus ASCII case-folded collision deduplication across all 13 Rust 2024 workspace crates (`[lints] workspace = true`, `#![forbid(unsafe_code)]` on pure-Rust crates).
+- **Crates**: `abcd-decompile`, `abcd-cli`, root `abcd-rs`.
 
 ---
 

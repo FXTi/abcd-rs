@@ -156,3 +156,17 @@ fn abc_write_failure_is_a_tool_error() {
         "nothing beyond the failed .abc write"
     );
 }
+
+#[test]
+fn empty_zip_container_is_recognized_as_container_and_returns_tool_error() {
+    let empty_zip = common::zip(&[]);
+    assert!(empty_zip.starts_with(b"PK\x05\x06"));
+    let dir = common::tempdir("extract-empty-zip");
+    let err = extract::extract_bytes(&empty_zip, "empty.hap", &dir, false).unwrap_err();
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "empty ZIP is a container without .abc entries (tool error, not user error): {err}"
+    );
+    assert!(err.to_string().contains("no .abc entry found"), "{err}");
+}

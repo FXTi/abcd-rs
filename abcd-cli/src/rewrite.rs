@@ -3,9 +3,10 @@
 //!
 //! A writer command: the emitted bytes are a new `.abc` file. `--check`
 //! re-decodes the emitted bytes (a full structural decode — header, index
-//! regions, and every method body's instruction stream) before they leave
-//! the process, so a pipeline bug surfaces as a tool error (exit 2)
-//! instead of a corrupt file on disk.
+//! regions, and every method body's instruction stream), re-lifts them to IR,
+//! and runs [`abcd_ir::verify_module`] before they leave the process, so a
+//! pipeline bug surfaces as a tool error (exit 2) instead of a corrupt file on
+//! disk.
 //!
 //! Whole-file lowering delegates to [`abcd_lower::rewrite_file`]: the lifted
 //! module is verified ([`abcd_ir::verify_module`]), optionally optimized, and
@@ -26,9 +27,9 @@ use crate::input::InputModule;
 pub struct RewriteOptions {
     /// Run abcd-opt's optimization pipeline between lift and lower.
     pub optimize: bool,
-    /// Re-decode the emitted bytes (full structural + per-method bytecode
-    /// decode) before returning them; a failure is a tool error and the
-    /// bytes are dropped, never written.
+    /// Re-decode, re-lift, and re-verify the emitted bytes before returning
+    /// them; a failure is a tool error and the bytes are dropped, never
+    /// written.
     pub check: bool,
 }
 
@@ -134,43 +135,13 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
         .map_err(|e| CliError::Tool(format!("{}: encode failed: {e}", ctx())))?;
     drop(rewritten_file);
 
-    // Stage 6 (optional): `--check` self-check. `abcd_file::decode` is a
-    // full structural decode — header, index regions, and every method
-    // body's instruction stream (each body comes back as decoded
-    // `Vec<Bytecode>`; a corrupt instruction fails the decode). The body
-    // pattern is then compared against the input: every method that had a
-    // body must still have one with a non-empty instruction stream. Any
-    // mismatch is a tool error and the bad bytes are dropped — the caller
-    // never sees them.
+    // Stage 6 (optional): `--check` self-check (design/cli.md §2).
+    // Re-decodes `abc` (header, index regions, and every method body's
+    // instruction stream), verifies method-count and body-presence parity,
+    // re-lifts the decoded file to SSA IR, and verifies the re-lifted IR.
+    // Any failure is a tool error (exit 2) and the bad bytes are dropped.
     let output_instructions = if opts.check {
-        let checked = abcd_file::decode(&abc).map_err(|e| {
-            CliError::Tool(format!(
-                "{}: --check failed: emitted bytes do not re-decode: {e}",
-                ctx()
-            ))
-        })?;
-        let (out_methods, out_instructions) = shape(&checked);
-        if out_methods != methods {
-            return Err(CliError::Tool(format!(
-                "{}: --check failed: method count changed {methods} -> {out_methods}",
-                ctx()
-            )));
-        }
-        for (before_tag, (_, after)) in before_body_tags.into_iter().zip(checked.all_methods()) {
-            let after_tag = body_state(&after.body);
-            let ok = match before_tag {
-                "no body" => after_tag == "no body",
-                _ => after_tag == "body",
-            };
-            if !ok {
-                return Err(CliError::Tool(format!(
-                    "{}: --check failed: method body presence changed \
-                     ({before_tag} -> {after_tag})",
-                    ctx(),
-                )));
-            }
-        }
-        out_instructions
+        check_emitted(&ctx, &abc, methods, &before_body_tags)?
     } else {
         unchecked_output_instructions
     };
@@ -187,6 +158,58 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
             optimized_changed,
         },
     })
+}
+
+/// Run the `--check` readback pipeline (`decode → parity → lift_file → verify_module`)
+/// over emitted `.abc` bytes, returning the decoded instruction count on success.
+fn check_emitted(
+    ctx: &dyn Fn() -> String,
+    abc: &[u8],
+    expected_methods: usize,
+    before_body_tags: &[&'static str],
+) -> Result<usize, CliError> {
+    let redecoded = abcd_file::decode(abc).map_err(|e| {
+        CliError::Tool(format!(
+            "{}: --check: emitted bytes do not re-decode: {e}",
+            ctx()
+        ))
+    })?;
+    let (out_methods, out_instructions) = shape(&redecoded);
+    if out_methods != expected_methods {
+        return Err(CliError::Tool(format!(
+            "{}: --check: method count changed {expected_methods} -> {out_methods}",
+            ctx()
+        )));
+    }
+    for (&before_tag, (_, after)) in before_body_tags.iter().zip(redecoded.all_methods()) {
+        let after_tag = body_state(&after.body);
+        let ok = match before_tag {
+            "no body" => after_tag == "no body",
+            _ => after_tag == "body",
+        };
+        if !ok {
+            return Err(CliError::Tool(format!(
+                "{}: --check: method body presence changed ({before_tag} -> {after_tag})",
+                ctx(),
+            )));
+        }
+    }
+    let relifted = abcd_lift::lift_file(&redecoded).map_err(|e| {
+        CliError::Tool(format!(
+            "{}: --check: emitted bytes failed to re-lift: {e}",
+            ctx()
+        ))
+    })?;
+    drop(redecoded);
+    let verify_report = verify_module(&relifted);
+    if !verify_report.is_ok() {
+        return Err(CliError::Tool(format!(
+            "{}: --check: re-lifted IR verify failed: {:?}",
+            ctx(),
+            verify_report.errors
+        )));
+    }
+    Ok(out_instructions)
 }
 
 /// Short body-state tag for `--check` diagnostics.
@@ -355,5 +378,53 @@ mod tests {
             "stale pre-rewrite local_vars must be cleared: {:?}",
             dbg.local_vars
         );
+    }
+
+    #[test]
+    fn check_emitted_rejects_unliftable_or_corrupt_bytes_with_tool_error() {
+        use abcd_file::{AccessFlags, Builder, CodeEntity, Type};
+        use abcd_isa::{Bytecode, EntityId, Imm};
+
+        let ctx = || "rewrite probe (probe.abc)".to_string();
+
+        // Corrupt bytes fail the re-decode step of `--check`.
+        let err = check_emitted(&ctx, b"not an abc", 1, &["body"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--check:"), "{err}");
+
+        // Valid `.abc` carrying `ldthisbyname` decodes and passes method/body
+        // parity, then fails `abcd_lift::lift_file` inside `--check`.
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let placeholder = EntityId(u16::MAX as u32);
+        let (code, offsets) = abcd_isa::encode(&[
+            Bytecode::Ldthisbyname(Imm(0), placeholder),
+            Bytecode::Returnundefined,
+        ])
+        .unwrap();
+        let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
+        let key = b.add_string("key");
+        b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(key))
+            .unwrap();
+        b.deduplicate();
+        let unliftable_abc = b.finalize().unwrap();
+
+        let err = check_emitted(&ctx, &unliftable_abc, 1, &["body"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(msg.contains("--check:"), "{msg}");
+        assert!(msg.contains("re-lift"), "{msg}");
+        assert!(msg.contains("ldthisbyname"), "{msg}");
+
+        // Method-count and body-presence parity mismatches also report `--check:` tool errors.
+        let err_count = check_emitted(&ctx, &unliftable_abc, 2, &["body", "body"]).unwrap_err();
+        assert_eq!(err_count.exit_code(), 2);
+        assert!(err_count.to_string().contains("--check:"), "{err_count}");
+
+        let err_body = check_emitted(&ctx, &unliftable_abc, 1, &["no body"]).unwrap_err();
+        assert_eq!(err_body.exit_code(), 2);
+        assert!(err_body.to_string().contains("--check:"), "{err_body}");
     }
 }

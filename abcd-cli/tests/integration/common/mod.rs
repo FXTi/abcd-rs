@@ -4,7 +4,10 @@
 //! archives (the restricted container dialect abcd-hap reads), and
 //! [`tiny_abc`] synthesizes a minimal valid .abc through
 //! `abcd_file::Builder` (precedent: tests/lift-decompile/n74_*.rs).
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared fixture helpers are selectively used across integration test submodules"
+)]
 
 use std::path::PathBuf;
 

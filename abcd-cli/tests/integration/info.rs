@@ -139,3 +139,24 @@ fn report_zeropadded_matches_report() {
     let err = info::report_zeropadded("modules", "modules.abc", &raw, false).unwrap_err();
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn empty_zip_container_takes_container_path_in_info() {
+    let empty_zip = common::zip(&[]);
+    assert!(empty_zip.starts_with(b"PK\x05\x06"));
+    assert!(input::is_container(&empty_zip));
+
+    let dir = common::tempdir("info-empty-zip");
+    let path = dir.join("empty.hap");
+    std::fs::write(&path, &empty_zip).unwrap();
+
+    let cli = <abcd_cli::cli::Cli as clap::Parser>::try_parse_from([
+        "abcd",
+        "info",
+        path.to_str().unwrap(),
+    ])
+    .unwrap();
+    let err = abcd_cli::run(cli).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("no .abc entry found"), "{err}");
+}

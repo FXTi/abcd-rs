@@ -118,47 +118,61 @@ pub fn generator_machine_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats:
     }
 }
 
-/// The entry-site validity check (immutable): find the sequence where
-/// the run declaring the CreateGenerator temp sits next to its
+/// The entry-site validity check (immutable, iterative): find the sequence
+/// where the run declaring the CreateGenerator temp sits next to its
 /// dispatch, and verify the full site shape.
 pub(in crate::folds) fn entry_site_matches(nodes: &[SNode], cx: &mut GenDriverCx) -> bool {
-    for i in 0..nodes.len().saturating_sub(1) {
-        if let Some(site) = match_driver_site(nodes, i, cx)
-            && site.entry
-            && site.genobj == cx.genobj
-            && !nodes_use_temp(&site.continuation, site.resume)
-        {
-            return true;
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        for i in 0..slice.len().saturating_sub(1) {
+            if let Some(site) = match_driver_site(slice, i, cx)
+                && site.entry
+                && site.genobj == cx.genobj
+                && !nodes_use_temp(&site.continuation, site.resume)
+            {
+                return true;
+            }
+        }
+        for n in slice.iter().rev() {
+            match n {
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
         }
     }
-    nodes.iter().any(|n| match n {
-        SNode::If {
-            then, otherwise, ..
-        } => entry_site_matches(then, cx) || entry_site_matches(otherwise, cx),
-        SNode::While { body, .. }
-        | SNode::DoWhile { body, .. }
-        | SNode::Labeled { body, .. }
-        // unreachable: ForOf/ForIn nodes are created only inside fold()
-        // (folds.rs:1418/1433/2577), which runs after
-        // generator_machine_fold (emit.rs:508 vs 531) — c-COV diagnosis
-        | SNode::ForOf { body, .. }
-        | SNode::ForIn { body, .. } => entry_site_matches(body, cx),
-        SNode::Try {
-            body,
-            catches,
-            finally,
-            ..
-        } => {
-            entry_site_matches(body, cx)
-                || catches.iter().any(|c| entry_site_matches(&c.body, cx))
-                || finally.as_ref().is_some_and(|f| entry_site_matches(f, cx))
-        }
-        // unreachable: SNode::Switch is created only by fold_switches
-        // (folds.rs:3115/3183) inside fold(), which runs after
-        // generator_machine_fold — c-COV diagnosis
-        SNode::Switch { cases, .. } => cases.iter().any(|c| entry_site_matches(&c.body, cx)),
-        SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
-    })
+    false
 }
 
 /// One matched driver site (immutable match; applied separately).
@@ -187,6 +201,17 @@ fn is_set_gen_state(l: &Leaf) -> bool {
     matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
 }
 
+fn is_gen_plumbing(l: &Leaf) -> bool {
+    is_set_gen_state(l)
+        || matches!(
+            l,
+            Leaf::Raw(Stmt::PhiAssign {
+                exceptional: true,
+                ..
+            })
+        )
+}
+
 /// Match `nodes[i]` (a `Stmts` run ending in
 /// `[yield-stmt, decl r = ResumeGenerator(g), decl m =
 /// GetResumeMode(g)]`) + `nodes[i+1]` (the mode dispatch on `m`).
@@ -202,7 +227,7 @@ pub(in crate::folds) fn match_driver_site(
     let prev_sig = |cur: &mut usize| -> Option<usize> {
         while *cur > 0 {
             *cur -= 1;
-            if !is_set_gen_state(&run[*cur]) {
+            if !is_gen_plumbing(&run[*cur]) {
                 return Some(*cur);
             }
         }
@@ -332,24 +357,31 @@ pub(in crate::folds) fn match_dispatch(
             return Some(cont.clone());
         }
         // Descend the chain: the continuation of a not-yet-complete
-        // dispatch is exactly the next test, optionally preceded by a
-        // run of pure number-const decls (the optimized profile
-        // materializes the second immediate there).
-        cur = match cont.as_slice() {
-            [SNode::If { .. }] => &cont[0],
-            [SNode::Stmts(run), SNode::If { .. }]
-                if run.iter().all(|l| {
-                    matches!(
-                        l,
-                        Leaf::Raw(Stmt::Declare {
-                            value: Expr::Lit(Lit::Number(_)),
-                            ..
+        // dispatch is exactly the next test, optionally preceded by
+        // plumbing/honest runs or pure number-const decls (the optimized
+        // profile materializes the second immediate there).
+        let mut k = 0;
+        while k < cont.len()
+            && (matches!(&cont[k], SNode::Honest(_))
+                || matches!(
+                    &cont[k],
+                    SNode::Stmts(run)
+                        if run.iter().all(|l| {
+                            is_gen_plumbing(l)
+                                || matches!(
+                                    l,
+                                    Leaf::Raw(Stmt::Declare {
+                                        value: Expr::Lit(Lit::Number(_)),
+                                        ..
+                                    })
+                                )
                         })
-                    )
-                }) =>
-            {
-                &cont[1]
-            }
+                ))
+        {
+            k += 1;
+        }
+        cur = match &cont[k..] {
+            [SNode::If { .. }] => &cont[k],
             _ => return None,
         };
     }
@@ -424,13 +456,22 @@ pub(in crate::folds) fn resolve_num(
 /// append loop-bookkeeping `break`s after the dominating `return`
 /// (dead control points; d-P11 g04: yield inside a loop body).
 pub(in crate::folds) fn check_return_arm(arm: &[SNode], resume: ValueId) -> Option<()> {
-    let [SNode::Stmts(run), rest @ ..] = arm else {
+    let mut k = 0;
+    while k < arm.len()
+        && matches!(&arm[k], SNode::Stmts(r) if !r.is_empty() && r.iter().all(is_gen_plumbing))
+    {
+        k += 1;
+    }
+    let [SNode::Stmts(run), rest @ ..] = &arm[k..] else {
         return None;
     };
-    if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
+    if !rest.iter().all(|n| {
+        matches!(n, SNode::Break { .. })
+            || matches!(n, SNode::Stmts(r) if r.iter().all(is_gen_plumbing))
+    }) {
         return None;
     }
-    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_set_gen_state(l)).collect();
+    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_gen_plumbing(l)).collect();
     let [Leaf::Raw(Stmt::Return(Some(value)))] = sig.as_slice() else {
         return None;
     };
@@ -440,13 +481,22 @@ pub(in crate::folds) fn check_return_arm(arm: &[SNode], resume: ValueId) -> Opti
 /// The THROW arm: exactly `throw <resume>;` (+ the dead `Unreachable`
 /// and any dead loop-bookkeeping `break`s).
 pub(in crate::folds) fn check_throw_arm(arm: &[SNode], resume: ValueId) -> Option<()> {
-    let [SNode::Stmts(run), rest @ ..] = arm else {
+    let mut k = 0;
+    while k < arm.len()
+        && matches!(&arm[k], SNode::Stmts(r) if !r.is_empty() && r.iter().all(is_gen_plumbing))
+    {
+        k += 1;
+    }
+    let [SNode::Stmts(run), rest @ ..] = &arm[k..] else {
         return None;
     };
-    if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
+    if !rest.iter().all(|n| {
+        matches!(n, SNode::Break { .. })
+            || matches!(n, SNode::Stmts(r) if r.iter().all(is_gen_plumbing))
+    }) {
         return None;
     }
-    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_set_gen_state(l)).collect();
+    let sig: Vec<&Leaf> = run.iter().filter(|l| !is_gen_plumbing(l)).collect();
     match sig.as_slice() {
         [Leaf::Raw(Stmt::Throw(value))]
         | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
@@ -463,89 +513,44 @@ pub(in crate::folds) fn gen_fold_seq(
     cx: &mut GenDriverCx,
     stats: &mut FoldStats,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                gen_fold_seq(then, cx, stats);
-                gen_fold_seq(otherwise, cx, stats);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // generator_machine_fold (emit.rs:508 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => gen_fold_seq(body, cx, stats),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                gen_fold_seq(body, cx, stats);
-                for c in catches {
-                    gen_fold_seq(&mut c.body, cx, stats);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // generator_machine_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    gen_fold_seq(f, cx, stats);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // generator_machine_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    gen_fold_seq(&mut c.body, cx, stats);
-                }
-            }
-            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
-    let mut i = 0;
-    while i + 1 < nodes.len() {
-        let site = match_driver_site(nodes, i, cx);
-        match site {
-            Some(site) if site.genobj == cx.genobj => {
-                let SNode::Stmts(run) = &mut nodes[i] else {
-                    unreachable!()
-                };
-                // Remove the GetResumeMode/ResumeGenerator decl pair in
-                // descending index order (tolerating SetGeneratorState).
-                run.remove(site.pair_indices[1]);
-                run.remove(site.pair_indices[0]);
-                if site.entry {
-                    // The entry protocol suspend is invisible in
-                    // source; its resume value is dead (entry gate).
-                    run.remove(site.pre_idx);
-                    stats.gen_driver_entry += 1;
-                } else {
-                    let v = site.yield_value.expect("yield site carries a value");
-                    let leaf = &mut run[site.pre_idx];
-                    if nodes_use_temp(&site.continuation, site.resume) {
-                        // `x = yield v` — the resumption value has
-                        // real uses; bind the temp at the yield site.
-                        *leaf = Leaf::Raw(Stmt::Declare {
-                            name: site.resume_name,
-                            mutable: false,
-                            value: Expr::Yield { value: Box::new(v) },
-                            value_id: site.resume,
-                        });
-                        stats.gen_driver_bound += 1;
+    fold_snode_vecs_postorder(nodes, |seq| {
+        let mut i = 0;
+        while i + 1 < seq.len() {
+            let site = match_driver_site(seq, i, cx);
+            match site {
+                Some(site) if site.genobj == cx.genobj => {
+                    let SNode::Stmts(run) = &mut seq[i] else {
+                        unreachable!()
+                    };
+                    run.remove(site.pair_indices[1]);
+                    run.remove(site.pair_indices[0]);
+                    if site.entry {
+                        run.remove(site.pre_idx);
+                        stats.gen_driver_entry += 1;
                     } else {
-                        *leaf = Leaf::Raw(Stmt::Expr(Expr::Yield { value: Box::new(v) }));
+                        let Some(v) = site.yield_value else {
+                            i += 1;
+                            continue;
+                        };
+                        let leaf = &mut run[site.pre_idx];
+                        if nodes_use_temp(&site.continuation, site.resume) {
+                            *leaf = Leaf::Raw(Stmt::Declare {
+                                name: site.resume_name,
+                                mutable: false,
+                                value: Expr::Yield { value: Box::new(v) },
+                                value_id: site.resume,
+                            });
+                            stats.gen_driver_bound += 1;
+                        } else {
+                            *leaf = Leaf::Raw(Stmt::Expr(Expr::Yield { value: Box::new(v) }));
+                        }
                     }
+                    stats.gen_driver_sites += 1;
+                    seq.splice(i + 1..i + 2, site.continuation);
+                    i += 1;
                 }
-                stats.gen_driver_sites += 1;
-                nodes.splice(i + 1..i + 2, site.continuation);
-                i += 1;
+                _ => i += 1,
             }
-            _ => i += 1,
         }
-    }
+    });
 }

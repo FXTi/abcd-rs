@@ -292,7 +292,7 @@ fn golden_yield_star_delegate_async() {
     /* try region 1: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
     const value$2 = yield* inner$1();
     yield value$2;
-    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @4294967295:0 */
+    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow */
     return undefined;
   } catch (e$1) {
     var v257; /* phi */

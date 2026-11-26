@@ -281,8 +281,9 @@ fn s05_do_while() {
     link(&mut m, b, exit);
 
     let want = r#"function f(p1) {
+  var v2; /* hoisted temp: used outside its def's block */
   do {
-    const v2 = p1();
+    v2 = p1();
   } while (v2);
   return;
 }
@@ -1961,14 +1962,14 @@ fn s32_finally_fold() {
   var v17; /* phi */
   /* finally recovered from es2abc's duplicated-finally idiom (the dispatch handler was finally+rethrow; 2 inlined copy/copies folded) */
   try {
+    v12 = undefined;
     p1();
     const v3 = 3.0;
     return v3;
-    v12 = undefined;
   } catch (e) {
+    v12 = undefined/*hole*/;
     const v7 = e + 1.0;
     return v7;
-    v12 = undefined/*hole*/;
   } finally {
     p1();
   }
@@ -2096,14 +2097,14 @@ fn s33_finally_fold_bails_without_copy() {
   /* try region 1: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
   try {
     try {
+      v11 = undefined;
       p1();
       const v3 = 3.0;
       p1();
       return v3;
-      v11 = undefined;
     } catch (e) {
-      return e + 1.0;
       v11 = undefined/*hole*/;
+      return e + 1.0;
     }
   } catch (e$1) {
     var v11; /* phi */
@@ -2960,7 +2961,10 @@ fn parallel_phi_fibonacci_cycle() {
     );
     cond_on(&mut m, b_hdr, gt, b_latch, b_exit);
 
-    let ab = add(&mut m, b_latch, v_a, v_b);
+    // Place `i_dec` before `ab` in `b_latch` so `flush_phi_tail` draining the
+    // acyclic `v_i = v_i - 1.0` update before breaking the `[v_a, v_b]` cycle
+    // matches `b_latch`'s `ToNumeric` evaluation order (otherwise `D11`
+    // materializes `ab` into a `const` temp to preserve `ab` before `i_dec`).
     let one = load_number(&mut m, b_latch, 1.0);
     let i_dec = emit(
         &mut m,
@@ -2971,6 +2975,7 @@ fn parallel_phi_fibonacci_cycle() {
             right: v_i,
         },
     );
+    let ab = add(&mut m, b_latch, v_a, v_b);
     emit_void(&mut m, b_latch, Op::Branch { dest: b_hdr });
     emit_void(&mut m, b_exit, Op::Return { value: Some(v_a) });
 

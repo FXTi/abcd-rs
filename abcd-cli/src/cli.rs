@@ -6,7 +6,11 @@
 // `clap` derive uses `///` doc comments verbatim as terminal `--help` prose,
 // where `[opt]` and `<module-name>` are CLI notation rather than intra-doc
 // links or HTML tags.
-#![allow(rustdoc::broken_intra_doc_links, rustdoc::invalid_html_tags)]
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    reason = "clap derive uses doc comments verbatim as terminal --help prose where [opt] and <module-name> are CLI notation"
+)]
 
 use std::path::PathBuf;
 
@@ -153,9 +157,9 @@ pub struct RewriteArgs {
     /// Run the abcd-opt optimization pipeline between lift and lower.
     #[arg(long)]
     pub opt: bool,
-    /// Re-decode the emitted bytes before they leave the process
-    /// (writer self-check; a failure is a tool error and nothing is
-    /// written).
+    /// Re-decode, re-lift, and re-verify the emitted bytes before they leave
+    /// the process (writer self-check; a failure is a tool error and nothing
+    /// is written).
     #[arg(long)]
     pub check: bool,
     /// Module selection for multi-module containers.

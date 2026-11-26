@@ -29,7 +29,8 @@
 //!
 //! # Extra summaries (TaintConfig::extra_summaries): a compact subset of
 //! # the full Summary model. Endpoints are strings: "param:N" (0-based
-//! # call argument), "base" (receiver), "return" (call result).
+//! # call argument), "any_param_from:N" (any call argument at index >= N),
+//! # "base" (receiver), "return" (call result).
 //! # Field-chain endpoints are NOT expressible here — FieldKey::Named
 //! # needs module-interned symbols, which a module-independent config
 //! # file cannot supply (the builtin registry avoids named keys the
@@ -187,9 +188,9 @@ struct SummaryToml {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FlowToml {
-    /// Source endpoint string (`param:N` / `base`).
+    /// Source endpoint string (`param:N` / `any_param_from:N` / `base`).
     from: String,
-    /// Sink endpoint string (`param:N` / `base` / `return`).
+    /// Sink endpoint string (`param:N` / `any_param_from:N` / `base` / `return`).
     to: String,
 }
 
@@ -197,18 +198,24 @@ struct FlowToml {
 /// (see the module docs): the strings a config file can carry cannot
 /// name module-interned `FieldKey::Named` symbols.
 fn endpoint(text: &str) -> Result<Endpoint, CliError> {
-    match text {
-        "base" => return Ok(Endpoint::Base),
-        "return" => return Ok(Endpoint::Return),
-        _ => {}
+    if text == "base" {
+        return Ok(Endpoint::Base);
+    }
+    if text == "return" {
+        return Ok(Endpoint::Return);
     }
     if let Some(rest) = text.strip_prefix("param:")
         && let Ok(i) = rest.parse::<u16>()
     {
         return Ok(Endpoint::Param(i));
     }
+    if let Some(rest) = text.strip_prefix("any_param_from:")
+        && let Ok(i) = rest.parse::<u16>()
+    {
+        return Ok(Endpoint::AnyParamFrom(i));
+    }
     Err(CliError::User(format!(
-        "invalid summary endpoint {text:?} (expected \"param:N\", \"base\", or \"return\")"
+        "invalid summary endpoint {text:?} (expected \"param:N\", \"any_param_from:N\", \"base\", or \"return\")"
     )))
 }
 
@@ -493,9 +500,44 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.exit_code(), 1);
-        assert!(
-            err.to_string().contains("invalid summary endpoint"),
-            "{err}"
-        );
+        let msg = err.to_string();
+        assert!(msg.contains("invalid summary endpoint"), "{msg}");
+        assert!(msg.contains("any_param_from:N"), "{msg}");
+    }
+
+    #[test]
+    fn any_param_from_endpoint_parses_and_rejects_bad_indices() {
+        let cfg = parse(
+            r#"[[extra_summaries]]
+            name = "variadic"
+            flows = [ { from = "any_param_from:0", to = "return" } ]
+            alias_flows = [ { from = "any_param_from:1", to = "param:0" } ]
+            clears = [ "any_param_from:2" ]
+            "#,
+        )
+        .unwrap();
+        let (_, _, summary) = &cfg.extra_summaries[0];
+        assert_eq!(summary.flows.len(), 2);
+        assert_eq!(summary.flows[0].from, Endpoint::AnyParamFrom(0));
+        assert_eq!(summary.flows[0].to, Endpoint::Return);
+        assert!(!summary.flows[0].is_alias);
+        assert_eq!(summary.flows[1].from, Endpoint::AnyParamFrom(1));
+        assert_eq!(summary.flows[1].to, Endpoint::Param(0));
+        assert!(summary.flows[1].is_alias);
+        assert_eq!(summary.clears, vec![Endpoint::AnyParamFrom(2)]);
+
+        for bad in [
+            "any_param_from:",
+            "any_param_from:-1",
+            "any_param_from:65536",
+            "any_param_from:abc",
+        ] {
+            let err = parse(&format!(
+                "[[extra_summaries]]\nname = \"x\"\nflows = [ {{ from = {bad:?}, to = \"return\" }} ]\n"
+            ))
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 1);
+            assert!(err.to_string().contains("any_param_from:N"), "{err}");
+        }
     }
 }

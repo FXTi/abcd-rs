@@ -5,7 +5,7 @@
 - **Vendored Container & ISA Stack (`abcd-isa-sys`, `abcd-isa`, `abcd-file-sys`, `abcd-file`, `abcd-hap`)**:
   - Hermetic `vendor/arkcompiler_runtime_core/` snapshot (`OpenHarmony-v7.0-Release`) verified by `vendor/UPSTREAM.toml` SHA-256 and `109` compile-time C++17 `static_assert` enum locks—zero Git submodules, zero `bindgen`/`libclang`, zero build-time Ruby.
   - Full `.abc` `decode`/`encode` across `9.0.0.0`–`24.0.0.0`, legacy `0.0.0.2` decoding, byte-identical `abcd dis` (`5,517/5,517` vs. `ark_disasm`), semantic `abcd asm` round-trip, and pure-Rust `.hap`/`.hsp`/`.app`/`.hqf` extraction.
-- **Format-Independent `88`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
+- **Format-Independent `94`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
   - Braun SSA lifting, `Effects`-derived optimization (`Peephole`, `Sccp`, `Adce` + `CfgSimplify`, `CopyProp`, `inline`), chordal MCS register allocation, `acc`-as-cache lowering, per-method `u16` entity compaction, and full `--merge-abc` + `242/242` modern wild `.hap` rewrite gates (`1,149/1,149` × 3 variants + `2,685/2,685` `test262` VM oracle).
 - **Static Analysis, IFDS Taint & Decompiler (`abcd-analysis`, `abcd-taint`, `abcd-decompile`, `abcd-cli`)**:
   - Iterative CHK dominators, Euler intervals, pattern-independent region structuring, IFDS tabulation solver, Rung `0` / `0.5` (`ClassHierarchyIndex` `8.03×` OOP call resolution) / `1` / `2` (`k=1` root-cone-sliced PTA) precision ladder, cross-module `ModuleLinkTable` (4/5-segment commercial `@normalized:` OHMUrl), Stage/FA/ArkUI lifecycle harness, and sub-5s `50k+`-function `@ohos.*`/`@kit.*` taint engine (`#33`, `#34`).

@@ -337,318 +337,510 @@ fn cmpop_sym(op: CmpOp) -> &'static str {
 
 /// Render one expression node (fully parenthesized).
 pub fn dump_expr(e: &Expr) -> String {
-    match e {
-        Expr::Lit(lit) => render_lit(lit),
-        Expr::Ident(name) => name.clone(),
-        Expr::Temp { name, .. } => name.clone(),
-        Expr::PropName {
-            object,
-            name,
-            dot_legal,
-        } => {
-            if *dot_legal {
-                format!("({}.{name})", dump_expr(object))
-            } else {
-                format!(
-                    "({}[{}])",
-                    dump_expr(object),
-                    crate::consts::render_string(name)
-                )
-            }
+    let mut out = String::new();
+    dump_expr_into(e, &mut out);
+    out
+}
+
+enum DumpTask<'a> {
+    Expr(&'a Expr),
+    Str(&'static str),
+    Owned(String),
+}
+
+fn push_comma_exprs<'a>(tasks: &mut Vec<DumpTask<'a>>, exprs: &'a [Expr]) {
+    for (idx, ex) in exprs.iter().enumerate().rev() {
+        tasks.push(DumpTask::Expr(ex));
+        if idx > 0 {
+            tasks.push(DumpTask::Str(", "));
         }
-        Expr::PropIndex { object, index } | Expr::PropDyn { object, key: index } => {
-            format!("({}[{}])", dump_expr(object), dump_expr(index))
-        }
-        Expr::PrivateLoad { object, name } => format!("({}.#{name})", dump_expr(object)),
-        Expr::PrivateTest { object, name } => format!("(#{name} in {})", dump_expr(object)),
-        Expr::SuperProp { name, key } => match (name, key) {
-            (Some(n), None) => format!("super.{n}"),
-            (None, Some(k)) => format!("super[{}]", dump_expr(k)),
-            _ => "super[?]".to_string(),
-        },
-        Expr::Call {
-            callee,
-            this,
-            args,
-            kind,
-        } => dump_call(callee, this.as_deref(), args, *kind),
-        Expr::SuperMarker => "super".to_string(),
-        Expr::DynamicImport { specifier } => format!("import({})", dump_expr(specifier)),
-        Expr::Unary { op, operand } => dump_unary(*op, operand),
-        Expr::Delete { target } => format!("(delete {})", dump_expr(target)),
-        Expr::Binary { op, left, right } => format!(
-            "({} {} {})",
-            dump_expr(left),
-            binop_sym(*op),
-            dump_expr(right)
-        ),
-        Expr::Compare { op, left, right } => format!(
-            "({} {} {})",
-            dump_expr(left),
-            cmpop_sym(*op),
-            dump_expr(right)
-        ),
-        Expr::RegExp { pattern, flags } => {
-            format!("/{}/{flags}", pattern.replace('/', "\\/"))
-        }
-        Expr::ObjectLit { entries } => render_lit(&Lit::Object(entries.clone())),
-        Expr::ArrayLit { elements } => render_lit(&Lit::Array(elements.clone())),
-        Expr::Closure {
-            body,
-            name,
-            kind,
-            captures,
-        } => {
-            let caps: Vec<String> = captures
-                .iter()
-                .map(|(n, v)| format!("{n}={}", dump_expr(v)))
-                .collect();
-            format!(
-                "closure(fn#{} {:?} {} captures=[{}])",
-                body.index(),
-                name,
-                kind_tag(*kind),
-                caps.join(", ")
-            )
-        }
-        Expr::Class {
-            ctor,
-            name,
-            heritage,
-            members,
-            member_attrs: _,
-            sendable,
-        } => {
-            let ext = heritage
-                .as_ref()
-                .map(|h| format!(" extends {}", dump_expr(h)))
-                .unwrap_or_default();
-            let tag = if *sendable { " /*sendable*/" } else { "" };
-            format!(
-                "class(fn#{} {:?}{} members=c#{}){tag}",
-                ctor.index(),
-                name,
-                ext,
-                members.index()
-            )
-        }
-        Expr::Yield { value } => format!("(yield {})", dump_expr(value)),
-        Expr::YieldStar { value } => format!("(yield* {})", dump_expr(value)),
-        Expr::Await { value, uncaught } => {
-            if *uncaught {
-                format!("(await {} /*uncaught*/)", dump_expr(value))
-            } else {
-                format!("(await {})", dump_expr(value))
-            }
-        }
-        Expr::NewTarget => "new.target".to_string(),
-        Expr::GlobalThis => "globalThis".to_string(),
-        Expr::SelfFunction(name) => name.clone(),
-        Expr::Arguments => "arguments".to_string(),
-        Expr::RestArgs { start_index } => format!("...rest[from {start_index}]"),
-        Expr::TemplateObject { raw, cooked } => {
-            let show = |lits: &[Lit]| {
-                let inner: Vec<String> = lits.iter().map(render_lit).collect();
-                inner.join(", ")
-            };
-            match (raw, cooked) {
-                (Some(r), Some(c)) => format!("template(raw [{}], cooked [{}])", show(r), show(c)),
-                (Some(r), None) => format!("template(raw [{}], cooked <unresolved>)", show(r)),
-                (None, Some(c)) => format!("template([{}]) /*raw absent — cooked-only*/", show(c)),
-                (None, None) => "template(<unresolved>) /*raw+cooked absent*/".to_string(),
-            }
-        }
-        Expr::TaggedTemplate { tag, quasis, exprs } => {
-            let mut s = format!("{}`", dump_expr(tag));
-            for (i, q) in quasis.iter().enumerate() {
-                s.push_str(q);
-                if let Some(arg) = exprs.get(i) {
-                    s.push_str(&format!("${{{}}}", dump_expr(arg)));
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "iterative Stage-A debug printer dispatches across all Expr variants on a heap workstack"
+)]
+fn dump_expr_into(root: &Expr, out: &mut String) {
+    let mut tasks: Vec<DumpTask<'_>> = vec![DumpTask::Expr(root)];
+    while let Some(task) = tasks.pop() {
+        match task {
+            DumpTask::Str(s) => out.push_str(s),
+            DumpTask::Owned(s) => out.push_str(&s),
+            DumpTask::Expr(e) => match e {
+                Expr::Lit(lit) => out.push_str(&render_lit(lit)),
+                Expr::Ident(name) | Expr::Temp { name, .. } | Expr::SelfFunction(name) => {
+                    out.push_str(name);
                 }
-            }
-            s.push('`');
-            s
-        }
-        Expr::IterResultObj { value, done } => format!(
-            "{{value: {}, done: {}}} /*iter-result*/",
-            dump_expr(value),
-            dump_expr(done)
-        ),
-        Expr::Iter { op, obj, status } => {
-            let name = match op {
-                IterOp::GetIterator => "get-iterator",
-                IterOp::GetAsyncIterator => "get-async-iterator",
-                IterOp::Next => "iter-next",
-                IterOp::Return => "iter-return",
-                IterOp::Throw => "iter-throw",
-                IterOp::GetPropIterator => "get-prop-iterator",
-                IterOp::NextPropName => "next-prop-name",
-            };
-            let tag = match status {
-                NodeStatus::Fallback => " /*hard-fallback*/",
-                NodeStatus::Plumbing => " /*plumbing*/",
-                NodeStatus::Expressed => "",
-            };
-            format!("{name}({}){tag}", dump_expr(obj))
-        }
-        Expr::CreateGenerator { func } => {
-            format!("create-generator({}) /*plumbing*/", dump_expr(func))
-        }
-        Expr::GeneratorDriver { resume, genobj } => {
-            let name = if *resume {
-                "resume-generator"
-            } else {
-                "get-resume-mode"
-            };
-            format!("{name}({}) /*hard-fallback*/", dump_expr(genobj))
-        }
-        Expr::AsyncDriver { resolve, value } => {
-            let name = if *resolve {
-                "async-resolve"
-            } else {
-                "async-reject"
-            };
-            format!("{name}({}) /*hard-fallback*/", dump_expr(value))
-        }
-        Expr::AsyncGeneratorResolve {
-            genobj,
-            value,
-            done,
-        } => format!(
-            "async-generator-resolve({}, {}, {}) /*hard-fallback*/",
-            dump_expr(genobj),
-            dump_expr(value),
-            dump_expr(done)
-        ),
-        Expr::CopyDataProps { dst, src } => {
-            format!(
-                "copy-data-props({}, {}) /*plumbing*/",
-                dump_expr(dst),
-                dump_expr(src)
-            )
-        }
-        Expr::SetObjectWithProto { obj, proto } => format!(
-            "set-object-with-proto({}, {}) /*plumbing*/",
-            dump_expr(obj),
-            dump_expr(proto)
-        ),
-        Expr::ArraySpread { dst, index, src } => format!(
-            "array-spread({}, {}, {}) /*plumbing*/",
-            dump_expr(dst),
-            dump_expr(index),
-            dump_expr(src)
-        ),
-        Expr::RestObject { obj, excluded } => {
-            let keys: Vec<String> = excluded.iter().map(dump_expr).collect();
-            format!(
-                "rest-object({}, excluded=[{}]) /*plumbing*/",
-                dump_expr(obj),
-                keys.join(", ")
-            )
-        }
-        Expr::DefineGetterSetter {
-            obj,
-            key,
-            getter,
-            setter,
-        } => format!(
-            "define-getter-setter({}, {}, get={}, set={}) /*plumbing*/",
-            dump_expr(obj),
-            dump_expr(key),
-            dump_expr(getter),
-            dump_expr(setter)
-        ),
-        Expr::ModuleNamespace { index } => format!("ns{index}"),
-        Expr::ObjectBuild { entries } => {
-            let inner: Vec<String> = entries
-                .iter()
-                .map(|e| match e {
-                    crate::expr::ObjEntry::KeyValue(k, v) => {
-                        format!("{}: {}", render_lit(k), dump_expr(v))
+                Expr::PropName {
+                    object,
+                    name,
+                    dot_legal,
+                } => {
+                    out.push('(');
+                    let tail = if *dot_legal {
+                        format!(".{name})")
+                    } else {
+                        format!("[{}])", crate::consts::render_string(name))
+                    };
+                    tasks.push(DumpTask::Owned(tail));
+                    tasks.push(DumpTask::Expr(object));
+                }
+                Expr::PropIndex { object, index } | Expr::PropDyn { object, key: index } => {
+                    out.push('(');
+                    tasks.push(DumpTask::Str("])"));
+                    tasks.push(DumpTask::Expr(index));
+                    tasks.push(DumpTask::Str("["));
+                    tasks.push(DumpTask::Expr(object));
+                }
+                Expr::PrivateLoad { object, name } => {
+                    out.push('(');
+                    tasks.push(DumpTask::Owned(format!(".#{name})")));
+                    tasks.push(DumpTask::Expr(object));
+                }
+                Expr::PrivateTest { object, name } => {
+                    let _ = write!(out, "(#{name} in ");
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(object));
+                }
+                Expr::SuperProp { name, key } => match (name, key) {
+                    (Some(n), None) => {
+                        let _ = write!(out, "super.{n}");
                     }
-                    crate::expr::ObjEntry::Computed(k, v) => {
-                        format!("[{}]: {}", dump_expr(k), dump_expr(v))
+                    (None, Some(k)) => {
+                        out.push_str("super[");
+                        tasks.push(DumpTask::Str("]"));
+                        tasks.push(DumpTask::Expr(k));
                     }
-                    crate::expr::ObjEntry::Spread(s) => format!("...{}", dump_expr(s)),
-                    crate::expr::ObjEntry::Proto(p) => format!("__proto__: {}", dump_expr(p)),
-                    crate::expr::ObjEntry::Method(n, f) => format!("{n}: {}", dump_expr(f)),
-                    crate::expr::ObjEntry::Getter(k, f) => {
-                        format!("get {k:?}: {}", dump_expr(f))
+                    _ => out.push_str("super[?]"),
+                },
+                Expr::Call {
+                    callee,
+                    this,
+                    args,
+                    kind,
+                } => dump_call_tasks(&mut tasks, out, callee, this.as_deref(), args, *kind),
+                Expr::SuperMarker => out.push_str("super"),
+                Expr::DynamicImport { specifier } => {
+                    out.push_str("import(");
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(specifier));
+                }
+                Expr::Unary { op, operand } => {
+                    out.push_str(unop_prefix(*op));
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(operand));
+                }
+                Expr::Delete { target } => {
+                    out.push_str("(delete ");
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(target));
+                }
+                Expr::Binary { op, left, right } => {
+                    out.push('(');
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(right));
+                    tasks.push(DumpTask::Owned(format!(" {} ", binop_sym(*op))));
+                    tasks.push(DumpTask::Expr(left));
+                }
+                Expr::Compare { op, left, right } => {
+                    out.push('(');
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(right));
+                    tasks.push(DumpTask::Owned(format!(" {} ", cmpop_sym(*op))));
+                    tasks.push(DumpTask::Expr(left));
+                }
+                Expr::RegExp { pattern, flags } => {
+                    let _ = write!(out, "/{}/{flags}", pattern.replace('/', "\\/"));
+                }
+                Expr::ObjectLit { entries } => {
+                    out.push_str(&render_lit(&Lit::Object(entries.clone())));
+                }
+                Expr::ArrayLit { elements } => {
+                    out.push_str(&render_lit(&Lit::Array(elements.clone())));
+                }
+                Expr::Closure {
+                    body,
+                    name,
+                    kind,
+                    captures,
+                } => {
+                    let _ = write!(
+                        out,
+                        "closure(fn#{} {:?} {} captures=[",
+                        body.index(),
+                        name,
+                        kind_tag(*kind)
+                    );
+                    tasks.push(DumpTask::Str("])"));
+                    for (idx, (n, v)) in captures.iter().enumerate().rev() {
+                        tasks.push(DumpTask::Expr(v));
+                        tasks.push(DumpTask::Owned(if idx > 0 {
+                            format!(", {n}=")
+                        } else {
+                            format!("{n}=")
+                        }));
                     }
-                    crate::expr::ObjEntry::Setter(k, f) => {
-                        format!("set {k:?}: {}", dump_expr(f))
+                }
+                Expr::Class {
+                    ctor,
+                    name,
+                    heritage,
+                    members,
+                    member_attrs: _,
+                    sendable,
+                } => {
+                    let _ = write!(out, "class(fn#{} {:?}", ctor.index(), name);
+                    let tag = if *sendable { " /*sendable*/" } else { "" };
+                    tasks.push(DumpTask::Owned(format!(
+                        " members=c#{}){tag}",
+                        members.index()
+                    )));
+                    if let Some(h) = heritage {
+                        tasks.push(DumpTask::Expr(h));
+                        tasks.push(DumpTask::Str(" extends "));
                     }
-                })
-                .collect();
-            format!("build-object({{{}}})", inner.join(", "))
-        }
-        Expr::ArrayBuild { elements } => {
-            let inner: Vec<String> = elements
-                .iter()
-                .map(|e| match e {
-                    crate::expr::ArrayElem::Item(i) => dump_expr(i),
-                    crate::expr::ArrayElem::Spread(s) => format!("...{}", dump_expr(s)),
-                })
-                .collect();
-            format!("build-array([{}])", inner.join(", "))
-        }
-        Expr::Fallback { op, note, operands } => {
-            let ops: Vec<String> = operands.iter().map(dump_expr).collect();
-            if ops.is_empty() {
-                format!("fallback({op} /*{note}*/)")
-            } else {
-                format!("fallback({op} /*{note}*/, {})", ops.join(", "))
-            }
+                }
+                Expr::Yield { value } => {
+                    out.push_str("(yield ");
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(value));
+                }
+                Expr::YieldStar { value } => {
+                    out.push_str("(yield* ");
+                    tasks.push(DumpTask::Str(")"));
+                    tasks.push(DumpTask::Expr(value));
+                }
+                Expr::Await { value, uncaught } => {
+                    out.push_str("(await ");
+                    tasks.push(DumpTask::Str(if *uncaught {
+                        " /*uncaught*/)"
+                    } else {
+                        ")"
+                    }));
+                    tasks.push(DumpTask::Expr(value));
+                }
+                Expr::NewTarget => out.push_str("new.target"),
+                Expr::GlobalThis => out.push_str("globalThis"),
+                Expr::Arguments => out.push_str("arguments"),
+                Expr::RestArgs { start_index } => {
+                    let _ = write!(out, "...rest[from {start_index}]");
+                }
+                Expr::TemplateObject { raw, cooked } => {
+                    let show = |lits: &[Lit]| {
+                        let inner: Vec<String> = lits.iter().map(render_lit).collect();
+                        inner.join(", ")
+                    };
+                    match (raw, cooked) {
+                        (Some(r), Some(c)) => {
+                            let _ =
+                                write!(out, "template(raw [{}], cooked [{}])", show(r), show(c));
+                        }
+                        (Some(r), None) => {
+                            let _ = write!(out, "template(raw [{}], cooked <unresolved>)", show(r));
+                        }
+                        (None, Some(c)) => {
+                            let _ =
+                                write!(out, "template([{}]) /*raw absent — cooked-only*/", show(c));
+                        }
+                        (None, None) => {
+                            out.push_str("template(<unresolved>) /*raw+cooked absent*/");
+                        }
+                    }
+                }
+                Expr::TaggedTemplate { tag, quasis, exprs } => {
+                    tasks.push(DumpTask::Str("`"));
+                    for (i, q) in quasis.iter().enumerate().rev() {
+                        if let Some(arg) = exprs.get(i) {
+                            tasks.push(DumpTask::Str("}"));
+                            tasks.push(DumpTask::Expr(arg));
+                            tasks.push(DumpTask::Str("${"));
+                        }
+                        tasks.push(DumpTask::Owned(q.clone()));
+                    }
+                    tasks.push(DumpTask::Str("`"));
+                    tasks.push(DumpTask::Expr(tag));
+                }
+                Expr::IterResultObj { value, done } => {
+                    out.push_str("{value: ");
+                    tasks.push(DumpTask::Str("} /*iter-result*/"));
+                    tasks.push(DumpTask::Expr(done));
+                    tasks.push(DumpTask::Str(", done: "));
+                    tasks.push(DumpTask::Expr(value));
+                }
+                Expr::Iter { op, obj, status } => {
+                    let name = match op {
+                        IterOp::GetIterator => "get-iterator",
+                        IterOp::GetAsyncIterator => "get-async-iterator",
+                        IterOp::Next => "iter-next",
+                        IterOp::Return => "iter-return",
+                        IterOp::Throw => "iter-throw",
+                        IterOp::GetPropIterator => "get-prop-iterator",
+                        IterOp::NextPropName => "next-prop-name",
+                    };
+                    let tag = match status {
+                        NodeStatus::Fallback => ") /*hard-fallback*/",
+                        NodeStatus::Plumbing => ") /*plumbing*/",
+                        NodeStatus::Expressed => ")",
+                    };
+                    let _ = write!(out, "{name}(");
+                    tasks.push(DumpTask::Str(tag));
+                    tasks.push(DumpTask::Expr(obj));
+                }
+                Expr::CreateGenerator { func } => {
+                    out.push_str("create-generator(");
+                    tasks.push(DumpTask::Str(") /*plumbing*/"));
+                    tasks.push(DumpTask::Expr(func));
+                }
+                Expr::GeneratorDriver { resume, genobj } => {
+                    let name = if *resume {
+                        "resume-generator("
+                    } else {
+                        "get-resume-mode("
+                    };
+                    out.push_str(name);
+                    tasks.push(DumpTask::Str(") /*hard-fallback*/"));
+                    tasks.push(DumpTask::Expr(genobj));
+                }
+                Expr::AsyncDriver { resolve, value } => {
+                    let name = if *resolve {
+                        "async-resolve("
+                    } else {
+                        "async-reject("
+                    };
+                    out.push_str(name);
+                    tasks.push(DumpTask::Str(") /*hard-fallback*/"));
+                    tasks.push(DumpTask::Expr(value));
+                }
+                Expr::AsyncGeneratorResolve {
+                    genobj,
+                    value,
+                    done,
+                } => {
+                    out.push_str("async-generator-resolve(");
+                    tasks.push(DumpTask::Str(") /*hard-fallback*/"));
+                    tasks.push(DumpTask::Expr(done));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(value));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(genobj));
+                }
+                Expr::CopyDataProps { dst, src } => {
+                    out.push_str("copy-data-props(");
+                    tasks.push(DumpTask::Str(") /*plumbing*/"));
+                    tasks.push(DumpTask::Expr(src));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(dst));
+                }
+                Expr::SetObjectWithProto { obj, proto } => {
+                    out.push_str("set-object-with-proto(");
+                    tasks.push(DumpTask::Str(") /*plumbing*/"));
+                    tasks.push(DumpTask::Expr(proto));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(obj));
+                }
+                Expr::ArraySpread { dst, index, src } => {
+                    out.push_str("array-spread(");
+                    tasks.push(DumpTask::Str(") /*plumbing*/"));
+                    tasks.push(DumpTask::Expr(src));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(index));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(dst));
+                }
+                Expr::RestObject { obj, excluded } => {
+                    out.push_str("rest-object(");
+                    tasks.push(DumpTask::Str("]) /*plumbing*/"));
+                    push_comma_exprs(&mut tasks, excluded);
+                    tasks.push(DumpTask::Str(", excluded=["));
+                    tasks.push(DumpTask::Expr(obj));
+                }
+                Expr::DefineGetterSetter {
+                    obj,
+                    key,
+                    getter,
+                    setter,
+                } => {
+                    out.push_str("define-getter-setter(");
+                    tasks.push(DumpTask::Str(") /*plumbing*/"));
+                    tasks.push(DumpTask::Expr(setter));
+                    tasks.push(DumpTask::Str(", set="));
+                    tasks.push(DumpTask::Expr(getter));
+                    tasks.push(DumpTask::Str(", get="));
+                    tasks.push(DumpTask::Expr(key));
+                    tasks.push(DumpTask::Str(", "));
+                    tasks.push(DumpTask::Expr(obj));
+                }
+                Expr::ModuleNamespace { index } => {
+                    let _ = write!(out, "ns{index}");
+                }
+                Expr::ObjectBuild { entries } => {
+                    out.push_str("build-object({");
+                    tasks.push(DumpTask::Str("})"));
+                    for (idx, ent) in entries.iter().enumerate().rev() {
+                        match ent {
+                            crate::expr::ObjEntry::KeyValue(k, v) => {
+                                tasks.push(DumpTask::Expr(v));
+                                tasks.push(DumpTask::Owned(format!("{}: ", render_lit(k))));
+                            }
+                            crate::expr::ObjEntry::Computed(k, v) => {
+                                tasks.push(DumpTask::Expr(v));
+                                tasks.push(DumpTask::Str("]: "));
+                                tasks.push(DumpTask::Expr(k));
+                                tasks.push(DumpTask::Str("["));
+                            }
+                            crate::expr::ObjEntry::Spread(s) => {
+                                tasks.push(DumpTask::Expr(s));
+                                tasks.push(DumpTask::Str("..."));
+                            }
+                            crate::expr::ObjEntry::Proto(p) => {
+                                tasks.push(DumpTask::Expr(p));
+                                tasks.push(DumpTask::Str("__proto__: "));
+                            }
+                            crate::expr::ObjEntry::Method(n, f) => {
+                                tasks.push(DumpTask::Expr(f));
+                                tasks.push(DumpTask::Owned(format!("{n}: ")));
+                            }
+                            crate::expr::ObjEntry::Getter(k, f) => {
+                                tasks.push(DumpTask::Expr(f));
+                                tasks.push(DumpTask::Owned(format!("get {k:?}: ")));
+                            }
+                            crate::expr::ObjEntry::Setter(k, f) => {
+                                tasks.push(DumpTask::Expr(f));
+                                tasks.push(DumpTask::Owned(format!("set {k:?}: ")));
+                            }
+                        }
+                        if idx > 0 {
+                            tasks.push(DumpTask::Str(", "));
+                        }
+                    }
+                }
+                Expr::ArrayBuild { elements } => {
+                    out.push_str("build-array([");
+                    tasks.push(DumpTask::Str("])"));
+                    for (idx, elem) in elements.iter().enumerate().rev() {
+                        match elem {
+                            crate::expr::ArrayElem::Item(i) => tasks.push(DumpTask::Expr(i)),
+                            crate::expr::ArrayElem::Spread(s) => {
+                                tasks.push(DumpTask::Expr(s));
+                                tasks.push(DumpTask::Str("..."));
+                            }
+                        }
+                        if idx > 0 {
+                            tasks.push(DumpTask::Str(", "));
+                        }
+                    }
+                }
+                Expr::Fallback { op, note, operands } => {
+                    if operands.is_empty() {
+                        let _ = write!(out, "fallback({op} /*{note}*/)");
+                    } else {
+                        let _ = write!(out, "fallback({op} /*{note}*/, ");
+                        tasks.push(DumpTask::Str(")"));
+                        push_comma_exprs(&mut tasks, operands);
+                    }
+                }
+            },
         }
     }
 }
 
-fn dump_call(callee: &Expr, this: Option<&Expr>, args: &[Expr], kind: CallKind) -> String {
-    let args: Vec<String> = args.iter().map(dump_expr).collect();
+fn dump_call_tasks<'a>(
+    tasks: &mut Vec<DumpTask<'a>>,
+    out: &mut String,
+    callee: &'a Expr,
+    this: Option<&'a Expr>,
+    args: &'a [Expr],
+    kind: CallKind,
+) {
     match kind {
-        CallKind::Direct => format!(
-            "call({}, this={}, {})",
-            dump_expr(callee),
-            this.map(dump_expr).unwrap_or_else(|| "?".to_string()),
-            args.join(", ")
-        ),
-        CallKind::Dynamic => format!("({}({}))", dump_expr(callee), args.join(", ")),
-        CallKind::New => format!("(new {}({}))", dump_expr(callee), args.join(", ")),
-        CallKind::NewSpread => format!("(new {}(...{}))", dump_expr(callee), args.join(", ")),
-        CallKind::Apply => format!(
-            "({}.apply({}, {}))",
-            dump_expr(callee),
-            this.map(dump_expr).unwrap_or_else(|| "?".to_string()),
-            args.join(", ")
-        ),
-        CallKind::ClassInit => format!(
-            "({}.call({}))",
-            dump_expr(callee),
-            this.map(dump_expr).unwrap_or_else(|| "this".to_string())
-        ),
-        CallKind::Super | CallKind::SuperArrow => format!("super({})", args.join(", ")),
-        CallKind::SuperSpread => format!("super(...{})", args.join(", ")),
-        CallKind::SuperForwardAllArgs => "super(...args) /*forward-all*/".to_string(),
+        CallKind::Direct => {
+            out.push_str("call(");
+            tasks.push(DumpTask::Str(")"));
+            push_comma_exprs(tasks, args);
+            tasks.push(DumpTask::Str(", "));
+            match this {
+                Some(t) => tasks.push(DumpTask::Expr(t)),
+                None => tasks.push(DumpTask::Str("?")),
+            }
+            tasks.push(DumpTask::Str(", this="));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::Dynamic => {
+            out.push('(');
+            tasks.push(DumpTask::Str("))"));
+            push_comma_exprs(tasks, args);
+            tasks.push(DumpTask::Str("("));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::New => {
+            out.push_str("(new ");
+            tasks.push(DumpTask::Str("))"));
+            push_comma_exprs(tasks, args);
+            tasks.push(DumpTask::Str("("));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::NewSpread => {
+            out.push_str("(new ");
+            tasks.push(DumpTask::Str("))"));
+            push_comma_exprs(tasks, args);
+            tasks.push(DumpTask::Str("(..."));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::Apply => {
+            out.push('(');
+            tasks.push(DumpTask::Str("))"));
+            push_comma_exprs(tasks, args);
+            tasks.push(DumpTask::Str(", "));
+            match this {
+                Some(t) => tasks.push(DumpTask::Expr(t)),
+                None => tasks.push(DumpTask::Str("?")),
+            }
+            tasks.push(DumpTask::Str(".apply("));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::ClassInit => {
+            out.push('(');
+            tasks.push(DumpTask::Str("))"));
+            match this {
+                Some(t) => tasks.push(DumpTask::Expr(t)),
+                None => tasks.push(DumpTask::Str("this")),
+            }
+            tasks.push(DumpTask::Str(".call("));
+            tasks.push(DumpTask::Expr(callee));
+        }
+        CallKind::Super | CallKind::SuperArrow => {
+            out.push_str("super(");
+            tasks.push(DumpTask::Str(")"));
+            push_comma_exprs(tasks, args);
+        }
+        CallKind::SuperSpread => {
+            out.push_str("super(...");
+            tasks.push(DumpTask::Str(")"));
+            push_comma_exprs(tasks, args);
+        }
+        CallKind::SuperForwardAllArgs => {
+            out.push_str("super(...args) /*forward-all*/");
+        }
     }
 }
 
-fn dump_unary(op: UnOp, operand: &Expr) -> String {
-    let e = dump_expr(operand);
+fn unop_prefix(op: UnOp) -> &'static str {
     match op {
-        UnOp::Minus => format!("(-{e})"),
-        UnOp::BitNot => format!("(~{e})"),
-        UnOp::LogicalNot => format!("(!{e})"),
-        UnOp::Inc => format!("(++{e})"),
-        UnOp::Dec => format!("(--{e})"),
-        UnOp::TypeOf => format!("(typeof {e})"),
-        UnOp::ToNumber => format!("(+{e})"),
-        UnOp::ToNumeric => format!("(tonumeric {e})"),
-        UnOp::ToPropertyKey => format!("(topropertykey {e})"),
-        UnOp::Void => format!("(void {e})"),
-        UnOp::IsTrue => format!("(istrue {e})"),
-        UnOp::IsFalse => format!("(isfalse {e})"),
-        UnOp::JumpEqz => format!("(jeqz {e})"),
-        UnOp::JumpNez => format!("(jnez {e})"),
+        UnOp::Minus => "(-",
+        UnOp::BitNot => "(~",
+        UnOp::LogicalNot => "(!",
+        UnOp::Inc => "(++",
+        UnOp::Dec => "(--",
+        UnOp::TypeOf => "(typeof ",
+        UnOp::ToNumber => "(+",
+        UnOp::ToNumeric => "(tonumeric ",
+        UnOp::ToPropertyKey => "(topropertykey ",
+        UnOp::Void => "(void ",
+        UnOp::IsTrue => "(istrue ",
+        UnOp::IsFalse => "(isfalse ",
+        UnOp::JumpEqz => "(jeqz ",
+        UnOp::JumpNez => "(jnez ",
     }
 }
 

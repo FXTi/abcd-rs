@@ -12,6 +12,7 @@
 //! Output conventions (design/cli.md §3): results on stdout, diagnostics on
 //! stderr, exit codes 0 ok / 1 user error / 2 tool error, no panics on data.
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod analyze;
@@ -64,6 +65,67 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// Map an I/O result from writing to `stdout`: `BrokenPipe` is treated as
+/// clean completion (`Ok(())`, exit 0 when piped into `head`, etc.), while any
+/// other I/O error becomes [`CliError::Tool`] (exit 2).
+pub(crate) fn map_stdout_io(res: std::io::Result<()>) -> Result<(), CliError> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(CliError::Tool(format!("failed writing to stdout: {e}"))),
+    }
+}
+
+/// Write raw `bytes` to `writer` and flush, treating `BrokenPipe` as `Ok(())`.
+pub fn write_stdout_bytes_to<W: std::io::Write>(
+    mut writer: W,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    map_stdout_io(writer.write_all(bytes).and_then(|()| writer.flush()))
+}
+
+/// Write formatted display arguments (without trailing newline) to `writer`
+/// and flush, treating `BrokenPipe` as `Ok(())`.
+pub fn write_stdout_fmt_to<W: std::io::Write>(
+    mut writer: W,
+    args: std::fmt::Arguments<'_>,
+) -> Result<(), CliError> {
+    map_stdout_io(writer.write_fmt(args).and_then(|()| writer.flush()))
+}
+
+/// Write raw `bytes` to locked `stdout`, treating `BrokenPipe` as `Ok(())`.
+pub fn write_stdout_bytes(bytes: &[u8]) -> Result<(), CliError> {
+    write_stdout_bytes_to(std::io::stdout().lock(), bytes)
+}
+
+/// Write formatted text (without trailing newline) to locked `stdout`,
+/// treating `BrokenPipe` as `Ok(())`.
+pub fn write_stdout_fmt(args: std::fmt::Arguments<'_>) -> Result<(), CliError> {
+    write_stdout_fmt_to(std::io::stdout().lock(), args)
+}
+
+/// Write `text` followed by `'\n'` to locked `stdout`, treating `BrokenPipe`
+/// as `Ok(())`.
+pub(crate) fn write_stdout_line(text: &str) -> Result<(), CliError> {
+    let mut out = std::io::stdout().lock();
+    map_stdout_io(
+        std::io::Write::write_all(&mut out, text.as_bytes())
+            .and_then(|()| std::io::Write::write_all(&mut out, b"\n"))
+            .and_then(|()| std::io::Write::flush(&mut out)),
+    )
+}
+
+/// Write formatted text followed by `'\n'` to locked `stdout`, treating
+/// `BrokenPipe` as `Ok(())`.
+pub(crate) fn write_stdout_fmt_line(args: std::fmt::Arguments<'_>) -> Result<(), CliError> {
+    let mut out = std::io::stdout().lock();
+    map_stdout_io(
+        std::io::Write::write_fmt(&mut out, args)
+            .and_then(|()| std::io::Write::write_all(&mut out, b"\n"))
+            .and_then(|()| std::io::Write::flush(&mut out)),
+    )
+}
+
 /// Dispatch a parsed command line. Prints results to stdout; diagnostics
 /// are the caller's job (see `main`).
 pub fn run(cli: cli::Cli) -> Result<(), CliError> {
@@ -100,9 +162,12 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
             }
         };
         let written = rewrite::write_all(&modules, &out_dir, opts)?;
+        let mut summary = String::new();
         for (name, path, size) in &written {
-            println!("{name}: {size} bytes -> {}", path.display());
+            use std::fmt::Write as _;
+            let _ = writeln!(summary, "{name}: {size} bytes -> {}", path.display());
         }
+        write_stdout_bytes(summary.as_bytes())?;
         return Ok(());
     }
 
@@ -114,7 +179,7 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
         Some(path) => {
             std::fs::write(path, &out.abc)
                 .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-            println!(
+            write_stdout_fmt_line(format_args!(
                 "{}: {} bytes -> {} ({} methods, {} lowered, instructions {} -> {}{})",
                 module.name,
                 out.abc.len(),
@@ -128,15 +193,33 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
                 } else {
                     ""
                 },
-            );
+            ))?;
         }
         None => dis::print_raw(&out.abc)?,
     }
     Ok(())
 }
 
-fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
+fn validate_analyze_args(args: &AnalyzeArgs) -> Result<u8, CliError> {
+    if args.pta
+        && let Some(rung) = args.alias_rung
+        && rung < 2
+    {
+        return Err(CliError::User(format!(
+            "--pta conflicts with --alias-rung {rung} (--pta / --pta-budget require --alias-rung 2)"
+        )));
+    }
     let alias_rung = args.alias_rung.unwrap_or(if args.pta { 2 } else { 0 });
+    if args.pta_budget.is_some() && alias_rung < 2 {
+        return Err(CliError::User(format!(
+            "--pta-budget requires --alias-rung 2 (or --pta), got effective alias rung {alias_rung}"
+        )));
+    }
+    Ok(alias_rung)
+}
+
+fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
+    let alias_rung = validate_analyze_args(args)?;
     let opts = analyze::AnalyzeOptions {
         callgraph: args.callgraph,
         dominators: args.dominators,
@@ -149,8 +232,7 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
         .iter()
         .map(|m| analyze::report(m, opts))
         .collect::<Result<_, _>>()?;
-    println!("{}", analyze::render(&reports, args.json)?);
-    Ok(())
+    write_stdout_line(&analyze::render(&reports, args.json)?)
 }
 
 fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
@@ -171,8 +253,7 @@ fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
             .map(|m| taint::report(m, &cfg))
             .collect::<Result<_, _>>()?
     };
-    println!("{}", taint::render(&reports, args.json)?);
-    Ok(())
+    write_stdout_line(&taint::render(&reports, args.json)?)
 }
 
 fn run_dis(args: &DisArgs) -> Result<(), CliError> {
@@ -190,9 +271,12 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
             }
         };
         let written = dis::write_all(&modules, &out_dir)?;
+        let mut summary = String::new();
         for (name, path, size) in &written {
-            println!("{name}: {size} bytes -> {}", path.display());
+            use std::fmt::Write as _;
+            let _ = writeln!(summary, "{name}: {size} bytes -> {}", path.display());
         }
+        write_stdout_bytes(summary.as_bytes())?;
         return Ok(());
     }
 
@@ -202,7 +286,11 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
     match &args.output {
         Some(path) => {
             let size = dis::disassemble_to_path(module, path)?;
-            println!("{}: {size} bytes -> {}", module.name, path.display());
+            write_stdout_fmt_line(format_args!(
+                "{}: {size} bytes -> {}",
+                module.name,
+                path.display()
+            ))?;
         }
         None => {
             let stdout = std::io::stdout();
@@ -215,11 +303,9 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
 fn run_extract(args: &ExtractArgs) -> Result<(), CliError> {
     let out_dir = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
     let modules = extract::extract_path(&args.container, &out_dir, args.force)?;
-    print!(
-        "{}",
-        extract::render_summary(&args.container.display().to_string(), &out_dir, &modules)
-    );
-    Ok(())
+    let summary =
+        extract::render_summary(&args.container.display().to_string(), &out_dir, &modules);
+    write_stdout_bytes(summary.as_bytes())
 }
 
 fn run_info(args: &InfoArgs) -> Result<(), CliError> {
@@ -247,8 +333,7 @@ fn run_info(args: &InfoArgs) -> Result<(), CliError> {
             .map(|m| info::report(m, args.verify))
             .collect::<Result<_, _>>()?
     };
-    println!("{}", info::render(&reports, args.json)?);
-    Ok(())
+    write_stdout_line(&info::render(&reports, args.json)?)
 }
 
 fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
@@ -271,27 +356,31 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
             }
         };
         if args.select.all && modules.len() > 1 {
+            let mut summary = String::new();
             for m in &modules {
                 let sub = out_dir.join(&m.name);
                 let (files, bytes) = decompile::write_split(m, &sub, opts)?;
-                println!(
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    summary,
                     "{}: {} files ({bytes} bytes) -> {}",
                     m.name,
                     files,
                     sub.display()
                 );
             }
+            write_stdout_bytes(summary.as_bytes())?;
         } else {
             let module = modules
                 .first()
                 .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
             let (files, bytes) = decompile::write_split(module, &out_dir, opts)?;
-            println!(
+            write_stdout_fmt_line(format_args!(
                 "{}: {} files ({bytes} bytes) -> {}",
                 module.name,
                 files,
                 out_dir.display()
-            );
+            ))?;
         }
         return Ok(());
     }
@@ -307,9 +396,12 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
             }
         };
         let written = decompile::write_all(&modules, &out_dir, opts)?;
+        let mut summary = String::new();
         for (name, path, size) in &written {
-            println!("{name}: {size} bytes -> {}", path.display());
+            use std::fmt::Write as _;
+            let _ = writeln!(summary, "{name}: {size} bytes -> {}", path.display());
         }
+        write_stdout_bytes(summary.as_bytes())?;
         return Ok(());
     }
 
@@ -319,7 +411,11 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
     match &args.output {
         Some(path) => {
             let size = decompile::decompile_to_path(module, opts, path)?;
-            println!("{}: {size} bytes -> {}", module.name, path.display());
+            write_stdout_fmt_line(format_args!(
+                "{}: {size} bytes -> {}",
+                module.name,
+                path.display()
+            ))?;
         }
         None => {
             let stdout = std::io::stdout();

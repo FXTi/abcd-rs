@@ -59,51 +59,7 @@ pub(in crate::folds) fn async_fold_seq(
     decls: &BTreeMap<ValueId, usize>,
     stats: &mut FoldStats,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::Stmts(run) => fold_async_run(run, uses, decls, stats),
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                async_fold_seq(then, uses, decls, stats);
-                async_fold_seq(otherwise, uses, decls, stats);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after async_driver_fold
-            // (emit.rs:512 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => async_fold_seq(body, uses, decls, stats),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                async_fold_seq(body, uses, decls, stats);
-                for c in catches {
-                    async_fold_seq(&mut c.body, uses, decls, stats);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // async_driver_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    async_fold_seq(f, uses, decls, stats);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_driver_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    async_fold_seq(&mut c.body, uses, decls, stats);
-                }
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
+    walk_stmts_runs_mut(nodes, |run| fold_async_run(run, uses, decls, stats));
 }
 
 /// One leaf run: fold adjacent AsyncDriver declares into their
@@ -370,36 +326,62 @@ pub(in crate::folds) fn funcobj_aliases(nodes: &[SNode], genobj: ValueId) -> BTr
 /// `await`'s implicit rejection throw is equivalent only when the
 /// removed `break` routed to `throw <resume temp>`.
 pub(in crate::folds) fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
+    enum FsTask<'a> {
+        Slice(&'a [SNode]),
+        StopIfNone,
+    }
     fn first_significant_stmt(nodes: &[SNode]) -> Option<&Stmt> {
-        for n in nodes {
-            match n {
-                SNode::Honest(_) => continue,
-                SNode::Stmts(run) => {
-                    let sig = run.iter().find(|l| {
-                        !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. }))
-                            && !matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState")
-                    });
-                    match sig {
-                        None => continue,
-                        Some(Leaf::Raw(s)) => return Some(s),
-                        Some(_) => return None, // synthetic leaf: not a throw
+        let mut stack = vec![FsTask::Slice(nodes)];
+        while let Some(task) = stack.pop() {
+            match task {
+                FsTask::StopIfNone => return None,
+                FsTask::Slice(slice) => {
+                    let Some((n, rest)) = slice.split_first() else {
+                        continue;
+                    };
+                    match n {
+                        SNode::Honest(_) => {
+                            if !rest.is_empty() {
+                                stack.push(FsTask::Slice(rest));
+                            }
+                        }
+                        SNode::Stmts(run) => {
+                            let sig = run.iter().find(|l| {
+                                !matches!(
+                                    l,
+                                    Leaf::Raw(Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. })
+                                ) && !matches!(
+                                    l,
+                                    Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState"
+                                )
+                            });
+                            match sig {
+                                None => {
+                                    if !rest.is_empty() {
+                                        stack.push(FsTask::Slice(rest));
+                                    }
+                                }
+                                Some(Leaf::Raw(s)) => return Some(s),
+                                Some(_) => return None,
+                            }
+                        }
+                        SNode::Try { body, .. } => {
+                            if !rest.is_empty() {
+                                stack.push(FsTask::Slice(rest));
+                            }
+                            stack.push(FsTask::Slice(body));
+                        }
+                        SNode::While { body, .. }
+                        | SNode::DoWhile { body, .. }
+                        | SNode::Labeled { body, .. }
+                        | SNode::ForOf { body, .. }
+                        | SNode::ForIn { body, .. } => {
+                            stack.push(FsTask::StopIfNone);
+                            stack.push(FsTask::Slice(body));
+                        }
+                        _ => return None,
                     }
                 }
-                SNode::Try { body, .. } => match first_significant_stmt(body) {
-                    None => continue, // empty try: fall to next sibling
-                    some => return some,
-                },
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                // unreachable: ForOf/ForIn nodes are created only inside
-                // fold() (folds.rs:1418/1433/2577), which runs after
-                // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => return first_significant_stmt(body),
-                // If/Switch/Break/Continue: the first executed statement
-                // is not statically unique (or not a fall-through).
-                _ => return None,
             }
         }
         None
@@ -409,68 +391,77 @@ pub(in crate::folds) fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<Va
             match first_significant_stmt(level) {
                 Some(Stmt::Throw(e)) => return temp_value(e),
                 Some(_) => return None,
-                None => continue, // nothing significant here — one level up
+                None => continue,
             }
         }
         None
     }
-    fn visit<'a>(nodes: &'a [SNode], stack: &mut Vec<&'a [SNode]>, out: &mut BTreeSet<ValueId>) {
-        for (k, n) in nodes.iter().enumerate() {
-            stack.push(&nodes[k + 1..]);
-            match n {
-                SNode::While { body, .. } | SNode::DoWhile { body, .. } => {
-                    if let Some(t) = continuation_throw(stack) {
-                        out.insert(t);
-                    }
-                    visit(body, stack, out);
-                }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    visit(then, stack, out);
-                    visit(otherwise, stack, out);
-                }
-                SNode::Labeled { body, .. }
-                // unreachable: ForOf/ForIn nodes are created only inside
-                // fold(), which runs after async_machine_fold (emit.rs:517
-                // vs 531) — c-COV diagnosis
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => visit(body, stack, out),
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    visit(body, stack, out);
-                    for c in catches {
-                        visit(&c.body, stack, out);
-                    }
-                    // unreachable: Try.finally is Some only after
-                    // fold_finally (folds.rs:4143/4154) inside fold(),
-                    // which runs after async_machine_fold — c-COV diagnosis
-                    if let Some(f) = finally {
-                        visit(f, stack, out);
-                    }
-                }
-                // unreachable: SNode::Switch is created only by
-                // fold_switches (folds.rs:3115/3183) inside fold(), which
-                // runs after async_machine_fold — c-COV diagnosis
-                SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        visit(&c.body, stack, out);
-                    }
-                }
-                SNode::Stmts(_)
-                | SNode::Break { .. }
-                | SNode::Continue { .. }
-                | SNode::Honest(_) => {}
-            }
-            stack.pop();
-        }
+    enum VisitTask<'a> {
+        Slice(&'a [SNode]),
+        PopCont,
     }
     let mut out = BTreeSet::new();
-    visit(nodes, &mut Vec::new(), &mut out);
+    let mut cont_stack: Vec<&[SNode]> = Vec::new();
+    let mut tasks = vec![VisitTask::Slice(nodes)];
+    while let Some(task) = tasks.pop() {
+        match task {
+            VisitTask::PopCont => {
+                cont_stack.pop();
+            }
+            VisitTask::Slice(slice) => {
+                let Some((n, rest)) = slice.split_first() else {
+                    continue;
+                };
+                if !rest.is_empty() {
+                    tasks.push(VisitTask::Slice(rest));
+                }
+                cont_stack.push(rest);
+                tasks.push(VisitTask::PopCont);
+                match n {
+                    SNode::While { body, .. } | SNode::DoWhile { body, .. } => {
+                        if let Some(t) = continuation_throw(&cont_stack) {
+                            out.insert(t);
+                        }
+                        tasks.push(VisitTask::Slice(body));
+                    }
+                    SNode::If {
+                        then, otherwise, ..
+                    } => {
+                        tasks.push(VisitTask::Slice(otherwise));
+                        tasks.push(VisitTask::Slice(then));
+                    }
+                    SNode::Labeled { body, .. }
+                    | SNode::ForOf { body, .. }
+                    | SNode::ForIn { body, .. } => {
+                        tasks.push(VisitTask::Slice(body));
+                    }
+                    SNode::Try {
+                        body,
+                        catches,
+                        finally,
+                        ..
+                    } => {
+                        if let Some(f) = finally {
+                            tasks.push(VisitTask::Slice(f));
+                        }
+                        for c in catches.iter().rev() {
+                            tasks.push(VisitTask::Slice(&c.body));
+                        }
+                        tasks.push(VisitTask::Slice(body));
+                    }
+                    SNode::Switch { cases, .. } => {
+                        for c in cases.iter().rev() {
+                            tasks.push(VisitTask::Slice(&c.body));
+                        }
+                    }
+                    SNode::Stmts(_)
+                    | SNode::Break { .. }
+                    | SNode::Continue { .. }
+                    | SNode::Honest(_) => {}
+                }
+            }
+        }
+    }
     out
 }
 
@@ -481,18 +472,27 @@ pub(in crate::folds) fn funcobj_uses_are_machinery(
     nodes: &[SNode],
     aliases: &BTreeSet<ValueId>,
 ) -> bool {
-    /// `in_genobj_slot` marks the `GeneratorDriver::genobj` operand
-    /// position (the only legal expression use of the temp).
-    fn expr_ok(e: &Expr, aliases: &BTreeSet<ValueId>, in_genobj_slot: bool) -> bool {
-        if let Some(v) = temp_value(e)
-            && aliases.contains(&v)
-        {
-            return in_genobj_slot;
+    fn expr_ok(root: &Expr, aliases: &BTreeSet<ValueId>) -> bool {
+        let mut stack: Vec<(&Expr, bool)> = vec![(root, false)];
+        while let Some((e, in_genobj_slot)) = stack.pop() {
+            if let Some(v) = temp_value(e)
+                && aliases.contains(&v)
+            {
+                if !in_genobj_slot {
+                    return false;
+                }
+                continue;
+            }
+            match e {
+                Expr::GeneratorDriver { genobj: g, .. } => stack.push((g, true)),
+                _ => {
+                    for c in expr_children(e) {
+                        stack.push((c, false));
+                    }
+                }
+            }
         }
-        match e {
-            Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, aliases, true),
-            _ => expr_children(e).iter().all(|c| expr_ok(c, aliases, false)),
-        }
+        true
     }
     let mut ok = true;
     walk_leaves(nodes, &mut |l| {
@@ -500,15 +500,12 @@ pub(in crate::folds) fn funcobj_uses_are_machinery(
             return;
         }
         if let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l {
-            // `phi = funcobj` (the catch-region context phi) and the
-            // N70 alias wiring (`phi = alias`, self-assigns) are
-            // machinery bookkeeping; anything richer is not.
             ok = !aliases.iter().any(|a| expr_uses_value(value, *a))
                 || temp_value(value).is_some_and(|v| aliases.contains(&v));
             return;
         }
         for e in leaf_exprs(l) {
-            if !expr_ok(e, aliases, false) {
+            if !expr_ok(e, aliases) {
                 ok = false;
                 return;
             }
@@ -639,7 +636,7 @@ pub(in crate::folds) fn match_await_site(
                     },
                 value_id,
                 ..
-            }) if cx.uses.get(value_id).copied().unwrap_or(0) == 0 => {
+            }) if cx.uses.get(value_id).copied().unwrap_or(0) <= 1 => {
                 let bits = if is_mode_drv(left) {
                     resolve_num(right, &cx.const_env, &mut spec_consts)
                 } else if is_mode_drv(right) {
@@ -950,103 +947,58 @@ pub(in crate::folds) fn async_machine_seq(
     cx: &mut AsyncMachineCx,
     stats: &mut FoldStats,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                async_machine_seq(then, cx, stats);
-                async_machine_seq(otherwise, cx, stats);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => async_machine_seq(body, cx, stats),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                async_machine_seq(body, cx, stats);
-                for c in catches {
-                    async_machine_seq(&mut c.body, cx, stats);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // async_machine_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    async_machine_seq(f, cx, stats);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_machine_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    async_machine_seq(&mut c.body, cx, stats);
-                }
-            }
-            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
-    let mut i = 0;
-    while i + 1 < nodes.len() {
-        let site = match_await_site(nodes, i, cx);
-        match site {
-            Some(site) => {
-                // `site.remove` was collected tail-first, so per-node
-                // leaf indices are strictly descending — removal in
-                // order is index-safe across every touched `Stmts` run.
-                let &(insert_ni, insert_li) =
-                    site.remove.last().expect("at least the suspend leaf");
-                for &(rni, rli) in &site.remove {
-                    let SNode::Stmts(run) = &mut nodes[rni] else {
-                        unreachable!()
+    fold_snode_vecs_postorder(nodes, |seq| {
+        let mut i = 0;
+        while i + 1 < seq.len() {
+            let site = match_await_site(seq, i, cx);
+            match site {
+                Some(site) => {
+                    let Some(&(insert_ni, insert_li)) = site.remove.last() else {
+                        i += 1;
+                        continue;
                     };
-                    run.remove(rli);
-                }
-                let aw = Expr::Await {
-                    value: Box::new(site.awaited),
-                    uncaught: true,
-                };
-                {
-                    let SNode::Stmts(run) = &mut nodes[insert_ni] else {
-                        unreachable!()
-                    };
-                    let insert_at = insert_li.min(run.len());
-                    match site.resume {
-                        // The resumption value has real uses beyond the
-                        // (removed) throw arm: bind it — `const t = await v`.
-                        Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
-                            run.insert(
-                                insert_at,
-                                Leaf::Raw(Stmt::Declare {
-                                    name,
-                                    mutable: false,
-                                    value: aw,
-                                    value_id: r,
-                                }),
-                            );
-                            stats.async_machine_bound += 1;
-                        }
-                        _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
+                    for &(rni, rli) in &site.remove {
+                        let SNode::Stmts(run) = &mut seq[rni] else {
+                            unreachable!()
+                        };
+                        run.remove(rli);
                     }
+                    let aw = Expr::Await {
+                        value: Box::new(site.awaited),
+                        uncaught: true,
+                    };
+                    {
+                        let SNode::Stmts(run) = &mut seq[insert_ni] else {
+                            unreachable!()
+                        };
+                        let insert_at = insert_li.min(run.len());
+                        match site.resume {
+                            Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                                run.insert(
+                                    insert_at,
+                                    Leaf::Raw(Stmt::Declare {
+                                        name,
+                                        mutable: false,
+                                        value: aw,
+                                        value_id: r,
+                                    }),
+                                );
+                                stats.async_machine_bound += 1;
+                            }
+                            _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
+                        }
+                    }
+                    stats.async_machine_sites += 1;
+                    seq.splice(
+                        i + site.dispatch_off..i + site.dispatch_off + 1,
+                        site.continuation,
+                    );
+                    i = insert_ni + 1;
                 }
-                stats.async_machine_sites += 1;
-                nodes.splice(
-                    i + site.dispatch_off..i + site.dispatch_off + 1,
-                    site.continuation,
-                );
-                i = insert_ni + 1;
+                None => i += 1,
             }
-            None => i += 1,
         }
-    }
+    });
 }
 
 /// Post-fold sweep: remove the resolved mode-immediate consts, and the
@@ -1166,6 +1118,13 @@ pub(in crate::folds) fn sweep_async_machinery(
             }
             strip_dead_phi_decls(nodes, &phi_targets, &remaining, &uses_adj);
         }
+    } else if !strip_only.is_empty() {
+        // Even when the genObj alias web remains alive (e.g. a subsequent
+        // `yield*` loop still reads `genobj`), alias-valued catch-context
+        // phi assigns targeting unread non-alias phi decls are dead
+        // bookkeeping and must be stripped so they do not force `genobj`
+        // to hoist out of its entry `try` block.
+        strip_genobj_phi_assigns(nodes, aliases, &strip_only);
     }
     if !dead.is_empty() {
         sweep_dead_decls(nodes, &dead);
@@ -1179,58 +1138,16 @@ pub(in crate::folds) fn strip_genobj_phi_assigns(
     aliases: &BTreeSet<ValueId>,
     targets: &BTreeSet<String>,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::Stmts(run) => run.retain(|l| {
-                !matches!(
-                    l,
-                    Leaf::Raw(Stmt::PhiAssign { target, value, .. })
-                        if targets.contains(target)
-                            && temp_value(value).is_some_and(|v| aliases.contains(&v))
-                )
-            }),
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                strip_genobj_phi_assigns(then, aliases, targets);
-                strip_genobj_phi_assigns(otherwise, aliases, targets);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => strip_genobj_phi_assigns(body, aliases, targets),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                strip_genobj_phi_assigns(body, aliases, targets);
-                for c in catches {
-                    strip_genobj_phi_assigns(&mut c.body, aliases, targets);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // async_machine_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    strip_genobj_phi_assigns(f, aliases, targets);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_machine_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    strip_genobj_phi_assigns(&mut c.body, aliases, targets);
-                }
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
+    walk_stmts_runs_mut(nodes, |run| {
+        run.retain(|l| {
+            !matches!(
+                l,
+                Leaf::Raw(Stmt::PhiAssign { target, value, .. })
+                    if targets.contains(target)
+                        && temp_value(value).is_some_and(|v| aliases.contains(&v))
+            )
+        });
+    });
 }
 
 /// Remove `PhiDecl`s for stripped targets that have no remaining
@@ -1241,57 +1158,15 @@ pub(in crate::folds) fn strip_dead_phi_decls(
     remaining: &BTreeSet<String>,
     uses: &BTreeMap<ValueId, usize>,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::Stmts(run) => run.retain(|l| {
-                !matches!(
-                    l,
-                    Leaf::Raw(Stmt::PhiDecl { name, value_id })
-                        if targets.contains(name)
-                            && !remaining.contains(name)
-                            && uses.get(value_id).copied().unwrap_or(0) == 0
-                )
-            }),
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                strip_dead_phi_decls(then, targets, remaining, uses);
-                strip_dead_phi_decls(otherwise, targets, remaining, uses);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after
-            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => strip_dead_phi_decls(body, targets, remaining, uses),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                strip_dead_phi_decls(body, targets, remaining, uses);
-                for c in catches {
-                    strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // async_machine_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    strip_dead_phi_decls(f, targets, remaining, uses);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // async_machine_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
-                }
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
+    walk_stmts_runs_mut(nodes, |run| {
+        run.retain(|l| {
+            !matches!(
+                l,
+                Leaf::Raw(Stmt::PhiDecl { name, value_id })
+                    if targets.contains(name)
+                        && !remaining.contains(name)
+                        && uses.get(value_id).copied().unwrap_or(0) == 0
+            )
+        });
+    });
 }

@@ -23,8 +23,10 @@
 //!   [`taint_scaffold`] (used by `tests/lift-taint/probes.rs`) and
 //!   [`decompile_scaffold`] (used by `tests/lift-decompile/async_node.rs`).
 
-// Each test target uses a different subset.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared integration-test helper module; each test binary exercises a different subset"
+)]
 
 pub mod decompile_scaffold;
 pub mod taint_scaffold;

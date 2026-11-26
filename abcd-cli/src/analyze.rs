@@ -88,6 +88,9 @@ pub struct PtaReport {
     pub env_rounds: usize,
     /// Whether the step budget was exhausted before fixed point.
     pub capped: bool,
+    /// Whether PTA ran in demand-driven root-sliced mode (`roots` excluded at
+    /// least one internal function).
+    pub root_sliced: bool,
 }
 
 /// Module-level counts (IR arena sizes) and resolution histogram.
@@ -204,6 +207,18 @@ const ENTRY_NAME: &str = "func_main_0";
 
 /// Decode, lift, and analyze one module.
 pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeReport, CliError> {
+    if opts.alias_rung > 2 {
+        return Err(CliError::User(format!(
+            "invalid alias_rung {} (expected 0, 1, or 2)",
+            opts.alias_rung
+        )));
+    }
+    if opts.pta_budget.is_some() && opts.alias_rung < 2 {
+        return Err(CliError::User(format!(
+            "--pta-budget requires --alias-rung 2 (or --pta), got alias rung {}",
+            opts.alias_rung
+        )));
+    }
     let ir = {
         let file = abcd_file::decode(&module.abc).map_err(|e| {
             CliError::Tool(format!(
@@ -249,6 +264,7 @@ pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeRepor
                 call_sites_partial: stats.call_sites_partial,
                 env_rounds: stats.env_rounds,
                 capped: stats.capped,
+                root_sliced: stats.root_sliced,
             };
             (cg, Some(rep))
         }
@@ -417,7 +433,8 @@ pub fn render_text(report: &AnalyzeReport) -> String {
     if let Some(pta) = &report.pta {
         let capped_tag = if pta.capped { ", capped" } else { "" };
         out.push_str(&format!(
-            "pta:             rung {}, {} activations, {} facts, {} flow edges, {} call edges, {} partial, {} env rounds{}\n",
+            "pta:             rung {}, {} activations, {} facts, {} flow edges, {} call edges, {} partial, {} env rounds{}\n\
+             pta root sliced: {}\n",
             pta.alias_rung_used,
             pta.activations,
             pta.facts,
@@ -426,6 +443,7 @@ pub fn render_text(report: &AnalyzeReport) -> String {
             pta.call_sites_partial,
             pta.env_rounds,
             capped_tag,
+            pta.root_sliced,
         ));
     }
 

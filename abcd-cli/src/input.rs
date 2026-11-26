@@ -2,19 +2,23 @@
 //!
 //! Every bytecode-consuming command accepts both a bare `.abc` file and a
 //! container (`.hap` / `.hsp` / `.app` / `.hqf`). The kind is sniffed by
-//! magic bytes: a leading `PK\x03\x04` means ZIP container (handled by
-//! abcd-hap), anything else is read as raw Ark bytecode.
+//! magic bytes: a leading `PK\x03\x04` (local header) or `PK\x05\x06` (empty
+//! ZIP end-of-central-directory) means ZIP container (handled by abcd-hap),
+//! anything else is read as raw Ark bytecode.
 //!
 //! Multi-module containers (`.app`) never resolve silently: without
 //! `--module <name>` or `--all` the caller gets a hard error listing the
 //! available module names.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::CliError;
 
-/// Local file header signature of every ZIP dialect container in scope.
-const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
+/// Local file header signature of a non-empty ZIP container.
+const ZIP_LOCAL_MAGIC: &[u8; 4] = b"PK\x03\x04";
+/// End-of-central-directory signature at offset 0 of an empty ZIP container.
+const ZIP_EMPTY_MAGIC: &[u8; 4] = b"PK\x05\x06";
 
 /// How many modules of a multi-module container a command wants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -44,9 +48,10 @@ pub struct InputModule {
     pub provenance: String,
 }
 
-/// True when `bytes` looks like a ZIP container (magic-byte sniff).
+/// True when `bytes` looks like a ZIP container (magic-byte sniff:
+/// `PK\x03\x04` local header or `PK\x05\x06` empty ZIP archive).
 pub fn is_container(bytes: &[u8]) -> bool {
-    bytes.len() >= ZIP_MAGIC.len() && &bytes[..ZIP_MAGIC.len()] == ZIP_MAGIC
+    bytes.starts_with(ZIP_LOCAL_MAGIC) || bytes.starts_with(ZIP_EMPTY_MAGIC)
 }
 
 /// Read `path` into a single allocation carrying a trailing 16-byte `[0u8; 16]`
@@ -128,21 +133,29 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
     let modules = abcd_hap::abc_modules(bytes)
         .map_err(|e| CliError::Tool(format!("failed to read container {source_name}: {e}")))?;
     let mut out = Vec::with_capacity(modules.len());
-    let mut used_names: Vec<String> = Vec::with_capacity(modules.len());
+    let mut used_keys: BTreeSet<String> = BTreeSet::new();
     for m in modules {
         let abc = m.data.as_slice().to_vec();
         let module_json = m.module_json.as_ref().map(|d| d.as_slice().to_vec());
         let base = resolve_module_name(module_json.as_deref(), &m.container_path, source_name);
-        // A per-ability hap (ets/<Ability>/<Name>.abc …) yields several
-        // modules that all resolve to the SAME base name (the shared
-        // module.json's name). Names land in output paths, so disambiguate
-        // deterministically: first occurrence keeps the base, collisions get
-        // `<base>__<entry-stem>`, then `__N` on the rare repeat.
-        let name = if used_names.contains(&base) {
+        // Validate the base module name first so an unsafe container-supplied
+        // name is never masked by collision suffixing.
+        if safe_module_name(&base).is_none() {
+            return Err(CliError::Tool(format!(
+                "{source_name}: module name {base:?} is not a safe output path component"
+            )));
+        }
+        // A per-ability hap (ets/<Ability>/<Name>.abc …) or a container with
+        // case-only name variants (`Entry` + `entry`) yields modules whose
+        // output filenames collide on case-insensitive filesystems (APFS/NTFS).
+        // Deduplicate collision keys case-insensitively while preserving the
+        // original case in `m.name`: first occurrence keeps `base`, collisions
+        // get `<base>__<entry-stem>`, then `__N` on repeat.
+        let name = if used_keys.contains(&base.to_ascii_lowercase()) {
             let stem = file_stem(&m.entry_name);
             let mut candidate = format!("{base}__{stem}");
             let mut n = 2;
-            while used_names.contains(&candidate) {
+            while used_keys.contains(&candidate.to_ascii_lowercase()) {
                 candidate = format!("{base}__{stem}{n}");
                 n += 1;
             }
@@ -152,15 +165,14 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
         };
         // Module names end up in OUTPUT PATHS (`extract`, `decompile --all`),
         // and they come from container content — an attacker-controlled
-        // module.json `name` like "../../tmp/x" must not escape the output
-        // directory (the in-memory reader needs no Zip Slip guard; the CLI
-        // writer does).
+        // module.json `name` or entry stem must not escape the output directory
+        // or hit a reserved Windows device name.
         let name = safe_module_name(&name).ok_or_else(|| {
             CliError::Tool(format!(
                 "{source_name}: module name {name:?} is not a safe output path component"
             ))
         })?;
-        used_names.push(name.clone());
+        used_keys.insert(name.to_ascii_lowercase());
         let mut provenance = source_name.to_string();
         for hop in &m.container_path {
             provenance.push_str("::");
@@ -218,16 +230,56 @@ pub(crate) fn file_stem(path: &str) -> String {
     }
 }
 
-/// A module name is safe iff it is a single, inert path component: no
-/// separators (including Windows-style), no drive/absolute prefix, no dot
-/// specials, no control characters.
+/// True when `stem` (the portion of a path segment before the first `.`) is a
+/// Windows reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`..`COM9`,
+/// `LPT0`..`LPT9`, `CONIN$`, `CONOUT$`), matched case-insensitively.
+fn is_windows_reserved_device(stem: &str) -> bool {
+    let b = stem.as_bytes();
+    match b.len() {
+        3 => {
+            b.eq_ignore_ascii_case(b"CON")
+                || b.eq_ignore_ascii_case(b"PRN")
+                || b.eq_ignore_ascii_case(b"AUX")
+                || b.eq_ignore_ascii_case(b"NUL")
+        }
+        4 => {
+            (b[..3].eq_ignore_ascii_case(b"COM") || b[..3].eq_ignore_ascii_case(b"LPT"))
+                && b[3].is_ascii_digit()
+        }
+        6 => b.eq_ignore_ascii_case(b"CONIN$"),
+        7 => b.eq_ignore_ascii_case(b"CONOUT$"),
+        _ => false,
+    }
+}
+
+/// Portable single path-segment validator shared across container module names
+/// (`extract`, `dis`/`rewrite`/`decompile --all`) and `--split-modules` output
+/// paths (`decompile::safe_join`).
+///
+/// Rejects empty segments, `.` and `..`, `/` and `\`, control characters
+/// (`<= 0x1F`, `0x7F`, or Unicode C1 controls), Windows-forbidden characters
+/// (`<`, `>`, `:`, `"`, `|`, `?`, `*`), trailing `.` or `' '`, and Windows
+/// reserved device names checked case-insensitively on the stem before the
+/// first `.`.
+pub fn is_safe_path_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg == "." || seg == ".." || seg.ends_with('.') || seg.ends_with(' ') {
+        return false;
+    }
+    if seg.chars().any(|c| {
+        c <= '\x1f'
+            || c == '\x7f'
+            || c.is_control()
+            || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        return false;
+    }
+    let stem = seg.split('.').next().unwrap_or(seg);
+    !is_windows_reserved_device(stem)
+}
+
+/// A module name is safe iff it is a single, inert portable path component.
 fn safe_module_name(name: &str) -> Option<String> {
-    let safe = !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains(['/', '\\', ':'])
-        && !name.chars().any(char::is_control);
-    safe.then(|| name.to_string())
+    is_safe_path_segment(name).then(|| name.to_string())
 }
 
 /// Apply the module-selection rule (never silently pick from several).
@@ -269,7 +321,9 @@ mod tests {
     #[test]
     fn container_sniff_magic() {
         assert!(is_container(b"PK\x03\x04rest"));
+        assert!(is_container(b"PK\x05\x06\x00\x00")); // empty ZIP EOCD
         assert!(!is_container(b"PK\x03")); // truncated
+        assert!(!is_container(b"PK\x05")); // truncated
         assert!(!is_container(b"PLEX")); // abc magic family is not PK
         assert!(!is_container(b""));
     }
@@ -313,12 +367,54 @@ mod tests {
         assert_eq!(safe_module_name(".."), None);
         assert_eq!(safe_module_name(""), None);
         assert_eq!(safe_module_name("with\nnewline"), None);
-        // Legit names survive, including unicode and dotted names.
+        assert_eq!(safe_module_name("del\x7fchar"), None);
+        assert_eq!(safe_module_name("nul\x00byte"), None);
+        // Windows-forbidden characters, trailing dot/space, and reserved device names.
+        for bad in [
+            "a<b",
+            "a>b",
+            "a:b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con",
+            "con.txt",
+            "PRN",
+            "prn.abc",
+            "AUX",
+            "aux.json",
+            "aux.config.js",
+            "NUL",
+            "nul.pa",
+            "COM0",
+            "com1.txt",
+            "COM9.json",
+            "LPT0",
+            "lpt1.js",
+            "LPT9",
+            "CONIN$",
+            "conin$.txt",
+            "CONOUT$",
+            "conout$.log",
+        ] {
+            assert_eq!(safe_module_name(bad), None, "must reject {bad:?}");
+        }
+        // Legit names survive, including unicode, 4-byte UTF-8 stems, and dotted names.
         assert_eq!(safe_module_name("entry").as_deref(), Some("entry"));
         assert_eq!(
             safe_module_name("com.example.app").as_deref(),
             Some("com.example.app")
         );
+        assert_eq!(safe_module_name("com10").as_deref(), Some("com10"));
+        assert_eq!(
+            safe_module_name("console.js").as_deref(),
+            Some("console.js")
+        );
+        assert_eq!(safe_module_name("abä").as_deref(), Some("abä"));
         assert_eq!(safe_module_name("模块").as_deref(), Some("模块"));
         assert_eq!(
             safe_module_name("my-module_2").as_deref(),

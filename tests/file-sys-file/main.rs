@@ -23,18 +23,22 @@ fn cstr(raw: *const std::os::raw::c_char) -> String {
 
 #[test]
 fn type_summary_offset_field_matches_vendor() {
+    // SAFETY: pure FFI getter returning a static NUL-terminated vendor C string.
+    let vendor = cstr(unsafe { sys::abc_vendor_type_summary_field_name() });
     assert_eq!(
         abcd_file::TYPE_SUMMARY_OFFSET_FIELD,
-        cstr(unsafe { sys::abc_vendor_type_summary_field_name() }),
+        vendor,
         "vendor renamed typeSummaryOffset (ark::TYPE_SUMMARY_FIELD_NAME)"
     );
 }
 
 #[test]
 fn module_request_phase_field_matches_vendor() {
+    // SAFETY: pure FFI getter returning a static NUL-terminated vendor C string.
+    let vendor = cstr(unsafe { sys::abc_vendor_module_request_phase_idx() });
     assert_eq!(
         abcd_file::MODULE_REQUEST_PHASE_FIELD,
-        cstr(unsafe { sys::abc_vendor_module_request_phase_idx() }),
+        vendor,
         "vendor renamed moduleRequestPhaseIdx (ark::MODULE_REQUEST_PAHSE_IDX)"
     );
 }
@@ -42,6 +46,7 @@ fn module_request_phase_field_matches_vendor() {
 #[test]
 fn scope_names_record_descriptor_matches_vendor() {
     // Our constant is the descriptor form: "L" + vendor record name + ";".
+    // SAFETY: pure FFI getter returning a static NUL-terminated vendor C string.
     let vendor = cstr(unsafe { sys::abc_vendor_scope_names_record() });
     assert_eq!(
         abcd_file::ES_SCOPE_NAMES_RECORD_DESCRIPTOR,
@@ -52,9 +57,11 @@ fn scope_names_record_descriptor_matches_vendor() {
 
 #[test]
 fn scope_names_field_matches_vendor() {
+    // SAFETY: pure FFI getter returning a static NUL-terminated vendor C string.
+    let vendor = cstr(unsafe { sys::abc_vendor_scope_names_field_name() });
     assert_eq!(
         abcd_file::SCOPE_NAMES_FIELD,
-        cstr(unsafe { sys::abc_vendor_scope_names_field_name() }),
+        vendor,
         "vendor renamed scopeNames (ark::SCOPE_NAMES)"
     );
 }

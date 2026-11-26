@@ -132,7 +132,9 @@ fn json_report_is_machine_readable() {
     assert_eq!(v["module"], "probe");
     assert_eq!(v["config"]["builtin_summaries"], true);
     assert_eq!(v["config"]["seed_all_functions"], true);
+    assert_eq!(v["config"]["ohos_lifecycle"], true);
     assert_eq!(v["config"]["alias_rung"], 2);
+    assert_eq!(v["pta_root_sliced"], false);
     let hits = v["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["sink"], "print");
@@ -514,6 +516,7 @@ fn hand_built_report(
             seed_all_functions: true,
             follow_returns_past_seeds: true,
             native_identity: true,
+            ohos_lifecycle: true,
             max_field_chain: 5,
             alias_rung: 2,
             pta_step_budget: None,
@@ -545,6 +548,7 @@ fn hand_built_report(
         gap_sites_resolved: 0,
         gap_sites_unresolved: 0,
         alias_rung_used: 2,
+        pta_root_sliced: false,
     }
 }
 
@@ -945,4 +949,102 @@ fn cli_taint_alias_rung_and_pta_budget_override_config() {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         abcd_cli::run(cli).expect("taint dispatch must succeed");
     }
+}
+
+#[test]
+fn taint_surfaces_pta_root_sliced_ohos_lifecycle_and_any_param_from_summaries() {
+    // 1. Build a 513-function .abc (`func_main_0` + 512 unreferenced helpers)
+    // so demand-driven Rung-2 PTA root slicing activates (`pta_root_sliced == true`),
+    // while also exercising `ohos_lifecycle = false` and `any_param_from:1` summary flows.
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+
+    // `func_main_0() { let r = pick_tail("safe", TAINT); print(r); }`
+    let (main_code, main_offsets) = abcd_isa::encode(&[
+        Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 0: acc = pick_tail
+        Bytecode::Sta(Reg(0)),                            // 1: v0 = pick_tail
+        Bytecode::LdaStr(placeholder),                    // 2: acc = "safe"
+        Bytecode::Sta(Reg(1)),                            // 3: v1 = "safe" (arg 0)
+        Bytecode::Tryldglobalbyname(Imm(1), placeholder), // 4: acc = TAINT
+        Bytecode::Sta(Reg(2)),                            // 5: v2 = tainted (arg 1)
+        Bytecode::Lda(Reg(0)),                            // 6: acc = pick_tail
+        Bytecode::Callargs2(Imm(2), Reg(1), Reg(2)),      // 7: acc = pick_tail(v1, v2)
+        Bytecode::Sta(Reg(3)),                            // 8: v3 = r
+        Bytecode::Tryldglobalbyname(Imm(3), placeholder), // 9: acc = print
+        Bytecode::Sta(Reg(4)),                            // 10: v4 = print
+        Bytecode::Lda(Reg(4)),                            // 11: acc = print
+        Bytecode::Callarg1(Imm(4), Reg(3)),               // 12: print(r)
+        Bytecode::Returnundefined,                        // 13
+    ])
+    .unwrap();
+    let main = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::STATIC,
+        &main_code,
+        6,
+        3,
+    );
+    let s_pick = b.add_string("pick_tail");
+    let s_safe = b.add_string("safe");
+    let s_taint = b.add_string("TAINT");
+    let s_print = b.add_string("print");
+    b.relocate_code_id(main, main_offsets[0], 0, CodeEntity::String(s_pick))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[2], 0, CodeEntity::String(s_safe))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[4], 0, CodeEntity::String(s_taint))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[9], 0, CodeEntity::String(s_print))
+        .unwrap();
+
+    let (noop, _) = abcd_isa::encode(&[Bytecode::Returnundefined]).unwrap();
+    for idx in 0..512 {
+        b.class_add_method(
+            cls,
+            &format!("dead_helper_{idx}"),
+            proto,
+            AccessFlags::STATIC,
+            &noop,
+            1,
+            3,
+        );
+    }
+    b.deduplicate();
+    let large_abc = b.finalize().expect("513-fn abc must finalize");
+
+    // `any_param_from:1` propagates arg 1 (`TAINT`) -> `return`, with `native_identity = false`
+    // and `ohos_lifecycle = false`.
+    let cfg_hit = format!(
+        "native_identity = false\nbuiltin_summaries = false\nohos_lifecycle = false\n\
+         {TAINT_TO_PRINT}\n\
+         [[extra_summaries]]\n\
+         name = \"pick_tail\"\n\
+         flows = [ {{ from = \"any_param_from:1\", to = \"return\" }} ]\n"
+    );
+    let rep = run(&large_abc, &cfg_hit);
+    assert!(
+        rep.pta_root_sliced,
+        "513-fn module must set pta_root_sliced"
+    );
+    assert!(!rep.config.ohos_lifecycle);
+    assert_eq!(rep.hits.len(), 1, "{rep:?}");
+
+    let text = taint::render_text(&rep);
+    assert!(text.contains("pta root sliced: true\n"), "{text}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&taint::render(&[rep], true).unwrap()).unwrap();
+    assert_eq!(json["pta_root_sliced"], true);
+    assert_eq!(json["config"]["ohos_lifecycle"], false);
+
+    // Starting at index 2 (`any_param_from:2`) skips arg 1 (`TAINT`), yielding 0 hits.
+    let cfg_miss = cfg_hit.replace("any_param_from:1", "any_param_from:2");
+    let rep_miss = run(&large_abc, &cfg_miss);
+    assert!(rep_miss.pta_root_sliced);
+    assert_eq!(rep_miss.hits.len(), 0, "{rep_miss:?}");
 }

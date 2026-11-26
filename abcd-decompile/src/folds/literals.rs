@@ -5,9 +5,13 @@ use crate::folds::loops::subst_temp_in_expr;
 
 // ── Fold 1: literal builders ─────────────────────────────────────────
 
-pub(in crate::folds) fn fold_leaves(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
+pub(in crate::folds) fn fold_leaves_with_uses(
+    leaves: &mut Vec<Leaf>,
+    global_uses: Option<&BTreeMap<ValueId, usize>>,
+    stats: &mut FoldStats,
+) {
     fold_rest_destructure(leaves, stats);
-    fold_literal_builders(leaves, stats);
+    fold_literal_builders_with_uses(leaves, global_uses, stats);
 }
 
 // ── Tagged-template call fold (#30) ──────────────────────────────────
@@ -23,11 +27,12 @@ pub(in crate::folds) fn collect_value_uses_in_expr(
     e: &Expr,
     counts: &mut std::collections::HashMap<ValueId, usize>,
 ) {
-    if let Expr::Temp { value, .. } = e {
-        *counts.entry(*value).or_insert(0) += 1;
-    }
-    for c in expr_children(e) {
-        collect_value_uses_in_expr(c, counts);
+    let mut stack: Vec<&Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        if let Expr::Temp { value, .. } = cur {
+            *counts.entry(*value).or_insert(0) += 1;
+        }
+        stack.extend(expr_children(cur));
     }
 }
 
@@ -86,65 +91,68 @@ pub(in crate::folds) fn collect_value_uses_in_snodes(
     nodes: &[SNode],
     counts: &mut std::collections::HashMap<ValueId, usize>,
 ) {
-    for n in nodes {
-        match n {
-            SNode::Stmts(leaves) => {
-                for l in leaves {
-                    collect_value_uses_in_leaf(l, counts);
-                }
-            }
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                collect_value_uses_in_expr(cond, counts);
-                collect_value_uses_in_snodes(then, counts);
-                collect_value_uses_in_snodes(otherwise, counts);
-            }
-            SNode::While { cond, body, .. } => {
-                if let Some(c) = cond {
-                    collect_value_uses_in_expr(c, counts);
-                }
-                collect_value_uses_in_snodes(body, counts);
-            }
-            SNode::DoWhile { cond, body, .. } => {
-                collect_value_uses_in_expr(cond, counts);
-                collect_value_uses_in_snodes(body, counts);
-            }
-            SNode::ForOf { iter, body, .. } => {
-                collect_value_uses_in_expr(iter, counts);
-                collect_value_uses_in_snodes(body, counts);
-            }
-            SNode::ForIn { obj, body, .. } => {
-                collect_value_uses_in_expr(obj, counts);
-                collect_value_uses_in_snodes(body, counts);
-            }
-            SNode::Switch { disc, cases, .. } => {
-                collect_value_uses_in_expr(disc, counts);
-                for c in cases {
-                    for t in &c.tests {
-                        collect_value_uses_in_expr(t, counts);
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        collect_value_uses_in_leaf(l, counts);
                     }
-                    collect_value_uses_in_snodes(&c.body, counts);
                 }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    collect_value_uses_in_expr(cond, counts);
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        collect_value_uses_in_expr(c, counts);
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { cond, body, .. } => {
+                    collect_value_uses_in_expr(cond, counts);
+                    stack.push(body);
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    collect_value_uses_in_expr(iter, counts);
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    collect_value_uses_in_expr(obj, counts);
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases, .. } => {
+                    collect_value_uses_in_expr(disc, counts);
+                    for c in cases.iter().rev() {
+                        for t in &c.tests {
+                            collect_value_uses_in_expr(t, counts);
+                        }
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        stack.push(fin);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                collect_value_uses_in_snodes(body, counts);
-                for c in catches {
-                    collect_value_uses_in_snodes(&c.body, counts);
-                }
-                if let Some(fin) = finally {
-                    collect_value_uses_in_snodes(fin, counts);
-                }
-            }
-            SNode::Labeled { body, .. } => collect_value_uses_in_snodes(body, counts),
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
 }
@@ -153,42 +161,7 @@ pub(in crate::folds) fn fold_tagged_in_snodes(
     nodes: &mut [SNode],
     use_counts: &std::collections::HashMap<ValueId, usize>,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::Stmts(leaves) => fold_tagged_in_leaves(leaves, use_counts),
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                fold_tagged_in_snodes(then, use_counts);
-                fold_tagged_in_snodes(otherwise, use_counts);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. }
-            | SNode::Labeled { body, .. } => fold_tagged_in_snodes(body, use_counts),
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    fold_tagged_in_snodes(&mut c.body, use_counts);
-                }
-            }
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                fold_tagged_in_snodes(body, use_counts);
-                for c in catches {
-                    fold_tagged_in_snodes(&mut c.body, use_counts);
-                }
-                if let Some(fin) = finally {
-                    fold_tagged_in_snodes(fin, use_counts);
-                }
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
+    walk_stmts_runs_mut(nodes, |leaves| fold_tagged_in_leaves(leaves, use_counts));
 }
 
 pub(in crate::folds) fn member_expr_object(e: &Expr) -> Option<&Expr> {
@@ -237,104 +210,98 @@ pub(in crate::folds) fn try_rewrite_tagged_call_in_expr(
     intervening_leaves: &[Leaf],
     use_counts: &std::collections::HashMap<ValueId, usize>,
 ) -> Option<Option<usize>> {
-    if let Expr::Call {
-        callee,
-        this,
-        args,
-        kind: abcd_ir::op::CallKind::Direct | abcd_ir::op::CallKind::Dynamic,
-    } = e
-        && args.len() == quasis.len()
-        && temp_value(&args[0]) == Some(tpl_vid)
-    {
-        match this {
-            None => {
-                // `tag(...)` without receiver: `tag` must not be a bare member
-                // expression (which in JS `` obj.m`...` `` would bind `this = obj`).
-                if member_expr_object(callee).is_none()
-                    && !matches!(
-                        callee.as_ref(),
-                        Expr::PrivateLoad { .. } | Expr::SuperProp { .. }
-                    )
-                {
-                    let mutated = temp_name(callee).is_some_and(|nm| {
-                        intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
-                    });
-                    if !mutated {
+    let mut stack: Vec<&mut Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        if let Expr::Call {
+            callee,
+            this,
+            args,
+            kind: abcd_ir::op::CallKind::Direct | abcd_ir::op::CallKind::Dynamic,
+        } = cur
+            && args.len() == quasis.len()
+            && temp_value(&args[0]) == Some(tpl_vid)
+        {
+            match this {
+                None => {
+                    // `tag(...)` without receiver: `tag` must not be a bare member
+                    // expression (which in JS `` obj.m`...` `` would bind `this = obj`).
+                    if member_expr_object(callee).is_none()
+                        && !matches!(
+                            callee.as_ref(),
+                            Expr::PrivateLoad { .. } | Expr::SuperProp { .. }
+                        )
+                    {
+                        let mutated = temp_name(callee).is_some_and(|nm| {
+                            intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
+                        });
+                        if !mutated {
+                            let subs = args[1..].to_vec();
+                            let tag = callee.clone();
+                            *cur = Expr::TaggedTemplate {
+                                tag,
+                                quasis: quasis.to_vec(),
+                                exprs: subs,
+                            };
+                            return Some(None);
+                        }
+                    }
+                }
+                Some(recv) => {
+                    if member_expr_object(callee) == Some(recv.as_ref()) {
                         let subs = args[1..].to_vec();
                         let tag = callee.clone();
-                        *e = Expr::TaggedTemplate {
+                        *cur = Expr::TaggedTemplate {
                             tag,
                             quasis: quasis.to_vec(),
                             exprs: subs,
                         };
                         return Some(None);
                     }
-                }
-            }
-            Some(recv) => {
-                if member_expr_object(callee) == Some(recv.as_ref()) {
-                    let subs = args[1..].to_vec();
-                    let tag = callee.clone();
-                    *e = Expr::TaggedTemplate {
-                        tag,
-                        quasis: quasis.to_vec(),
-                        exprs: subs,
-                    };
-                    return Some(None);
-                }
-                if let Some(fn_vid) = temp_value(callee)
-                    && use_counts.get(&fn_vid).copied() == Some(1)
-                    && matches!(
-                        recv.as_ref(),
-                        Expr::Ident(_) | Expr::Temp { .. } | Expr::GlobalThis
-                    )
-                {
-                    let found_c = prior_leaves.iter().enumerate().rev().find_map(|(c, l)| {
-                        if let Leaf::Raw(Stmt::Declare {
-                            mutable: false,
-                            value,
-                            value_id,
-                            ..
-                        }) = l
-                            && *value_id == fn_vid
-                        {
-                            Some((c, value))
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some((c, member_val)) = found_c
-                        && member_expr_object(member_val) == Some(recv.as_ref())
-                        && prior_leaves[c + 1..]
-                            .iter()
-                            .all(is_pure_template_setup_leaf)
-                        && temp_name(recv).is_none_or(|nm| {
-                            !intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
-                        })
+                    if let Some(fn_vid) = temp_value(callee)
+                        && use_counts.get(&fn_vid).copied() == Some(1)
+                        && matches!(
+                            recv.as_ref(),
+                            Expr::Ident(_) | Expr::Temp { .. } | Expr::GlobalThis
+                        )
                     {
-                        let subs = args[1..].to_vec();
-                        let tag = Box::new(member_val.clone());
-                        *e = Expr::TaggedTemplate {
-                            tag,
-                            quasis: quasis.to_vec(),
-                            exprs: subs,
-                        };
-                        return Some(Some(c));
+                        let found_c = prior_leaves.iter().enumerate().rev().find_map(|(c, l)| {
+                            if let Leaf::Raw(Stmt::Declare {
+                                mutable: false,
+                                value,
+                                value_id,
+                                ..
+                            }) = l
+                                && *value_id == fn_vid
+                            {
+                                Some((c, value))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((c, member_val)) = found_c
+                            && member_expr_object(member_val) == Some(recv.as_ref())
+                            && prior_leaves[c + 1..]
+                                .iter()
+                                .all(is_pure_template_setup_leaf)
+                            && temp_name(recv).is_none_or(|nm| {
+                                !intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
+                            })
+                        {
+                            let subs = args[1..].to_vec();
+                            let tag = Box::new(member_val.clone());
+                            *cur = Expr::TaggedTemplate {
+                                tag,
+                                quasis: quasis.to_vec(),
+                                exprs: subs,
+                            };
+                            return Some(Some(c));
+                        }
                     }
                 }
             }
         }
-    }
-    for child in expr_children_mut(e) {
-        if let Some(res) = try_rewrite_tagged_call_in_expr(
-            child,
-            tpl_vid,
-            quasis,
-            prior_leaves,
-            intervening_leaves,
-            use_counts,
-        ) {
-            return Some(res);
+        for child in expr_children_mut(cur).into_iter().rev() {
+            stack.push(child);
         }
     }
     None
@@ -515,7 +482,36 @@ pub(in crate::folds) fn fold_tagged_in_leaves(
     }
 }
 
+#[cfg(test)]
 pub(in crate::folds) fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
+    fold_literal_builders_with_uses(leaves, None, stats);
+}
+
+pub(in crate::folds) fn fold_literal_builders_with_uses(
+    leaves: &mut Vec<Leaf>,
+    global_uses: Option<&BTreeMap<ValueId, usize>>,
+    stats: &mut FoldStats,
+) {
+    let owned_run_uses;
+    let run_uses = match global_uses {
+        Some(u) => u,
+        None => {
+            let mut m = BTreeMap::new();
+            for l in leaves.iter() {
+                for e in leaf_exprs(l) {
+                    let mut st = vec![e];
+                    while let Some(cur) = st.pop() {
+                        if let Expr::Temp { value, .. } = cur {
+                            *m.entry(*value).or_insert(0) += 1;
+                        }
+                        st.extend(expr_children(cur));
+                    }
+                }
+            }
+            owned_run_uses = m;
+            &owned_run_uses
+        }
+    };
     let mut i = 0;
     while i < leaves.len() {
         let (vid, is_array) = match &leaves[i] {
@@ -581,6 +577,13 @@ pub(in crate::folds) fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mu
             i += 1;
             continue;
         }
+        // Trailing `Declare`s after the last absorbed store belong to
+        // subsequent statements, not this literal builder sequence.
+        if let Some(&last_abs) = absorbed_idx.last() {
+            let keep = skipped_idx.partition_point(|&idx| idx < last_abs);
+            skipped.truncate(keep);
+            skipped_idx.truncate(keep);
+        }
         // N74-W4: resolve the skipped interleaved declares BEFORE
         // rebuilding: a temp used exactly ONCE across the absorbed
         // entries (or another skipped declare's value) inlines at that
@@ -615,38 +618,44 @@ pub(in crate::folds) fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mu
                     }
                     n
                 };
-            let mut inline: Vec<(abcd_ir::ValueId, Expr)> = Vec::new();
+            let mut inline: Vec<(abcd_ir::ValueId, Expr, usize)> = Vec::new();
             for k in 0..skip_vals.len() {
                 let (vid, value, _) = &skip_vals[k];
                 let (vid, is_lit, value) = (*vid, matches!(value, Expr::Lit(_)), value.clone());
-                match count_uses(vid, &absorbed, &skip_vals) {
-                    0 if is_lit => skip_vals[k].2 = false, // dead pure: drop
-                    1 => {
-                        inline.push((vid, value));
+                let local_n = count_uses(vid, &absorbed, &skip_vals);
+                let total_n = run_uses.get(&vid).copied().unwrap_or(local_n);
+                match (local_n, total_n) {
+                    (0, 0) if is_lit => skip_vals[k].2 = false, // dead pure: drop
+                    (1, 1) => {
+                        inline.push((vid, value, skipped_idx[k]));
                         skip_vals[k].2 = false;
                     }
-                    // Multi-use or used elsewhere: reordering the
-                    // declare is unprovable — bail the WHOLE fold
-                    // (nothing is mutated yet).
+                    // Multi-use or used elsewhere in the function (including
+                    // control headers and `finally`): bail the whole fold.
                     _ => {
                         bail = true;
                     }
                 }
             }
+            if !bail && !literal_eval_order_ok(&absorbed, &absorbed_idx, &inline) {
+                bail = true;
+            }
             // Inline in decision order: an earlier inline may feed a
             // later one (temp chains), so substitute into the later
             // inline values too.
-            for pos in 0..inline.len() {
-                let (vid, value) = inline[pos].clone();
-                for later in inline.iter_mut().skip(pos + 1) {
-                    subst_temp_in_expr(&mut later.1, vid, &value);
-                }
-                for (_, v, _) in skip_vals.iter_mut() {
-                    subst_temp_in_expr(v, vid, &value);
-                }
-                for a in absorbed.iter_mut() {
-                    for e in absorb_exprs_mut(a) {
-                        subst_temp_in_expr(e, vid, &value);
+            if !bail {
+                for pos in 0..inline.len() {
+                    let (vid, value, _) = inline[pos].clone();
+                    for later in inline.iter_mut().skip(pos + 1) {
+                        subst_temp_in_expr(&mut later.1, vid, &value);
+                    }
+                    for (_, v, _) in skip_vals.iter_mut() {
+                        subst_temp_in_expr(v, vid, &value);
+                    }
+                    for a in absorbed.iter_mut() {
+                        for e in absorb_exprs_mut(a) {
+                            subst_temp_in_expr(e, vid, &value);
+                        }
                     }
                 }
             }
@@ -664,30 +673,42 @@ pub(in crate::folds) fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mu
             Leaf::Raw(Stmt::Declare {
                 name,
                 mutable,
-                value,
+                mut value,
                 value_id,
             }) => {
-                let folded = match value {
+                let folded = match &mut value {
                     Expr::ObjectLit { entries } => {
-                        let mut out: Vec<ObjEntry> = entries
+                        let mut out: Vec<ObjEntry> = std::mem::take(entries)
                             .into_iter()
-                            .map(|(k, v)| ObjEntry::KeyValue(k, Expr::Lit(v)))
+                            .map(|(k, v)| match k {
+                                Lit::String(ref s) if s == "__proto__" => {
+                                    ObjEntry::Computed(Expr::Lit(k), Expr::Lit(v))
+                                }
+                                _ => ObjEntry::KeyValue(k, Expr::Lit(v)),
+                            })
                             .collect();
                         for a in absorbed {
                             match a {
-                                Absorb::ObjKV(k, v) => out.push(ObjEntry::KeyValue(k, v)),
+                                Absorb::ObjKV(k, v) => match k {
+                                    Lit::String(ref s) if s == "__proto__" => {
+                                        out.push(ObjEntry::Computed(Expr::Lit(k), v));
+                                    }
+                                    _ => out.push(ObjEntry::KeyValue(k, v)),
+                                },
                                 Absorb::ObjComputed(k, v) => out.push(ObjEntry::Computed(k, v)),
                                 Absorb::ObjSpread(s) => out.push(ObjEntry::Spread(s)),
                                 Absorb::ObjProto(p) => out.push(ObjEntry::Proto(p)),
                                 Absorb::ObjMethod(n, f) => out.push(ObjEntry::Method(n, f)),
                                 Absorb::ObjAccessors {
-                                    key,
+                                    mut key,
                                     getter,
                                     setter,
                                 } => {
-                                    let k = match key {
-                                        Expr::Lit(Lit::String(s)) => crate::expr::ObjKey::Name(s),
-                                        other => crate::expr::ObjKey::Computed(Box::new(other)),
+                                    let k = match &mut key {
+                                        Expr::Lit(Lit::String(s)) => {
+                                            crate::expr::ObjKey::Name(std::mem::take(s))
+                                        }
+                                        _ => crate::expr::ObjKey::Computed(Box::new(key)),
                                     };
                                     if let Some(g) = getter {
                                         out.push(ObjEntry::Getter(k.clone(), g));
@@ -704,7 +725,7 @@ pub(in crate::folds) fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mu
                         Expr::ObjectBuild { entries: out }
                     }
                     Expr::ArrayLit { elements } => {
-                        let mut out: Vec<ArrayElem> = elements
+                        let mut out: Vec<ArrayElem> = std::mem::take(elements)
                             .into_iter()
                             .map(|e| ArrayElem::Item(Expr::Lit(e)))
                             .collect();
@@ -811,13 +832,111 @@ pub(in crate::folds) fn absorb_exprs_mut(a: &mut Absorb) -> Vec<&mut Expr> {
     }
 }
 
-/// How often an expression references a temp by SSA value.
+/// How often an expression references a temp by SSA value (`O(|Expr|)`
+/// iterative stack walk, `#87.3`).
 pub(in crate::folds) fn expr_count_value(e: &Expr, vid: abcd_ir::ValueId) -> usize {
-    let mut n = usize::from(expr_uses_value(e, vid) && temp_value(e) == Some(vid));
-    for c in expr_children(e) {
-        n += expr_count_value(c, vid);
+    let mut n = 0usize;
+    let mut stack = vec![e];
+    while let Some(cur) = stack.pop() {
+        if temp_value(cur) == Some(vid) {
+            n += 1;
+        }
+        stack.extend(expr_children(cur));
     }
     n
+}
+
+fn expr_root_is_pure_for_lit(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Lit(_)
+            | Expr::Temp { .. }
+            | Expr::Closure { .. }
+            | Expr::RegExp { .. }
+            | Expr::ObjectLit { .. }
+            | Expr::ArrayLit { .. }
+            | Expr::Arguments
+            | Expr::NewTarget
+            | Expr::GlobalThis
+            | Expr::SelfFunction(_)
+            | Expr::SuperMarker
+            | Expr::ModuleNamespace { .. }
+            | Expr::Unary {
+                op: abcd_ir::op::UnOp::LogicalNot
+                    | abcd_ir::op::UnOp::IsTrue
+                    | abcd_ir::op::UnOp::IsFalse
+                    | abcd_ir::op::UnOp::Void
+                    | abcd_ir::op::UnOp::JumpEqz
+                    | abcd_ir::op::UnOp::JumpNez,
+                ..
+            }
+            | Expr::Compare {
+                op: abcd_ir::op::CmpOp::StrictEq | abcd_ir::op::CmpOp::StrictNotEq,
+                ..
+            }
+    )
+}
+
+/// Verify that inlining skipped `Declare`s into `absorbed` preserves the
+/// original leaf execution order of all non-pure expressions (`#87.3`).
+fn literal_eval_order_ok(
+    absorbed: &[Absorb],
+    absorbed_idx: &[usize],
+    inline: &[(abcd_ir::ValueId, Expr, usize)],
+) -> bool {
+    let inline_map: std::collections::HashMap<abcd_ir::ValueId, (&Expr, usize)> = inline
+        .iter()
+        .map(|(vid, expr, orig_j)| (*vid, (expr, *orig_j)))
+        .collect();
+    let mut last_effect_idx = 0usize;
+
+    for (m, a) in absorbed.iter().enumerate() {
+        let abs_j = absorbed_idx[m];
+        for root_expr in absorb_exprs(a) {
+            // Explicit post-order stack: `(expr, owner_leaf_idx, expanded)`.
+            let mut stack: Vec<(&Expr, usize, bool)> = vec![(root_expr, abs_j, false)];
+            let mut active_inlines: std::collections::HashSet<abcd_ir::ValueId> =
+                std::collections::HashSet::new();
+            let mut unmark_stack: Vec<abcd_ir::ValueId> = Vec::new();
+
+            while let Some((cur, owner_j, expanded)) = stack.pop() {
+                if expanded {
+                    if let Some(vid) = temp_value(cur)
+                        && inline_map.contains_key(&vid)
+                    {
+                        if let Some(done_vid) = unmark_stack.pop() {
+                            active_inlines.remove(&done_vid);
+                        }
+                        continue;
+                    }
+                    if !expr_root_is_pure_for_lit(cur) {
+                        if owner_j < last_effect_idx {
+                            return false;
+                        }
+                        last_effect_idx = owner_j;
+                    }
+                    continue;
+                }
+
+                if let Some(vid) = temp_value(cur)
+                    && let Some(&(inlined_expr, inlined_j)) = inline_map.get(&vid)
+                    && active_inlines.insert(vid)
+                {
+                    unmark_stack.push(vid);
+                    stack.push((cur, owner_j, true));
+                    stack.push((inlined_expr, inlined_j, false));
+                    continue;
+                }
+
+                stack.push((cur, owner_j, true));
+                let children = expr_children(cur);
+                for child in children.into_iter().rev() {
+                    stack.push((child, owner_j, false));
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Whether leaf `l` is a builder statement targeting temp `vid` that

@@ -125,7 +125,7 @@ mod scope;
 mod tests;
 
 use control::{fold_finally, fold_switches};
-use literals::{fold_leaves, fold_tagged_templates};
+use literals::fold_tagged_templates;
 use loops::{fold_loops, fold_single_pass_for_ins, sweep_dead_loop_exit_throws};
 
 pub use machines::{
@@ -211,27 +211,253 @@ pub struct FoldStats {
     pub dead_exit_throw: usize,
 }
 
-/// Run every fold over a structured body (recursive driver).
+/// Run every fold over a structured body.
 pub fn fold(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
     fold_seq(nodes, stats);
     fold_tagged_templates(nodes);
 }
 
-pub(in crate::folds) fn fold_seq(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
-    for n in nodes.iter_mut() {
-        fold_children(n, stats);
+/// Visit every `SNode::Stmts` leaf run in pre-order using an explicit heap stack.
+pub(in crate::folds) fn walk_stmts_runs_mut(
+    nodes: &mut [SNode],
+    mut f: impl FnMut(&mut Vec<Leaf>),
+) {
+    let mut stack: Vec<&mut [SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        for n in slice.iter_mut() {
+            match n {
+                SNode::Stmts(leaves) => f(leaves),
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        stack.push(fin);
+                    }
+                    for c in catches.iter_mut().rev() {
+                        stack.push(&mut c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter_mut().rev() {
+                        stack.push(&mut c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
     }
-    dissolve_rethrow_trys(nodes);
-    // d-P17 (N70 residual 2): after dissolution the async machine
-    // fold's dead loop-exit dispatch throw is a direct sibling of its
-    // loop — sweep it when provably unreachable (before the loop
-    // folds, while the header await temp the residue throws is still
-    // visible).
-    sweep_dead_loop_exit_throws(nodes, stats);
-    fold_loops(nodes, stats);
-    fold_single_pass_for_ins(nodes, stats);
-    fold_switches(nodes, stats);
-    fold_finally(nodes, stats);
+}
+
+/// Apply `f` to every `Vec<SNode>` sequence in left-to-right depth-first
+/// post-order (children before their enclosing sequence) without call-stack
+/// recursion.
+pub(in crate::folds) fn fold_snode_vecs_postorder(
+    nodes: &mut Vec<SNode>,
+    mut f: impl FnMut(&mut Vec<SNode>),
+) {
+    enum PostTask {
+        EnterSeq(Vec<SNode>),
+        FinishNode { shell: SNode, child_count: usize },
+        FinishSeq(usize),
+    }
+    let mut tasks = vec![PostTask::EnterSeq(std::mem::take(nodes))];
+    let mut done_seqs: Vec<Vec<SNode>> = Vec::new();
+    let mut done_nodes: Vec<SNode> = Vec::new();
+
+    while let Some(task) = tasks.pop() {
+        match task {
+            PostTask::EnterSeq(mut seq) => {
+                let has_compound = seq.iter().any(|n| {
+                    !matches!(
+                        n,
+                        SNode::Stmts(_)
+                            | SNode::Break { .. }
+                            | SNode::Continue { .. }
+                            | SNode::Honest(_)
+                    )
+                });
+                if !has_compound {
+                    f(&mut seq);
+                    done_seqs.push(seq);
+                    continue;
+                }
+                tasks.push(PostTask::FinishSeq(seq.len()));
+                for mut n in seq.into_iter().rev() {
+                    match &mut n {
+                        SNode::Stmts(_)
+                        | SNode::Break { .. }
+                        | SNode::Continue { .. }
+                        | SNode::Honest(_) => {
+                            tasks.push(PostTask::FinishNode {
+                                shell: n,
+                                child_count: 0,
+                            });
+                        }
+                        SNode::If {
+                            then, otherwise, ..
+                        } => {
+                            let t = std::mem::take(then);
+                            let o = std::mem::take(otherwise);
+                            tasks.push(PostTask::FinishNode {
+                                shell: n,
+                                child_count: 2,
+                            });
+                            tasks.push(PostTask::EnterSeq(o));
+                            tasks.push(PostTask::EnterSeq(t));
+                        }
+                        SNode::While { body, .. }
+                        | SNode::DoWhile { body, .. }
+                        | SNode::Labeled { body, .. }
+                        | SNode::ForOf { body, .. }
+                        | SNode::ForIn { body, .. } => {
+                            let b = std::mem::take(body);
+                            tasks.push(PostTask::FinishNode {
+                                shell: n,
+                                child_count: 1,
+                            });
+                            tasks.push(PostTask::EnterSeq(b));
+                        }
+                        SNode::Try {
+                            body,
+                            catches,
+                            finally,
+                            ..
+                        } => {
+                            let b = std::mem::take(body);
+                            let mut c_seqs: Vec<Vec<SNode>> = catches
+                                .iter_mut()
+                                .map(|c| std::mem::take(&mut c.body))
+                                .collect();
+                            let fin = finally.as_mut().map(std::mem::take);
+                            let child_count = 1 + c_seqs.len() + usize::from(fin.is_some());
+                            tasks.push(PostTask::FinishNode {
+                                shell: n,
+                                child_count,
+                            });
+                            if let Some(fseq) = fin {
+                                tasks.push(PostTask::EnterSeq(fseq));
+                            }
+                            while let Some(cseq) = c_seqs.pop() {
+                                tasks.push(PostTask::EnterSeq(cseq));
+                            }
+                            tasks.push(PostTask::EnterSeq(b));
+                        }
+                        SNode::Switch { cases, .. } => {
+                            let mut c_seqs: Vec<Vec<SNode>> = cases
+                                .iter_mut()
+                                .map(|c| std::mem::take(&mut c.body))
+                                .collect();
+                            let child_count = c_seqs.len();
+                            tasks.push(PostTask::FinishNode {
+                                shell: n,
+                                child_count,
+                            });
+                            while let Some(cseq) = c_seqs.pop() {
+                                tasks.push(PostTask::EnterSeq(cseq));
+                            }
+                        }
+                    }
+                }
+            }
+            PostTask::FinishNode {
+                mut shell,
+                child_count,
+            } => {
+                if child_count > 0 {
+                    let mut children = done_seqs.split_off(done_seqs.len() - child_count);
+                    let mut it = children.drain(..);
+                    match &mut shell {
+                        SNode::If {
+                            then, otherwise, ..
+                        } => {
+                            *then = it.next().unwrap_or_default();
+                            *otherwise = it.next().unwrap_or_default();
+                        }
+                        SNode::While { body, .. }
+                        | SNode::DoWhile { body, .. }
+                        | SNode::Labeled { body, .. }
+                        | SNode::ForOf { body, .. }
+                        | SNode::ForIn { body, .. } => {
+                            *body = it.next().unwrap_or_default();
+                        }
+                        SNode::Try {
+                            body,
+                            catches,
+                            finally,
+                            ..
+                        } => {
+                            *body = it.next().unwrap_or_default();
+                            for c in catches.iter_mut() {
+                                c.body = it.next().unwrap_or_default();
+                            }
+                            if let Some(fin) = finally.as_mut() {
+                                *fin = it.next().unwrap_or_default();
+                            }
+                        }
+                        SNode::Switch { cases, .. } => {
+                            for c in cases.iter_mut() {
+                                c.body = it.next().unwrap_or_default();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                done_nodes.push(shell);
+            }
+            PostTask::FinishSeq(len) => {
+                let mut seq = done_nodes.split_off(done_nodes.len() - len);
+                f(&mut seq);
+                done_seqs.push(seq);
+            }
+        }
+    }
+    *nodes = done_seqs.pop().unwrap_or_default();
+}
+
+fn fold_all_rest_destructure(nodes: &mut [SNode], stats: &mut FoldStats) {
+    walk_stmts_runs_mut(nodes, |leaves| {
+        literals::fold_rest_destructure(leaves, stats);
+    });
+}
+
+pub(in crate::folds) fn fold_seq(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
+    fold_all_rest_destructure(nodes, stats);
+    let mut use_counts = BTreeMap::new();
+    count_temp_uses(nodes, &mut use_counts);
+    fold_seq_with_uses(nodes, Some(&use_counts), stats);
+}
+
+fn fold_seq_with_uses(
+    nodes: &mut Vec<SNode>,
+    global_uses: Option<&BTreeMap<ValueId, usize>>,
+    stats: &mut FoldStats,
+) {
+    walk_stmts_runs_mut(nodes, |leaves| {
+        literals::fold_leaves_with_uses(leaves, global_uses, stats);
+    });
+    fold_snode_vecs_postorder(nodes, |seq| {
+        dissolve_rethrow_trys(seq);
+        sweep_dead_loop_exit_throws(seq, stats);
+        fold_loops(seq, stats);
+        fold_single_pass_for_ins(seq, stats);
+        fold_switches(seq, stats);
+        fold_finally(seq, stats);
+    });
 }
 
 /// Dissolve `try { X } catch (e) { throw e; }` wrappers — a semantic
@@ -269,49 +495,19 @@ pub(in crate::folds) fn dissolve_rethrow_trys(nodes: &mut Vec<SNode>) {
             _ => false,
         };
         if dissolve {
-            let SNode::Try { body, .. } = nodes.remove(i) else {
+            let mut removed = nodes.remove(i);
+            let SNode::Try { body, .. } = &mut removed else {
                 unreachable!()
             };
             let mut replacement: Vec<SNode> = vec![SNode::Honest(
                 "rethrow-only try/catch dissolved (semantic no-op)".to_string(),
             )];
-            replacement.extend(body);
+            replacement.extend(std::mem::take(body));
             nodes.splice(i..i, replacement);
             i += 1;
         } else {
             i += 1;
         }
-    }
-}
-
-pub(in crate::folds) fn fold_children(n: &mut SNode, stats: &mut FoldStats) {
-    match n {
-        SNode::Stmts(leaves) => fold_leaves(leaves, stats),
-        SNode::If {
-            then, otherwise, ..
-        } => {
-            fold_seq(then, stats);
-            fold_seq(otherwise, stats);
-        }
-        SNode::While { body, .. } | SNode::DoWhile { body, .. } | SNode::Labeled { body, .. } => {
-            fold_seq(body, stats)
-        }
-        SNode::Try { body, catches, .. } => {
-            fold_seq(body, stats);
-            for c in catches {
-                fold_seq(&mut c.body, stats);
-            }
-        }
-        // unreachable: fold_children runs per-list strictly BEFORE the list
-        // folds that create ForOf/ForIn/Switch nodes (folds.rs:200-213), and
-        // no list is re-walked — c-COV diagnosis
-        SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => fold_seq(body, stats),
-        SNode::Switch { cases, .. } => {
-            for c in cases {
-                fold_seq(&mut c.body, stats);
-            }
-        }
-        SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
     }
 }
 
@@ -334,12 +530,16 @@ pub(in crate::folds) fn temp_value(e: &Expr) -> Option<abcd_ir::ValueId> {
     }
 }
 
-/// Whether the expression mentions a temp with SSA value `vid`.
+/// Whether the expression mentions a temp with SSA value `vid` (iterative).
 pub(in crate::folds) fn expr_uses_value(e: &Expr, vid: abcd_ir::ValueId) -> bool {
-    temp_value(e) == Some(vid)
-        || expr_children(e)
-            .into_iter()
-            .any(|c| expr_uses_value(c, vid))
+    let mut stack = vec![e];
+    while let Some(cur) = stack.pop() {
+        if temp_value(cur) == Some(vid) {
+            return true;
+        }
+        stack.extend(expr_children(cur));
+    }
+    false
 }
 
 /// Whether any leaf in the list mentions a temp named `name`.
@@ -399,14 +599,16 @@ pub(in crate::folds) fn stmt_uses_name(s: &Stmt, name: &str) -> bool {
     }
 }
 
-/// Whether an expression mentions a temp/ident with `name`.
+/// Whether an expression mentions a temp/ident with `name` (iterative).
 pub(in crate::folds) fn expr_uses_name(e: &Expr, name: &str) -> bool {
-    match e {
-        Expr::Temp { name: n, .. } | Expr::Ident(n) => n == name,
-        _ => expr_children(e)
-            .into_iter()
-            .any(|c| expr_uses_name(c, name)),
+    let mut stack = vec![e];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Temp { name: n, .. } | Expr::Ident(n) if n == name => return true,
+            _ => stack.extend(expr_children(cur)),
+        }
     }
+    false
 }
 
 /// All direct child expressions (for the name walker).
@@ -665,39 +867,48 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
     out
 }
 
-/// Walk every leaf of a structured tree (immutable).
+/// Walk every leaf of a structured tree in pre-order (iterative).
 pub(in crate::folds) fn walk_leaves(nodes: &[SNode], f: &mut impl FnMut(&Leaf)) {
-    for n in nodes {
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        if slice.is_empty() {
+            continue;
+        }
+        let n = &slice[0];
+        let rest = &slice[1..];
+        if !rest.is_empty() {
+            stack.push(rest);
+        }
         match n {
             SNode::Stmts(run) => run.iter().for_each(&mut *f),
             SNode::If {
                 then, otherwise, ..
             } => {
-                walk_leaves(then, f);
-                walk_leaves(otherwise, f);
+                stack.push(otherwise);
+                stack.push(then);
             }
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => walk_leaves(body, f),
+            | SNode::ForIn { body, .. } => stack.push(body),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                walk_leaves(body, f);
-                for c in catches {
-                    walk_leaves(&c.body, f);
-                }
                 if let Some(fin) = finally {
-                    walk_leaves(fin, f);
+                    stack.push(fin);
                 }
+                for c in catches.iter().rev() {
+                    stack.push(&c.body);
+                }
+                stack.push(body);
             }
             SNode::Switch { cases, .. } => {
-                for c in cases {
-                    walk_leaves(&c.body, f);
+                for c in cases.iter().rev() {
+                    stack.push(&c.body);
                 }
             }
             SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
@@ -705,127 +916,181 @@ pub(in crate::folds) fn walk_leaves(nodes: &[SNode], f: &mut impl FnMut(&Leaf)) 
     }
 }
 
-/// Does any expression in the tree reference the given temp value?
-/// N74-W4: node CONDITION/discriminant expressions count too —
-/// `walk_leaves` never visits them, which dropped the `const t = yield
-/// v` binding when the resumption value was only read by an `if`/`while`
-/// test (test262 methods-gen-yield-as-expression-*: `if (!v388)`).
+/// Does any expression in the tree reference the given temp value? (iterative)
 pub(in crate::folds) fn nodes_use_temp(nodes: &[SNode], id: ValueId) -> bool {
-    fn expr_uses(e: &Expr, id: ValueId) -> bool {
-        if temp_value(e) == Some(id) {
-            return true;
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        for n in slice {
+            match n {
+                SNode::Stmts(run) => {
+                    if run
+                        .iter()
+                        .any(|l| leaf_exprs(l).iter().any(|e| expr_uses_value(e, id)))
+                    {
+                        return true;
+                    }
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    if expr_uses_value(cond, id) {
+                        return true;
+                    }
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if cond.as_ref().is_some_and(|c| expr_uses_value(c, id)) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    if expr_uses_value(cond, id) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::ForOf { iter, body, .. } => {
+                    if expr_uses_value(iter, id) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    if expr_uses_value(obj, id) {
+                        return true;
+                    }
+                    stack.push(body);
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        stack.push(fin);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    if expr_uses_value(disc, id) {
+                        return true;
+                    }
+                    for c in cases.iter().rev() {
+                        if c.tests.iter().any(|t| expr_uses_value(t, id)) {
+                            return true;
+                        }
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
         }
-        expr_children(e).iter().any(|c| expr_uses(c, id))
     }
-    fn node_uses(n: &SNode, id: ValueId) -> bool {
-        match n {
-            SNode::Stmts(run) => run
-                .iter()
-                .any(|l| leaf_exprs(l).iter().any(|e| expr_uses(e, id))),
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => expr_uses(cond, id) || nodes_use_temp(then, id) || nodes_use_temp(otherwise, id),
-            SNode::While { cond, body, .. } => {
-                cond.as_ref().is_some_and(|c| expr_uses(c, id)) || nodes_use_temp(body, id)
-            }
-            SNode::DoWhile { body, cond, .. } => nodes_use_temp(body, id) || expr_uses(cond, id),
-            SNode::Labeled { body, .. } => nodes_use_temp(body, id),
-            SNode::ForOf { iter, body, .. } => expr_uses(iter, id) || nodes_use_temp(body, id),
-            SNode::ForIn { obj, body, .. } => expr_uses(obj, id) || nodes_use_temp(body, id),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                nodes_use_temp(body, id)
-                    || catches.iter().any(|c| nodes_use_temp(&c.body, id))
-                    || finally.as_ref().is_some_and(|f| nodes_use_temp(f, id))
-            }
-            SNode::Switch { disc, cases } => {
-                expr_uses(disc, id)
-                    || cases.iter().any(|c| {
-                        c.tests.iter().any(|t| expr_uses(t, id)) || nodes_use_temp(&c.body, id)
-                    })
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
-        }
-    }
-    nodes.iter().any(|n| node_uses(n, id))
+    false
 }
 
-/// Count temp references over the whole tree (for the dead-decl sweep).
+/// Count temp references over the whole `SNode` tree, including all control
+/// header expressions (`If.cond`, `While.cond`, `DoWhile.cond`, `ForOf.iter`,
+/// `ForIn.obj`, `Switch.disc`, `SwitchCase.tests`), `Try.{body, catches, finally}`,
+/// and `Leaf` expressions (`#87.1`, iterative with zero recursion).
 pub(in crate::folds) fn count_temp_uses(nodes: &[SNode], uses: &mut BTreeMap<ValueId, usize>) {
-    fn count_expr(e: &Expr, uses: &mut BTreeMap<ValueId, usize>) {
-        if let Expr::Temp { value, .. } = e {
-            *uses.entry(*value).or_insert(0) += 1;
-        }
-        for c in expr_children(e) {
-            count_expr(c, uses);
+    fn count_expr(root: &Expr, uses: &mut BTreeMap<ValueId, usize>) {
+        let mut estack = vec![root];
+        while let Some(e) = estack.pop() {
+            if let Expr::Temp { value, .. } = e {
+                *uses.entry(*value).or_insert(0) += 1;
+            }
+            estack.extend(expr_children(e));
         }
     }
-    walk_leaves(nodes, &mut |l| {
-        for e in leaf_exprs(l) {
-            count_expr(e, uses);
+    let mut nstack: Vec<&[SNode]> = vec![nodes];
+    while let Some(slice) = nstack.pop() {
+        for n in slice {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        for e in leaf_exprs(l) {
+                            count_expr(e, uses);
+                        }
+                    }
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    count_expr(cond, uses);
+                    nstack.push(otherwise);
+                    nstack.push(then);
+                }
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        count_expr(c, uses);
+                    }
+                    nstack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    count_expr(cond, uses);
+                    nstack.push(body);
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    count_expr(iter, uses);
+                    nstack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    count_expr(obj, uses);
+                    nstack.push(body);
+                }
+                SNode::Labeled { body, .. } => nstack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        nstack.push(fin);
+                    }
+                    for c in catches {
+                        nstack.push(&c.body);
+                    }
+                    nstack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    count_expr(disc, uses);
+                    for c in cases {
+                        for t in &c.tests {
+                            count_expr(t, uses);
+                        }
+                        nstack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
         }
-    });
+    }
 }
 
 /// Remove `Declare` leaves whose SSA value is in `dead` (callers prove
 /// zero remaining uses first).
 pub(in crate::folds) fn sweep_dead_decls(nodes: &mut [SNode], dead: &BTreeSet<ValueId>) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::Stmts(run) => run.retain(|l| {
-                !matches!(
-                    l,
-                    Leaf::Raw(Stmt::Declare { value_id, .. }) if dead.contains(value_id)
-                )
-            }),
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                sweep_dead_decls(then, dead);
-                sweep_dead_decls(otherwise, dead);
-            }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577); sweep_dead_decls runs only from the
-            // generator/async machine folds, all before fold() — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => sweep_dead_decls(body, dead),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                sweep_dead_decls(body, dead);
-                for c in catches {
-                    sweep_dead_decls(&mut c.body, dead);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after the
-                // generator/async machine folds — c-COV diagnosis
-                if let Some(f) = finally {
-                    sweep_dead_decls(f, dead);
-                }
-            }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after the
-            // generator/async machine folds — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    sweep_dead_decls(&mut c.body, dead);
-                }
-            }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-        }
-    }
+    walk_stmts_runs_mut(nodes, |run| {
+        run.retain(|l| {
+            !matches!(
+                l,
+                Leaf::Raw(Stmt::Declare { value_id, .. }) if dead.contains(value_id)
+            )
+        });
+    });
 }
 
 /// The expressions a leaf carries (for temp-use walks).

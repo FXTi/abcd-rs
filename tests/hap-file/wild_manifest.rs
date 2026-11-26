@@ -26,16 +26,16 @@ pub struct Package {
     pub path: String,
     /// SHA-256 of the package bytes (provenance; the gate reads the files
     /// fresh, so this is informational).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "deserialized manifest provenance field")]
     pub sha256: String,
     /// Package size in bytes (informational).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "deserialized manifest provenance field")]
     pub size: u64,
     /// .abc layout class: merged | per-ability | fa-assets (informational).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "deserialized manifest provenance field")]
     pub abc_layout: String,
     /// Declaring module name (informational).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "deserialized manifest provenance field")]
     pub module_name: String,
     pub expectation: Expectation,
 }

@@ -1,4 +1,7 @@
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "emit unit tests import sibling submodule items via wildcard"
+)]
 use super::{decl::*, expr::*, *};
 use abcd_ir::function::{Block, FunctionData, Inst, Value};
 use abcd_ir::id::{BlockId, ClassId, InstId, ValueId};
@@ -88,6 +91,7 @@ fn emitter<'m>(module: &'m Module, opts: &'m EmitOptions) -> Emitter<'m> {
         class_depth: 0,
         hoisted: BTreeSet::new(),
         prepared: BTreeMap::new(),
+        emitting_funcs: HashSet::new(),
     }
 }
 
@@ -1405,30 +1409,11 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
 
                 let batch = collect_batch_funcs(&m, &[chain[0]]);
                 assert_eq!(batch.len(), chain_len);
+                drop((rf, deep_nodes));
             })
             .expect("spawn 256k scoped thread");
         handle.join().expect("256k thread must not stack-overflow");
     });
-
-    // Iteratively dismantle deep trees so test teardown itself uses O(1) stack.
-    let mut rf = rf;
-    if let Some(Stmt::Expr(mut cur)) = rf.blocks[0].stmts.pop() {
-        while let Expr::Unary { operand, .. } = cur {
-            cur = *operand;
-        }
-    }
-    while let Some(node) = deep_nodes.pop() {
-        match node {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                deep_nodes.extend(then);
-                deep_nodes.extend(otherwise);
-            }
-            SNode::DoWhile { body, .. } => deep_nodes.extend(body),
-            _ => {}
-        }
-    }
 }
 
 #[test]

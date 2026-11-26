@@ -8,7 +8,10 @@
 //!   `abcd-lift/tests/corpus_lift_verify.rs`.
 
 // Each test binary uses a different subset.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared integration test harness helpers used selectively across test modules"
+)]
 
 use std::path::PathBuf;
 use std::process::Command;

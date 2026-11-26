@@ -7,8 +7,10 @@
 //! but diverge semantically — here `add_param` derives the index from
 //! `params.len()` and `add` encodes the N36 acc/vreg operand swap.
 
-// Each test binary uses a different subset.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared hand-built IR scaffolding; each decompile test target uses a subset of helpers"
+)]
 
 use abcd_ir::consts::Const;
 use abcd_ir::function::{Block, Catch, FunctionData, Inst, TryRegion, Value};

@@ -107,8 +107,11 @@ fn rewrite_check_path_passes_on_valid_pipeline_output() {
         check: true,
     };
     let out = rewrite::rewrite(&module, opts).expect("rewrite --check");
-    // --check already re-decoded internally; the bytes must still decode
-    // for an independent reader.
+    // --check already re-decoded, re-lifted, and re-verified internally; confirm
+    // independently that the emitted bytes decode, lift, and pass verify_module.
+    let redecoded = abcd_file::decode(&out.abc).expect("redecode");
+    let relifted = abcd_lift::lift_file(&redecoded).expect("relift");
+    assert!(abcd_ir::verify_module(&relifted).is_ok());
     let (out_methods, _) = shape(&out.abc);
     assert_eq!(out_methods, 1);
 }

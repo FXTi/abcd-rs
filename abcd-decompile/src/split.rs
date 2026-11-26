@@ -80,8 +80,9 @@ const SYNTHETIC_DESCRIPTORS: &[&str] = &[
 /// Windows reserved device basenames (case-insensitive) that must not be
 /// emitted raw onto portable filesystems.
 const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9",
 ];
 
 /// Normalize an `.abc` class descriptor or OHMUrl record identifier into a
@@ -138,16 +139,17 @@ pub fn normalize_record_path(descriptor: &str, is_json: bool, ext: &str) -> Opti
                 break;
             }
         }
-        if is_windows_reserved(last) {
-            last.push('_');
-        }
+        let trimmed = last.trim_end_matches(['.', ' ']).to_string();
+        *last = if trimmed.is_empty() {
+            "_".to_string()
+        } else {
+            escape_windows_reserved_segment(&trimmed)
+        };
         last.push('.');
         last.push_str(target_ext);
     }
     for seg in segments.iter_mut().rev().skip(1) {
-        if is_windows_reserved(seg) {
-            seg.push('_');
-        }
+        *seg = escape_windows_reserved_segment(seg);
     }
     Some(segments.join("/"))
 }
@@ -194,11 +196,31 @@ fn sanitize_path_segment(seg: &str) -> String {
     trimmed.to_string()
 }
 
-fn is_windows_reserved(stem: &str) -> bool {
-    let base = stem.split('.').next().unwrap_or(stem);
-    WINDOWS_RESERVED
+/// Escape Windows reserved device names on the stem BEFORE the first `.`
+/// (`aux.config` -> `aux_.config`, `CONIN$` -> `CONIN$_`), and strip any
+/// trailing dots/spaces before `.` so segments are portable across NTFS/APFS/ext4.
+fn escape_windows_reserved_segment(seg: &str) -> String {
+    let (raw_stem, rest) = match seg.find('.') {
+        Some(dot) => (&seg[..dot], &seg[dot..]),
+        None => (seg, ""),
+    };
+    if raw_stem.is_empty() {
+        return seg.to_string();
+    }
+    let stem = raw_stem.trim_end_matches(['.', ' ']);
+    if stem.is_empty() {
+        return format!("_{rest}");
+    }
+    if WINDOWS_RESERVED
         .iter()
-        .any(|&r| base.eq_ignore_ascii_case(r))
+        .any(|&r| stem.eq_ignore_ascii_case(r))
+    {
+        format!("{stem}_{rest}")
+    } else if stem.len() != raw_stem.len() {
+        format!("{stem}{rest}")
+    } else {
+        seg.to_string()
+    }
 }
 
 /// Whether `cls` carries a `--merge-abc` `jsonFileContent` string field.
@@ -531,6 +553,7 @@ where
                 class_depth: 0,
                 hoisted: BTreeSet::new(),
                 prepared: std::mem::take(&mut batch_prepared),
+                emitting_funcs: HashSet::new(),
             };
 
             let text = emit_single_record(
@@ -586,7 +609,7 @@ fn is_standalone_single_module(module: &Module) -> bool {
 }
 
 fn disambiguate_path(base: String, used: &mut BTreeSet<String>) -> String {
-    if used.insert(base.clone()) {
+    if used.insert(base.to_ascii_lowercase()) {
         return base;
     }
     let (stem, ext) = match base.rfind('.') {
@@ -596,7 +619,7 @@ fn disambiguate_path(base: String, used: &mut BTreeSet<String>) -> String {
     let mut n = 1usize;
     loop {
         let cand = format!("{stem}${n}{ext}");
-        if used.insert(cand.clone()) {
+        if used.insert(cand.to_ascii_lowercase()) {
             return cand;
         }
         n += 1;
@@ -636,7 +659,10 @@ struct PlannedRecord {
     kind: SplitFileKind,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "per-record split emitter threads record metadata, ESM tables, function slices, and specifier maps"
+)]
 fn emit_single_record(
     em: &mut Emitter<'_>,
     cid: ClassId,
@@ -814,7 +840,12 @@ fn emit_single_record(
     if let Some(esm) = esm {
         for exp in &esm.exports {
             if let ExportDecl::Local { local_name, .. } = exp {
-                let local = sanitize(&sym_str(module, *local_name));
+                let local = crate::emit::resolve_export_local_ident(
+                    module,
+                    &esm.exports,
+                    record_env,
+                    &sym_str(module, *local_name),
+                );
                 if !declared_locals.contains(&local)
                     && !globals.contains(&local)
                     && !record_globals.contains(&local)
@@ -903,7 +934,12 @@ fn emit_single_record(
                     local_name,
                     export_name,
                 } => {
-                    let local = sanitize(&sym_str(module, *local_name));
+                    let local = crate::emit::resolve_export_local_ident(
+                        module,
+                        &esm.exports,
+                        record_env,
+                        &sym_str(module, *local_name),
+                    );
                     let export = module_facing_name(&sym_str(module, *export_name));
                     if local == export {
                         out.push_str(&format!("export {{ {local} }};\n"));

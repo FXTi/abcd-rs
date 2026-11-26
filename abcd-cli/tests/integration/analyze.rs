@@ -617,11 +617,13 @@ fn alias_rungs_progressively_refine_call_graph_and_report_pta_telemetry() {
 
     let r2_text = analyze::render_text(&r2);
     assert!(r2_text.contains("pta:             rung 2,"), "{r2_text}");
+    assert!(r2_text.contains("pta root sliced: false\n"), "{r2_text}");
     assert!(!r2_text.contains(", capped"), "{r2_text}");
     let r2_json: serde_json::Value =
         serde_json::from_str(&analyze::render(&[r2], true).unwrap()).unwrap();
     assert_eq!(r2_json["pta"]["alias_rung_used"], 2);
     assert_eq!(r2_json["pta"]["capped"], false);
+    assert_eq!(r2_json["pta"]["root_sliced"], false);
 }
 
 #[test]
@@ -711,4 +713,58 @@ fn cli_analyze_pta_and_alias_rung_dispatch_end_to_end() {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         abcd_cli::run(cli).expect("analyze dispatch must succeed");
     }
+
+    // `--pta` with `--alias-rung < 2` or `--pta-budget` with effective rung < 2
+    // must fail with exit code 1 (`CliError::User`).
+    for bad_argv in [
+        &["abcd", "analyze", abc, "--pta", "--alias-rung", "0"][..],
+        &["abcd", "analyze", abc, "--pta", "--alias-rung", "1"][..],
+        &["abcd", "analyze", abc, "--pta-budget", "100"][..],
+        &[
+            "abcd",
+            "analyze",
+            abc,
+            "--pta-budget",
+            "100",
+            "--alias-rung",
+            "0",
+        ][..],
+        &[
+            "abcd",
+            "analyze",
+            abc,
+            "--pta-budget",
+            "100",
+            "--alias-rung",
+            "1",
+        ][..],
+    ] {
+        let cli = Cli::try_parse_from(bad_argv).expect("argv must parse");
+        let err = abcd_cli::run(cli).expect_err("conflicting pta flags must fail");
+        assert_eq!(err.exit_code(), 1, "bad_argv={bad_argv:?} -> {err}");
+        assert!(
+            err.to_string().contains("--alias-rung 2"),
+            "bad_argv={bad_argv:?} -> {err}"
+        );
+    }
+}
+
+#[test]
+fn pta_report_surfaces_root_sliced_true_in_text_and_json() {
+    let mut rep = analyze(
+        &pta_calls_abc(),
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: false,
+            dominators: false,
+            alias_rung: 2,
+            pta_budget: None,
+        },
+    );
+    rep.pta.as_mut().expect("pta report").root_sliced = true;
+    let text = analyze::render_text(&rep);
+    assert!(text.contains("pta root sliced: true\n"), "{text}");
+    let json: serde_json::Value =
+        serde_json::from_str(&analyze::render(&[rep], true).unwrap()).unwrap();
+    assert_eq!(json["pta"]["root_sliced"], true);
 }

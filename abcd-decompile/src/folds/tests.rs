@@ -9,7 +9,10 @@
 // shapes, computed-key/`__proto__` literal builders, and per-matcher
 // near-miss bail pins (one mutation per checkpoint group, not per
 // line).
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "wildcard fold test prelude re-exports sibling module helpers"
+)]
 use super::{
     control::*,
     literals::*,
@@ -8110,6 +8113,15 @@ fn yield_star_async_positive() {
         ],
         "{nodes:?}"
     );
+    // Stripped catch-context `PhiAssign` placeholders (`run(vec![])`) left by
+    // `async_generator_machine_fold` inside the loop body are pruned at entry.
+    let mut with_empty = ys_async_shape();
+    if let SNode::While { body, .. } = ys_while(&mut with_empty) {
+        body.insert(1, run(vec![]));
+    }
+    let mut stats2 = FoldStats::default();
+    yield_star_fold(&mut with_empty, FunctionKind::AsyncGenerator, &mut stats2);
+    assert_eq!(stats2.yield_star_sites, 1);
 }
 
 #[test]

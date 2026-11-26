@@ -34,7 +34,7 @@ pub enum NodeStatus {
 }
 
 /// A literal, rendered from [`abcd_ir::Const`] trees.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Lit {
     /// `undefined`.
     Undefined,
@@ -72,7 +72,7 @@ pub enum Lit {
 }
 
 /// An expression-tree node.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Expr {
     /// A literal.
     Lit(Lit),
@@ -524,6 +524,25 @@ pub enum IterOp {
 }
 
 impl Expr {
+    /// Whether this expression prints with a leading `-` token as a numeric
+    /// or BigInt literal (`-0.0`, `-1.0`, `-Infinity`, `-42n`, negative `Int64`).
+    ///
+    /// In JS grammar, `-1` is a `UnaryExpression` (`Unary` + `NumericLiteral`),
+    /// NOT a `PrimaryExpression`, so member access (`(-1.0).constructor`),
+    /// exponentiation LHS (`(-2.0) ** x`), and outer unary `+`/`-` (`-(-3.0)`)
+    /// must parenthesize it.
+    pub fn is_negative_numeric_lit(&self) -> bool {
+        match self {
+            Expr::Lit(Lit::Number(bits)) => {
+                let v = f64::from_bits(*bits);
+                !v.is_nan() && v.is_sign_negative()
+            }
+            Expr::Lit(Lit::Int64(v)) => *v < 0,
+            Expr::Lit(Lit::BigInt(s)) => s.starts_with('-'),
+            _ => false,
+        }
+    }
+
     /// The JS operator precedence of this node's root (higher binds
     /// tighter; 20 = primary). Metadata for the Stage-C printer; the
     /// Stage-A dump prints fully parenthesized.
@@ -548,7 +567,9 @@ impl Expr {
                 CmpOp::Eq | CmpOp::NotEq | CmpOp::StrictEq | CmpOp::StrictNotEq => 11,
                 _ => 12,
             },
+            Expr::PrivateTest { .. } => 12,
             Expr::Unary { .. } | Expr::Delete { .. } | Expr::Await { .. } => 17,
+            e if e.is_negative_numeric_lit() => 17,
             // `yield`/`yield*` parse as AssignmentExpressions: as the
             // operand of any real operator they MUST be parenthesized
             // (`yield v + w` means `yield (v + w)`).
@@ -569,5 +590,1403 @@ impl Expr {
             | Expr::PrivateLoad { .. } => 19,
             _ => 20,
         }
+    }
+}
+
+// ── Iterative Drop / Clone / PartialEq (Issue #88: 256 KiB stack guarantee) ──
+
+impl Lit {
+    /// Extract the inner element vector when `self` is [`Lit::Array`].
+    pub(crate) fn into_array(mut self) -> Option<Vec<Lit>> {
+        match &mut self {
+            Lit::Array(items) => Some(std::mem::take(items)),
+            _ => None,
+        }
+    }
+
+    /// Extract the inner string when `self` is [`Lit::String`].
+    pub(crate) fn into_string(mut self) -> Option<String> {
+        match &mut self {
+            Lit::String(s) => Some(std::mem::take(s)),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Lit {
+    fn drop(&mut self) {
+        let mut stack: Vec<Lit> = Vec::new();
+        match self {
+            Lit::Array(items) if !items.is_empty() => {
+                stack.extend(std::mem::take(items));
+            }
+            Lit::Object(entries) if !entries.is_empty() => {
+                for (k, v) in std::mem::take(entries) {
+                    stack.push(k);
+                    stack.push(v);
+                }
+            }
+            _ => return,
+        }
+        while let Some(mut cur) = stack.pop() {
+            match &mut cur {
+                Lit::Array(items) => stack.extend(std::mem::take(items)),
+                Lit::Object(entries) => {
+                    for (k, v) in std::mem::take(entries) {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Clone for Lit {
+    fn clone(&self) -> Self {
+        fn clone_flat_lit(lit: &Lit) -> Option<Lit> {
+            match lit {
+                Lit::Undefined => Some(Lit::Undefined),
+                Lit::Hole => Some(Lit::Hole),
+                Lit::Null => Some(Lit::Null),
+                Lit::Bool(b) => Some(Lit::Bool(*b)),
+                Lit::Number(n) => Some(Lit::Number(*n)),
+                Lit::Int64(n) => Some(Lit::Int64(*n)),
+                Lit::UInt64(n) => Some(Lit::UInt64(*n)),
+                Lit::String(s) => Some(Lit::String(s.clone())),
+                Lit::Utf16(u) => Some(Lit::Utf16(u.clone())),
+                Lit::BigInt(s) => Some(Lit::BigInt(s.clone())),
+                Lit::MethodRef(f) => Some(Lit::MethodRef(*f)),
+                Lit::Array(items) if items.is_empty() => Some(Lit::Array(Vec::new())),
+                Lit::Object(entries) if entries.is_empty() => Some(Lit::Object(Vec::new())),
+                Lit::Array(_) | Lit::Object(_) => None,
+            }
+        }
+
+        if let Some(flat) = clone_flat_lit(self) {
+            return flat;
+        }
+
+        enum Step<'a> {
+            Eval(&'a Lit),
+            BuildArray(usize),
+            BuildObject(usize),
+        }
+
+        let mut steps: Vec<Step<'_>> = vec![Step::Eval(self)];
+        let mut vals: Vec<Lit> = Vec::new();
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Eval(lit) => {
+                    if let Some(flat) = clone_flat_lit(lit) {
+                        vals.push(flat);
+                    } else {
+                        match lit {
+                            Lit::Array(items) => {
+                                steps.push(Step::BuildArray(items.len()));
+                                for it in items.iter().rev() {
+                                    steps.push(Step::Eval(it));
+                                }
+                            }
+                            Lit::Object(entries) => {
+                                steps.push(Step::BuildObject(entries.len()));
+                                for (k, v) in entries.iter().rev() {
+                                    steps.push(Step::Eval(v));
+                                    steps.push(Step::Eval(k));
+                                }
+                            }
+                            _ => vals.push(Lit::Undefined),
+                        }
+                    }
+                }
+                Step::BuildArray(n) => {
+                    let start = vals.len().saturating_sub(n);
+                    let arr = vals.split_off(start);
+                    vals.push(Lit::Array(arr));
+                }
+                Step::BuildObject(n) => {
+                    let start = vals.len().saturating_sub(n.saturating_mul(2));
+                    let mut drain = vals.drain(start..);
+                    let mut pairs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let k = drain.next().unwrap_or(Lit::Undefined);
+                        let v = drain.next().unwrap_or(Lit::Undefined);
+                        pairs.push((k, v));
+                    }
+                    drop(drain);
+                    vals.push(Lit::Object(pairs));
+                }
+            }
+        }
+        vals.pop().unwrap_or(Lit::Undefined)
+    }
+}
+
+impl PartialEq for Lit {
+    fn eq(&self, other: &Self) -> bool {
+        fn cmp_lit_step<'a>(a: &'a Lit, b: &'a Lit, stack: &mut Vec<(&'a Lit, &'a Lit)>) -> bool {
+            match (a, b) {
+                (Lit::Undefined, Lit::Undefined)
+                | (Lit::Hole, Lit::Hole)
+                | (Lit::Null, Lit::Null) => true,
+                (Lit::Bool(x), Lit::Bool(y)) => x == y,
+                (Lit::Number(x), Lit::Number(y)) => x == y,
+                (Lit::Int64(x), Lit::Int64(y)) => x == y,
+                (Lit::UInt64(x), Lit::UInt64(y)) => x == y,
+                (Lit::String(x), Lit::String(y)) => x == y,
+                (Lit::Utf16(x), Lit::Utf16(y)) => x == y,
+                (Lit::BigInt(x), Lit::BigInt(y)) => x == y,
+                (Lit::MethodRef(x), Lit::MethodRef(y)) => x == y,
+                (Lit::Array(xs), Lit::Array(ys)) => {
+                    if xs.len() != ys.len() {
+                        return false;
+                    }
+                    for (x, y) in xs.iter().zip(ys.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                    true
+                }
+                (Lit::Object(xs), Lit::Object(ys)) => {
+                    if xs.len() != ys.len() {
+                        return false;
+                    }
+                    for ((kx, vx), (ky, vy)) in xs.iter().zip(ys.iter()).rev() {
+                        stack.push((vx, vy));
+                        stack.push((kx, ky));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut stack: Vec<(&Lit, &Lit)> = Vec::new();
+        if !cmp_lit_step(self, other, &mut stack) {
+            return false;
+        }
+        while let Some((x, y)) = stack.pop() {
+            if !cmp_lit_step(x, y, &mut stack) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn drain_expr_children(expr: &mut Expr, stack: &mut Vec<Expr>) {
+    let take_box = |b: &mut Box<Expr>| std::mem::replace(b.as_mut(), Expr::SuperMarker);
+    match expr {
+        Expr::PropName { object, .. }
+        | Expr::PrivateLoad { object, .. }
+        | Expr::PrivateTest { object, .. } => stack.push(take_box(object)),
+        Expr::PropIndex { object, index } => {
+            stack.push(take_box(object));
+            stack.push(take_box(index));
+        }
+        Expr::PropDyn { object, key } => {
+            stack.push(take_box(object));
+            stack.push(take_box(key));
+        }
+        Expr::SuperProp { key: Some(k), .. } => {
+            stack.push(take_box(k));
+        }
+        Expr::Call {
+            callee, this, args, ..
+        } => {
+            stack.push(take_box(callee));
+            if let Some(t) = this.as_mut() {
+                stack.push(take_box(t));
+            }
+            stack.extend(std::mem::take(args));
+        }
+        Expr::DynamicImport { specifier } => stack.push(take_box(specifier)),
+        Expr::Unary { operand, .. } => stack.push(take_box(operand)),
+        Expr::Delete { target } => stack.push(take_box(target)),
+        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
+            stack.push(take_box(left));
+            stack.push(take_box(right));
+        }
+        Expr::Closure { captures, .. } if !captures.is_empty() => {
+            for (_, c) in std::mem::take(captures) {
+                stack.push(c);
+            }
+        }
+        Expr::Class {
+            heritage: Some(h), ..
+        } => {
+            stack.push(take_box(h));
+        }
+        Expr::Yield { value }
+        | Expr::YieldStar { value }
+        | Expr::Await { value, .. }
+        | Expr::Iter { obj: value, .. }
+        | Expr::CreateGenerator { func: value }
+        | Expr::GeneratorDriver { genobj: value, .. }
+        | Expr::AsyncDriver { value, .. } => stack.push(take_box(value)),
+        Expr::TaggedTemplate { tag, exprs, .. } => {
+            stack.push(take_box(tag));
+            stack.extend(std::mem::take(exprs));
+        }
+        Expr::IterResultObj { value, done }
+        | Expr::CopyDataProps {
+            dst: value,
+            src: done,
+        }
+        | Expr::SetObjectWithProto {
+            obj: value,
+            proto: done,
+        } => {
+            stack.push(take_box(value));
+            stack.push(take_box(done));
+        }
+        Expr::AsyncGeneratorResolve {
+            genobj: a,
+            value: b,
+            done: c,
+        }
+        | Expr::ArraySpread {
+            dst: a,
+            index: b,
+            src: c,
+        } => {
+            stack.push(take_box(a));
+            stack.push(take_box(b));
+            stack.push(take_box(c));
+        }
+        Expr::RestObject { obj, excluded } => {
+            stack.push(take_box(obj));
+            stack.extend(std::mem::take(excluded));
+        }
+        Expr::DefineGetterSetter {
+            obj,
+            key,
+            getter,
+            setter,
+        } => {
+            stack.push(take_box(obj));
+            stack.push(take_box(key));
+            stack.push(take_box(getter));
+            stack.push(take_box(setter));
+        }
+        Expr::ObjectBuild { entries } if !entries.is_empty() => {
+            for entry in std::mem::take(entries) {
+                match entry {
+                    ObjEntry::KeyValue(_, v)
+                    | ObjEntry::Spread(v)
+                    | ObjEntry::Proto(v)
+                    | ObjEntry::Method(_, v) => stack.push(v),
+                    ObjEntry::Computed(k, v) => {
+                        stack.push(k);
+                        stack.push(v);
+                    }
+                    ObjEntry::Getter(k, v) | ObjEntry::Setter(k, v) => {
+                        if let ObjKey::Computed(mut ke) = k {
+                            stack.push(take_box(&mut ke));
+                        }
+                        stack.push(v);
+                    }
+                }
+            }
+        }
+        Expr::ArrayBuild { elements } if !elements.is_empty() => {
+            for elem in std::mem::take(elements) {
+                match elem {
+                    ArrayElem::Item(e) | ArrayElem::Spread(e) => stack.push(e),
+                }
+            }
+        }
+        Expr::Fallback { operands, .. } if !operands.is_empty() => {
+            stack.extend(std::mem::take(operands));
+        }
+        _ => {}
+    }
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        drain_expr_children(self, &mut stack);
+        while let Some(mut cur) = stack.pop() {
+            drain_expr_children(&mut cur, &mut stack);
+        }
+    }
+}
+
+impl Clone for Expr {
+    fn clone(&self) -> Self {
+        fn clone_flat_expr(e: &Expr) -> Option<Expr> {
+            match e {
+                Expr::Lit(l) => Some(Expr::Lit(l.clone())),
+                Expr::Ident(s) => Some(Expr::Ident(s.clone())),
+                Expr::Temp { value, name } => Some(Expr::Temp {
+                    value: *value,
+                    name: name.clone(),
+                }),
+                Expr::SuperProp { name, key: None } => Some(Expr::SuperProp {
+                    name: name.clone(),
+                    key: None,
+                }),
+                Expr::SuperMarker => Some(Expr::SuperMarker),
+                Expr::RegExp { pattern, flags } => Some(Expr::RegExp {
+                    pattern: pattern.clone(),
+                    flags: flags.clone(),
+                }),
+                Expr::ObjectLit { entries } => Some(Expr::ObjectLit {
+                    entries: entries.clone(),
+                }),
+                Expr::ArrayLit { elements } => Some(Expr::ArrayLit {
+                    elements: elements.clone(),
+                }),
+                Expr::Closure {
+                    body,
+                    name,
+                    kind,
+                    captures,
+                } if captures.is_empty() => Some(Expr::Closure {
+                    body: *body,
+                    name: name.clone(),
+                    kind: *kind,
+                    captures: Vec::new(),
+                }),
+                Expr::Class {
+                    ctor,
+                    name,
+                    heritage: None,
+                    members,
+                    member_attrs,
+                    sendable,
+                } => Some(Expr::Class {
+                    ctor: *ctor,
+                    name: name.clone(),
+                    heritage: None,
+                    members: *members,
+                    member_attrs: member_attrs.clone(),
+                    sendable: *sendable,
+                }),
+                Expr::NewTarget => Some(Expr::NewTarget),
+                Expr::GlobalThis => Some(Expr::GlobalThis),
+                Expr::SelfFunction(s) => Some(Expr::SelfFunction(s.clone())),
+                Expr::Arguments => Some(Expr::Arguments),
+                Expr::RestArgs { start_index } => Some(Expr::RestArgs {
+                    start_index: *start_index,
+                }),
+                Expr::TemplateObject { raw, cooked } => Some(Expr::TemplateObject {
+                    raw: raw.clone(),
+                    cooked: cooked.clone(),
+                }),
+                Expr::ModuleNamespace { index } => Some(Expr::ModuleNamespace { index: *index }),
+                Expr::ObjectBuild { entries } if entries.is_empty() => Some(Expr::ObjectBuild {
+                    entries: Vec::new(),
+                }),
+                Expr::ArrayBuild { elements } if elements.is_empty() => Some(Expr::ArrayBuild {
+                    elements: Vec::new(),
+                }),
+                Expr::Fallback { op, note, operands } if operands.is_empty() => {
+                    Some(Expr::Fallback {
+                        op,
+                        note,
+                        operands: Vec::new(),
+                    })
+                }
+                _ => None,
+            }
+        }
+
+        if let Some(flat) = clone_flat_expr(self) {
+            return flat;
+        }
+
+        enum Step<'a> {
+            Eval(&'a Expr),
+            Finish(&'a Expr),
+        }
+
+        let pop_expr = |vals: &mut Vec<Expr>| vals.pop().unwrap_or(Expr::SuperMarker);
+        let mut steps: Vec<Step<'_>> = vec![Step::Eval(self)];
+        let mut vals: Vec<Expr> = Vec::new();
+
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Eval(e) => {
+                    if let Some(flat) = clone_flat_expr(e) {
+                        vals.push(flat);
+                        continue;
+                    }
+                    steps.push(Step::Finish(e));
+                    match e {
+                        Expr::PropName { object, .. }
+                        | Expr::PrivateLoad { object, .. }
+                        | Expr::PrivateTest { object, .. } => steps.push(Step::Eval(object)),
+                        Expr::PropIndex { object, index } => {
+                            steps.push(Step::Eval(index));
+                            steps.push(Step::Eval(object));
+                        }
+                        Expr::PropDyn { object, key } => {
+                            steps.push(Step::Eval(key));
+                            steps.push(Step::Eval(object));
+                        }
+                        Expr::SuperProp { key: Some(k), .. } => steps.push(Step::Eval(k)),
+                        Expr::Call {
+                            callee, this, args, ..
+                        } => {
+                            for a in args.iter().rev() {
+                                steps.push(Step::Eval(a));
+                            }
+                            if let Some(t) = this {
+                                steps.push(Step::Eval(t));
+                            }
+                            steps.push(Step::Eval(callee));
+                        }
+                        Expr::DynamicImport { specifier } => steps.push(Step::Eval(specifier)),
+                        Expr::Unary { operand, .. } => steps.push(Step::Eval(operand)),
+                        Expr::Delete { target } => steps.push(Step::Eval(target)),
+                        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
+                            steps.push(Step::Eval(right));
+                            steps.push(Step::Eval(left));
+                        }
+                        Expr::Closure { captures, .. } => {
+                            for (_, c) in captures.iter().rev() {
+                                steps.push(Step::Eval(c));
+                            }
+                        }
+                        Expr::Class {
+                            heritage: Some(h), ..
+                        } => steps.push(Step::Eval(h)),
+                        Expr::Yield { value }
+                        | Expr::YieldStar { value }
+                        | Expr::Await { value, .. }
+                        | Expr::Iter { obj: value, .. }
+                        | Expr::CreateGenerator { func: value }
+                        | Expr::GeneratorDriver { genobj: value, .. }
+                        | Expr::AsyncDriver { value, .. } => steps.push(Step::Eval(value)),
+                        Expr::TaggedTemplate { tag, exprs, .. } => {
+                            for ex in exprs.iter().rev() {
+                                steps.push(Step::Eval(ex));
+                            }
+                            steps.push(Step::Eval(tag));
+                        }
+                        Expr::IterResultObj { value, done }
+                        | Expr::CopyDataProps {
+                            dst: value,
+                            src: done,
+                        }
+                        | Expr::SetObjectWithProto {
+                            obj: value,
+                            proto: done,
+                        } => {
+                            steps.push(Step::Eval(done));
+                            steps.push(Step::Eval(value));
+                        }
+                        Expr::AsyncGeneratorResolve {
+                            genobj: a,
+                            value: b,
+                            done: c,
+                        }
+                        | Expr::ArraySpread {
+                            dst: a,
+                            index: b,
+                            src: c,
+                        } => {
+                            steps.push(Step::Eval(c));
+                            steps.push(Step::Eval(b));
+                            steps.push(Step::Eval(a));
+                        }
+                        Expr::RestObject { obj, excluded } => {
+                            for ex in excluded.iter().rev() {
+                                steps.push(Step::Eval(ex));
+                            }
+                            steps.push(Step::Eval(obj));
+                        }
+                        Expr::DefineGetterSetter {
+                            obj,
+                            key,
+                            getter,
+                            setter,
+                        } => {
+                            steps.push(Step::Eval(setter));
+                            steps.push(Step::Eval(getter));
+                            steps.push(Step::Eval(key));
+                            steps.push(Step::Eval(obj));
+                        }
+                        Expr::ObjectBuild { entries } => {
+                            for entry in entries.iter().rev() {
+                                match entry {
+                                    ObjEntry::KeyValue(_, v)
+                                    | ObjEntry::Spread(v)
+                                    | ObjEntry::Proto(v)
+                                    | ObjEntry::Method(_, v) => steps.push(Step::Eval(v)),
+                                    ObjEntry::Computed(k, v) => {
+                                        steps.push(Step::Eval(v));
+                                        steps.push(Step::Eval(k));
+                                    }
+                                    ObjEntry::Getter(k, v) | ObjEntry::Setter(k, v) => {
+                                        steps.push(Step::Eval(v));
+                                        if let ObjKey::Computed(ke) = k {
+                                            steps.push(Step::Eval(ke));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Expr::ArrayBuild { elements } => {
+                            for elem in elements.iter().rev() {
+                                match elem {
+                                    ArrayElem::Item(ex) | ArrayElem::Spread(ex) => {
+                                        steps.push(Step::Eval(ex));
+                                    }
+                                }
+                            }
+                        }
+                        Expr::Fallback { operands, .. } => {
+                            for opnd in operands.iter().rev() {
+                                steps.push(Step::Eval(opnd));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Step::Finish(e) => {
+                    let built = match e {
+                        Expr::PropName {
+                            name, dot_legal, ..
+                        } => Expr::PropName {
+                            object: Box::new(pop_expr(&mut vals)),
+                            name: name.clone(),
+                            dot_legal: *dot_legal,
+                        },
+                        Expr::PrivateLoad { name, .. } => Expr::PrivateLoad {
+                            object: Box::new(pop_expr(&mut vals)),
+                            name: name.clone(),
+                        },
+                        Expr::PrivateTest { name, .. } => Expr::PrivateTest {
+                            object: Box::new(pop_expr(&mut vals)),
+                            name: name.clone(),
+                        },
+                        Expr::PropIndex { .. } => {
+                            let index = Box::new(pop_expr(&mut vals));
+                            let object = Box::new(pop_expr(&mut vals));
+                            Expr::PropIndex { object, index }
+                        }
+                        Expr::PropDyn { .. } => {
+                            let key = Box::new(pop_expr(&mut vals));
+                            let object = Box::new(pop_expr(&mut vals));
+                            Expr::PropDyn { object, key }
+                        }
+                        Expr::SuperProp { name, key: Some(_) } => Expr::SuperProp {
+                            name: name.clone(),
+                            key: Some(Box::new(pop_expr(&mut vals))),
+                        },
+                        Expr::Call {
+                            this, args, kind, ..
+                        } => {
+                            let start = vals.len().saturating_sub(args.len());
+                            let cloned_args = vals.split_off(start);
+                            let cloned_this = this.as_ref().map(|_| Box::new(pop_expr(&mut vals)));
+                            let cloned_callee = Box::new(pop_expr(&mut vals));
+                            Expr::Call {
+                                callee: cloned_callee,
+                                this: cloned_this,
+                                args: cloned_args,
+                                kind: *kind,
+                            }
+                        }
+                        Expr::DynamicImport { .. } => Expr::DynamicImport {
+                            specifier: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::Unary { op, .. } => Expr::Unary {
+                            op: *op,
+                            operand: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::Delete { .. } => Expr::Delete {
+                            target: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::Binary { op, .. } => {
+                            let right = Box::new(pop_expr(&mut vals));
+                            let left = Box::new(pop_expr(&mut vals));
+                            Expr::Binary {
+                                op: *op,
+                                left,
+                                right,
+                            }
+                        }
+                        Expr::Compare { op, .. } => {
+                            let right = Box::new(pop_expr(&mut vals));
+                            let left = Box::new(pop_expr(&mut vals));
+                            Expr::Compare {
+                                op: *op,
+                                left,
+                                right,
+                            }
+                        }
+                        Expr::Closure {
+                            body,
+                            name,
+                            kind,
+                            captures,
+                        } => {
+                            let start = vals.len().saturating_sub(captures.len());
+                            let mut drain = vals.drain(start..);
+                            let mut out_caps = Vec::with_capacity(captures.len());
+                            for (cname, _) in captures {
+                                out_caps.push((
+                                    cname.clone(),
+                                    drain.next().unwrap_or(Expr::SuperMarker),
+                                ));
+                            }
+                            drop(drain);
+                            Expr::Closure {
+                                body: *body,
+                                name: name.clone(),
+                                kind: *kind,
+                                captures: out_caps,
+                            }
+                        }
+                        Expr::Class {
+                            ctor,
+                            name,
+                            heritage: Some(_),
+                            members,
+                            member_attrs,
+                            sendable,
+                        } => Expr::Class {
+                            ctor: *ctor,
+                            name: name.clone(),
+                            heritage: Some(Box::new(pop_expr(&mut vals))),
+                            members: *members,
+                            member_attrs: member_attrs.clone(),
+                            sendable: *sendable,
+                        },
+                        Expr::Yield { .. } => Expr::Yield {
+                            value: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::YieldStar { .. } => Expr::YieldStar {
+                            value: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::Await { uncaught, .. } => Expr::Await {
+                            value: Box::new(pop_expr(&mut vals)),
+                            uncaught: *uncaught,
+                        },
+                        Expr::Iter { op, status, .. } => Expr::Iter {
+                            op: *op,
+                            obj: Box::new(pop_expr(&mut vals)),
+                            status: *status,
+                        },
+                        Expr::CreateGenerator { .. } => Expr::CreateGenerator {
+                            func: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::GeneratorDriver { resume, .. } => Expr::GeneratorDriver {
+                            resume: *resume,
+                            genobj: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::AsyncDriver { resolve, .. } => Expr::AsyncDriver {
+                            resolve: *resolve,
+                            value: Box::new(pop_expr(&mut vals)),
+                        },
+                        Expr::TaggedTemplate { quasis, exprs, .. } => {
+                            let start = vals.len().saturating_sub(exprs.len());
+                            let cloned_exprs = vals.split_off(start);
+                            let cloned_tag = Box::new(pop_expr(&mut vals));
+                            Expr::TaggedTemplate {
+                                tag: cloned_tag,
+                                quasis: quasis.clone(),
+                                exprs: cloned_exprs,
+                            }
+                        }
+                        Expr::IterResultObj { .. } => {
+                            let done = Box::new(pop_expr(&mut vals));
+                            let value = Box::new(pop_expr(&mut vals));
+                            Expr::IterResultObj { value, done }
+                        }
+                        Expr::CopyDataProps { .. } => {
+                            let src = Box::new(pop_expr(&mut vals));
+                            let dst = Box::new(pop_expr(&mut vals));
+                            Expr::CopyDataProps { dst, src }
+                        }
+                        Expr::SetObjectWithProto { .. } => {
+                            let proto = Box::new(pop_expr(&mut vals));
+                            let obj = Box::new(pop_expr(&mut vals));
+                            Expr::SetObjectWithProto { obj, proto }
+                        }
+                        Expr::AsyncGeneratorResolve { .. } => {
+                            let done = Box::new(pop_expr(&mut vals));
+                            let value = Box::new(pop_expr(&mut vals));
+                            let genobj = Box::new(pop_expr(&mut vals));
+                            Expr::AsyncGeneratorResolve {
+                                genobj,
+                                value,
+                                done,
+                            }
+                        }
+                        Expr::ArraySpread { .. } => {
+                            let src = Box::new(pop_expr(&mut vals));
+                            let index = Box::new(pop_expr(&mut vals));
+                            let dst = Box::new(pop_expr(&mut vals));
+                            Expr::ArraySpread { dst, index, src }
+                        }
+                        Expr::RestObject { excluded, .. } => {
+                            let start = vals.len().saturating_sub(excluded.len());
+                            let cloned_ex = vals.split_off(start);
+                            let cloned_obj = Box::new(pop_expr(&mut vals));
+                            Expr::RestObject {
+                                obj: cloned_obj,
+                                excluded: cloned_ex,
+                            }
+                        }
+                        Expr::DefineGetterSetter { .. } => {
+                            let setter = Box::new(pop_expr(&mut vals));
+                            let getter = Box::new(pop_expr(&mut vals));
+                            let key = Box::new(pop_expr(&mut vals));
+                            let obj = Box::new(pop_expr(&mut vals));
+                            Expr::DefineGetterSetter {
+                                obj,
+                                key,
+                                getter,
+                                setter,
+                            }
+                        }
+                        Expr::ObjectBuild { entries } => {
+                            let total: usize = entries
+                                .iter()
+                                .map(|ent| match ent {
+                                    ObjEntry::Computed(_, _)
+                                    | ObjEntry::Getter(ObjKey::Computed(_), _)
+                                    | ObjEntry::Setter(ObjKey::Computed(_), _) => 2,
+                                    _ => 1,
+                                })
+                                .sum();
+                            let start = vals.len().saturating_sub(total);
+                            let mut drain = vals.drain(start..);
+                            let mut next_val = || drain.next().unwrap_or(Expr::SuperMarker);
+                            let mut out_entries = Vec::with_capacity(entries.len());
+                            for ent in entries {
+                                let built_ent = match ent {
+                                    ObjEntry::KeyValue(k, _) => {
+                                        ObjEntry::KeyValue(k.clone(), next_val())
+                                    }
+                                    ObjEntry::Computed(_, _) => {
+                                        let k = next_val();
+                                        let v = next_val();
+                                        ObjEntry::Computed(k, v)
+                                    }
+                                    ObjEntry::Spread(_) => ObjEntry::Spread(next_val()),
+                                    ObjEntry::Proto(_) => ObjEntry::Proto(next_val()),
+                                    ObjEntry::Method(m, _) => {
+                                        ObjEntry::Method(m.clone(), next_val())
+                                    }
+                                    ObjEntry::Getter(ObjKey::Name(n), _) => {
+                                        ObjEntry::Getter(ObjKey::Name(n.clone()), next_val())
+                                    }
+                                    ObjEntry::Getter(ObjKey::Computed(_), _) => {
+                                        let ke = Box::new(next_val());
+                                        let v = next_val();
+                                        ObjEntry::Getter(ObjKey::Computed(ke), v)
+                                    }
+                                    ObjEntry::Setter(ObjKey::Name(n), _) => {
+                                        ObjEntry::Setter(ObjKey::Name(n.clone()), next_val())
+                                    }
+                                    ObjEntry::Setter(ObjKey::Computed(_), _) => {
+                                        let ke = Box::new(next_val());
+                                        let v = next_val();
+                                        ObjEntry::Setter(ObjKey::Computed(ke), v)
+                                    }
+                                };
+                                out_entries.push(built_ent);
+                            }
+                            drop(drain);
+                            Expr::ObjectBuild {
+                                entries: out_entries,
+                            }
+                        }
+                        Expr::ArrayBuild { elements } => {
+                            let start = vals.len().saturating_sub(elements.len());
+                            let mut drain = vals.drain(start..);
+                            let mut out_elems = Vec::with_capacity(elements.len());
+                            for elem in elements {
+                                let v = drain.next().unwrap_or(Expr::SuperMarker);
+                                out_elems.push(match elem {
+                                    ArrayElem::Item(_) => ArrayElem::Item(v),
+                                    ArrayElem::Spread(_) => ArrayElem::Spread(v),
+                                });
+                            }
+                            drop(drain);
+                            Expr::ArrayBuild {
+                                elements: out_elems,
+                            }
+                        }
+                        Expr::Fallback { op, note, operands } => {
+                            let start = vals.len().saturating_sub(operands.len());
+                            let cloned_ops = vals.split_off(start);
+                            Expr::Fallback {
+                                op,
+                                note,
+                                operands: cloned_ops,
+                            }
+                        }
+                        _ => clone_flat_expr(e).unwrap_or(Expr::SuperMarker),
+                    };
+                    vals.push(built);
+                }
+            }
+        }
+        pop_expr(&mut vals)
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        fn cmp_expr_step<'a>(
+            a: &'a Expr,
+            b: &'a Expr,
+            stack: &mut Vec<(&'a Expr, &'a Expr)>,
+        ) -> bool {
+            match (a, b) {
+                (Expr::Lit(x), Expr::Lit(y)) => x == y,
+                (Expr::Ident(x), Expr::Ident(y)) => x == y,
+                (
+                    Expr::Temp {
+                        value: vx,
+                        name: nx,
+                    },
+                    Expr::Temp {
+                        value: vy,
+                        name: ny,
+                    },
+                ) => vx == vy && nx == ny,
+                (
+                    Expr::PropName {
+                        object: ox,
+                        name: nx,
+                        dot_legal: dx,
+                    },
+                    Expr::PropName {
+                        object: oy,
+                        name: ny,
+                        dot_legal: dy,
+                    },
+                ) => {
+                    if dx != dy || nx != ny {
+                        return false;
+                    }
+                    stack.push((ox, oy));
+                    true
+                }
+                (
+                    Expr::PropIndex {
+                        object: ox,
+                        index: ix,
+                    },
+                    Expr::PropIndex {
+                        object: oy,
+                        index: iy,
+                    },
+                ) => {
+                    stack.push((ix, iy));
+                    stack.push((ox, oy));
+                    true
+                }
+                (
+                    Expr::PropDyn {
+                        object: ox,
+                        key: kx,
+                    },
+                    Expr::PropDyn {
+                        object: oy,
+                        key: ky,
+                    },
+                ) => {
+                    stack.push((kx, ky));
+                    stack.push((ox, oy));
+                    true
+                }
+                (
+                    Expr::PrivateLoad {
+                        object: ox,
+                        name: nx,
+                    },
+                    Expr::PrivateLoad {
+                        object: oy,
+                        name: ny,
+                    },
+                )
+                | (
+                    Expr::PrivateTest {
+                        object: ox,
+                        name: nx,
+                    },
+                    Expr::PrivateTest {
+                        object: oy,
+                        name: ny,
+                    },
+                ) => {
+                    if nx != ny {
+                        return false;
+                    }
+                    stack.push((ox, oy));
+                    true
+                }
+                (Expr::SuperProp { name: nx, key: kx }, Expr::SuperProp { name: ny, key: ky }) => {
+                    match (kx, ky) {
+                        (None, None) => nx == ny,
+                        (Some(kx), Some(ky)) if nx == ny => {
+                            stack.push((kx, ky));
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                (
+                    Expr::Call {
+                        callee: cx,
+                        this: tx,
+                        args: ax,
+                        kind: kx,
+                    },
+                    Expr::Call {
+                        callee: cy,
+                        this: ty,
+                        args: ay,
+                        kind: ky,
+                    },
+                ) => {
+                    if kx != ky || ax.len() != ay.len() || tx.is_some() != ty.is_some() {
+                        return false;
+                    }
+                    for (x, y) in ax.iter().zip(ay.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                    if let (Some(tx), Some(ty)) = (tx, ty) {
+                        stack.push((tx, ty));
+                    }
+                    stack.push((cx, cy));
+                    true
+                }
+                (Expr::SuperMarker, Expr::SuperMarker)
+                | (Expr::NewTarget, Expr::NewTarget)
+                | (Expr::GlobalThis, Expr::GlobalThis)
+                | (Expr::Arguments, Expr::Arguments) => true,
+                (Expr::DynamicImport { specifier: sx }, Expr::DynamicImport { specifier: sy }) => {
+                    stack.push((sx, sy));
+                    true
+                }
+                (
+                    Expr::Unary {
+                        op: ox,
+                        operand: px,
+                    },
+                    Expr::Unary {
+                        op: oy,
+                        operand: py,
+                    },
+                ) => {
+                    if ox != oy {
+                        return false;
+                    }
+                    stack.push((px, py));
+                    true
+                }
+                (Expr::Delete { target: tx }, Expr::Delete { target: ty }) => {
+                    stack.push((tx, ty));
+                    true
+                }
+                (
+                    Expr::Binary {
+                        op: ox,
+                        left: lx,
+                        right: rx,
+                    },
+                    Expr::Binary {
+                        op: oy,
+                        left: ly,
+                        right: ry,
+                    },
+                ) => {
+                    if ox != oy {
+                        return false;
+                    }
+                    stack.push((rx, ry));
+                    stack.push((lx, ly));
+                    true
+                }
+                (
+                    Expr::Compare {
+                        op: ox,
+                        left: lx,
+                        right: rx,
+                    },
+                    Expr::Compare {
+                        op: oy,
+                        left: ly,
+                        right: ry,
+                    },
+                ) => {
+                    if ox != oy {
+                        return false;
+                    }
+                    stack.push((rx, ry));
+                    stack.push((lx, ly));
+                    true
+                }
+                (
+                    Expr::RegExp {
+                        pattern: px,
+                        flags: fx,
+                    },
+                    Expr::RegExp {
+                        pattern: py,
+                        flags: fy,
+                    },
+                ) => px == py && fx == fy,
+                (Expr::ObjectLit { entries: ex }, Expr::ObjectLit { entries: ey }) => ex == ey,
+                (Expr::ArrayLit { elements: ex }, Expr::ArrayLit { elements: ey }) => ex == ey,
+                (
+                    Expr::Closure {
+                        body: bx,
+                        name: nx,
+                        kind: kx,
+                        captures: cx,
+                    },
+                    Expr::Closure {
+                        body: by,
+                        name: ny,
+                        kind: ky,
+                        captures: cy,
+                    },
+                ) => {
+                    if bx != by || kx != ky || nx != ny || cx.len() != cy.len() {
+                        return false;
+                    }
+                    for ((cnx, cvx), (cny, cvy)) in cx.iter().zip(cy.iter()).rev() {
+                        if cnx != cny {
+                            return false;
+                        }
+                        stack.push((cvx, cvy));
+                    }
+                    true
+                }
+                (
+                    Expr::Class {
+                        ctor: cx,
+                        name: nx,
+                        heritage: hx,
+                        members: mx,
+                        member_attrs: max,
+                        sendable: sx,
+                    },
+                    Expr::Class {
+                        ctor: cy,
+                        name: ny,
+                        heritage: hy,
+                        members: my,
+                        member_attrs: may,
+                        sendable: sy,
+                    },
+                ) => {
+                    if cx != cy
+                        || mx != my
+                        || sx != sy
+                        || nx != ny
+                        || max != may
+                        || hx.is_some() != hy.is_some()
+                    {
+                        return false;
+                    }
+                    if let (Some(hx), Some(hy)) = (hx, hy) {
+                        stack.push((hx, hy));
+                    }
+                    true
+                }
+                (Expr::Yield { value: vx }, Expr::Yield { value: vy })
+                | (Expr::YieldStar { value: vx }, Expr::YieldStar { value: vy })
+                | (Expr::CreateGenerator { func: vx }, Expr::CreateGenerator { func: vy }) => {
+                    stack.push((vx, vy));
+                    true
+                }
+                (
+                    Expr::Await {
+                        value: vx,
+                        uncaught: ux,
+                    },
+                    Expr::Await {
+                        value: vy,
+                        uncaught: uy,
+                    },
+                ) => {
+                    if ux != uy {
+                        return false;
+                    }
+                    stack.push((vx, vy));
+                    true
+                }
+                (Expr::SelfFunction(x), Expr::SelfFunction(y)) => x == y,
+                (Expr::RestArgs { start_index: x }, Expr::RestArgs { start_index: y }) => x == y,
+                (
+                    Expr::TemplateObject {
+                        raw: rx,
+                        cooked: cx,
+                    },
+                    Expr::TemplateObject {
+                        raw: ry,
+                        cooked: cy,
+                    },
+                ) => rx == ry && cx == cy,
+                (
+                    Expr::TaggedTemplate {
+                        tag: tx,
+                        quasis: qx,
+                        exprs: ex,
+                    },
+                    Expr::TaggedTemplate {
+                        tag: ty,
+                        quasis: qy,
+                        exprs: ey,
+                    },
+                ) => {
+                    if qx != qy || ex.len() != ey.len() {
+                        return false;
+                    }
+                    for (x, y) in ex.iter().zip(ey.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                    stack.push((tx, ty));
+                    true
+                }
+                (
+                    Expr::IterResultObj {
+                        value: vx,
+                        done: dx,
+                    },
+                    Expr::IterResultObj {
+                        value: vy,
+                        done: dy,
+                    },
+                )
+                | (
+                    Expr::CopyDataProps { dst: vx, src: dx },
+                    Expr::CopyDataProps { dst: vy, src: dy },
+                )
+                | (
+                    Expr::SetObjectWithProto { obj: vx, proto: dx },
+                    Expr::SetObjectWithProto { obj: vy, proto: dy },
+                ) => {
+                    stack.push((dx, dy));
+                    stack.push((vx, vy));
+                    true
+                }
+                (
+                    Expr::Iter {
+                        op: ox,
+                        obj: bx,
+                        status: sx,
+                    },
+                    Expr::Iter {
+                        op: oy,
+                        obj: by,
+                        status: sy,
+                    },
+                ) => {
+                    if ox != oy || sx != sy {
+                        return false;
+                    }
+                    stack.push((bx, by));
+                    true
+                }
+                (
+                    Expr::GeneratorDriver {
+                        resume: rx,
+                        genobj: gx,
+                    },
+                    Expr::GeneratorDriver {
+                        resume: ry,
+                        genobj: gy,
+                    },
+                )
+                | (
+                    Expr::AsyncDriver {
+                        resolve: rx,
+                        value: gx,
+                    },
+                    Expr::AsyncDriver {
+                        resolve: ry,
+                        value: gy,
+                    },
+                ) => {
+                    if rx != ry {
+                        return false;
+                    }
+                    stack.push((gx, gy));
+                    true
+                }
+                (
+                    Expr::AsyncGeneratorResolve {
+                        genobj: ax,
+                        value: bx,
+                        done: cx,
+                    },
+                    Expr::AsyncGeneratorResolve {
+                        genobj: ay,
+                        value: by,
+                        done: cy,
+                    },
+                )
+                | (
+                    Expr::ArraySpread {
+                        dst: ax,
+                        index: bx,
+                        src: cx,
+                    },
+                    Expr::ArraySpread {
+                        dst: ay,
+                        index: by,
+                        src: cy,
+                    },
+                ) => {
+                    stack.push((cx, cy));
+                    stack.push((bx, by));
+                    stack.push((ax, ay));
+                    true
+                }
+                (
+                    Expr::RestObject {
+                        obj: ox,
+                        excluded: ex,
+                    },
+                    Expr::RestObject {
+                        obj: oy,
+                        excluded: ey,
+                    },
+                ) => {
+                    if ex.len() != ey.len() {
+                        return false;
+                    }
+                    for (x, y) in ex.iter().zip(ey.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                    stack.push((ox, oy));
+                    true
+                }
+                (
+                    Expr::DefineGetterSetter {
+                        obj: ox,
+                        key: kx,
+                        getter: gx,
+                        setter: sx,
+                    },
+                    Expr::DefineGetterSetter {
+                        obj: oy,
+                        key: ky,
+                        getter: gy,
+                        setter: sy,
+                    },
+                ) => {
+                    stack.push((sx, sy));
+                    stack.push((gx, gy));
+                    stack.push((kx, ky));
+                    stack.push((ox, oy));
+                    true
+                }
+                (Expr::ModuleNamespace { index: x }, Expr::ModuleNamespace { index: y }) => x == y,
+                (Expr::ObjectBuild { entries: ex }, Expr::ObjectBuild { entries: ey }) => {
+                    if ex.len() != ey.len() {
+                        return false;
+                    }
+                    for (x, y) in ex.iter().zip(ey.iter()).rev() {
+                        match (x, y) {
+                            (ObjEntry::KeyValue(kx, vx), ObjEntry::KeyValue(ky, vy)) => {
+                                if kx != ky {
+                                    return false;
+                                }
+                                stack.push((vx, vy));
+                            }
+                            (ObjEntry::Computed(kx, vx), ObjEntry::Computed(ky, vy)) => {
+                                stack.push((vx, vy));
+                                stack.push((kx, ky));
+                            }
+                            (ObjEntry::Spread(vx), ObjEntry::Spread(vy))
+                            | (ObjEntry::Proto(vx), ObjEntry::Proto(vy)) => stack.push((vx, vy)),
+                            (ObjEntry::Method(mx, vx), ObjEntry::Method(my, vy)) => {
+                                if mx != my {
+                                    return false;
+                                }
+                                stack.push((vx, vy));
+                            }
+                            (
+                                ObjEntry::Getter(ObjKey::Name(nx), vx),
+                                ObjEntry::Getter(ObjKey::Name(ny), vy),
+                            )
+                            | (
+                                ObjEntry::Setter(ObjKey::Name(nx), vx),
+                                ObjEntry::Setter(ObjKey::Name(ny), vy),
+                            ) => {
+                                if nx != ny {
+                                    return false;
+                                }
+                                stack.push((vx, vy));
+                            }
+                            (
+                                ObjEntry::Getter(ObjKey::Computed(kx), vx),
+                                ObjEntry::Getter(ObjKey::Computed(ky), vy),
+                            )
+                            | (
+                                ObjEntry::Setter(ObjKey::Computed(kx), vx),
+                                ObjEntry::Setter(ObjKey::Computed(ky), vy),
+                            ) => {
+                                stack.push((vx, vy));
+                                stack.push((kx, ky));
+                            }
+                            _ => return false,
+                        }
+                    }
+                    true
+                }
+                (Expr::ArrayBuild { elements: ex }, Expr::ArrayBuild { elements: ey }) => {
+                    if ex.len() != ey.len() {
+                        return false;
+                    }
+                    for (x, y) in ex.iter().zip(ey.iter()).rev() {
+                        match (x, y) {
+                            (ArrayElem::Item(vx), ArrayElem::Item(vy))
+                            | (ArrayElem::Spread(vx), ArrayElem::Spread(vy)) => {
+                                stack.push((vx, vy));
+                            }
+                            _ => return false,
+                        }
+                    }
+                    true
+                }
+                (
+                    Expr::Fallback {
+                        op: ox,
+                        note: nx,
+                        operands: px,
+                    },
+                    Expr::Fallback {
+                        op: oy,
+                        note: ny,
+                        operands: py,
+                    },
+                ) => {
+                    if ox != oy || nx != ny || px.len() != py.len() {
+                        return false;
+                    }
+                    for (x, y) in px.iter().zip(py.iter()).rev() {
+                        stack.push((x, y));
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut stack: Vec<(&Expr, &Expr)> = Vec::new();
+        if !cmp_expr_step(self, other, &mut stack) {
+            return false;
+        }
+        while let Some((x, y)) = stack.pop() {
+            if !cmp_expr_step(x, y, &mut stack) {
+                return false;
+            }
+        }
+        true
     }
 }

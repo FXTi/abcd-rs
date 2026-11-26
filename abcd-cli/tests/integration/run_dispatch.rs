@@ -564,3 +564,93 @@ fn taint_all_json_multi_module() {
     ])
     .expect("taint --all --json");
 }
+
+#[test]
+fn asm_unsupported_version_exits_one() {
+    let (_dir, pa) = pa_file("dispatch-asm-v0002");
+    let err = run_argv(&["abcd", "asm", &pa, "--version", "0.0.0.2"]).unwrap_err();
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert!(err.to_string().contains("0.0.0.2"), "{err}");
+}
+
+#[test]
+fn stdout_helpers_and_binary_treat_broken_pipe_as_clean_exit_zero() {
+    struct ErrWriter(std::io::ErrorKind);
+    impl std::io::Write for ErrWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "pipe closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(self.0, "pipe closed"))
+        }
+    }
+
+    abcd_cli::write_stdout_bytes_to(ErrWriter(std::io::ErrorKind::BrokenPipe), b"hello\n")
+        .expect("BrokenPipe on bytes writer must return Ok(())");
+    abcd_cli::write_stdout_fmt_to(
+        ErrWriter(std::io::ErrorKind::BrokenPipe),
+        format_args!("hello {}\n", 42),
+    )
+    .expect("BrokenPipe on fmt writer must return Ok(())");
+
+    let err_b = abcd_cli::write_stdout_bytes_to(ErrWriter(std::io::ErrorKind::Other), b"hello\n")
+        .expect_err("non-BrokenPipe error must return CliError::Tool");
+    assert_eq!(err_b.exit_code(), 2);
+    assert!(
+        err_b.to_string().contains("failed writing to stdout:"),
+        "{err_b}"
+    );
+
+    let err_f = abcd_cli::write_stdout_fmt_to(
+        ErrWriter(std::io::ErrorKind::Other),
+        format_args!("hello {}\n", 42),
+    )
+    .expect_err("non-BrokenPipe error must return CliError::Tool");
+    assert_eq!(err_f.exit_code(), 2);
+    assert!(
+        err_f.to_string().contains("failed writing to stdout:"),
+        "{err_f}"
+    );
+
+    // End-to-end binary subprocess test: close the read end of a real OS pipe
+    // before writing > 128 KiB so the write hits EPIPE / BrokenPipe and exits 0.
+    let dir = common::tempdir("dispatch-broken-pipe-bin");
+    let mut b = abcd_file::Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(abcd_file::Type::Void, &[]);
+    let (code, _) = abcd_isa::encode(&[abcd_isa::Bytecode::Returnundefined]).unwrap();
+    for i in 0..400 {
+        b.class_add_method(
+            cls,
+            &format!("fn_padding_long_symbol_name_{i:04}"),
+            proto,
+            abcd_file::AccessFlags::STATIC,
+            &code,
+            1,
+            3,
+        );
+    }
+    b.deduplicate();
+    let big_abc = write_in(&dir, "big.abc", &b.finalize().unwrap());
+
+    for subcmd in [
+        vec!["dis", big_abc.as_str()],
+        vec!["analyze", big_abc.as_str(), "--dominators", "--json"],
+    ] {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+            .args(&subcmd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn abcd binary");
+        drop(child.stdout.take());
+        let output = child.wait_with_output().expect("wait abcd binary");
+        assert!(
+            output.status.success(),
+            "subcmd={subcmd:?} exited {:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

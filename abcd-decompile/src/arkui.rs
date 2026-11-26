@@ -118,6 +118,40 @@ enum UiNode {
     RawStmt(String),
 }
 
+impl Drop for UiNode {
+    fn drop(&mut self) {
+        let mut stack: Vec<UiNode> = Vec::new();
+        match self {
+            UiNode::Component { children, .. } => stack.extend(std::mem::take(children)),
+            UiNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stack.extend(std::mem::take(then_body));
+                stack.extend(std::mem::take(else_body));
+            }
+            UiNode::ForEach { body, .. } => stack.extend(std::mem::take(body)),
+            UiNode::CustomChild { .. } | UiNode::RawStmt(_) => return,
+        }
+        while let Some(mut cur) = stack.pop() {
+            match &mut cur {
+                UiNode::Component { children, .. } => stack.extend(std::mem::take(children)),
+                UiNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    stack.extend(std::mem::take(then_body));
+                    stack.extend(std::mem::take(else_body));
+                }
+                UiNode::ForEach { body, .. } => stack.extend(std::mem::take(body)),
+                UiNode::CustomChild { .. } | UiNode::RawStmt(_) => {}
+            }
+        }
+    }
+}
+
 const SYNTHETIC_VIEWPU_METHODS: &[&str] = &[
     "setInitiallyProvidedValue",
     "updateStateVars",
@@ -448,14 +482,19 @@ fn emit_arkui_main_node(
                 }
             }
         }
-        SNode::Honest(_) => {}
+        SNode::Honest(note) => {
+            out.push_str(&format!("/* {note} */\n"));
+        }
         _ => em.emit_node(n, 0, out),
     }
 }
 
 /// Attempt to emit a `Class` as an `@Component struct` when `opts.arkui`
 /// is enabled and `heritage` resolves to `ViewPU` or `View`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ArkUI component hook mirrors emit_class across class IR facets"
+)]
 pub(crate) fn try_emit_arkui_component(
     em: &mut Emitter<'_>,
     pad: &str,
@@ -485,7 +524,10 @@ pub(crate) fn try_emit_arkui_component(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "struct emitter threads indentation, ctor, member buffers, overflow methods, and entry flag"
+)]
 fn emit_arkui_struct(
     em: &mut Emitter<'_>,
     pad: &str,
@@ -498,7 +540,7 @@ fn emit_arkui_struct(
     mut is_entry: bool,
     out: &mut String,
 ) -> bool {
-    let Some(Lit::Array(items)) = lit_of(em.module, members) else {
+    let Some(items) = lit_of(em.module, members).and_then(Lit::into_array) else {
         return false;
     };
 
@@ -551,8 +593,15 @@ fn emit_arkui_struct(
     out.push_str(&format!("{pad}@Component\n"));
     out.push_str(&format!("{pad}struct {struct_name} {{\n"));
 
-    let (_ctor_rf, ctor_body) = em.func_nodes(ctor, false);
-    let fields = extract_arkui_fields(em, &ctor_body);
+    let (ctor_rf, ctor_body) = em.func_nodes(ctor, false);
+    let mut base_this_aliases = BTreeSet::from(["this".to_string()]);
+    for p in &ctor_rf.params {
+        if p == "this" {
+            base_this_aliases.insert(p.clone());
+        }
+    }
+    collect_this_aliases(&ctor_body, &mut base_this_aliases);
+    let fields = extract_arkui_fields(em, &ctor_body, &base_this_aliases);
     let mut decorated_names = BTreeSet::new();
     let mut link_names = BTreeSet::new();
     for field in &fields {
@@ -582,7 +631,7 @@ fn emit_arkui_struct(
                 let dec = if alias == name {
                     "@Provide".to_string()
                 } else {
-                    format!("@Provide({alias:?})")
+                    format!("@Provide({})", crate::consts::render_string(alias))
                 };
                 match init {
                     Some(v) => out.push_str(&format!("{pad}  {dec} {name}: any = {v};\n")),
@@ -594,31 +643,38 @@ fn emit_arkui_struct(
                 if alias == name {
                     out.push_str(&format!("{pad}  @Consume {name}: any;\n"));
                 } else {
-                    out.push_str(&format!("{pad}  @Consume({alias:?}) {name}: any;\n"));
+                    out.push_str(&format!(
+                        "{pad}  @Consume({}) {name}: any;\n",
+                        crate::consts::render_string(alias)
+                    ));
                 }
             }
             ArkField::LocalStorageLink { key, name, init } => {
                 decorated_names.insert(name.clone());
                 out.push_str(&format!(
-                    "{pad}  @LocalStorageLink({key:?}) {name}: any = {init};\n"
+                    "{pad}  @LocalStorageLink({}) {name}: any = {init};\n",
+                    crate::consts::render_string(key)
                 ));
             }
             ArkField::LocalStorageProp { key, name, init } => {
                 decorated_names.insert(name.clone());
                 out.push_str(&format!(
-                    "{pad}  @LocalStorageProp({key:?}) {name}: any = {init};\n"
+                    "{pad}  @LocalStorageProp({}) {name}: any = {init};\n",
+                    crate::consts::render_string(key)
                 ));
             }
             ArkField::StorageLink { key, name, init } => {
                 decorated_names.insert(name.clone());
                 out.push_str(&format!(
-                    "{pad}  @StorageLink({key:?}) {name}: any = {init};\n"
+                    "{pad}  @StorageLink({}) {name}: any = {init};\n",
+                    crate::consts::render_string(key)
                 ));
             }
             ArkField::StorageProp { key, name, init } => {
                 decorated_names.insert(name.clone());
                 out.push_str(&format!(
-                    "{pad}  @StorageProp({key:?}) {name}: any = {init};\n"
+                    "{pad}  @StorageProp({}) {name}: any = {init};\n",
+                    crate::consts::render_string(key)
                 ));
             }
             ArkField::Plain { name, init } => {
@@ -644,7 +700,14 @@ fn emit_arkui_struct(
         if mname == "initialRender" {
             em.stats.class_methods += 1;
             let (_rf, mbody) = em.func_nodes(mfid, false);
-            let ui_nodes = reconstruct_ui_body(em, &mbody, &link_names);
+            let mut method_this = base_this_aliases.clone();
+            collect_this_aliases(&mbody, &mut method_this);
+            let ui_ctx = ArkUiExprCtx {
+                this_aliases: method_this,
+                decorated_names: decorated_names.clone(),
+                link_names: link_names.clone(),
+            };
+            let ui_nodes = reconstruct_ui_body(em, &mbody, &ui_ctx);
             out.push_str(&format!("{pad}  build() {{\n"));
             render_ui_nodes(&ui_nodes, indent + 2, out);
             out.push_str(&format!("{pad}  }}\n"));
@@ -658,13 +721,20 @@ fn emit_arkui_struct(
             let (rf, mbody) = em.func_nodes(mfid, false);
             let visible = &rf.params[rf.hidden_params.min(rf.params.len())..];
             let clean_m = sanitize(&mname);
-            let ui_nodes = reconstruct_ui_body(em, &mbody, &link_names);
+            let mut method_this = base_this_aliases.clone();
+            collect_this_aliases(&mbody, &mut method_this);
+            let ui_ctx = ArkUiExprCtx {
+                this_aliases: method_this,
+                decorated_names: decorated_names.clone(),
+                link_names: link_names.clone(),
+            };
+            let ui_nodes = reconstruct_ui_body(em, &mbody, &ui_ctx);
             out.push_str(&format!(
                 "{pad}  @Builder\n{pad}  {clean_m}({}) {{\n",
                 visible.join(", ")
             ));
             for d in lex_decls(&mbody, &rf.params) {
-                if !d.starts_with("v1_") {
+                if !ui_ctx.this_aliases.contains(&d) {
                     out.push_str(&format!("{pad}    let {d};\n"));
                 }
             }
@@ -778,55 +848,66 @@ fn heritage_mentions_view(heritage: Option<&Expr>) -> bool {
     }
 }
 
+/// Match ONLY `ets_loader`'s synthetic constructor guard
+/// `if (!("finalizeConstruction" in ViewPU.prototype)) { Reflect.set(...); }`
+/// (or its positive-condition empty-`then` mirror), never arbitrary user `if` blocks.
 fn is_finalize_construction_polyfill(
     cond: &Expr,
     then: &[SNode],
     otherwise: &[SNode],
     env: &BTreeMap<String, Expr>,
 ) -> bool {
-    if expr_mentions_finalize_str(cond, env) {
-        return true;
-    }
-    for branch in [then, otherwise] {
-        for n in branch {
-            if let SNode::Stmts(leaves) = n {
-                for l in leaves {
-                    if let Leaf::Raw(Stmt::Expr(e)) = l
-                        && expr_mentions_finalize_str(e, env)
-                    {
-                        return true;
-                    }
-                }
+    let mut cur = resolve_expr(cond, env);
+    let mut negated = false;
+    for _ in 0..8 {
+        match cur {
+            Expr::Unary {
+                op:
+                    abcd_ir::op::UnOp::LogicalNot
+                    | abcd_ir::op::UnOp::IsFalse
+                    | abcd_ir::op::UnOp::JumpEqz,
+                operand,
+            } => {
+                negated = !negated;
+                cur = resolve_expr(operand, env);
             }
+            Expr::Unary {
+                op: abcd_ir::op::UnOp::IsTrue | abcd_ir::op::UnOp::JumpNez,
+                operand,
+            } => {
+                cur = resolve_expr(operand, env);
+            }
+            _ => break,
         }
     }
-    false
-}
-
-fn expr_mentions_finalize_str(root: &Expr, env: &BTreeMap<String, Expr>) -> bool {
-    let mut stack: Vec<&Expr> = vec![root];
-    let mut budget = 4096usize;
-    while let Some(e) = stack.pop() {
-        if budget == 0 {
-            break;
-        }
-        budget -= 1;
-        match resolve_expr(e, env) {
-            Expr::Lit(Lit::String(s)) if s == "finalizeConstruction" => return true,
-            Expr::Unary { operand, .. } => stack.push(operand),
-            Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
-                stack.push(right);
-                stack.push(left);
-            }
-            Expr::Call { args, .. } => {
-                for a in args.iter().rev() {
-                    stack.push(a);
-                }
-            }
-            _ => {}
-        }
+    let Expr::Compare {
+        op: abcd_ir::op::CmpOp::In,
+        left,
+        right,
+    } = cur
+    else {
+        return false;
+    };
+    let is_view_proto = |e: &Expr| -> bool {
+        matches!(
+            resolve_expr(e, env),
+            Expr::PropName { object, name, .. }
+                if name == "prototype"
+                    && matches!(ident_of(object, env).as_deref(), Some("ViewPU" | "View"))
+        )
+    };
+    let is_fc_str =
+        |e: &Expr| -> bool { string_lit(Some(e), env).as_deref() == Some("finalizeConstruction") };
+    let matches_in_guard =
+        (is_fc_str(left) && is_view_proto(right)) || (is_view_proto(left) && is_fc_str(right));
+    if !matches_in_guard {
+        return false;
     }
-    false
+    if negated {
+        otherwise.is_empty() && !then.is_empty()
+    } else {
+        then.is_empty() && !otherwise.is_empty()
+    }
 }
 
 fn is_pure_arkui_main_setup(value: &Expr, env: &BTreeMap<String, Expr>) -> bool {
@@ -881,8 +962,41 @@ fn extract_entry_registration(e: &Expr, env: &BTreeMap<String, Expr>) -> Option<
 
 // ── Constructor field extraction ──────────────────────────────────────────
 
-fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkField> {
+#[derive(Clone)]
+struct ArkUiExprCtx {
+    this_aliases: BTreeSet<String>,
+    decorated_names: BTreeSet<String>,
+    link_names: BTreeSet<String>,
+}
+
+fn collect_this_aliases(nodes: &[SNode], aliases: &mut BTreeSet<String>) {
+    let mut grew = true;
+    while grew {
+        grew = false;
+        walk_ctor_stmts(nodes, &mut |stmt| {
+            if let Stmt::Declare { name, value, .. } | Stmt::LexStore { name, value, .. } = stmt
+                && let Expr::Ident(src) | Expr::Temp { name: src, .. } = value
+                && aliases.contains(src)
+            {
+                if aliases.insert(name.clone()) {
+                    grew = true;
+                }
+                let san = sanitize(name);
+                if aliases.insert(san) {
+                    grew = true;
+                }
+            }
+        });
+    }
+}
+
+fn extract_arkui_fields(
+    em: &mut Emitter<'_>,
+    ctor_body: &[SNode],
+    this_aliases: &BTreeSet<String>,
+) -> Vec<ArkField> {
     let env = collect_const_bindings(ctor_body);
+    let empty_dec = BTreeSet::new();
     let mut fields: Vec<ArkField> = Vec::new();
     let mut provided_aliases: BTreeMap<String, String> = BTreeMap::new();
 
@@ -926,7 +1040,15 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                     let wrapper = ident_of(callee, &env).unwrap_or_default();
                     let init_str = args
                         .first()
-                        .map(|a| render_clean_expr(em, resolve_expr(a, &env)))
+                        .map(|a| {
+                            render_clean_expr(
+                                em,
+                                resolve_expr(a, &env),
+                                &env,
+                                this_aliases,
+                                &empty_dec,
+                            )
+                        })
                         .filter(|s| s != "undefined");
                     match wrapper.as_str() {
                         "ObservedPropertySimplePU"
@@ -977,7 +1099,15 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                             string_lit(args.first(), &env).unwrap_or_else(|| prop_name.clone());
                         let init = args
                             .get(1)
-                            .map(|a| render_clean_expr(em, resolve_expr(a, &env)))
+                            .map(|a| {
+                                render_clean_expr(
+                                    em,
+                                    resolve_expr(a, &env),
+                                    &env,
+                                    this_aliases,
+                                    &empty_dec,
+                                )
+                            })
                             .unwrap_or_else(|| "undefined".to_string());
                         fields.push(ArkField::LocalStorageLink {
                             key,
@@ -989,7 +1119,15 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                             string_lit(args.first(), &env).unwrap_or_else(|| prop_name.clone());
                         let init = args
                             .get(1)
-                            .map(|a| render_clean_expr(em, resolve_expr(a, &env)))
+                            .map(|a| {
+                                render_clean_expr(
+                                    em,
+                                    resolve_expr(a, &env),
+                                    &env,
+                                    this_aliases,
+                                    &empty_dec,
+                                )
+                            })
                             .unwrap_or_else(|| "undefined".to_string());
                         fields.push(ArkField::LocalStorageProp {
                             key,
@@ -1003,7 +1141,15 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                             string_lit(args.first(), &env).unwrap_or_else(|| prop_name.clone());
                         let init = args
                             .get(1)
-                            .map(|a| render_clean_expr(em, resolve_expr(a, &env)))
+                            .map(|a| {
+                                render_clean_expr(
+                                    em,
+                                    resolve_expr(a, &env),
+                                    &env,
+                                    this_aliases,
+                                    &empty_dec,
+                                )
+                            })
                             .unwrap_or_else(|| "undefined".to_string());
                         fields.push(ArkField::StorageLink {
                             key,
@@ -1017,7 +1163,15 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                             string_lit(args.first(), &env).unwrap_or_else(|| prop_name.clone());
                         let init = args
                             .get(1)
-                            .map(|a| render_clean_expr(em, resolve_expr(a, &env)))
+                            .map(|a| {
+                                render_clean_expr(
+                                    em,
+                                    resolve_expr(a, &env),
+                                    &env,
+                                    this_aliases,
+                                    &empty_dec,
+                                )
+                            })
                             .unwrap_or_else(|| "undefined".to_string());
                         fields.push(ArkField::StorageProp {
                             key,
@@ -1029,7 +1183,7 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
                 _ => {}
             }
         } else if is_legal_ident(raw_prop) && seen.insert(raw_prop.clone()) {
-            let init = render_clean_expr(em, val);
+            let init = render_clean_expr(em, val, &env, this_aliases, &empty_dec);
             fields.push(ArkField::Plain {
                 name: raw_prop.clone(),
                 init,
@@ -1114,17 +1268,43 @@ fn body_has_observe_creation(nodes: &[SNode]) -> bool {
     found
 }
 
-fn reconstruct_ui_body(
-    em: &mut Emitter<'_>,
-    nodes: &[SNode],
-    link_names: &BTreeSet<String>,
-) -> Vec<UiNode> {
-    let env = collect_const_bindings(nodes);
-    let mut stack: Vec<OpenComp> = Vec::new();
-    let mut root: Vec<UiNode> = Vec::new();
+enum UiFinishKind {
+    Root,
+    IfThen {
+        cond: String,
+        otherwise: Vec<SNode>,
+    },
+    IfElse {
+        cond: String,
+        then_body: Vec<UiNode>,
+    },
+    ForEach {
+        func_id: FuncId,
+        is_lazy: bool,
+        arr: String,
+        item_param: String,
+        idx_param: Option<String>,
+        key_gen: Option<String>,
+    },
+    BranchClosure {
+        func_id: FuncId,
+    },
+    ObserveSubbody {
+        func_id: FuncId,
+    },
+}
 
-    process_ui_snodes(em, nodes, &env, link_names, &mut stack, &mut root);
+struct UiBuildFrame {
+    nodes: std::vec::IntoIter<SNode>,
+    pending_leaves: std::vec::IntoIter<Leaf>,
+    env: BTreeMap<String, Expr>,
+    ctx: ArkUiExprCtx,
+    stack: Vec<OpenComp>,
+    root: Vec<UiNode>,
+    finish: UiFinishKind,
+}
 
+fn close_open_comps(stack: &mut Vec<OpenComp>, root: &mut Vec<UiNode>) {
     while let Some(open) = stack.pop() {
         let finished = UiNode::Component {
             name: open.name,
@@ -1132,9 +1312,182 @@ fn reconstruct_ui_body(
             attrs: open.attrs,
             children: open.children,
         };
-        push_ui_node(&mut stack, &mut root, finished);
+        push_ui_node(stack, root, finished);
     }
-    root
+}
+
+fn reconstruct_ui_body(em: &mut Emitter<'_>, nodes: &[SNode], ctx: &ArkUiExprCtx) -> Vec<UiNode> {
+    let env = collect_const_bindings(nodes);
+    let mut local_ctx = ctx.clone();
+    collect_this_aliases(nodes, &mut local_ctx.this_aliases);
+
+    let root_nodes = nodes.to_vec();
+    let mut active_funcs: BTreeSet<FuncId> = BTreeSet::new();
+    let mut frames = vec![UiBuildFrame {
+        nodes: root_nodes.into_iter(),
+        pending_leaves: Vec::new().into_iter(),
+        env,
+        ctx: local_ctx,
+        stack: Vec::new(),
+        root: Vec::new(),
+        finish: UiFinishKind::Root,
+    }];
+
+    while let Some(top) = frames.last_mut() {
+        if let Some(leaf) = top.pending_leaves.next() {
+            let Leaf::Raw(s) = leaf else { continue };
+            match s {
+                Stmt::Declare { .. }
+                | Stmt::LexStore { .. }
+                | Stmt::Return(None)
+                | Stmt::Elided { .. } => {}
+                Stmt::Expr(e) => {
+                    if let Some(next_frame) = step_ui_expr(em, &e, top, &mut active_funcs) {
+                        frames.push(next_frame);
+                    }
+                }
+                other => {
+                    let mut buf = String::new();
+                    em.emit_stmt(&other, 0, &mut buf);
+                    let trimmed = buf.trim().to_string();
+                    if !trimmed.is_empty() {
+                        push_ui_node(&mut top.stack, &mut top.root, UiNode::RawStmt(trimmed));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(mut node) = top.nodes.next() {
+            match &mut node {
+                SNode::Stmts(leaves) => {
+                    top.pending_leaves = std::mem::take(leaves).into_iter();
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    if then.is_empty() && otherwise.is_empty() {
+                        continue;
+                    }
+                    let cond_s = render_clean_expr(
+                        em,
+                        cond,
+                        &top.env,
+                        &top.ctx.this_aliases,
+                        &top.ctx.decorated_names,
+                    );
+                    let child_env = top.env.clone();
+                    let child_ctx = top.ctx.clone();
+                    let then_vec = std::mem::take(then);
+                    let else_vec = std::mem::take(otherwise);
+                    frames.push(UiBuildFrame {
+                        nodes: then_vec.into_iter(),
+                        pending_leaves: Vec::new().into_iter(),
+                        env: child_env,
+                        ctx: child_ctx,
+                        stack: Vec::new(),
+                        root: Vec::new(),
+                        finish: UiFinishKind::IfThen {
+                            cond: cond_s,
+                            otherwise: else_vec,
+                        },
+                    });
+                }
+                other => {
+                    let mut buf = String::new();
+                    em.emit_node(other, 0, &mut buf);
+                    let trimmed = buf.trim().to_string();
+                    if !trimmed.is_empty() {
+                        push_ui_node(&mut top.stack, &mut top.root, UiNode::RawStmt(trimmed));
+                    }
+                }
+            }
+            continue;
+        }
+
+        let Some(mut done) = frames.pop() else {
+            break;
+        };
+        match done.finish {
+            UiFinishKind::Root => {
+                close_open_comps(&mut done.stack, &mut done.root);
+                return done.root;
+            }
+            UiFinishKind::IfThen { cond, otherwise } => {
+                close_open_comps(&mut done.stack, &mut done.root);
+                frames.push(UiBuildFrame {
+                    nodes: otherwise.into_iter(),
+                    pending_leaves: Vec::new().into_iter(),
+                    env: done.env,
+                    ctx: done.ctx,
+                    stack: Vec::new(),
+                    root: Vec::new(),
+                    finish: UiFinishKind::IfElse {
+                        cond,
+                        then_body: done.root,
+                    },
+                });
+            }
+            UiFinishKind::IfElse { cond, then_body } => {
+                close_open_comps(&mut done.stack, &mut done.root);
+                if let Some(parent) = frames.last_mut() {
+                    push_ui_node(
+                        &mut parent.stack,
+                        &mut parent.root,
+                        UiNode::If {
+                            cond,
+                            then_body,
+                            else_body: done.root,
+                        },
+                    );
+                }
+            }
+            UiFinishKind::ForEach {
+                func_id,
+                is_lazy,
+                arr,
+                item_param,
+                idx_param,
+                key_gen,
+            } => {
+                active_funcs.remove(&func_id);
+                close_open_comps(&mut done.stack, &mut done.root);
+                if let Some(parent) = frames.last_mut() {
+                    push_ui_node(
+                        &mut parent.stack,
+                        &mut parent.root,
+                        UiNode::ForEach {
+                            is_lazy,
+                            arr,
+                            item_param,
+                            idx_param,
+                            body: done.root,
+                            key_gen,
+                        },
+                    );
+                }
+            }
+            UiFinishKind::BranchClosure { func_id } => {
+                active_funcs.remove(&func_id);
+                close_open_comps(&mut done.stack, &mut done.root);
+                if let Some(parent) = frames.last_mut() {
+                    for c in done.root {
+                        push_ui_node(&mut parent.stack, &mut parent.root, c);
+                    }
+                }
+            }
+            UiFinishKind::ObserveSubbody { func_id } => {
+                active_funcs.remove(&func_id);
+                if let Some(parent) = frames.last_mut() {
+                    parent.stack = done.stack;
+                    parent.root = done.root;
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 fn push_ui_node(stack: &mut [OpenComp], root: &mut Vec<UiNode>, node: UiNode) {
@@ -1164,146 +1517,94 @@ fn flush_self_closing_top(stack: &mut Vec<OpenComp>, root: &mut Vec<UiNode>) {
     }
 }
 
-fn process_ui_snodes(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ForEach frame builder threads emitter, generator closure, bindings, context, and cycle set"
+)]
+fn prepare_foreach_frame(
     em: &mut Emitter<'_>,
-    nodes: &[SNode],
+    gen_expr: &Expr,
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
-    stack: &mut Vec<OpenComp>,
-    root: &mut Vec<UiNode>,
-) {
-    for n in nodes {
-        match n {
-            SNode::Stmts(leaves) => {
-                for l in leaves {
-                    let Leaf::Raw(s) = l else { continue };
-                    match s {
-                        Stmt::Declare { .. }
-                        | Stmt::LexStore { .. }
-                        | Stmt::Return(None)
-                        | Stmt::Elided { .. } => {}
-                        Stmt::Expr(e) => {
-                            process_ui_expr(em, e, env, link_names, stack, root);
-                        }
-                        other => {
-                            let mut buf = String::new();
-                            em.emit_stmt(other, 0, &mut buf);
-                            let trimmed = buf.trim().to_string();
-                            if !trimmed.is_empty() {
-                                push_ui_node(stack, root, UiNode::RawStmt(trimmed));
-                            }
-                        }
-                    }
-                }
-            }
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                if then.is_empty() && otherwise.is_empty() {
-                    continue;
-                }
-                let cond_s = render_clean_expr(em, cond);
-                let mut then_nodes = Vec::new();
-                let mut then_stack = Vec::new();
-                process_ui_snodes(em, then, env, link_names, &mut then_stack, &mut then_nodes);
-                while let Some(o) = then_stack.pop() {
-                    push_ui_node(
-                        &mut then_stack,
-                        &mut then_nodes,
-                        UiNode::Component {
-                            name: o.name,
-                            args: o.args,
-                            attrs: o.attrs,
-                            children: o.children,
-                        },
-                    );
-                }
-                let mut else_nodes = Vec::new();
-                let mut else_stack = Vec::new();
-                process_ui_snodes(
-                    em,
-                    otherwise,
-                    env,
-                    link_names,
-                    &mut else_stack,
-                    &mut else_nodes,
-                );
-                while let Some(o) = else_stack.pop() {
-                    push_ui_node(
-                        &mut else_stack,
-                        &mut else_nodes,
-                        UiNode::Component {
-                            name: o.name,
-                            args: o.args,
-                            attrs: o.attrs,
-                            children: o.children,
-                        },
-                    );
-                }
-                push_ui_node(
-                    stack,
-                    root,
-                    UiNode::If {
-                        cond: cond_s,
-                        then_body: then_nodes,
-                        else_body: else_nodes,
-                    },
-                );
-            }
-            other => {
-                let mut buf = String::new();
-                em.emit_node(other, 0, &mut buf);
-                let trimmed = buf.trim().to_string();
-                if !trimmed.is_empty() {
-                    push_ui_node(stack, root, UiNode::RawStmt(trimmed));
-                }
-            }
-        }
+    ctx: &ArkUiExprCtx,
+    is_lazy: bool,
+    arr_s: String,
+    key_s: Option<String>,
+    active_funcs: &mut BTreeSet<FuncId>,
+) -> Option<UiBuildFrame> {
+    let Expr::Closure { body: fn_id, .. } = resolve_expr(gen_expr, env) else {
+        return None;
+    };
+    let fn_id = *fn_id;
+    if !active_funcs.insert(fn_id) {
+        return None;
     }
+    let (rf, body) = em.func_nodes(fn_id, false);
+    let visible = &rf.params[rf.hidden_params.min(rf.params.len())..];
+    let item_p = visible
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "item".to_string());
+    let idx_p = visible.get(1).cloned();
+    let sub_env = collect_const_bindings(&body);
+    let mut sub_ctx = ctx.clone();
+    collect_this_aliases(&body, &mut sub_ctx.this_aliases);
+    Some(UiBuildFrame {
+        nodes: body.into_iter(),
+        pending_leaves: Vec::new().into_iter(),
+        env: sub_env,
+        ctx: sub_ctx,
+        stack: Vec::new(),
+        root: Vec::new(),
+        finish: UiFinishKind::ForEach {
+            func_id: fn_id,
+            is_lazy,
+            arr: arr_s,
+            item_param: item_p,
+            idx_param: idx_p,
+            key_gen: key_s,
+        },
+    })
 }
 
-fn process_ui_expr(
+fn step_ui_expr(
     em: &mut Emitter<'_>,
     e: &Expr,
-    env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
-    stack: &mut Vec<OpenComp>,
-    root: &mut Vec<UiNode>,
-) {
+    frame: &mut UiBuildFrame,
+    active_funcs: &mut BTreeSet<FuncId>,
+) -> Option<UiBuildFrame> {
     let Expr::Call { callee, args, .. } = e else {
-        return;
+        return None;
     };
+    let env = &frame.env;
+    let ctx = &frame.ctx;
 
     if is_method_named(callee, "observeComponentCreation2", env)
         || is_method_named(callee, "observeComponentCreation", env)
     {
-        flush_self_closing_top(stack, root);
+        flush_self_closing_top(&mut frame.stack, &mut frame.root);
         if let Some(first) = args.first()
             && let Expr::Closure { body: fn_id, .. } = resolve_expr(first, env)
         {
             let fn_id = *fn_id;
-            let second_meta = args.get(1).map(|a| resolve_expr(a, env));
-            handle_observe_closure(em, fn_id, second_meta, link_names, stack, root);
-            return;
+            let second_meta = args.get(1).map(|a| resolve_expr(a, env).clone());
+            return step_observe_closure(em, fn_id, second_meta.as_ref(), frame, active_funcs);
         }
     }
 
     if is_method_named(callee, "pop", env) {
         let comp_name = receiver_component_name(callee, e, env);
         if matches!(comp_name.as_deref(), Some("If" | "ForEach" | "LazyForEach")) {
-            return;
+            return None;
         }
-        flush_self_closing_top(stack, root);
+        flush_self_closing_top(&mut frame.stack, &mut frame.root);
         if let Some(target) = &comp_name
-            && let Some(pos) = stack.iter().rposition(|c| &c.name == target)
+            && let Some(pos) = frame.stack.iter().rposition(|c| &c.name == target)
         {
-            while stack.len() > pos + 1 {
-                if let Some(inner) = stack.pop() {
+            while frame.stack.len() > pos + 1 {
+                if let Some(inner) = frame.stack.pop() {
                     push_ui_node(
-                        stack,
-                        root,
+                        &mut frame.stack,
+                        &mut frame.root,
                         UiNode::Component {
                             name: inner.name,
                             args: inner.args,
@@ -1313,10 +1614,10 @@ fn process_ui_expr(
                     );
                 }
             }
-            if let Some(open) = stack.pop() {
+            if let Some(open) = frame.stack.pop() {
                 push_ui_node(
-                    stack,
-                    root,
+                    &mut frame.stack,
+                    &mut frame.root,
                     UiNode::Component {
                         name: open.name,
                         args: open.args,
@@ -1325,7 +1626,7 @@ fn process_ui_expr(
                     },
                 );
             }
-            return;
+            return None;
         }
     }
 
@@ -1334,50 +1635,59 @@ fn process_ui_expr(
         && (comp == "LazyForEach" || comp == "ForEach")
         && args.len() >= 4
     {
-        flush_self_closing_top(stack, root);
-        let arr_s = render_clean_expr(em, resolve_expr(&args[2], env));
-        if let Some((item_p, idx_p, item_body)) = extract_foreach_gen(em, &args[3], env, link_names)
-        {
-            let key_s = args
-                .get(4)
-                .map(|k| render_clean_expr(em, resolve_expr(k, env)));
-            push_ui_node(
-                stack,
-                root,
-                UiNode::ForEach {
-                    is_lazy: comp == "LazyForEach",
-                    arr: arr_s,
-                    item_param: item_p,
-                    idx_param: idx_p,
-                    body: item_body,
-                    key_gen: key_s,
-                },
-            );
-            return;
+        flush_self_closing_top(&mut frame.stack, &mut frame.root);
+        let arr_s = render_clean_expr(
+            em,
+            resolve_expr(&args[2], env),
+            env,
+            &ctx.this_aliases,
+            &ctx.decorated_names,
+        );
+        let key_s = args.get(4).map(|k| {
+            render_clean_expr(
+                em,
+                resolve_expr(k, env),
+                env,
+                &ctx.this_aliases,
+                &ctx.decorated_names,
+            )
+        });
+        if let Some(next_frame) = prepare_foreach_frame(
+            em,
+            &args[3],
+            env,
+            ctx,
+            comp == "LazyForEach",
+            arr_s,
+            key_s,
+            active_funcs,
+        ) {
+            return Some(next_frame);
         }
     }
 
     if is_method_named(callee, "forEachUpdateFunction", env) && args.len() >= 3 {
-        let arr_s = render_clean_expr(em, resolve_expr(&args[1], env));
+        let arr_s = render_clean_expr(
+            em,
+            resolve_expr(&args[1], env),
+            env,
+            &ctx.this_aliases,
+            &ctx.decorated_names,
+        );
         let item_arg = unwrap_foreach_item_gen(&args[2], env).unwrap_or(&args[2]);
-        if let Some((item_p, idx_p, item_body)) = extract_foreach_gen(em, item_arg, env, link_names)
+        let key_s = args.get(3).map(|k| {
+            render_clean_expr(
+                em,
+                resolve_expr(k, env),
+                env,
+                &ctx.this_aliases,
+                &ctx.decorated_names,
+            )
+        });
+        if let Some(next_frame) =
+            prepare_foreach_frame(em, item_arg, env, ctx, false, arr_s, key_s, active_funcs)
         {
-            let key_s = args
-                .get(3)
-                .map(|k| render_clean_expr(em, resolve_expr(k, env)));
-            push_ui_node(
-                stack,
-                root,
-                UiNode::ForEach {
-                    is_lazy: false,
-                    arr: arr_s,
-                    item_param: item_p,
-                    idx_param: idx_p,
-                    body: item_body,
-                    key_gen: key_s,
-                },
-            );
-            return;
+            return Some(next_frame);
         }
     }
 
@@ -1386,63 +1696,93 @@ fn process_ui_expr(
         && let Expr::Closure { body: br_fn, .. } = resolve_expr(&args[1], env)
     {
         let br_fn = *br_fn;
-        let (_rf, br_body) = em.func_nodes(br_fn, false);
-        let children = reconstruct_ui_body(em, &br_body, link_names);
-        for c in children {
-            push_ui_node(stack, root, c);
+        if active_funcs.insert(br_fn) {
+            let (_rf, br_body) = em.func_nodes(br_fn, false);
+            let sub_env = collect_const_bindings(&br_body);
+            let mut sub_ctx = ctx.clone();
+            collect_this_aliases(&br_body, &mut sub_ctx.this_aliases);
+            return Some(UiBuildFrame {
+                nodes: br_body.into_iter(),
+                pending_leaves: Vec::new().into_iter(),
+                env: sub_env,
+                ctx: sub_ctx,
+                stack: Vec::new(),
+                root: Vec::new(),
+                finish: UiFinishKind::BranchClosure { func_id: br_fn },
+            });
         }
-        return;
+        return None;
     }
 
-    let rendered = render_clean_expr(em, e);
+    let rendered = render_clean_expr(em, e, env, &ctx.this_aliases, &ctx.decorated_names);
     if !rendered.is_empty() {
-        push_ui_node(stack, root, UiNode::RawStmt(format!("{rendered};")));
+        push_ui_node(
+            &mut frame.stack,
+            &mut frame.root,
+            UiNode::RawStmt(format!("{rendered};")),
+        );
     }
+    None
 }
 
-fn handle_observe_closure(
+fn step_observe_closure(
     em: &mut Emitter<'_>,
     closure_fn: FuncId,
     second_meta: Option<&Expr>,
-    link_names: &BTreeSet<String>,
-    stack: &mut Vec<OpenComp>,
-    root: &mut Vec<UiNode>,
-) {
+    parent: &mut UiBuildFrame,
+    active_funcs: &mut BTreeSet<FuncId>,
+) -> Option<UiBuildFrame> {
+    if !active_funcs.insert(closure_fn) {
+        return None;
+    }
     let (_rf, body) = em.func_nodes(closure_fn, false);
     let env = collect_const_bindings(&body);
+    let mut ctx = parent.ctx.clone();
+    collect_this_aliases(&body, &mut ctx.this_aliases);
 
     if let Some(meta_name) = custom_child_meta_name(second_meta, &env) {
-        let props = extract_custom_child_props(em, &body, &env, link_names);
+        let props = extract_custom_child_props(em, &body, &env, &ctx);
         push_ui_node(
-            stack,
-            root,
+            &mut parent.stack,
+            &mut parent.root,
             UiNode::CustomChild {
                 name: meta_name,
                 props,
             },
         );
-        return;
+        active_funcs.remove(&closure_fn);
+        return None;
     }
-    if let Some((child_name, props)) = extract_viewpu_child_from_body(em, &body, &env, link_names) {
+    if let Some((child_name, props)) = extract_viewpu_child_from_body(em, &body, &env, &ctx) {
         push_ui_node(
-            stack,
-            root,
+            &mut parent.stack,
+            &mut parent.root,
             UiNode::CustomChild {
                 name: child_name,
                 props,
             },
         );
-        return;
+        active_funcs.remove(&closure_fn);
+        return None;
     }
 
     let meta_ident = second_meta.and_then(|m| ident_of(m, &env));
     if meta_ident.as_deref() == Some("If") || body_calls_comp_create(&body, &env, "If") {
-        for n in &body {
-            if let SNode::If { .. } = n {
-                process_ui_snodes(em, std::slice::from_ref(n), &env, link_names, stack, root);
-            }
-        }
-        return;
+        let if_nodes: Vec<SNode> = body
+            .into_iter()
+            .filter(|n| matches!(n, SNode::If { .. }))
+            .collect();
+        return Some(UiBuildFrame {
+            nodes: if_nodes.into_iter(),
+            pending_leaves: Vec::new().into_iter(),
+            env,
+            ctx,
+            stack: std::mem::take(&mut parent.stack),
+            root: std::mem::take(&mut parent.root),
+            finish: UiFinishKind::ObserveSubbody {
+                func_id: closure_fn,
+            },
+        });
     }
 
     let mut comp_name: Option<String> = meta_ident;
@@ -1464,13 +1804,13 @@ fn handle_observe_closure(
         if recv.is_some() && recv == comp_name {
             match mname.as_str() {
                 "create" | "createWithLabel" | "createWithChild" => {
-                    create_args = render_call_args_clean(em, args, &env, link_names, true);
+                    create_args = render_call_args_clean(em, args, &env, &ctx, true);
                 }
                 "pop" => {
                     saw_pop = true;
                 }
                 attr => {
-                    let attr_args = render_call_args_clean(em, args, &env, link_names, false);
+                    let attr_args = render_call_args_clean(em, args, &env, &ctx, false);
                     attrs.push((attr.to_string(), attr_args));
                 }
             }
@@ -1479,8 +1819,17 @@ fn handle_observe_closure(
 
     if let Some(name) = comp_name {
         if name == "ForEach" {
-            process_ui_snodes(em, &body, &env, link_names, stack, root);
-            return;
+            return Some(UiBuildFrame {
+                nodes: body.into_iter(),
+                pending_leaves: Vec::new().into_iter(),
+                env,
+                ctx,
+                stack: std::mem::take(&mut parent.stack),
+                root: std::mem::take(&mut parent.root),
+                finish: UiFinishKind::ObserveSubbody {
+                    func_id: closure_fn,
+                },
+            });
         }
         let open = OpenComp {
             name,
@@ -1490,8 +1839,8 @@ fn handle_observe_closure(
         };
         if saw_pop {
             push_ui_node(
-                stack,
-                root,
+                &mut parent.stack,
+                &mut parent.root,
                 UiNode::Component {
                     name: open.name,
                     args: open.args,
@@ -1500,9 +1849,11 @@ fn handle_observe_closure(
                 },
             );
         } else {
-            stack.push(open);
+            parent.stack.push(open);
         }
     }
+    active_funcs.remove(&closure_fn);
+    None
 }
 
 fn method_name_of(callee: &Expr, env: &BTreeMap<String, Expr>) -> Option<String> {
@@ -1594,7 +1945,7 @@ fn extract_custom_child_props(
     em: &mut Emitter<'_>,
     body: &[SNode],
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
+    ctx: &ArkUiExprCtx,
 ) -> Option<String> {
     let obj_stores = collect_obj_prop_stores(body);
     let mut new_props: Option<String> = None;
@@ -1612,8 +1963,7 @@ fn extract_custom_child_props(
             && new_props.is_none()
             && let Some(arg1) = args.get(1)
         {
-            new_props =
-                render_props_object(em, arg1, &obj_stores, env, link_names).filter(|p| p != "{}");
+            new_props = render_props_object(em, arg1, &obj_stores, env, ctx).filter(|p| p != "{}");
         }
         if let Stmt::Expr(Expr::Call { callee, args, .. }) = s {
             if new_props.is_none()
@@ -1626,15 +1976,15 @@ fn extract_custom_child_props(
                 } = resolve_expr(first, env)
                 && let Some(arg1) = new_args.get(1)
             {
-                new_props = render_props_object(em, arg1, &obj_stores, env, link_names)
-                    .filter(|p| p != "{}");
+                new_props =
+                    render_props_object(em, arg1, &obj_stores, env, ctx).filter(|p| p != "{}");
             }
             if update_props.is_none()
                 && is_method_named(callee, "updateStateVarsOfChildByElmtId", env)
                 && let Some(arg1) = args.get(1)
             {
-                update_props = render_props_object(em, arg1, &obj_stores, env, link_names)
-                    .filter(|p| p != "{}");
+                update_props =
+                    render_props_object(em, arg1, &obj_stores, env, ctx).filter(|p| p != "{}");
             }
         }
     });
@@ -1645,7 +1995,7 @@ fn extract_viewpu_child_from_body(
     em: &mut Emitter<'_>,
     body: &[SNode],
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
+    ctx: &ArkUiExprCtx,
 ) -> Option<(String, Option<String>)> {
     let obj_stores = collect_obj_prop_stores(body);
     let mut found: Option<(String, Option<String>)> = None;
@@ -1671,7 +2021,7 @@ fn extract_viewpu_child_from_body(
             {
                 let props = new_args
                     .get(1)
-                    .and_then(|a| render_props_object(em, a, &obj_stores, env, link_names))
+                    .and_then(|a| render_props_object(em, a, &obj_stores, env, ctx))
                     .filter(|p| p != "{}");
                 found = Some((clean_component_name(&cname), props));
             }
@@ -1692,7 +2042,7 @@ fn extract_viewpu_child_from_body(
         {
             let props = args
                 .get(1)
-                .and_then(|a| render_props_object(em, a, &obj_stores, env, link_names))
+                .and_then(|a| render_props_object(em, a, &obj_stores, env, ctx))
                 .filter(|p| p != "{}");
             found = Some((clean_component_name(&cname), props));
         }
@@ -1700,96 +2050,198 @@ fn extract_viewpu_child_from_body(
     if saw_view_create { found } else { None }
 }
 
+enum PropValSrc<'a> {
+    Lit(&'a Lit),
+    Expr(&'a Expr),
+}
+
+struct PropFrame<'a> {
+    pending: std::vec::IntoIter<(String, PropValSrc<'a>)>,
+    ordered_keys: Vec<String>,
+    values: BTreeMap<String, String>,
+    pop_ident: Option<String>,
+    parent_key: Option<String>,
+}
+
+fn try_make_prop_frame<'a>(
+    raw_e: &'a Expr,
+    obj_stores: &'a BTreeMap<String, Vec<(String, Expr)>>,
+    env: &'a BTreeMap<String, Expr>,
+    active_objs: &mut BTreeSet<String>,
+    parent_key: Option<String>,
+) -> Option<PropFrame<'a>> {
+    let raw_id = raw_ident_of(raw_e);
+    if let Some(id) = &raw_id
+        && active_objs.contains(id)
+    {
+        return None;
+    }
+    let e = resolve_expr(raw_e, env);
+    let extra = raw_id.as_ref().and_then(|id| obj_stores.get(id));
+    match e {
+        Expr::ObjectBuild { entries } => {
+            let pop_ident = raw_id.filter(|id| obj_stores.contains_key(id));
+            if let Some(id) = &pop_ident {
+                active_objs.insert(id.clone());
+            }
+            let mut items: Vec<(String, PropValSrc<'a>)> = Vec::new();
+            for entry in entries {
+                if let ObjEntry::KeyValue(Lit::String(k), value) = entry {
+                    items.push((k.clone(), PropValSrc::Expr(resolve_expr(value, env))));
+                }
+            }
+            if let Some(stores) = extra {
+                for (k, value) in stores {
+                    items.push((k.clone(), PropValSrc::Expr(value)));
+                }
+            }
+            Some(PropFrame {
+                pending: items.into_iter(),
+                ordered_keys: Vec::new(),
+                values: BTreeMap::new(),
+                pop_ident,
+                parent_key,
+            })
+        }
+        Expr::ObjectLit { entries } => {
+            let pop_ident = raw_id.filter(|id| obj_stores.contains_key(id));
+            if let Some(id) = &pop_ident {
+                active_objs.insert(id.clone());
+            }
+            let mut items: Vec<(String, PropValSrc<'a>)> = Vec::new();
+            for (k, v) in entries {
+                if let Lit::String(ks) = k {
+                    items.push((ks.clone(), PropValSrc::Lit(v)));
+                }
+            }
+            if let Some(stores) = extra {
+                for (k, value) in stores {
+                    items.push((k.clone(), PropValSrc::Expr(value)));
+                }
+            }
+            Some(PropFrame {
+                pending: items.into_iter(),
+                ordered_keys: Vec::new(),
+                values: BTreeMap::new(),
+                pop_ident,
+                parent_key,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_leaf_prop_val(
+    em: &mut Emitter<'_>,
+    rv: &Expr,
+    env: &BTreeMap<String, Expr>,
+    ctx: &ArkUiExprCtx,
+) -> String {
+    if let Expr::PropName { object, name, .. } = rv
+        && is_this_alias_expr(object, env, &ctx.this_aliases)
+    {
+        if let Some(prop) = name.strip_prefix("__")
+            && !prop.is_empty()
+        {
+            return format!("${prop}");
+        }
+        if ctx.link_names.contains(name) {
+            return format!("${name}");
+        }
+    }
+    render_clean_expr(em, rv, env, &ctx.this_aliases, &ctx.decorated_names)
+}
+
 fn render_props_object(
     em: &mut Emitter<'_>,
     raw_e: &Expr,
     obj_stores: &BTreeMap<String, Vec<(String, Expr)>>,
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
+    ctx: &ArkUiExprCtx,
 ) -> Option<String> {
-    let extra = raw_ident_of(raw_e).and_then(|id| obj_stores.get(&id));
-    let e = resolve_expr(raw_e, env);
-    match e {
-        Expr::ObjectBuild { entries } => {
-            let mut ordered_keys: Vec<String> = Vec::new();
-            let mut values: BTreeMap<String, String> = BTreeMap::new();
-            for entry in entries {
-                if let ObjEntry::KeyValue(Lit::String(k), value) = entry {
-                    let rv = resolve_expr(value, env);
-                    let vs = render_prop_val(em, rv, obj_stores, env, link_names);
-                    if !values.contains_key(k) {
-                        ordered_keys.push(k.clone());
-                    }
-                    values.insert(k.clone(), vs);
-                }
+    let mut active_objs = BTreeSet::new();
+    let Some(root_frame) = try_make_prop_frame(raw_e, obj_stores, env, &mut active_objs, None)
+    else {
+        let e = resolve_expr(raw_e, env);
+        return Some(render_clean_expr(
+            em,
+            e,
+            env,
+            &ctx.this_aliases,
+            &ctx.decorated_names,
+        ));
+    };
+
+    let mut frames = vec![root_frame];
+    let mut completed: Option<(String, String)> = None;
+
+    while let Some(top) = frames.last_mut() {
+        if let Some((k, v_str)) = completed.take() {
+            if !top.values.contains_key(&k) {
+                top.ordered_keys.push(k.clone());
             }
-            if let Some(stores) = extra {
-                for (k, value) in stores {
-                    let vs = render_prop_val(em, value, obj_stores, env, link_names);
-                    if !values.contains_key(k) {
-                        ordered_keys.push(k.clone());
-                    }
-                    values.insert(k.clone(), vs);
-                }
-            }
-            Some(format_kv_map(ordered_keys, values))
+            top.values.insert(k, v_str);
         }
-        Expr::ObjectLit { entries } => {
-            let mut ordered_keys: Vec<String> = Vec::new();
-            let mut values: BTreeMap<String, String> = BTreeMap::new();
-            for (k, v) in entries {
-                if let Lit::String(ks) = k {
-                    let vs = em.render_lit_js(v);
-                    if !values.contains_key(ks) {
-                        ordered_keys.push(ks.clone());
+        if let Some((k, src)) = top.pending.next() {
+            match src {
+                PropValSrc::Lit(lit) => {
+                    let vs = em.render_lit_js(lit);
+                    if !top.values.contains_key(&k) {
+                        top.ordered_keys.push(k.clone());
                     }
-                    values.insert(ks.clone(), vs);
+                    top.values.insert(k, vs);
+                }
+                PropValSrc::Expr(raw_rv) => {
+                    let rv = resolve_expr(raw_rv, env);
+                    if matches!(rv, Expr::ObjectBuild { .. } | Expr::ObjectLit { .. })
+                        && let Some(child_frame) = try_make_prop_frame(
+                            raw_rv,
+                            obj_stores,
+                            env,
+                            &mut active_objs,
+                            Some(k.clone()),
+                        )
+                    {
+                        frames.push(child_frame);
+                    } else {
+                        let vs = render_leaf_prop_val(em, rv, env, ctx);
+                        if !top.values.contains_key(&k) {
+                            top.ordered_keys.push(k.clone());
+                        }
+                        top.values.insert(k, vs);
+                    }
                 }
             }
-            if let Some(stores) = extra {
-                for (k, value) in stores {
-                    let vs = render_prop_val(em, value, obj_stores, env, link_names);
-                    if !values.contains_key(k) {
-                        ordered_keys.push(k.clone());
-                    }
-                    values.insert(k.clone(), vs);
-                }
-            }
-            Some(format_kv_map(ordered_keys, values))
+            continue;
         }
-        _ => Some(render_clean_expr(em, e)),
+
+        let Some(done) = frames.pop() else {
+            break;
+        };
+        if let Some(id) = done.pop_ident {
+            active_objs.remove(&id);
+        }
+        let formatted = format_kv_map(done.ordered_keys, done.values);
+        match done.parent_key {
+            None => return Some(formatted),
+            Some(pk) => completed = Some((pk, formatted)),
+        }
     }
+    None
 }
 
-fn render_prop_val(
-    em: &mut Emitter<'_>,
-    raw_rv: &Expr,
-    obj_stores: &BTreeMap<String, Vec<(String, Expr)>>,
+fn is_this_alias_expr(
+    e: &Expr,
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
-) -> String {
-    let rv = resolve_expr(raw_rv, env);
-    if matches!(rv, Expr::ObjectBuild { .. } | Expr::ObjectLit { .. })
-        && let Some(nested) = render_props_object(em, raw_rv, obj_stores, env, link_names)
-    {
-        return nested;
+    this_aliases: &BTreeSet<String>,
+) -> bool {
+    match e {
+        Expr::Ident(s) | Expr::Temp { name: s, .. } if this_aliases.contains(s) => true,
+        _ => match resolve_expr(e, env) {
+            Expr::Ident(s) | Expr::Temp { name: s, .. } => this_aliases.contains(s),
+            _ => false,
+        },
     }
-    if let Some(prop) = backing_prop_name(rv, env) {
-        return format!("${prop}");
-    }
-    let raw_s = em.estr(rv);
-    for alias in ["v1_1$2.__", "v1_1$1.__", "v1_1.__", "v1_2.__", "this.__"] {
-        if let Some(prop) = raw_s.strip_prefix(alias) {
-            return format!("${prop}");
-        }
-    }
-    let cleaned = clean_this_aliases(&raw_s);
-    if let Some(prop) = cleaned.strip_prefix("this.")
-        && link_names.contains(prop)
-    {
-        return format!("${prop}");
-    }
-    cleaned
 }
 
 fn format_kv_map(ordered_keys: Vec<String>, mut values: BTreeMap<String, String>) -> String {
@@ -1803,7 +2255,7 @@ fn format_kv_map(ordered_keys: Vec<String>, mut values: BTreeMap<String, String>
             if is_legal_ident(&k) {
                 Some(format!("{k}: {v}"))
             } else {
-                Some(format!("{k:?}: {v}"))
+                Some(format!("{}: {v}", crate::consts::render_string(&k)))
             }
         })
         .collect();
@@ -1827,31 +2279,11 @@ fn unwrap_foreach_item_gen<'a>(e: &'a Expr, env: &'a BTreeMap<String, Expr>) -> 
     None
 }
 
-fn extract_foreach_gen(
-    em: &mut Emitter<'_>,
-    gen_expr: &Expr,
-    env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
-) -> Option<(String, Option<String>, Vec<UiNode>)> {
-    let Expr::Closure { body: fn_id, .. } = resolve_expr(gen_expr, env) else {
-        return None;
-    };
-    let (rf, body) = em.func_nodes(*fn_id, false);
-    let visible = &rf.params[rf.hidden_params.min(rf.params.len())..];
-    let item_p = visible
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "item".to_string());
-    let idx_p = visible.get(1).cloned();
-    let ui = reconstruct_ui_body(em, &body, link_names);
-    Some((item_p, idx_p, ui))
-}
-
 fn render_call_args_clean(
     em: &mut Emitter<'_>,
     args: &[Expr],
     env: &BTreeMap<String, Expr>,
-    link_names: &BTreeSet<String>,
+    ctx: &ArkUiExprCtx,
     strip_nav_meta: bool,
 ) -> String {
     let mut rendered = Vec::new();
@@ -1861,12 +2293,18 @@ fn render_call_args_clean(
             continue;
         }
         if matches!(ra, Expr::ObjectBuild { .. } | Expr::ObjectLit { .. })
-            && let Some(obj_s) = render_props_object(em, a, &BTreeMap::new(), env, link_names)
+            && let Some(obj_s) = render_props_object(em, a, &BTreeMap::new(), env, ctx)
         {
             rendered.push(obj_s);
             continue;
         }
-        rendered.push(render_clean_expr(em, ra));
+        rendered.push(render_clean_expr(
+            em,
+            ra,
+            env,
+            &ctx.this_aliases,
+            &ctx.decorated_names,
+        ));
     }
     rendered.join(", ")
 }
@@ -1886,88 +2324,168 @@ fn is_navigation_meta_obj(e: &Expr) -> bool {
     }
 }
 
-fn render_clean_expr(em: &mut Emitter<'_>, e: &Expr) -> String {
-    let raw = em.estr(e);
-    clean_this_aliases(&raw)
+/// AST-level rewrite of ArkUI `this` capture aliases and observed `__prop`
+/// backing accesses BEFORE printing (`#87.6`): string literals and `new.target`
+/// are never modified.
+fn rewrite_arkui_expr(
+    root: &Expr,
+    env: &BTreeMap<String, Expr>,
+    this_aliases: &BTreeSet<String>,
+    decorated_names: &BTreeSet<String>,
+) -> Expr {
+    let mut cloned = root.clone();
+    // Iterative heap workstack over mutable `Expr` nodes (`(ptr, expanded)` is
+    // avoided via `#![forbid(unsafe_code)]`; instead we rewrite top-down on
+    // `Ident`/`Temp`/`PropName` using a safe mutable borrow stack!).
+    let mut stack: Vec<&mut Expr> = vec![&mut cloned];
+    while let Some(cur) = stack.pop() {
+        if is_this_alias_expr(cur, env, this_aliases) {
+            *cur = Expr::Ident("this".to_string());
+            continue;
+        }
+        if let Expr::PropName {
+            object,
+            name,
+            dot_legal,
+        } = cur
+            && is_this_alias_expr(object, env, this_aliases)
+        {
+            **object = Expr::Ident("this".to_string());
+            if let Some(stripped) = name.strip_prefix("__")
+                && !stripped.is_empty()
+                && (decorated_names.is_empty() || decorated_names.contains(stripped))
+            {
+                let clean = stripped.to_string();
+                *dot_legal = is_legal_ident(&clean);
+                *name = clean;
+            }
+            continue;
+        }
+        stack.extend(crate::folds::expr_children_mut(cur));
+    }
+    cloned
 }
 
-fn clean_this_aliases(raw: &str) -> String {
-    let mut s = raw.to_string();
-    for alias in ["v1_1$2.", "v1_1$1.", "v1_1.", "v1_2$1.", "v1_2."] {
-        s = s.replace(alias, "this.");
-    }
-    s = s.replace("this.__", "this.");
-    s
+fn render_clean_expr(
+    em: &mut Emitter<'_>,
+    e: &Expr,
+    env: &BTreeMap<String, Expr>,
+    this_aliases: &BTreeSet<String>,
+    decorated_names: &BTreeSet<String>,
+) -> String {
+    let rewritten = rewrite_arkui_expr(e, env, this_aliases, decorated_names);
+    em.estr(&rewritten)
 }
 
 fn render_ui_nodes(nodes: &[UiNode], indent: usize, out: &mut String) {
-    let pad = "  ".repeat(indent);
-    for node in nodes {
-        match node {
-            UiNode::Component {
-                name,
-                args,
-                attrs,
-                children,
-            } => {
-                if children.is_empty() {
-                    out.push_str(&format!("{pad}{name}({args})"));
-                    for (aname, aargs) in attrs {
-                        out.push_str(&format!("\n{pad}  .{aname}({aargs})"));
-                    }
-                    out.push('\n');
-                } else {
-                    out.push_str(&format!("{pad}{name}({args}) {{\n"));
-                    render_ui_nodes(children, indent + 1, out);
-                    out.push_str(&format!("{pad}}}"));
-                    for (aname, aargs) in attrs {
-                        out.push_str(&format!("\n{pad}  .{aname}({aargs})"));
-                    }
-                    out.push('\n');
-                }
-            }
-            UiNode::CustomChild { name, props } => match props {
-                Some(p) => out.push_str(&format!("{pad}{name}({p})\n")),
-                None => out.push_str(&format!("{pad}{name}()\n")),
-            },
-            UiNode::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                out.push_str(&format!("{pad}if ({cond}) {{\n"));
-                render_ui_nodes(then_body, indent + 1, out);
-                if else_body.is_empty() {
-                    out.push_str(&format!("{pad}}}\n"));
-                } else {
-                    out.push_str(&format!("{pad}}} else {{\n"));
-                    render_ui_nodes(else_body, indent + 1, out);
-                    out.push_str(&format!("{pad}}}\n"));
-                }
-            }
-            UiNode::ForEach {
-                is_lazy,
-                arr,
-                item_param,
-                idx_param,
-                body,
-                key_gen,
-            } => {
-                let kw = if *is_lazy { "LazyForEach" } else { "ForEach" };
-                let params = match idx_param {
-                    Some(ix) => format!("({item_param}, {ix})"),
-                    None => format!("({item_param})"),
+    enum RenderTask<'a> {
+        Nodes { slice: &'a [UiNode], indent: usize },
+        Raw(String),
+    }
+
+    let mut stack = vec![RenderTask::Nodes {
+        slice: nodes,
+        indent,
+    }];
+    while let Some(task) = stack.pop() {
+        match task {
+            RenderTask::Raw(s) => out.push_str(&s),
+            RenderTask::Nodes { slice, indent } => {
+                let Some((node, rest)) = slice.split_first() else {
+                    continue;
                 };
-                out.push_str(&format!("{pad}{kw}({arr}, {params} => {{\n"));
-                render_ui_nodes(body, indent + 1, out);
-                match key_gen {
-                    Some(k) => out.push_str(&format!("{pad}}}, {k})\n")),
-                    None => out.push_str(&format!("{pad}}})\n")),
+                if !rest.is_empty() {
+                    stack.push(RenderTask::Nodes {
+                        slice: rest,
+                        indent,
+                    });
                 }
-            }
-            UiNode::RawStmt(text) => {
-                for line in text.lines() {
-                    out.push_str(&format!("{pad}{line}\n"));
+                let pad = "  ".repeat(indent);
+                match node {
+                    UiNode::Component {
+                        name,
+                        args,
+                        attrs,
+                        children,
+                    } => {
+                        if children.is_empty() {
+                            out.push_str(&format!("{pad}{name}({args})"));
+                            for (aname, aargs) in attrs {
+                                out.push_str(&format!("\n{pad}  .{aname}({aargs})"));
+                            }
+                            out.push('\n');
+                        } else {
+                            out.push_str(&format!("{pad}{name}({args}) {{\n"));
+                            let mut close = format!("{pad}}}");
+                            for (aname, aargs) in attrs {
+                                close.push_str(&format!("\n{pad}  .{aname}({aargs})"));
+                            }
+                            close.push('\n');
+                            stack.push(RenderTask::Raw(close));
+                            stack.push(RenderTask::Nodes {
+                                slice: children,
+                                indent: indent + 1,
+                            });
+                        }
+                    }
+                    UiNode::CustomChild { name, props } => match props {
+                        Some(p) => out.push_str(&format!("{pad}{name}({p})\n")),
+                        None => out.push_str(&format!("{pad}{name}()\n")),
+                    },
+                    UiNode::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        out.push_str(&format!("{pad}if ({cond}) {{\n"));
+                        if else_body.is_empty() {
+                            stack.push(RenderTask::Raw(format!("{pad}}}\n")));
+                            stack.push(RenderTask::Nodes {
+                                slice: then_body,
+                                indent: indent + 1,
+                            });
+                        } else {
+                            stack.push(RenderTask::Raw(format!("{pad}}}\n")));
+                            stack.push(RenderTask::Nodes {
+                                slice: else_body,
+                                indent: indent + 1,
+                            });
+                            stack.push(RenderTask::Raw(format!("{pad}}} else {{\n")));
+                            stack.push(RenderTask::Nodes {
+                                slice: then_body,
+                                indent: indent + 1,
+                            });
+                        }
+                    }
+                    UiNode::ForEach {
+                        is_lazy,
+                        arr,
+                        item_param,
+                        idx_param,
+                        body,
+                        key_gen,
+                    } => {
+                        let kw = if *is_lazy { "LazyForEach" } else { "ForEach" };
+                        let params = match idx_param {
+                            Some(ix) => format!("({item_param}, {ix})"),
+                            None => format!("({item_param})"),
+                        };
+                        out.push_str(&format!("{pad}{kw}({arr}, {params} => {{\n"));
+                        let close = match key_gen {
+                            Some(k) => format!("{pad}}}, {k})\n"),
+                            None => format!("{pad}}})\n"),
+                        };
+                        stack.push(RenderTask::Raw(close));
+                        stack.push(RenderTask::Nodes {
+                            slice: body,
+                            indent: indent + 1,
+                        });
+                    }
+                    UiNode::RawStmt(text) => {
+                        for line in text.lines() {
+                            out.push_str(&format!("{pad}{line}\n"));
+                        }
+                    }
                 }
             }
         }

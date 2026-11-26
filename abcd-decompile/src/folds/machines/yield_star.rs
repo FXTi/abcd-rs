@@ -96,80 +96,40 @@ pub fn yield_star_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut F
         FunctionKind::AsyncGenerator => true,
         _ => return,
     };
+    // `async_generator_machine_fold` strips dead catch-context `PhiAssign`
+    // leaves in place (`strip_genobj_phi_assigns`), which can leave empty
+    // `SNode::Stmts([])` placeholders where an exceptional-only run used to sit.
+    fold_snode_vecs_postorder(nodes, |seq| {
+        seq.retain(|n| !matches!(n, SNode::Stmts(r) if r.is_empty()));
+    });
     let mut uses = BTreeMap::new();
     count_temp_uses(nodes, &mut uses);
     ys_fold_seq(nodes, async_, &uses, stats);
 }
 
-/// The recursive driver: children first, then the sequence scan.
+/// The iterative post-order driver: children first, then the sequence scan.
 pub(in crate::folds) fn ys_fold_seq(
     nodes: &mut Vec<SNode>,
     async_: bool,
     uses: &BTreeMap<ValueId, usize>,
     stats: &mut FoldStats,
 ) {
-    for n in nodes.iter_mut() {
-        match n {
-            SNode::If {
-                then, otherwise, ..
-            } => {
-                ys_fold_seq(then, async_, uses, stats);
-                ys_fold_seq(otherwise, async_, uses, stats);
+    fold_snode_vecs_postorder(nodes, |seq| {
+        let mut i = 0;
+        while i < seq.len() {
+            if matches!(&seq[i], SNode::While { cond: None, .. })
+                && ys_apply_bare(seq, i, async_, uses, stats)
+            {
+                continue;
             }
-            SNode::While { body, .. }
-            | SNode::DoWhile { body, .. }
-            | SNode::Labeled { body, .. }
-            // unreachable: ForOf/ForIn nodes are created only inside fold()
-            // (folds.rs:1418/1433/2577), which runs after yield_star_fold
-            // (emit.rs:530 vs 531) — c-COV diagnosis
-            | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => ys_fold_seq(body, async_, uses, stats),
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                ys_fold_seq(body, async_, uses, stats);
-                for c in catches {
-                    ys_fold_seq(&mut c.body, async_, uses, stats);
-                }
-                // unreachable: Try.finally is Some only after fold_finally
-                // (folds.rs:4143/4154) inside fold(), which runs after
-                // yield_star_fold — c-COV diagnosis
-                if let Some(f) = finally {
-                    ys_fold_seq(f, async_, uses, stats);
-                }
+            if matches!(&seq[i], SNode::Try { .. })
+                && ys_apply_fragments(seq, i, async_, uses, stats)
+            {
+                continue;
             }
-            // unreachable: SNode::Switch is created only by fold_switches
-            // (folds.rs:3115/3183) inside fold(), which runs after
-            // yield_star_fold — c-COV diagnosis
-            SNode::Switch { cases, .. } => {
-                for c in cases {
-                    ys_fold_seq(&mut c.body, async_, uses, stats);
-                }
-            }
-            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            i += 1;
         }
-    }
-    let mut i = 0;
-    while i < nodes.len() {
-        // Arrangement A (bare siblings): [.., setup-run, phi-init-run,
-        // While, exit-If (sync)]. Arrangement B (try fragments, the
-        // structurer's "protected statements are not contiguous"
-        // split): [Try(setup+init), Try(While), Try(exit-If)].
-        if matches!(&nodes[i], SNode::While { cond: None, .. })
-            && ys_apply_bare(nodes, i, async_, uses, stats)
-        {
-            continue;
-        }
-        if matches!(&nodes[i], SNode::Try { .. })
-            && ys_apply_fragments(nodes, i, async_, uses, stats)
-        {
-            continue;
-        }
-        i += 1;
-    }
+    });
 }
 
 // ── small matchers ─────────────────────────────────────────────────
@@ -365,11 +325,10 @@ pub(in crate::folds) fn ys_undefined_test(cond: &Expr) -> Option<(ValueId, bool)
     }
 }
 
-/// Debug tracing (YS_DEBUG=1).
+/// No-op stage marker (retained for matcher readability; library code must not
+/// read environment variables or write to stderr).
 pub(in crate::folds) fn ys_trace(stage: &str) {
-    if std::env::var_os("YS_DEBUG").is_some() {
-        eprintln!("yield-star: bail at {stage}");
-    }
+    let _ = stage;
 }
 
 /// A `GeneratorDriver` expr with the given resume flag and genobj temp.
@@ -437,18 +396,22 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
     let SNode::Stmts(header) = sig[0] else {
         return None;
     };
-    if header.is_empty() {
+    let header_sig: Vec<&Leaf> = header
+        .iter()
+        .filter(|l| !ys_skip_plumbing_leaf(l))
+        .collect();
+    if header_sig.is_empty() {
         return None;
     }
     let (phis, exit_decl) = {
         let mut phis = BTreeMap::new();
-        for l in &header[..header.len() - 1] {
+        for &l in &header_sig[..header_sig.len() - 1] {
             let Leaf::Raw(Stmt::PhiDecl { name, value_id }) = l else {
                 return None;
             };
             phis.insert(name.clone(), *value_id);
         }
-        let (_, id, value) = ys_declare_of(&header[header.len() - 1])?;
+        let (_, id, value) = ys_declare_of(header_sig[header_sig.len() - 1])?;
         if !matches!(value, Expr::Lit(Lit::Bool(false))) {
             return None;
         }
@@ -692,11 +655,6 @@ pub(in crate::folds) fn ys_match_return_arm(
         ys_trace("ret-arm:no-if");
         return None;
     }
-    if std::env::var_os("YS_DEBUG").is_some() {
-        eprintln!(
-            "yield-star: ret-arm it={it_id:?} exit={exit_phi:?} rv={rv_id:?} true={true_decl:?}"
-        );
-    }
     if async_ {
         // The async RETURN arm awaits the resume value and completes
         // via the AsyncGeneratorResolve machinery (d-P14 shapes,
@@ -805,8 +763,8 @@ pub(in crate::folds) fn ys_match_throw_arm(
                         // machinery; ThrowNotExists must be in there.
                         flag = Some(t);
                         saw_close_if = true;
-                        if !ys_contains_elided(then, "ThrowNotExists")
-                            && !ys_contains_elided(otherwise, "ThrowNotExists")
+                        if !ys_contains_throw_not_exists(then)
+                            && !ys_contains_throw_not_exists(otherwise)
                         {
                             return None;
                         }
@@ -824,6 +782,69 @@ pub(in crate::folds) fn ys_match_throw_arm(
         return None;
     }
     flag
+}
+
+fn ys_contains_throw_not_exists(nodes: &[SNode]) -> bool {
+    if ys_contains_elided(nodes, "ThrowNotExists") {
+        return true;
+    }
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        for n in slice {
+            match n {
+                SNode::Stmts(run) => {
+                    for l in run {
+                        if let Leaf::Raw(Stmt::Throw(Expr::Call {
+                            callee,
+                            args,
+                            kind: abcd_ir::op::CallKind::New,
+                            ..
+                        })) = l
+                            && matches!(callee.as_ref(), Expr::Ident(k) if k == "ReferenceError")
+                            && matches!(
+                                args.as_slice(),
+                                [Expr::Lit(Lit::String(msg))] if msg == "Variable does not exist"
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        stack.push(fin);
+                    }
+                    for c in catches {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    false
 }
 
 fn ys_skip_plumbing_leaf(l: &Leaf) -> bool {
@@ -948,7 +969,10 @@ fn ys_match_sync_suspend_loopback(
 
 /// The sync driver tail: pre-call run, done test, pass-through
 /// suspend, loop-back assigns, continue.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "sync yield-star tail matcher binds distinct SSA phis and names"
+)]
 pub(in crate::folds) fn ys_match_loop_tail_sync(
     sig: &[&SNode],
     phis: &BTreeMap<String, ValueId>,
@@ -1095,7 +1119,10 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
 /// AsyncGeneratorYield machinery, the done test, and the IN-LOOP
 /// completion dispatch (the async YieldStar's `iteratorComplete` is
 /// inlined in the loop body).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "async yield-star tail matcher binds distinct SSA phis and names"
+)]
 pub(in crate::folds) fn ys_match_loop_tail_async(
     sig: &[&SNode],
     phis: &BTreeMap<String, ValueId>,
@@ -1273,7 +1300,8 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     let [SNode::Stmts(nrun), nrest @ ..] = nsig.as_slice() else {
         return None;
     };
-    let Some((bind_name, bind_id, bind_val)) = nrun.first().and_then(ys_declare_of) else {
+    let bind_idx = nrun.iter().position(|l| !ys_skip_plumbing_leaf(l))?;
+    let Some((bind_name, bind_id, bind_val)) = ys_declare_of(&nrun[bind_idx]) else {
         ys_trace("a-tail:bind");
         return None;
     };
@@ -1281,8 +1309,8 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
         return None;
     }
     let mut continuation: Vec<SNode> = Vec::new();
-    if nrun.len() > 1 {
-        continuation.push(SNode::Stmts(nrun[1..].to_vec()));
+    if bind_idx + 1 < nrun.len() {
+        continuation.push(SNode::Stmts(nrun[bind_idx + 1..].to_vec()));
     }
     continuation.extend(nrest.iter().map(|n| (*n).clone()));
     // Return completion: `v = resume1.value; return v` (+ plumbing).
@@ -1802,17 +1830,19 @@ pub(in crate::folds) fn ys_match_exit(
     let [SNode::Stmts(first), rest @ ..] = tsig.as_slice() else {
         return None;
     };
-    let (bind, first_rest) = match first.as_slice() {
-        [
-            Leaf::Raw(Stmt::Declare {
-                name,
-                value,
-                value_id,
-                ..
-            }),
-            tail @ ..,
-        ] if ys_prop(value, "value") == Some(res) => (Some((name.clone(), *value_id)), tail),
-        [Leaf::Raw(Stmt::Expr(e)), tail @ ..] if ys_prop(e, "value") == Some(res) => (None, tail),
+    let load_idx = first.iter().position(|l| !ys_skip_plumbing_leaf(l))?;
+    let (bind, first_rest) = match &first[load_idx] {
+        Leaf::Raw(Stmt::Declare {
+            name,
+            value,
+            value_id,
+            ..
+        }) if ys_prop(value, "value") == Some(res) => {
+            (Some((name.clone(), *value_id)), &first[load_idx + 1..])
+        }
+        Leaf::Raw(Stmt::Expr(e)) if ys_prop(e, "value") == Some(res) => {
+            (None, &first[load_idx + 1..])
+        }
         _ => return None,
     };
     let mut continuation: Vec<SNode> = Vec::new();
@@ -1825,10 +1855,7 @@ pub(in crate::folds) fn ys_match_exit(
     let [SNode::Stmts(rrun)] = rsig.as_slice() else {
         return None;
     };
-    let rrun_sig: Vec<&Leaf> = rrun
-        .iter()
-        .filter(|l| !matches!(l, Leaf::Raw(Stmt::Elided { op, .. }) if *op == "SetGeneratorState"))
-        .collect();
+    let rrun_sig: Vec<&Leaf> = rrun.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
     let [
         Leaf::Raw(Stmt::Declare {
             value: v2load,
@@ -1867,11 +1894,19 @@ pub(in crate::folds) fn ys_match_setup(
     let SNode::Stmts(run) = n else {
         return None;
     };
-    if run.len() < 2 {
+    let sig_indices: Vec<usize> = run
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| !ys_skip_plumbing_leaf(l))
+        .map(|(idx, _)| idx)
+        .collect();
+    if sig_indices.len() < 2 {
         return None;
     }
-    let (.., next_id, next_val) = ys_declare_of(&run[run.len() - 1])?;
-    let (_, iter_id, iter_val) = ys_declare_of(&run[run.len() - 2])?;
+    let next_idx = sig_indices[sig_indices.len() - 1];
+    let iter_idx = sig_indices[sig_indices.len() - 2];
+    let (.., next_id, next_val) = ys_declare_of(&run[next_idx])?;
+    let (_, iter_id, iter_val) = ys_declare_of(&run[iter_idx])?;
     let Expr::Iter { op, obj, .. } = iter_val else {
         return None;
     };
@@ -1886,16 +1921,26 @@ pub(in crate::folds) fn ys_match_setup(
     if ys_prop(next_val, "next") != Some(iter_id) {
         return None;
     }
+    for l in &run[iter_idx + 1..] {
+        if let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l
+            && (expr_uses_value(value, iter_id) || expr_uses_value(value, next_id))
+        {
+            return None;
+        }
+    }
     let mut delegate = (**obj).clone();
-    let mut prefix: Vec<Leaf> = run[..run.len() - 2].to_vec();
+    let mut prefix: Vec<Leaf> = run[..iter_idx].to_vec();
     // Inline trailing single-use temp declares into the delegate
     // expr (`t = inner(); yield* t` → `yield* inner()`): the removed
     // pieces between the declare and the yield* are all consumed
     // machinery, so the observable evaluation order is unchanged.
     while let Expr::Temp { value: t, .. } = &delegate {
-        let Some(Leaf::Raw(Stmt::Declare {
+        let Some(last_sig) = prefix.iter().rposition(|l| !ys_skip_plumbing_leaf(l)) else {
+            break;
+        };
+        let Leaf::Raw(Stmt::Declare {
             value, value_id, ..
-        })) = prefix.last()
+        }) = &prefix[last_sig]
         else {
             break;
         };
@@ -1903,7 +1948,7 @@ pub(in crate::folds) fn ys_match_setup(
             break;
         }
         delegate = value.clone();
-        prefix.pop();
+        prefix.remove(last_sig);
     }
     Some((delegate, iter_id, next_id, prefix))
 }
@@ -2083,27 +2128,39 @@ pub(in crate::folds) fn ys_sync_res(w: &SNode) -> Option<ValueId> {
     None
 }
 
-/// Descend through nested single-child `Try` wrappers to the
+/// Descend iteratively through nested single-child `Try` wrappers to the
 /// innermost body sequence.
-pub(in crate::folds) fn ys_innermost_body_mut(t: &mut SNode) -> &mut Vec<SNode> {
-    let SNode::Try { body, .. } = t else {
-        unreachable!()
-    };
-    if body.len() == 1 && matches!(body[0], SNode::Try { .. }) {
-        let inner = &mut body[0];
-        return ys_innermost_body_mut(inner);
+pub(in crate::folds) fn ys_innermost_body_mut(mut t: &mut SNode) -> &mut Vec<SNode> {
+    loop {
+        let has_single_try = matches!(
+            t,
+            SNode::Try { body, .. } if body.len() == 1 && matches!(body[0], SNode::Try { .. })
+        );
+        if has_single_try {
+            let SNode::Try { body, .. } = t else {
+                unreachable!()
+            };
+            t = &mut body[0];
+        } else {
+            let SNode::Try { body, .. } = t else {
+                unreachable!()
+            };
+            return body;
+        }
     }
-    body
 }
 
-pub(in crate::folds) fn ys_innermost_body(t: &SNode) -> Option<&Vec<SNode>> {
-    let SNode::Try { body, .. } = t else {
-        return None;
-    };
-    if body.len() == 1 && matches!(body[0], SNode::Try { .. }) {
-        return ys_innermost_body(&body[0]);
+pub(in crate::folds) fn ys_innermost_body(mut t: &SNode) -> Option<&Vec<SNode>> {
+    loop {
+        let SNode::Try { body, .. } = t else {
+            return None;
+        };
+        if body.len() == 1 && matches!(body[0], SNode::Try { .. }) {
+            t = &body[0];
+        } else {
+            return Some(body);
+        }
     }
-    Some(body)
 }
 
 /// Arrangement B: try fragments `[Try(setup+init), Try(While),

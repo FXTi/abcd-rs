@@ -13,7 +13,6 @@
 //! process, so a parser/encoder bug surfaces as a tool error (exit 2)
 //! instead of a corrupt file on disk.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
@@ -30,8 +29,12 @@ pub fn assemble(
         None => abcd_file::pandasm::parse_file(pa),
     }
     .map_err(|e| CliError::User(format!("{source_name}: parse failed: {e}")))?;
-    let abc = abcd_file::encode(&file)
-        .map_err(|e| CliError::Tool(format!("{source_name}: encode failed: {e}")))?;
+    let abc = abcd_file::encode(&file).map_err(|e| match e {
+        abcd_file::Error::UnsupportedOutputVersion(_) => {
+            CliError::User(format!("{source_name}: encode failed: {e}"))
+        }
+        other => CliError::Tool(format!("{source_name}: encode failed: {other}")),
+    })?;
     if check {
         abcd_file::decode(&abc).map_err(|e| {
             CliError::Tool(format!(
@@ -56,13 +59,14 @@ pub fn run_asm(
         Some(path) => {
             std::fs::write(path, &abc)
                 .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-            println!("{} bytes -> {}", abc.len(), path.display());
+            crate::write_stdout_fmt_line(format_args!(
+                "{} bytes -> {}",
+                abc.len(),
+                path.display()
+            ))?;
         }
         None => {
-            let mut out = std::io::stdout().lock();
-            out.write_all(&abc)
-                .and_then(|()| out.flush())
-                .map_err(|e| CliError::Tool(format!("cannot write to stdout: {e}")))?;
+            crate::write_stdout_bytes(&abc)?;
         }
     }
     Ok(())

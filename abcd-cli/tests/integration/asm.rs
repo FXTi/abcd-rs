@@ -53,3 +53,24 @@ fn unparsable_text_is_a_user_error() {
     let err = asm::assemble(b"this is not pandasm at all", "junk.pa", None, false).unwrap_err();
     assert_eq!(err.exit_code(), 1, "parse failures are user errors");
 }
+
+#[test]
+fn unsupported_output_version_is_a_user_error() {
+    let abc = common::tiny_abc();
+    let file = abcd_file::decode(&abc).expect("decode fixture");
+    let pa = abcd_file::pandasm::emit_file(&file, "tiny.abc");
+
+    let err = asm::assemble(
+        &pa,
+        "tiny.pa",
+        Some(abcd_file::Version::new(0, 0, 0, 2)),
+        false,
+    )
+    .expect_err("0.0.0.2 output version must be rejected");
+    assert_eq!(
+        err.exit_code(),
+        1,
+        "UnsupportedOutputVersion must map to CliError::User (exit 1): {err}"
+    );
+    assert!(err.to_string().contains("0.0.0.2"), "{err}");
+}

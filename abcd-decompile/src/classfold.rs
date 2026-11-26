@@ -233,7 +233,7 @@ pub fn plan_with_index(
 /// Peel a `DefineMethod`/`AllocClosure`/`DefineFunc` chain to the
 /// function body behind a value; `None` for any other shape.
 pub(crate) fn peel_closure_body(module: &Module, mut v: abcd_ir::ValueId) -> Option<FuncId> {
-    loop {
+    for _ in 0..module.insts.len().saturating_add(1) {
         let ValueDef::Inst(iid) = module.value(v)?.def else {
             return None;
         };
@@ -244,6 +244,7 @@ pub(crate) fn peel_closure_body(module: &Module, mut v: abcd_ir::ValueId) -> Opt
             _ => return None,
         }
     }
+    None
 }
 
 /// The constant behind a value (a pooled constant or a `LoadConst`).

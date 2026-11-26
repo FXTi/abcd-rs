@@ -42,118 +42,70 @@ pub(in crate::folds) struct LexStoreSite {
 /// sites. Runs AFTER the desugar folds (it consumes their output).
 pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats) {
     // Pass 1: census of every LexStore name → its sites.
-    fn census(
-        nodes: &[SNode],
-        runs: &mut usize,
-        stores: &mut std::collections::HashMap<String, Vec<LexStoreSite>>,
-    ) {
-        for n in nodes {
-            match n {
-                SNode::Stmts(leaves) => {
-                    let run = *runs;
-                    *runs += 1;
-                    for (index, l) in leaves.iter().enumerate() {
-                        if let Leaf::Raw(Stmt::LexStore { name, .. }) = l {
-                            stores
-                                .entry(name.clone())
-                                .or_default()
-                                .push(LexStoreSite { run, index });
-                        }
-                    }
-                }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    census(then, runs, stores);
-                    census(otherwise, runs, stores);
-                }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => census(body, runs, stores),
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    census(body, runs, stores);
-                    for c in catches {
-                        census(&c.body, runs, stores);
-                    }
-                    if let Some(f) = finally {
-                        census(f, runs, stores);
-                    }
-                }
-                SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        census(&c.body, runs, stores);
-                    }
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-            }
-        }
-    }
     let mut runs = 0usize;
     let mut stores: std::collections::HashMap<String, Vec<LexStoreSite>> =
         std::collections::HashMap::new();
-    census(nodes, &mut runs, &mut stores);
+    let mut cstack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = cstack.pop() {
+        let Some((first, rest)) = seq.split_first() else {
+            continue;
+        };
+        if !rest.is_empty() {
+            cstack.push(rest);
+        }
+        match first {
+            SNode::Stmts(leaves) => {
+                let run = runs;
+                runs += 1;
+                for (index, l) in leaves.iter().enumerate() {
+                    if let Leaf::Raw(Stmt::LexStore { name, .. }) = l {
+                        stores
+                            .entry(name.clone())
+                            .or_default()
+                            .push(LexStoreSite { run, index });
+                    }
+                }
+            }
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                cstack.push(otherwise);
+                cstack.push(then);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => cstack.push(body),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                if let Some(f) = finally {
+                    cstack.push(f);
+                }
+                for c in catches.iter().rev() {
+                    cstack.push(&c.body);
+                }
+                cstack.push(body);
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases.iter().rev() {
+                    cstack.push(&c.body);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
 
     // Pass 2: convert the provable initializations.
     let mut converted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    fn convert(
-        nodes: &mut [SNode],
-        runs: &mut usize,
-        stores: &std::collections::HashMap<String, Vec<LexStoreSite>>,
-        params: &[String],
-        converted: &mut std::collections::HashSet<String>,
-        stats: &mut FoldStats,
-    ) {
-        for n in nodes.iter_mut() {
-            match n {
-                SNode::Stmts(leaves) => {
-                    let run = *runs;
-                    *runs += 1;
-                    convert_run(leaves, run, stores, params, converted, stats);
-                }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    convert(then, runs, stores, params, converted, stats);
-                    convert(otherwise, runs, stores, params, converted, stats);
-                }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => {
-                    convert(body, runs, stores, params, converted, stats)
-                }
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    convert(body, runs, stores, params, converted, stats);
-                    for c in catches {
-                        convert(&mut c.body, runs, stores, params, converted, stats);
-                    }
-                    if let Some(f) = finally {
-                        convert(f, runs, stores, params, converted, stats);
-                    }
-                }
-                SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        convert(&mut c.body, runs, stores, params, converted, stats);
-                    }
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-            }
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "per-run scope conversion threads run id, store table, params, converted set, and stats"
+    )]
     fn convert_run(
         leaves: &mut Vec<Leaf>,
         run: usize,
@@ -298,7 +250,11 @@ pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats)
         }
     }
     let mut runs = 0usize;
-    convert(nodes, &mut runs, &stores, params, &mut converted, stats);
+    walk_stmts_runs_mut(nodes, |leaves| {
+        let run = runs;
+        runs += 1;
+        convert_run(leaves, run, &stores, params, &mut converted, stats);
+    });
 }
 
 // ── N74-W4: late declaration-site reconstruction (TDZ honesty) ─────
@@ -427,11 +383,14 @@ pub(in crate::folds) fn collect_ident_uses(
     try_stack: &[usize],
     out: &mut Vec<(String, Vec<usize>)>,
 ) {
-    if let Expr::Ident(name) = e {
-        out.push((name.clone(), try_stack.to_vec()));
-    }
-    for c in expr_children(e) {
-        collect_ident_uses(c, try_stack, out);
+    let mut stack: Vec<&Expr> = vec![e];
+    while let Some(cur) = stack.pop() {
+        if let Expr::Ident(name) = cur {
+            out.push((name.clone(), try_stack.to_vec()));
+        }
+        for c in expr_children(cur).into_iter().rev() {
+            stack.push(c);
+        }
     }
 }
 
@@ -447,155 +406,233 @@ pub(in crate::folds) fn late_decl_census(
     region_stack: &mut Vec<usize>,
     cx: &mut LateDeclCx,
 ) {
-    for n in nodes {
-        match n {
-            SNode::Stmts(leaves) => {
-                for l in leaves {
-                    cx.seq += 1;
-                    match l {
-                        Leaf::Raw(Stmt::ScopePush { .. }) => {
-                            cx.pushes += 1;
-                            cx.scope_edges.push(cx.seq);
-                        }
-                        Leaf::Raw(Stmt::LexStore {
-                            level, name, value, ..
-                        }) => {
-                            let name = crate::legalize::sanitize(name);
-                            collect_ident_uses(value, region_stack, &mut cx.uses);
-                            cx.uses.push((name.clone(), region_stack.clone()));
-                            cx.stores.push(LateStore {
-                                func_valued: matches!(
-                                    value,
-                                    Expr::Closure { .. } | Expr::Class { .. }
-                                ),
-                                name,
-                                lexical: true,
-                                level: *level,
-                                region: capable_here
-                                    .then(|| region_stack.last().copied().unwrap_or(0)),
-                                stack: region_stack.clone(),
-                                seq: cx.seq,
-                            });
-                        }
-                        Leaf::Raw(Stmt::GlobalStore { name, value, .. }) => {
-                            let name = crate::legalize::sanitize(name);
-                            collect_ident_uses(value, region_stack, &mut cx.uses);
-                            cx.uses.push((name.clone(), region_stack.clone()));
-                            cx.stores.push(LateStore {
-                                func_valued: matches!(
-                                    value,
-                                    Expr::Closure { .. } | Expr::Class { .. }
-                                ),
-                                name,
-                                lexical: false,
-                                level: 0,
-                                region: capable_here
-                                    .then(|| region_stack.last().copied().unwrap_or(0)),
-                                stack: region_stack.clone(),
-                                seq: cx.seq,
-                            });
-                        }
-                        Leaf::Decl { name, value, .. } => {
-                            cx.declared.insert(name.clone());
-                            if let Some(v) = value {
-                                collect_ident_uses(v, region_stack, &mut cx.uses);
-                            }
-                        }
-                        Leaf::Raw(Stmt::ScopePop) => {
-                            cx.scope_edges.push(cx.seq);
-                        }
-                        Leaf::Assign { target, value } => {
-                            collect_ident_uses(value, region_stack, &mut cx.uses);
-                            cx.uses.push((target.clone(), region_stack.clone()));
-                        }
-                        Leaf::Raw(s) => {
-                            for e in stmt_exprs_of(s) {
-                                collect_ident_uses(e, region_stack, &mut cx.uses);
-                            }
-                        }
-                        Leaf::Destructure { obj, .. } => {
-                            collect_ident_uses(obj, region_stack, &mut cx.uses);
-                        }
+    enum Task<'a> {
+        EnterRegion {
+            nodes: &'a [SNode],
+            capable: bool,
+            push_new_id: bool,
+        },
+        PopRegion,
+        Nodes {
+            slice: &'a [SNode],
+            capable: bool,
+        },
+        Expr(&'a Expr),
+        SwitchCases(&'a [SwitchCase]),
+    }
+
+    let mut stack = vec![Task::Nodes {
+        slice: nodes,
+        capable: capable_here,
+    }];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::EnterRegion {
+                nodes,
+                capable,
+                push_new_id,
+            } => {
+                if push_new_id {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    stack.push(Task::PopRegion);
+                }
+                stack.push(Task::Nodes {
+                    slice: nodes,
+                    capable,
+                });
+            }
+            Task::PopRegion => {
+                region_stack.pop();
+            }
+            Task::Expr(e) => {
+                collect_ident_uses(e, region_stack, &mut cx.uses);
+            }
+            Task::SwitchCases(cases) => {
+                if let Some((first, rest)) = cases.split_first() {
+                    if !rest.is_empty() {
+                        stack.push(Task::SwitchCases(rest));
+                    }
+                    stack.push(Task::Nodes {
+                        slice: &first.body,
+                        capable: false,
+                    });
+                    for t in first.tests.iter().rev() {
+                        stack.push(Task::Expr(t));
                     }
                 }
             }
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                collect_ident_uses(cond, region_stack, &mut cx.uses);
-                for arm in [then, otherwise] {
-                    let id = cx.next_try;
-                    cx.next_try += 1;
-                    region_stack.push(id);
-                    late_decl_census(arm, true, region_stack, cx);
-                    region_stack.pop();
+            Task::Nodes { slice, capable } => {
+                let Some((first, rest)) = slice.split_first() else {
+                    continue;
+                };
+                if !rest.is_empty() {
+                    stack.push(Task::Nodes {
+                        slice: rest,
+                        capable,
+                    });
                 }
-            }
-            SNode::While { cond, body, .. } => {
-                if let Some(c) = cond {
-                    collect_ident_uses(c, region_stack, &mut cx.uses);
-                }
-                late_decl_census(body, false, region_stack, cx);
-            }
-            SNode::DoWhile { body, cond, .. } => {
-                late_decl_census(body, false, region_stack, cx);
-                collect_ident_uses(cond, region_stack, &mut cx.uses);
-            }
-            SNode::Labeled { body, .. } => {
-                let id = cx.next_try;
-                cx.next_try += 1;
-                region_stack.push(id);
-                late_decl_census(body, true, region_stack, cx);
-                region_stack.pop();
-            }
-            SNode::ForOf { iter, body, .. } => {
-                collect_ident_uses(iter, region_stack, &mut cx.uses);
-                late_decl_census(body, false, region_stack, cx);
-            }
-            SNode::ForIn { obj, body, .. } => {
-                collect_ident_uses(obj, region_stack, &mut cx.uses);
-                late_decl_census(body, false, region_stack, cx);
-            }
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                // Body, catches, and finally are all capable regions
-                // (a `let` confined to any of them is scoped to it).
-                let id = cx.next_try;
-                cx.next_try += 1;
-                region_stack.push(id);
-                late_decl_census(body, true, region_stack, cx);
-                region_stack.pop();
-                for c in catches {
-                    let id = cx.next_try;
-                    cx.next_try += 1;
-                    region_stack.push(id);
-                    late_decl_census(&c.body, true, region_stack, cx);
-                    region_stack.pop();
-                }
-                if let Some(f) = finally {
-                    let id = cx.next_try;
-                    cx.next_try += 1;
-                    region_stack.push(id);
-                    late_decl_census(f, true, region_stack, cx);
-                    region_stack.pop();
-                }
-            }
-            SNode::Switch { disc, cases } => {
-                collect_ident_uses(disc, region_stack, &mut cx.uses);
-                for c in cases {
-                    for t in &c.tests {
-                        collect_ident_uses(t, region_stack, &mut cx.uses);
+                match first {
+                    SNode::Stmts(leaves) => {
+                        for l in leaves {
+                            cx.seq += 1;
+                            match l {
+                                Leaf::Raw(Stmt::ScopePush { .. }) => {
+                                    cx.pushes += 1;
+                                    cx.scope_edges.push(cx.seq);
+                                }
+                                Leaf::Raw(Stmt::LexStore {
+                                    level, name, value, ..
+                                }) => {
+                                    let name = crate::legalize::sanitize(name);
+                                    collect_ident_uses(value, region_stack, &mut cx.uses);
+                                    cx.uses.push((name.clone(), region_stack.clone()));
+                                    cx.stores.push(LateStore {
+                                        func_valued: matches!(
+                                            value,
+                                            Expr::Closure { .. } | Expr::Class { .. }
+                                        ),
+                                        name,
+                                        lexical: true,
+                                        level: *level,
+                                        region: capable
+                                            .then(|| region_stack.last().copied().unwrap_or(0)),
+                                        stack: region_stack.clone(),
+                                        seq: cx.seq,
+                                    });
+                                }
+                                Leaf::Raw(Stmt::GlobalStore { name, value, .. }) => {
+                                    let name = crate::legalize::sanitize(name);
+                                    collect_ident_uses(value, region_stack, &mut cx.uses);
+                                    cx.uses.push((name.clone(), region_stack.clone()));
+                                    cx.stores.push(LateStore {
+                                        func_valued: matches!(
+                                            value,
+                                            Expr::Closure { .. } | Expr::Class { .. }
+                                        ),
+                                        name,
+                                        lexical: false,
+                                        level: 0,
+                                        region: capable
+                                            .then(|| region_stack.last().copied().unwrap_or(0)),
+                                        stack: region_stack.clone(),
+                                        seq: cx.seq,
+                                    });
+                                }
+                                Leaf::Decl { name, value, .. } => {
+                                    cx.declared.insert(name.clone());
+                                    if let Some(v) = value {
+                                        collect_ident_uses(v, region_stack, &mut cx.uses);
+                                    }
+                                }
+                                Leaf::Raw(Stmt::ScopePop) => {
+                                    cx.scope_edges.push(cx.seq);
+                                }
+                                Leaf::Assign { target, value } => {
+                                    collect_ident_uses(value, region_stack, &mut cx.uses);
+                                    cx.uses.push((target.clone(), region_stack.clone()));
+                                }
+                                Leaf::Raw(s) => {
+                                    for e in stmt_exprs_of(s) {
+                                        collect_ident_uses(e, region_stack, &mut cx.uses);
+                                    }
+                                }
+                                Leaf::Destructure { obj, .. } => {
+                                    collect_ident_uses(obj, region_stack, &mut cx.uses);
+                                }
+                            }
+                        }
                     }
-                    late_decl_census(&c.body, false, region_stack, cx);
+                    SNode::If {
+                        cond,
+                        then,
+                        otherwise,
+                    } => {
+                        stack.push(Task::EnterRegion {
+                            nodes: otherwise,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                        stack.push(Task::EnterRegion {
+                            nodes: then,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                        collect_ident_uses(cond, region_stack, &mut cx.uses);
+                    }
+                    SNode::While { cond, body, .. } => {
+                        stack.push(Task::Nodes {
+                            slice: body,
+                            capable: false,
+                        });
+                        if let Some(c) = cond {
+                            collect_ident_uses(c, region_stack, &mut cx.uses);
+                        }
+                    }
+                    SNode::DoWhile { body, cond, .. } => {
+                        stack.push(Task::Expr(cond));
+                        stack.push(Task::Nodes {
+                            slice: body,
+                            capable: false,
+                        });
+                    }
+                    SNode::Labeled { body, .. } => {
+                        stack.push(Task::EnterRegion {
+                            nodes: body,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                    }
+                    SNode::ForOf { iter, body, .. } => {
+                        stack.push(Task::Nodes {
+                            slice: body,
+                            capable: false,
+                        });
+                        collect_ident_uses(iter, region_stack, &mut cx.uses);
+                    }
+                    SNode::ForIn { obj, body, .. } => {
+                        stack.push(Task::Nodes {
+                            slice: body,
+                            capable: false,
+                        });
+                        collect_ident_uses(obj, region_stack, &mut cx.uses);
+                    }
+                    SNode::Try {
+                        body,
+                        catches,
+                        finally,
+                        ..
+                    } => {
+                        if let Some(f) = finally {
+                            stack.push(Task::EnterRegion {
+                                nodes: f,
+                                capable: true,
+                                push_new_id: true,
+                            });
+                        }
+                        for c in catches.iter().rev() {
+                            stack.push(Task::EnterRegion {
+                                nodes: &c.body,
+                                capable: true,
+                                push_new_id: true,
+                            });
+                        }
+                        stack.push(Task::EnterRegion {
+                            nodes: body,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                    }
+                    SNode::Switch { disc, cases } => {
+                        if !cases.is_empty() {
+                            stack.push(Task::SwitchCases(cases));
+                        }
+                        collect_ident_uses(disc, region_stack, &mut cx.uses);
+                    }
+                    SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
                 }
             }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
 }
@@ -701,9 +738,6 @@ pub fn late_decl_fold(
             // Same-name re-push mid-span → distinct bindings; bail.
             let span_lo = sites.iter().map(|s| s.seq).min().unwrap_or(0);
             let mut span_hi = span_lo;
-            for (n, _) in cx.uses.iter().filter(|(n, _)| *n == name) {
-                let _ = n;
-            }
             for s in sites.iter() {
                 span_hi = span_hi.max(s.seq);
             }
@@ -759,182 +793,160 @@ pub fn late_decl_fold(
     // recomputed with the census's traversal (same walk, same ids).
     let mut declared_now: std::collections::HashSet<(String, usize)> =
         std::collections::HashSet::new();
-    #[allow(clippy::too_many_arguments)]
-    fn rewrite(
-        nodes: &mut [SNode],
-        capable_here: bool,
-        region_stack: &mut Vec<usize>,
-        next_try: &mut usize,
-        convert: &std::collections::HashMap<String, Vec<usize>>,
-        declared_now: &mut std::collections::HashSet<(String, usize)>,
-        stats: &mut FoldStats,
-    ) {
-        for n in nodes.iter_mut() {
-            match n {
-                SNode::Stmts(leaves) => {
-                    let region = capable_here.then(|| region_stack.last().copied().unwrap_or(0));
-                    for l in leaves.iter_mut() {
-                        let name_regions = match l {
-                            Leaf::Raw(Stmt::LexStore { name, .. })
-                            | Leaf::Raw(Stmt::GlobalStore { name, .. }) => convert
-                                .get(&crate::legalize::sanitize(name))
-                                .map(|r| (crate::legalize::sanitize(name), r)),
-                            _ => None,
-                        };
-                        let Some((name, regions)) = name_regions else {
-                            continue;
-                        };
-                        let value = match l {
-                            Leaf::Raw(Stmt::LexStore { value, .. })
-                            | Leaf::Raw(Stmt::GlobalStore { value, .. }) => value.clone(),
-                            _ => unreachable!(),
-                        };
-                        // A declaration only in the name's DECL regions;
-                        // other capable stores (and non-capable runs)
-                        // stay plain assignments to it.
-                        let key = region.map(|r| (name.clone(), r));
-                        if let Some(key) = key
-                            && regions.contains(&key.1)
-                            && !declared_now.contains(&key)
-                        {
-                            declared_now.insert(key);
-                            *l = Leaf::Decl {
-                                name,
-                                mutable: true,
-                                value: Some(value),
+    enum RewriteTask<'a> {
+        EnterRegion {
+            nodes: &'a mut [SNode],
+            capable: bool,
+            push_new_id: bool,
+        },
+        PopRegion,
+        Nodes {
+            slice: &'a mut [SNode],
+            capable: bool,
+        },
+    }
+
+    let mut next_try = 1usize;
+    let mut region_stack: Vec<usize> = Vec::new();
+    let mut rstack = vec![RewriteTask::Nodes {
+        slice: nodes,
+        capable: true,
+    }];
+    while let Some(task) = rstack.pop() {
+        match task {
+            RewriteTask::EnterRegion {
+                nodes,
+                capable,
+                push_new_id,
+            } => {
+                if push_new_id {
+                    let id = next_try;
+                    next_try += 1;
+                    region_stack.push(id);
+                    rstack.push(RewriteTask::PopRegion);
+                }
+                rstack.push(RewriteTask::Nodes {
+                    slice: nodes,
+                    capable,
+                });
+            }
+            RewriteTask::PopRegion => {
+                region_stack.pop();
+            }
+            RewriteTask::Nodes { slice, capable } => {
+                let Some((first, rest)) = slice.split_first_mut() else {
+                    continue;
+                };
+                if !rest.is_empty() {
+                    rstack.push(RewriteTask::Nodes {
+                        slice: rest,
+                        capable,
+                    });
+                }
+                match first {
+                    SNode::Stmts(leaves) => {
+                        let region = capable.then(|| region_stack.last().copied().unwrap_or(0));
+                        for l in leaves.iter_mut() {
+                            let name_regions = match l {
+                                Leaf::Raw(Stmt::LexStore { name, .. })
+                                | Leaf::Raw(Stmt::GlobalStore { name, .. }) => convert
+                                    .get(&crate::legalize::sanitize(name))
+                                    .map(|r| (crate::legalize::sanitize(name), r)),
+                                _ => None,
                             };
-                            stats.late_decl += 1;
-                        } else {
-                            *l = Leaf::Assign {
-                                target: name,
-                                value,
+                            let Some((name, regions)) = name_regions else {
+                                continue;
                             };
+                            let value = match l {
+                                Leaf::Raw(Stmt::LexStore { value, .. })
+                                | Leaf::Raw(Stmt::GlobalStore { value, .. }) => value.clone(),
+                                _ => unreachable!(),
+                            };
+                            let key = region.map(|r| (name.clone(), r));
+                            if let Some(key) = key
+                                && regions.contains(&key.1)
+                                && !declared_now.contains(&key)
+                            {
+                                declared_now.insert(key);
+                                *l = Leaf::Decl {
+                                    name,
+                                    mutable: true,
+                                    value: Some(value),
+                                };
+                                stats.late_decl += 1;
+                            } else {
+                                *l = Leaf::Assign {
+                                    target: name,
+                                    value,
+                                };
+                            }
                         }
                     }
-                }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    for arm in [then, otherwise] {
-                        let id = *next_try;
-                        *next_try += 1;
-                        region_stack.push(id);
-                        rewrite(
-                            arm,
-                            true,
-                            region_stack,
-                            next_try,
-                            convert,
-                            declared_now,
-                            stats,
-                        );
-                        region_stack.pop();
+                    SNode::If {
+                        then, otherwise, ..
+                    } => {
+                        rstack.push(RewriteTask::EnterRegion {
+                            nodes: otherwise,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                        rstack.push(RewriteTask::EnterRegion {
+                            nodes: then,
+                            capable: true,
+                            push_new_id: true,
+                        });
                     }
-                }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => rewrite(
-                    body,
-                    false,
-                    region_stack,
-                    next_try,
-                    convert,
-                    declared_now,
-                    stats,
-                ),
-                SNode::Labeled { body, .. } => {
-                    let id = *next_try;
-                    *next_try += 1;
-                    region_stack.push(id);
-                    rewrite(
+                    SNode::While { body, .. }
+                    | SNode::DoWhile { body, .. }
+                    | SNode::ForOf { body, .. }
+                    | SNode::ForIn { body, .. } => rstack.push(RewriteTask::Nodes {
+                        slice: body,
+                        capable: false,
+                    }),
+                    SNode::Labeled { body, .. } => rstack.push(RewriteTask::EnterRegion {
+                        nodes: body,
+                        capable: true,
+                        push_new_id: true,
+                    }),
+                    SNode::Try {
                         body,
-                        true,
-                        region_stack,
-                        next_try,
-                        convert,
-                        declared_now,
-                        stats,
-                    );
-                    region_stack.pop();
-                }
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    let id = *next_try;
-                    *next_try += 1;
-                    region_stack.push(id);
-                    rewrite(
-                        body,
-                        true,
-                        region_stack,
-                        next_try,
-                        convert,
-                        declared_now,
-                        stats,
-                    );
-                    region_stack.pop();
-                    for c in catches {
-                        let id = *next_try;
-                        *next_try += 1;
-                        region_stack.push(id);
-                        rewrite(
-                            &mut c.body,
-                            true,
-                            region_stack,
-                            next_try,
-                            convert,
-                            declared_now,
-                            stats,
-                        );
-                        region_stack.pop();
+                        catches,
+                        finally,
+                        ..
+                    } => {
+                        if let Some(f) = finally {
+                            rstack.push(RewriteTask::EnterRegion {
+                                nodes: f,
+                                capable: true,
+                                push_new_id: true,
+                            });
+                        }
+                        for c in catches.iter_mut().rev() {
+                            rstack.push(RewriteTask::EnterRegion {
+                                nodes: &mut c.body,
+                                capable: true,
+                                push_new_id: true,
+                            });
+                        }
+                        rstack.push(RewriteTask::EnterRegion {
+                            nodes: body,
+                            capable: true,
+                            push_new_id: true,
+                        });
                     }
-                    if let Some(f) = finally {
-                        let id = *next_try;
-                        *next_try += 1;
-                        region_stack.push(id);
-                        rewrite(
-                            f,
-                            true,
-                            region_stack,
-                            next_try,
-                            convert,
-                            declared_now,
-                            stats,
-                        );
-                        region_stack.pop();
+                    SNode::Switch { cases, .. } => {
+                        for c in cases.iter_mut().rev() {
+                            rstack.push(RewriteTask::Nodes {
+                                slice: &mut c.body,
+                                capable: false,
+                            });
+                        }
                     }
+                    SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
                 }
-                SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        rewrite(
-                            &mut c.body,
-                            false,
-                            region_stack,
-                            next_try,
-                            convert,
-                            declared_now,
-                            stats,
-                        );
-                    }
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
     }
-    let mut next_try = 1usize;
-    rewrite(
-        nodes,
-        true,
-        &mut Vec::new(),
-        &mut next_try,
-        &convert,
-        &mut declared_now,
-        stats,
-    );
 }
 
 // ── N74-W4: rest-parameter reconstruction ──────────────────────────
@@ -958,9 +970,12 @@ pub fn late_decl_fold(
 /// node conditions — the mutation counterpart of the use-census walk).
 pub(in crate::folds) fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&mut Expr)) {
     fn one_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
-        f(e);
-        for c in expr_children_mut(e) {
-            one_expr(c, f);
+        let mut stack: Vec<&mut Expr> = vec![e];
+        while let Some(cur) = stack.pop() {
+            f(cur);
+            for c in expr_children_mut(cur).into_iter().rev() {
+                stack.push(c);
+            }
         }
     }
     fn one_leaf(l: &mut Leaf, f: &mut impl FnMut(&mut Expr)) {
@@ -1018,65 +1033,92 @@ pub(in crate::folds) fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&m
             Leaf::Assign { value, .. } => one_expr(value, f),
         }
     }
-    for n in nodes {
-        match n {
-            SNode::Stmts(run) => {
-                for l in run {
-                    one_leaf(l, f);
-                }
-            }
-            SNode::If {
-                cond,
-                then,
-                otherwise,
-            } => {
-                one_expr(cond, f);
-                map_exprs_mut(then, f);
-                map_exprs_mut(otherwise, f);
-            }
-            SNode::While { cond, body, .. } => {
-                if let Some(c) = cond {
-                    one_expr(c, f);
-                }
-                map_exprs_mut(body, f);
-            }
-            SNode::DoWhile { body, cond, .. } => {
-                map_exprs_mut(body, f);
-                one_expr(cond, f);
-            }
-            SNode::Labeled { body, .. } => map_exprs_mut(body, f),
-            SNode::ForOf { iter, body, .. } => {
-                one_expr(iter, f);
-                map_exprs_mut(body, f);
-            }
-            SNode::ForIn { obj, body, .. } => {
-                one_expr(obj, f);
-                map_exprs_mut(body, f);
-            }
-            SNode::Try {
-                body,
-                catches,
-                finally,
-                ..
-            } => {
-                map_exprs_mut(body, f);
-                for c in catches {
-                    map_exprs_mut(&mut c.body, f);
-                }
-                if let Some(fin) = finally {
-                    map_exprs_mut(fin, f);
-                }
-            }
-            SNode::Switch { disc, cases } => {
-                one_expr(disc, f);
-                for c in cases {
-                    for t in &mut c.tests {
-                        one_expr(t, f);
+
+    enum Task<'a> {
+        Nodes(&'a mut [SNode]),
+        Expr(&'a mut Expr),
+        SwitchCases(&'a mut [SwitchCase]),
+    }
+
+    let mut stack = vec![Task::Nodes(nodes)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Expr(e) => one_expr(e, f),
+            Task::SwitchCases(cases) => {
+                if let Some((first, rest)) = cases.split_first_mut() {
+                    if !rest.is_empty() {
+                        stack.push(Task::SwitchCases(rest));
                     }
-                    map_exprs_mut(&mut c.body, f);
+                    stack.push(Task::Nodes(&mut first.body));
+                    for t in first.tests.iter_mut().rev() {
+                        stack.push(Task::Expr(t));
+                    }
                 }
             }
-            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            Task::Nodes(slice) => {
+                let Some((first, rest)) = slice.split_first_mut() else {
+                    continue;
+                };
+                if !rest.is_empty() {
+                    stack.push(Task::Nodes(rest));
+                }
+                match first {
+                    SNode::Stmts(run) => {
+                        for l in run {
+                            one_leaf(l, f);
+                        }
+                    }
+                    SNode::If {
+                        cond,
+                        then,
+                        otherwise,
+                    } => {
+                        one_expr(cond, f);
+                        stack.push(Task::Nodes(otherwise));
+                        stack.push(Task::Nodes(then));
+                    }
+                    SNode::While { cond, body, .. } => {
+                        if let Some(c) = cond {
+                            one_expr(c, f);
+                        }
+                        stack.push(Task::Nodes(body));
+                    }
+                    SNode::DoWhile { body, cond, .. } => {
+                        stack.push(Task::Expr(cond));
+                        stack.push(Task::Nodes(body));
+                    }
+                    SNode::Labeled { body, .. } => stack.push(Task::Nodes(body)),
+                    SNode::ForOf { iter, body, .. } => {
+                        one_expr(iter, f);
+                        stack.push(Task::Nodes(body));
+                    }
+                    SNode::ForIn { obj, body, .. } => {
+                        one_expr(obj, f);
+                        stack.push(Task::Nodes(body));
+                    }
+                    SNode::Try {
+                        body,
+                        catches,
+                        finally,
+                        ..
+                    } => {
+                        if let Some(fin) = finally {
+                            stack.push(Task::Nodes(fin));
+                        }
+                        for c in catches.iter_mut().rev() {
+                            stack.push(Task::Nodes(&mut c.body));
+                        }
+                        stack.push(Task::Nodes(body));
+                    }
+                    SNode::Switch { disc, cases } => {
+                        one_expr(disc, f);
+                        if !cases.is_empty() {
+                            stack.push(Task::SwitchCases(cases));
+                        }
+                    }
+                    SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+                }
+            }
         }
     }
 }
@@ -1159,47 +1201,9 @@ pub fn rest_param_fold(
     // CopyRestArgs result — keep-alive evidence, recover.rs) is
     // consumed, not rewritten.
     let rest_expr = Expr::Ident(rest.clone());
-    fn strip_bare_rest(nodes: &mut [SNode]) {
-        for n in nodes.iter_mut() {
-            match n {
-                SNode::Stmts(run) => {
-                    run.retain(|l| !matches!(l, Leaf::Raw(Stmt::Expr(Expr::RestArgs { .. }))));
-                }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    strip_bare_rest(then);
-                    strip_bare_rest(otherwise);
-                }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => strip_bare_rest(body),
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    strip_bare_rest(body);
-                    for c in catches {
-                        strip_bare_rest(&mut c.body);
-                    }
-                    if let Some(f) = finally {
-                        strip_bare_rest(f);
-                    }
-                }
-                SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        strip_bare_rest(&mut c.body);
-                    }
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
-            }
-        }
-    }
-    strip_bare_rest(nodes);
+    walk_stmts_runs_mut(nodes, |run| {
+        run.retain(|l| !matches!(l, Leaf::Raw(Stmt::Expr(Expr::RestArgs { .. }))));
+    });
     map_exprs_mut(nodes, &mut |e| {
         if matches!(e, Expr::RestArgs { .. }) {
             *e = rest_expr.clone();

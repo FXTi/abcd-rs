@@ -142,11 +142,16 @@ impl DecompileIndex {
             }
         }
 
+        let has_esm = !module.imports.is_empty()
+            || !module.exports.is_empty()
+            || !module.module_requests.is_empty()
+            || module.classes.iter().any(|c| c.es_module.is_some());
+
         Self {
             parents,
             seed_chains,
             slot_names: module_slot_names(module),
-            per_class_env: None,
+            per_class_env: has_esm.then(|| build_per_class_module_envs(module)),
             class_ctors,
             lex_closure_stores,
         }
@@ -156,7 +161,9 @@ impl DecompileIndex {
     /// for `--split-modules` (#26 Phase 2).
     pub fn build_split(module: &Module) -> Self {
         let mut base = Self::build(module);
-        base.per_class_env = Some(build_per_class_module_envs(module));
+        if base.per_class_env.is_none() {
+            base.per_class_env = Some(build_per_class_module_envs(module));
+        }
         base
     }
 
@@ -369,13 +376,14 @@ impl NameScopes {
             }
         }
 
-        let mut exit_of: BTreeMap<BlockId, Vec<EnvFrame>> = BTreeMap::new();
+        let seed_arcs: Vec<Arc<EnvFrame>> = seed.iter().cloned().map(Arc::new).collect();
+        let mut exit_of: BTreeMap<BlockId, Vec<Arc<EnvFrame>>> = BTreeMap::new();
         for &b in &order {
             // Meet: longest common prefix of the processed preds' exits.
             // Blocks with no processed predecessor (the entry, loop
             // headers on the first pass, unreached blocks) start from
             // the SEED — the inherited chain is every block's floor.
-            let mut meet: Option<Vec<EnvFrame>> = None;
+            let mut meet: Option<Vec<Arc<EnvFrame>>> = None;
             for p in preds.get(&b).into_iter().flatten() {
                 if let Some(exit) = exit_of.get(p) {
                     meet = Some(match meet {
@@ -384,7 +392,7 @@ impl NameScopes {
                     });
                 }
             }
-            let mut stack = meet.unwrap_or_else(|| seed.to_vec());
+            let mut stack = meet.unwrap_or_else(|| seed_arcs.clone());
             let mut cached_arc: Option<Arc<[EnvFrame]>> = None;
             if let Some(block) = module.block(b) {
                 for &iid in &block.insts {
@@ -409,9 +417,13 @@ impl NameScopes {
     }
 }
 
-/// Longest common prefix of two chains (frame equality).
-fn common_prefix(a: &[EnvFrame], b: &[EnvFrame]) -> Vec<EnvFrame> {
-    let n = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+/// Longest common prefix of two chains (pointer-fast-path + frame equality).
+fn common_prefix(a: &[Arc<EnvFrame>], b: &[Arc<EnvFrame>]) -> Vec<Arc<EnvFrame>> {
+    let n = a
+        .iter()
+        .zip(b.iter())
+        .take_while(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+        .count();
     a[..n].to_vec()
 }
 
@@ -500,10 +512,13 @@ fn parent_of(module: &Module, func: FuncId) -> Option<FuncId> {
 /// scoped to the function's OWN frames (the legacy behavior — the
 /// private-name printing/class-fold pipeline keys on it), and define
 /// ops record the captured chain for their children.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "env-chain step threads module, stack, cache, seed boundary, and output table"
+)]
 fn step_inst(
     module: &Module,
-    stack: &mut Vec<EnvFrame>,
+    stack: &mut Vec<Arc<EnvFrame>>,
     cached_arc: &mut Option<Arc<[EnvFrame]>>,
     seed_len: usize,
     record_defines: bool,
@@ -528,7 +543,11 @@ fn step_inst(
                     Arc::from([])
                 } else {
                     cached_arc
-                        .get_or_insert_with(|| Arc::from(stack.as_slice()))
+                        .get_or_insert_with(|| {
+                            let plain: Vec<EnvFrame> =
+                                stack.iter().map(|f| (**f).clone()).collect();
+                            Arc::from(plain)
+                        })
                         .clone()
                 }
             });
@@ -537,10 +556,10 @@ fn step_inst(
     match op {
         Op::NewLexEnv { num_vars, .. } => {
             *cached_arc = None;
-            stack.push(EnvFrame {
+            stack.push(Arc::new(EnvFrame {
                 slots: vec![None; *num_vars as usize],
                 priv_names: Vec::new(),
-            });
+            }));
         }
         Op::NewLexEnvWithName {
             num_vars,
@@ -550,10 +569,10 @@ fn step_inst(
             let names = string_array(module, *scope_names).unwrap_or_default();
             let mut slots: Vec<Option<String>> = names.into_iter().map(Some).collect();
             slots.resize(*num_vars as usize, None);
-            stack.push(EnvFrame {
+            stack.push(Arc::new(EnvFrame {
                 slots,
                 priv_names: Vec::new(),
-            });
+            }));
         }
         Op::PopLexEnv => {
             *cached_arc = None;
@@ -562,8 +581,9 @@ fn step_inst(
         Op::CreatePrivateNames { names, .. } => {
             if let Some(top) = stack.last_mut() {
                 *cached_arc = None;
+                let top_mut = Arc::make_mut(top);
                 for n in string_array(module, *names).unwrap_or_default() {
-                    top.priv_names.push(Some(n));
+                    top_mut.priv_names.push(Some(n));
                 }
             }
         }
@@ -614,14 +634,14 @@ fn lex_fallback(stack_len: usize, level: u16, slot: u16) -> String {
 
 /// Resolve `{level, slot}` against the chain: `level` envs up from the
 /// top, `slot` within that frame.
-fn resolve_slot(stack: &[EnvFrame], level: u16, slot: u16) -> Option<String> {
+fn resolve_slot(stack: &[Arc<EnvFrame>], level: u16, slot: u16) -> Option<String> {
     let idx = stack.len().checked_sub(1 + level as usize)?;
     stack.get(idx)?.slots.get(slot as usize)?.clone()
 }
 
 /// Resolve a private name `{level, slot}` (slot indexes the frame's
 /// private-name table).
-fn resolve_priv(stack: &[EnvFrame], level: u16, slot: u16) -> Option<String> {
+fn resolve_priv(stack: &[Arc<EnvFrame>], level: u16, slot: u16) -> Option<String> {
     let idx = stack.len().checked_sub(1 + level as usize)?;
     stack.get(idx)?.priv_names.get(slot as usize)?.clone()
 }
@@ -904,6 +924,7 @@ pub fn namespace_fallback(index: u32) -> String {
 
 fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModuleEnv> {
     let mut out = HashMap::with_capacity(module.classes.len());
+    let any_class_has_esm = module.classes.iter().any(|c| c.es_module.is_some());
     let standalone_esm = if !module.imports.is_empty()
         || !module.exports.is_empty()
         || !module.module_requests.is_empty()
@@ -921,7 +942,7 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
         let cid = ClassId::new(ci as u32);
         let desc = sym_str(module, cls.descriptor);
         let esm = cls.es_module.as_ref().or_else(|| {
-            (desc == "L_GLOBAL;")
+            (!any_class_has_esm || desc == "L_GLOBAL;")
                 .then_some(standalone_esm.as_ref())
                 .flatten()
         });
@@ -945,54 +966,69 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
                     } => {
                         let local = sanitize(&sym_str(module, *local_name));
                         taken.insert(local.clone());
+                        let mut matched_req = false;
                         for (ridx, req) in esm.module_requests.iter().enumerate() {
                             if req.specifier == *module_request {
                                 env.namespace_slots.insert(ridx as u32, local.clone());
+                                matched_req = true;
                             }
+                        }
+                        // Synthetic IR modules that populate `imports` without
+                        // `module_requests` still bind slot 0 when unambiguous.
+                        if !matched_req && esm.module_requests.is_empty() {
+                            env.namespace_slots.entry(0).or_insert(local);
                         }
                     }
                 }
             }
         }
 
-        // Collect local-slot candidates from this class's own functions first.
+        // Collect local-slot candidates: per-class methods for multi-record
+        // modules, or whole-module instructions when single-file standalone ESM.
         let mut candidates: BTreeMap<u32, Option<String>> = BTreeMap::new();
-        for &fid in &cls.methods {
-            let Some(fd) = module.func(fid) else {
-                continue;
-            };
-            for &bid in &fd.blocks {
-                let Some(block) = module.block(bid) else {
+        let mut inspect_op = |op: &Op| match op {
+            Op::StoreGlobal { name, .. }
+            | Op::StoreGlobalRecord { name, .. }
+            | Op::TryStoreGlobal { name, .. } => {
+                taken.insert(sanitize(&sym_str(module, *name)));
+            }
+            Op::ThrowUndefinedIfHoleWithName { name, value } => {
+                if let Some(slot) = load_local_module_slot(module, *value) {
+                    consider(&mut candidates, slot, sym_str(module, *name));
+                }
+            }
+            Op::ThrowUndefinedIfHole { name, value } => {
+                if let Some(slot) = load_local_module_slot(module, *value)
+                    && let Some(n) = const_string(module, *name)
+                {
+                    consider(&mut candidates, slot, n);
+                }
+            }
+            Op::StoreModuleVar { index, value } => {
+                if let Some(name) = defined_value_name(module, *value) {
+                    consider(&mut candidates, *index, name);
+                }
+            }
+            _ => {}
+        };
+        if !any_class_has_esm && standalone_esm.is_some() {
+            for inst in &module.insts {
+                inspect_op(&inst.op);
+            }
+        } else {
+            for &fid in &cls.methods {
+                let Some(fd) = module.func(fid) else {
                     continue;
                 };
-                for &iid in &block.insts {
-                    let Some(inst) = module.inst(iid) else {
+                for &bid in &fd.blocks {
+                    let Some(block) = module.block(bid) else {
                         continue;
                     };
-                    match &inst.op {
-                        Op::StoreGlobal { name, .. }
-                        | Op::StoreGlobalRecord { name, .. }
-                        | Op::TryStoreGlobal { name, .. } => {
-                            taken.insert(sanitize(&sym_str(module, *name)));
-                        }
-                        Op::ThrowUndefinedIfHoleWithName { name, value } => {
-                            if let Some(slot) = load_local_module_slot(module, *value) {
-                                consider(&mut candidates, slot, sym_str(module, *name));
-                            }
-                        }
-                        Op::ThrowUndefinedIfHole { name, value } => {
-                            if let Some(slot) = load_local_module_slot(module, *value)
-                                && let Some(n) = const_string(module, *name)
-                            {
-                                consider(&mut candidates, slot, n);
-                            }
-                        }
-                        Op::StoreModuleVar { index, value } => {
-                            if let Some(name) = defined_value_name(module, *value) {
-                                consider(&mut candidates, *index, name);
-                            }
-                        }
-                        _ => {}
+                    for &iid in &block.insts {
+                        let Some(inst) = module.inst(iid) else {
+                            continue;
+                        };
+                        inspect_op(&inst.op);
                     }
                 }
             }
@@ -1117,9 +1153,11 @@ mod tests {
 
     #[test]
     fn common_prefix_meet() {
-        let f = |names: &[&str]| EnvFrame {
-            slots: names.iter().map(|s| Some(s.to_string())).collect(),
-            priv_names: vec![],
+        let f = |names: &[&str]| {
+            Arc::new(EnvFrame {
+                slots: names.iter().map(|s| Some(s.to_string())).collect(),
+                priv_names: vec![],
+            })
         };
         let a = vec![f(&["x", "y"]), f(&["z"])];
         let b = vec![f(&["x", "y"]), f(&["w"])];

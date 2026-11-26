@@ -243,7 +243,10 @@ fn g01_plain_generator_inline_immediates() {
 /// optimized profile shape): `zero` (and optionally `one`) are loaded
 /// once by the caller and reused across dispatches; returns the
 /// continuation block and the `one` temp in use.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "generator test builder helper binds IR scaffold, block, mode, resume, and shared immediates"
+)]
 fn dispatch_shared(
     m: &mut Module,
     f: FuncId,

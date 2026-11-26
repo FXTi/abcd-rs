@@ -30,6 +30,7 @@
 //!    explicit [`expr::Expr::Fallback`] / [`recover::Stmt::Fallback`] comment
 //!    naming the op (see [`fitness`]) — never silently dropped.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
