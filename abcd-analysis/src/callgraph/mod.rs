@@ -432,6 +432,9 @@ fn resolve_callee(
     if is_super_call(call_kind) && funcs.remove(&current) {
         complete = false;
     }
+    if funcs.is_empty() {
+        complete = false;
+    }
     Resolution { funcs, complete }
 }
 
@@ -548,61 +551,71 @@ fn trace(
                     }
                 }
                 Some(Op::LoadProp { object, name }) => {
-                    // Namespace import call: `import * as ns from "./sub"; ns.fn(...)`.
-                    let mut obj_cur = *object;
-                    for _ in 0..8 {
-                        let Some(ValueDef::Inst(oiid)) = module.value(obj_cur).map(|ov| ov.def)
-                        else {
-                            break;
-                        };
-                        match module.inst(oiid).map(|i| &i.op) {
-                            Some(Op::Mov { src }) => obj_cur = *src,
-                            Some(Op::GetModuleNamespace { index }) => {
-                                if let Some(cid) = links.func_class(current)
-                                    && let Some(slots) =
-                                        links.resolve_namespace_member(cid, *index, *name)
-                                    && !slots.is_empty()
-                                {
-                                    for &slot_ref in slots {
-                                        let defs = links.stored_values(slot_ref);
-                                        if defs.is_empty() {
-                                            complete = false;
-                                        } else {
-                                            for &(def_fn, def_val) in defs {
-                                                stack.push((def_fn, def_val));
-                                            }
+                    // Namespace member call: `import * as ns from "./sub"; ns.fn(...)`
+                    // or `export * as ns from "./sub"; import { ns } from "./barrel"; ns.fn(...)`.
+                    let obj_cur = crate::dataflow::heap::peel_movs(module, *object);
+                    let Some(cid) = links.func_class(current) else {
+                        complete = false;
+                        continue;
+                    };
+                    match module.value(obj_cur).and_then(|ov| match ov.def {
+                        ValueDef::Inst(oiid) => module.inst(oiid).map(|i| &i.op),
+                        _ => None,
+                    }) {
+                        Some(Op::GetModuleNamespace { index }) => {
+                            if let Some(slots) = links.resolve_namespace_member(cid, *index, *name)
+                                && !slots.is_empty()
+                            {
+                                for &slot_ref in slots {
+                                    let defs = links.stored_values(slot_ref);
+                                    if defs.is_empty() {
+                                        complete = false;
+                                    } else {
+                                        for &(def_fn, def_val) in defs {
+                                            stack.push((def_fn, def_val));
                                         }
                                     }
-                                } else {
+                                }
+                            } else {
+                                complete = false;
+                            }
+                        }
+                        Some(Op::LoadModuleVar { index, kind }) if !kind.is_local() => {
+                            if let Some(target) = links.external_load(cid, *index)
+                                && !target.namespace_classes.is_empty()
+                            {
+                                if target.unresolved_external || !target.slots.is_empty() {
                                     complete = false;
                                 }
-                                break;
-                            }
-                            _ => {
+                                let mut matched_any = false;
+                                for &ns_cid in &target.namespace_classes {
+                                    if let Some(slots) =
+                                        links.namespace_exports(ns_cid).and_then(|m| m.get(name))
+                                        && !slots.is_empty()
+                                    {
+                                        matched_any = true;
+                                        for &slot_ref in slots {
+                                            let defs = links.stored_values(slot_ref);
+                                            if defs.is_empty() {
+                                                complete = false;
+                                            } else {
+                                                for &(def_fn, def_val) in defs {
+                                                    stack.push((def_fn, def_val));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        complete = false;
+                                    }
+                                }
+                                if !matched_any {
+                                    complete = false;
+                                }
+                            } else {
                                 complete = false;
-                                break;
                             }
                         }
-                        if matches!(
-                            module.value(obj_cur).map(|ov| ov.def),
-                            Some(ValueDef::Inst(ni))
-                                if !matches!(
-                                    module.inst(ni).map(|i| &i.op),
-                                    Some(Op::Mov { .. } | Op::GetModuleNamespace { .. })
-                                )
-                        ) {
-                            complete = false;
-                            break;
-                        }
-                    }
-                    if !matches!(
-                        module.value(obj_cur).and_then(|ov| match ov.def {
-                            ValueDef::Inst(oiid) => module.inst(oiid).map(|i| &i.op),
-                            _ => None,
-                        }),
-                        Some(Op::GetModuleNamespace { .. })
-                    ) {
-                        complete = false;
+                        _ => complete = false,
                     }
                 }
                 _ => complete = false,
@@ -2743,5 +2756,388 @@ mod tests {
         let tag_ans = s_r2.query(read_tag, sub_super_call);
         assert!(!tag_ans.has_unknown, "{tag_ans:?}");
         assert_eq!(tag_ans.sites, s_r2.query(payload, sub_super_call).sites);
+    }
+
+    #[test]
+    fn deep_mov_chain_over_20_hops_and_export_star_as_ns_resolve() {
+        use abcd_ir::module::{ClassData, EsModule, ExportDecl, ImportDecl, ModuleRequest};
+        use abcd_ir::op::ModuleVarKind;
+
+        let mut m = Module::new();
+        let s_ping = m.sym.intern("ping");
+        let s_ns = m.sym.intern("ns");
+        let s_star = m.sym.intern("*");
+        let s_req_sub = m.sym.intern("./sub");
+        let s_req_barrel = m.sym.intern("./barrel");
+
+        // Record 0: `./sub` exporting `ping`
+        let cid_sub = ClassId::new(0);
+        let mut cls_sub = ClassData::new(
+            m.sym.intern("L@bundle:com.demo/ets/sub;"),
+            m.sym.intern("@bundle:com.demo/ets/sub"),
+        );
+        cls_sub.es_module = Some(EsModule {
+            imports: vec![],
+            exports: vec![ExportDecl::Local {
+                export_name: s_ping,
+                local_name: s_ping,
+            }],
+            module_requests: vec![],
+        });
+        m.classes.push(cls_sub);
+
+        // Record 1: `./barrel` doing `export * as ns from "./sub"`
+        let mut cls_barrel = ClassData::new(
+            m.sym.intern("L@bundle:com.demo/ets/barrel;"),
+            m.sym.intern("@bundle:com.demo/ets/barrel"),
+        );
+        cls_barrel.es_module = Some(EsModule {
+            imports: vec![],
+            exports: vec![ExportDecl::Indirect {
+                export_name: s_ns,
+                import_name: s_star,
+                module_request: s_req_sub,
+            }],
+            module_requests: vec![ModuleRequest {
+                specifier: s_req_sub,
+                lazy: false,
+            }],
+        });
+        m.classes.push(cls_barrel);
+
+        // Record 2: `./main` importing `{ ns } from "./barrel"`
+        let cid_main = ClassId::new(2);
+        let mut cls_main = ClassData::new(
+            m.sym.intern("L@bundle:com.demo/ets/main;"),
+            m.sym.intern("@bundle:com.demo/ets/main"),
+        );
+        cls_main.es_module = Some(EsModule {
+            imports: vec![ImportDecl::Regular {
+                local_name: s_ns,
+                import_name: s_ns,
+                module_request: s_req_barrel,
+            }],
+            exports: vec![],
+            module_requests: vec![ModuleRequest {
+                specifier: s_req_barrel,
+                lazy: false,
+            }],
+        });
+        m.classes.push(cls_main);
+
+        let (ping_fn, b_ping, _) =
+            add_method_fn(&mut m, cid_sub, "ping", FunctionKind::Function, 0);
+        emit_void(&mut m, b_ping, Op::Return { value: None });
+
+        let (_, b_sub_main, _) =
+            add_method_fn(&mut m, cid_sub, "func_main_0", FunctionKind::Function, 0);
+        let df_ping = emit(
+            &mut m,
+            b_sub_main,
+            Op::DefineFunc {
+                body: ping_fn,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        let mut cur_ping = emit(&mut m, b_sub_main, Op::AllocClosure { func: df_ping });
+        for _ in 0..25 {
+            cur_ping = emit(&mut m, b_sub_main, Op::Mov { src: cur_ping });
+        }
+        emit_void(
+            &mut m,
+            b_sub_main,
+            Op::StoreModuleVar {
+                index: 0,
+                value: cur_ping,
+            },
+        );
+        emit_void(&mut m, b_sub_main, Op::Return { value: None });
+
+        let (local_fn, b_loc, _) =
+            add_method_fn(&mut m, cid_main, "localFn", FunctionKind::Function, 0);
+        emit_void(&mut m, b_loc, Op::Return { value: None });
+
+        let (_, b_main, _) =
+            add_method_fn(&mut m, cid_main, "func_main_0", FunctionKind::Function, 0);
+        let df_loc = emit(
+            &mut m,
+            b_main,
+            Op::DefineFunc {
+                body: local_fn,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        let mut clo_chain = emit(&mut m, b_main, Op::AllocClosure { func: df_loc });
+        for _ in 0..25 {
+            clo_chain = emit(&mut m, b_main, Op::Mov { src: clo_chain });
+        }
+        let call_mov_clo = push_inst(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: clo_chain,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        let mut ns_val = emit(
+            &mut m,
+            b_main,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        for _ in 0..25 {
+            ns_val = emit(&mut m, b_main, Op::Mov { src: ns_val });
+        }
+        // Calling the namespace object itself resolves zero function targets -> complete == false.
+        let call_ns_direct = push_inst(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: ns_val,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        // `ns.ping()` across `export * as ns` + 25-hop `Mov` chain resolves `ping_fn`.
+        let ns_ping = emit(
+            &mut m,
+            b_main,
+            Op::LoadProp {
+                object: ns_val,
+                name: s_ping,
+            },
+        );
+        let call_ns_ping = push_inst(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: ns_ping,
+                this: Some(ns_val),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        let e_clo = cg.edge_at(call_mov_clo).unwrap();
+        assert_eq!(e_clo.targets, CallTargets::Resolved(vec![local_fn]));
+        assert!(e_clo.resolution_complete);
+
+        let e_ns_bad = cg.edge_at(call_ns_direct).unwrap();
+        assert_eq!(e_ns_bad.targets, CallTargets::UnknownCallees);
+        assert!(!e_ns_bad.resolution_complete);
+
+        let e_ns_ping = cg.edge_at(call_ns_ping).unwrap();
+        assert_eq!(e_ns_ping.targets, CallTargets::Resolved(vec![ping_fn]));
+        assert!(e_ns_ping.resolution_complete);
+    }
+
+    #[test]
+    fn super_forward_all_args_static_hierarchy_and_sendable_loop_lex_resolve() {
+        use abcd_ir::module::{ClassData, SourceLang};
+        use abcd_ir::op::LexEnvKind;
+        use abcd_ir::ty::{StaticTy, Ty};
+
+        let mut m = mk_module();
+        let dyn_cid = ClassId::new(0);
+        let s_greet = intern(&mut m, "greet");
+
+        // 1) Dynamic `DefineClass` default derived ctor using `SuperForwardAllArgs`.
+        let (dyn_base_ctor, b_dbc, _) =
+            add_method_fn(&mut m, dyn_cid, "DynBase", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_dbc, Op::Return { value: None });
+
+        let (dyn_sub_ctor, b_dsc, p_dsc) =
+            add_method_fn(&mut m, dyn_cid, "DynSub", FunctionKind::Constructor, 0);
+        let call_dyn_fwd = push_inst(
+            &mut m,
+            b_dsc,
+            Op::Call {
+                callee: p_dsc[0],
+                this: None,
+                args: vec![p_dsc[0]],
+                kind: CallKind::SuperForwardAllArgs,
+            },
+        );
+        emit_void(&mut m, b_dsc, Op::Return { value: None });
+
+        // 2) Static `ClassData::{super_class, interfaces}` (`SourceLang::ArkTS`) + `SuperForwardAllArgs`.
+        let iface_cid = ClassId::new(m.classes.len() as u32);
+        let mut iface_cls = ClassData::new(m.sym.intern("LIGreeter;"), m.sym.intern("IGreeter"));
+        iface_cls.source_lang = SourceLang::ArkTS;
+        iface_cls.modifiers = Modifiers::PUBLIC.union(Modifiers::INTERFACE);
+        m.classes.push(iface_cls);
+
+        let sbase_cid = ClassId::new(m.classes.len() as u32);
+        let mut sbase_cls =
+            ClassData::new(m.sym.intern("LStaticBase;"), m.sym.intern("StaticBase"));
+        sbase_cls.source_lang = SourceLang::ArkTS;
+        m.classes.push(sbase_cls);
+
+        let ssub_cid = ClassId::new(m.classes.len() as u32);
+        let mut ssub_cls = ClassData::new(m.sym.intern("LStaticSub;"), m.sym.intern("StaticSub"));
+        ssub_cls.source_lang = SourceLang::ArkTS;
+        ssub_cls.super_class = Some(sbase_cid);
+        ssub_cls.interfaces = vec![iface_cid];
+        m.classes.push(ssub_cls);
+
+        let add_ark_fn = |m: &mut Module, cid: ClassId, name: &str, kind: FunctionKind| {
+            let sym = m.sym.intern(name);
+            let fid = FuncId::new(m.functions.len() as u32);
+            let mut fd = FunctionData::new(cid, sym, kind);
+            fd.modifiers = Modifiers::PUBLIC;
+            m.functions.push(fd);
+            m.classes[cid.index()].methods.push(fid);
+            let b = add_block(m, fid);
+            let this_p = add_param(m, fid, 0);
+            (fid, b, this_p)
+        };
+
+        let (sbase_ctor, b_sbc, _) =
+            add_ark_fn(&mut m, sbase_cid, "<ctor>", FunctionKind::Constructor);
+        emit_void(&mut m, b_sbc, Op::Return { value: None });
+
+        let (_ssub_ctor, b_ssc, ssub_this) =
+            add_ark_fn(&mut m, ssub_cid, "<ctor>", FunctionKind::Constructor);
+        let call_static_fwd = push_inst(
+            &mut m,
+            b_ssc,
+            Op::Call {
+                callee: ssub_this,
+                this: None,
+                args: vec![ssub_this],
+                kind: CallKind::SuperForwardAllArgs,
+            },
+        );
+        emit_void(&mut m, b_ssc, Op::Return { value: None });
+
+        let (ssub_greet, b_ssg, _) = add_ark_fn(&mut m, ssub_cid, "greet", FunctionKind::Function);
+        emit_void(&mut m, b_ssg, Op::Return { value: None });
+
+        // 3) Driver: `Sendable` env survives `PopLexEnv`, loop back-edge propagates `Plain` env,
+        //    and `StaticTy::Reference(iface_cid)` resolves `IGreeter.greet` -> `StaticSub.greet`.
+        let (driver_fn, b_entry, p_drv) =
+            add_method_fn(&mut m, dyn_cid, "func_main_0", FunctionKind::Function, 1);
+        m.values[p_drv[3].index()].ty = Ty::Static(StaticTy::Reference(iface_cid));
+        let b_hdr = add_block(&mut m, driver_fn);
+        let b_exit = add_block(&mut m, driver_fn);
+
+        let empty_mem = m.consts.push_array(vec![]);
+        let dyn_base = emit(
+            &mut m,
+            b_entry,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: dyn_base_ctor,
+                heritage: None,
+                members: empty_mem,
+                member_attrs: vec![],
+                count: 0,
+            })),
+        );
+        let _ = emit(
+            &mut m,
+            b_entry,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: LexEnvKind::Sendable,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_entry,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: dyn_base,
+                kind: LexEnvKind::Sendable,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b_entry,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, b_entry, Op::PopLexEnv);
+        emit_void(&mut m, b_entry, Op::Branch { dest: b_hdr });
+        link(&mut m, b_entry, b_hdr);
+
+        let base_from_sendable = emit(
+            &mut m,
+            b_hdr,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: LexEnvKind::Sendable,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b_hdr,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: dyn_sub_ctor,
+                heritage: Some(base_from_sendable),
+                members: empty_mem,
+                member_attrs: vec![],
+                count: 0,
+            })),
+        );
+        let cond = load_number(&mut m, b_hdr, 0.0);
+        emit_void(
+            &mut m,
+            b_hdr,
+            Op::CondBranch {
+                cond,
+                true_dest: b_hdr,
+                false_dest: b_exit,
+            },
+        );
+        link(&mut m, b_hdr, b_hdr);
+        link(&mut m, b_hdr, b_exit);
+
+        let iface_callee = emit(
+            &mut m,
+            b_exit,
+            Op::LoadProp {
+                object: p_drv[3],
+                name: s_greet,
+            },
+        );
+        let call_iface = push_inst(
+            &mut m,
+            b_exit,
+            Op::Call {
+                callee: iface_callee,
+                this: Some(p_drv[3]),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_exit, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(call_dyn_fwd).unwrap().targets,
+            CallTargets::Resolved(vec![dyn_base_ctor])
+        );
+        assert_eq!(
+            cg.edge_at(call_static_fwd).unwrap().targets,
+            CallTargets::Resolved(vec![sbase_ctor])
+        );
+        assert_eq!(
+            cg.edge_at(call_iface).unwrap().targets,
+            CallTargets::Resolved(vec![ssub_greet])
+        );
     }
 }

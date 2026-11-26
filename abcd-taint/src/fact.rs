@@ -43,6 +43,11 @@
 use abcd_analysis::dataflow::heap::{AllocSiteSet, FieldChain, FieldKey};
 use abcd_ir::{ClassId, Sym, ValueId};
 
+/// Sentinel [`ValueId`] used in `TaintBase::Local(UNCAUGHT_EXCEPTION_VALUE)`
+/// to represent an in-flight uncaught exception value escaping across call
+/// frames without changing the [`TaintBase`] or [`Fact`] enum variants.
+pub const UNCAUGHT_EXCEPTION_VALUE: ValueId = ValueId::new(u32::MAX);
+
 /// The base of an access path (see module docs).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TaintBase {

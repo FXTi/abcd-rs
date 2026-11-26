@@ -840,3 +840,192 @@ fn names_guards_and_const_callee_names() {
         "the empty name never registers: {sinks:?}"
     );
 }
+
+/// Cross-block `AwaitUncaught -> SuspendGenerator -> ResumeGenerator` pairs
+/// both receiver name provenance (`names.rs`) and awaited value taint (`problem.rs`).
+#[test]
+fn cross_block_await_resume_resolves_sdk_receiver_and_taint() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let b0 = entry_of(&m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+
+    let genobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+    let rdb_mod = try_get_global(&mut m, b0, "@ohos.data.relationalStore");
+    let get_sym = intern(&mut m, "getRdbStore");
+    let get_fn = emit(
+        &mut m,
+        b0,
+        Op::LoadProp {
+            object: rdb_mod,
+            name: get_sym,
+        },
+    );
+    let rdb_promise = emit(
+        &mut m,
+        b0,
+        Op::Call {
+            callee: get_fn,
+            this: Some(rdb_mod),
+            args: vec![],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let aw_rdb = emit(
+        &mut m,
+        b0,
+        Op::AwaitUncaught {
+            funcobj: genobj,
+            value: rdb_promise,
+        },
+    );
+    emit_void(&mut m, b0, Op::Branch { dest: b1 });
+
+    let _ = emit(
+        &mut m,
+        b1,
+        Op::SuspendGenerator {
+            genobj,
+            value: aw_rdb,
+        },
+    );
+    emit_void(&mut m, b1, Op::Branch { dest: b2 });
+
+    let rdb = emit(&mut m, b2, Op::ResumeGenerator { genobj });
+    let exec_sym = intern(&mut m, "executeSql");
+    let exec_fn = emit(
+        &mut m,
+        b2,
+        Op::LoadProp {
+            object: rdb,
+            name: exec_sym,
+        },
+    );
+    push_inst(
+        &mut m,
+        b2,
+        Op::Call {
+            callee: exec_fn,
+            this: Some(rdb),
+            args: vec![p],
+            kind: CallKind::Dynamic,
+        },
+    );
+
+    // Second cross-block await carrying tainted data `p`.
+    let b3 = add_block(&mut m, f);
+    let b4 = add_block(&mut m, f);
+    let aw_p = emit(
+        &mut m,
+        b2,
+        Op::AwaitUncaught {
+            funcobj: genobj,
+            value: p,
+        },
+    );
+    emit_void(&mut m, b2, Op::Branch { dest: b3 });
+    let _ = emit(
+        &mut m,
+        b3,
+        Op::SuspendGenerator {
+            genobj,
+            value: aw_p,
+        },
+    );
+    emit_void(&mut m, b3, Op::Branch { dest: b4 });
+    let resumed_p = emit(&mut m, b4, Op::ResumeGenerator { genobj });
+    print_call(&mut m, b4, vec![resumed_p]);
+    emit_void(&mut m, b4, Op::Return { value: None });
+
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b2);
+    link(&mut m, b2, b3);
+    link(&mut m, b3, b4);
+
+    let cands = abcd_taint::names::callee_name_candidates(&m, exec_fn);
+    assert!(
+        cands
+            .iter()
+            .any(|c| c == "@ohos.data.relationalStore.RdbStore.executeSql"),
+        "cross-block await resolved RdbStore receiver: {cands:?}"
+    );
+
+    let config = TaintConfig {
+        sinks: vec![
+            SinkSpec::Call {
+                name: "@ohos.data.relationalStore.RdbStore.executeSql".to_owned(),
+            },
+            SinkSpec::Call {
+                name: "print".to_owned(),
+            },
+        ],
+        ..std_config()
+    };
+    let report = run_taint(&m, &config);
+    let sinks: Vec<&str> = report.hits.iter().map(|h| h.sink.as_str()).collect();
+    assert!(
+        sinks.contains(&"@ohos.data.relationalStore.RdbStore.executeSql"),
+        "sink matched across split-block await: {sinks:?}"
+    );
+    assert!(
+        report
+            .hits
+            .iter()
+            .any(|h| h.sink == "print" && h.fact.local_base() == Some(resumed_p)),
+        "taint crossed split-block await into ResumeGenerator: {:?}",
+        report.hits
+    );
+}
+
+/// Deep (> 8 hop) `Op::Mov` chains peel cleanly without an arbitrary hop cap.
+#[test]
+fn deep_mov_chain_peels_receiver_and_namespace() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    let this_p = add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+
+    let mut cur = this_p;
+    for _ in 0..12 {
+        cur = emit(&mut m, entry, Op::Mov { src: cur });
+    }
+    let ctx_sym = intern(&mut m, "context");
+    let ctx = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: cur,
+            name: ctx_sym,
+        },
+    );
+    let start_sym = intern(&mut m, "startAbility");
+    let start_fn = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: ctx,
+            name: start_sym,
+        },
+    );
+    push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: start_fn,
+            this: Some(ctx),
+            args: vec![p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let cands = abcd_taint::names::callee_name_candidates(&m, start_fn);
+    assert!(
+        cands.iter().any(|c| c == "UIAbilityContext.startAbility"),
+        "12-hop Mov chain resolved UIAbilityContext receiver: {cands:?}"
+    );
+}

@@ -2095,11 +2095,10 @@ fn gap_for_each_discards_callback_return_but_runs_body() {
     );
 }
 
-/// Exclusive × gap: an EXCLUSIVE summary with a callback must still run
-/// the user callback (the gap edge is distinct from the callee-body
-/// edge), while the
-/// exclusive bypass kill still applies to the summary call's operands
-/// (the tainted argument does not survive the call-to-return edge).
+/// Exclusive × gap (`R4-H3`): an EXCLUSIVE summary with a callback must
+/// still run the user callback (the gap edge is distinct from the
+/// callee-body edge), killing field-bearing `Local(ext).[k]` on the
+/// call-to-return bypass edge while scalar pass-by-value `Local(p)` survives.
 #[test]
 fn gap_exclusive_callback_summary_still_enters() {
     let mut m = mk_module();
@@ -2112,6 +2111,17 @@ fn gap_exclusive_callback_summary_still_enters() {
     let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
+    let ext = try_get_global(&mut m, entry, "ext");
+    let k = intern(&mut m, "k");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: ext,
+            name: k,
+            value: p,
+        },
+    );
     let def_cb = emit(
         &mut m,
         entry,
@@ -2129,17 +2139,18 @@ fn gap_exclusive_callback_summary_still_enters() {
         Op::Call {
             callee: collect,
             this: None,
-            args: vec![p, clo_cb],
+            args: vec![p, clo_cb, ext],
             kind: CallKind::Dynamic,
         },
     );
-    print_call(&mut m, entry, vec![p]); // killed by the exclusive bypass
+    print_call(&mut m, entry, vec![p]); // scalar Local(p) survives exclusive bypass
+    let print_ext = print_call(&mut m, entry, vec![ext]); // field-bearing Local(ext).[k] killed
     emit_void(&mut m, entry, Op::Return { value: None });
 
     let config = abcd_taint::TaintConfig {
         extra_summaries: vec![(
             "collect".to_owned(),
-            Some(2),
+            Some(3),
             abcd_taint::Summary::new("exclusive gap test: arg0 → cb formal 0")
                 .exclusive()
                 .callback(1)
@@ -2154,8 +2165,16 @@ fn gap_exclusive_callback_summary_still_enters() {
         report.hits
     );
     assert!(
-        !report.hits.iter().any(|h| h.fact.local_base() == Some(p)),
-        "the exclusive bypass kill still applies to the operands: {:?}",
+        report.hits.iter().any(|h| h.fact.local_base() == Some(p)),
+        "scalar pass-by-value Local(p) survives exclusive bypass: {:?}",
+        report.hits
+    );
+    assert!(
+        !report
+            .hits
+            .iter()
+            .any(|h| h.call == print_ext || h.fact.local_base() == Some(ext)),
+        "field-bearing Local(ext).[k] is killed on the exclusive bypass edge: {:?}",
         report.hits
     );
     assert!(

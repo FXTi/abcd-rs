@@ -121,9 +121,9 @@ pub const DEFAULT_STEP_BUDGET: usize = 25_000_000;
 
 /// Default lexical-environment stack depth cap. Closure capture chains
 /// in real bytecode are short (registration → wrapper → callback ≈ 3–4);
-/// beyond the cap the outer environments are dropped, so deep
-/// `GetLexVar` levels answer unknown (sound).
-pub const DEFAULT_MAX_ENV_DEPTH: usize = 8;
+/// beyond the cap the outer environments are truncated (`truncated_outer`),
+/// so deep `GetLexVar` levels answer unknown (sound).
+pub const DEFAULT_MAX_ENV_DEPTH: usize = 32;
 
 /// Maximum static forward call-graph / module-import BFS hops in root-sliced PTA.
 const MAX_SLICED_BASE_HOP: u8 = 3;
@@ -146,6 +146,9 @@ enum Obj {
     /// points-to set marks the answer incomplete (the rung-0 fallback
     /// trigger) — never a keyed site.
     Unknown,
+    /// Dedicated singleton representing `globalThis` (`Op::LoadGlobalObject`),
+    /// bridging `globalThis.x` property accesses with `Ptr::Global`.
+    GlobalThis,
     /// An allocation-site object.
     Site {
         /// The allocating instruction (`InstId` — unique and stable across
@@ -157,11 +160,30 @@ enum Obj {
         /// `DefineFunc` values, pooled method references).
         callable: Option<FuncId>,
         /// Whether the site is one of the four rung-0 keyed `Alloc*`
-        /// kinds (T7). Unkeyed objects (function values, generators)
-        /// drive call resolution but are never REPORTED as sites — the
-        /// taint layer's key vocabulary is unchanged by climbing.
+        /// kinds (`AllocObject`/`AllocArray`/`AllocClosure`/`AllocRegExp`
+        /// plus synthetic `New`/`CopyRestArgs`/`GetUnmappedArgs`/
+        /// `CreateObjectWithExcludedKeys` allocations).
         keyed: bool,
     },
+}
+
+/// Ordered lexical-environment flavor for `Ptr` keys (`abcd_ir::LexEnvKind`
+/// does not implement `Ord`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum LexKindKey {
+    Plain,
+    Sendable,
+    Patch,
+}
+
+impl From<abcd_ir::LexEnvKind> for LexKindKey {
+    fn from(k: abcd_ir::LexEnvKind) -> Self {
+        match k {
+            abcd_ir::LexEnvKind::Plain => Self::Plain,
+            abcd_ir::LexEnvKind::Sendable => Self::Sendable,
+            abcd_ir::LexEnvKind::Patch => Self::Patch,
+        }
+    }
 }
 
 /// A field bucket of an abstract object (the
@@ -185,10 +207,18 @@ enum Ptr {
     Field(InstId, Ctx, Slot),
     /// A named global binding (the module-global object's field — d4).
     Global(Sym),
+    /// Computed/indexed stores on `globalThis`.
+    GlobalDynamic,
     /// A per-record module-variable slot `(ClassId, local_slot)`.
     ModuleVar(ClassId, u32),
     /// A lexical-environment slot `(NewLexEnv InstId, slot, is_recorded_ctx)`.
     LexVar(InstId, u16, bool),
+    /// Conservative fallback slot for `PutLexVar`/`GetLexVar` on an `Unknown`
+    /// or `truncated_outer` lexical frame, partitioned by `(kind, slot)`.
+    UnknownLexVar(LexKindKey, u16),
+    /// Element-spread bridge pointer `(inst, ctx)` for `ArraySpread` and
+    /// `CallKind::{Apply, NewSpread, SuperSpread}`.
+    SpreadElem(InstId, Ctx),
 }
 
 /// Which buckets a load reads.
@@ -213,6 +243,22 @@ enum Handler {
     Load { result: Ptr, read: Read },
     /// `object(...)`: on callable object, wire the call edge.
     Call { call: InstId, caller_ctx: Ctx },
+    /// Copy own data properties from `src` (`base` of handler) onto `dst_base`
+    /// (`CopyDataProps` / `CreateObjectWithExcludedKeys`), skipping excluded
+    /// constant property names stored in `Pta::copy_excluded[excl_idx]`.
+    CopyProps { dst_base: Ptr, excl_idx: u32 },
+    /// Copy all buckets written on `dst_obj` from `src_obj` (`site, ctx`).
+    CopyFromSrc {
+        src_site: InstId,
+        src_ctx: Ctx,
+        excl_idx: u32,
+    },
+    /// Seed `Obj::Unknown` into wildcard element/property slots (`Index`,
+    /// `Dynamic`) of an object escaping into an incomplete/external call.
+    TaintEscape,
+    /// Seed `Obj::Unknown` into `Slot::Index` only on an `AllocArray` receiver
+    /// of an inherited `Array.prototype` method call, preserving named slots.
+    TaintEscapeIndex,
 }
 
 /// Engine configuration.
@@ -252,6 +298,9 @@ pub struct PtaStats {
     pub env_rounds: usize,
     /// The step budget fired (the driver degrades to rung 1).
     pub capped: bool,
+    /// `true` whenever `roots: Option<&[FuncId]>` excluded at least one
+    /// internal module function.
+    pub root_sliced: bool,
 }
 
 /// The rung-2 answer to a lexical-environment query: the environment
@@ -273,6 +322,89 @@ struct EnvEntry {
     unknown: bool,
 }
 
+/// Bounded top-aligned lexical-environment chain for one [`abcd_ir::LexEnvKind`]
+/// (`Plain` vs `Sendable`). `frames.last()` is `level = 0` (innermost top of
+/// stack); `truncated_outer` records whether outer frames beyond `frames.len()`
+/// may exist (depth cap overflow or `PopLexEnv` on an empty/uncertain stack).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EnvChain {
+    frames: Vec<EnvEntry>,
+    truncated_outer: bool,
+}
+
+impl EnvChain {
+    #[inline]
+    fn at_level(&self, level: u16) -> Option<&EnvEntry> {
+        let lvl = level as usize;
+        if lvl < self.frames.len() {
+            Some(&self.frames[self.frames.len() - 1 - lvl])
+        } else {
+            None
+        }
+    }
+
+    fn push_site(&mut self, site: InstId, max_depth: usize) {
+        if max_depth == 0 {
+            self.frames.clear();
+            self.truncated_outer = true;
+            return;
+        }
+        self.frames.push(EnvEntry {
+            sites: BTreeSet::from([site]),
+            unknown: false,
+        });
+        if self.frames.len() > max_depth {
+            let overflow = self.frames.len() - max_depth;
+            self.frames.drain(0..overflow);
+            self.truncated_outer = true;
+        }
+    }
+
+    fn pop_frame(&mut self) {
+        match self.frames.pop() {
+            None => self.truncated_outer = true,
+            Some(popped) if popped.unknown => self.truncated_outer = true,
+            Some(_) => {}
+        }
+    }
+
+    /// Top-aligned monotone semilattice join (`self = self ⊔ other`), returning
+    /// `true` iff `self` changed.
+    fn join_into(&mut self, other: &Self) -> bool {
+        let joined = join_chains(self, other);
+        if *self != joined {
+            *self = joined;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Dual lexical-environment stacks (`Plain` and `Sendable` never cross-pop).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EnvState {
+    plain: EnvChain,
+    sendable: EnvChain,
+}
+
+impl EnvState {
+    #[inline]
+    fn chain(&self, kind: abcd_ir::LexEnvKind) -> Option<&EnvChain> {
+        match kind {
+            abcd_ir::LexEnvKind::Plain => Some(&self.plain),
+            abcd_ir::LexEnvKind::Sendable => Some(&self.sendable),
+            abcd_ir::LexEnvKind::Patch => None,
+        }
+    }
+
+    fn join_into(&mut self, other: &Self) -> bool {
+        let c1 = self.plain.join_into(&other.plain);
+        let c2 = self.sendable.join_into(&other.sendable);
+        c1 || c2
+    }
+}
+
 /// A value's stripped answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ValueAnswer {
@@ -286,9 +418,8 @@ struct ValueAnswer {
 pub struct Rung2Tables {
     /// Value index → stripped answer (keyed sites + completeness).
     answers: Vec<ValueAnswer>,
-    /// Instruction index → lexical-environment stack BEFORE it, innermost
-    /// last.
-    env_stack_at: Vec<Arc<[EnvEntry]>>,
+    /// Instruction index → dual lexical-environment state BEFORE it.
+    env_stack_at: Vec<Arc<EnvState>>,
     /// Instruction index → whether it is a `NewLexEnv`/`NewLexEnvWithName`.
     env_sites: Vec<bool>,
 }
@@ -352,7 +483,6 @@ fn closure_body(module: &Module, func: ValueId) -> Option<FuncId> {
 }
 
 /// Resolve any callable `FuncId` wrapped by `val` across `Mov`,
-/// Resolve any callable `FuncId` wrapped by `val` across `Mov`,
 /// `AllocClosure`, `CreateGenerator`, `CreateAsyncGenerator`,
 /// `DefineMethod`, `DefineFunc`, and `MethodRef` constants (cycle-guarded).
 fn callable_body(module: &Module, mut val: ValueId) -> Option<FuncId> {
@@ -414,22 +544,130 @@ fn is_load_const(module: &Module, mut val: ValueId) -> bool {
     }
 }
 
-/// Extract all member `FuncId`s from a `DefineClass` / `DefineSendableClass`
-/// member-buffer constant.
-fn class_member_funcs(module: &Module, members: ConstId) -> Vec<FuncId> {
+/// Resolve `val` (peeling `Mov`) to a constant string [`Sym`], if statically known.
+fn const_string_sym(module: &Module, val: ValueId) -> Option<Sym> {
+    let root = super::heap::peel_movs(module, val);
+    let cid = match module.value(root)?.def {
+        ValueDef::Const(c) => c,
+        ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+            Op::LoadConst(c) => *c,
+            _ => return None,
+        },
+        ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return None,
+    };
+    match module.consts.get(cid) {
+        Some(Const::String(sym)) => Some(*sym),
+        _ => None,
+    }
+}
+
+/// Whether `op` is guaranteed to produce only primitive scalar values (never a
+/// heap object or callable), so leaving its `pts` set empty is exact.
+fn is_pure_primitive_op(module: &Module, op: &Op) -> bool {
+    match op {
+        Op::LoadConst(cid) => matches!(
+            module.consts.get(*cid),
+            Some(
+                Const::Undefined
+                    | Const::Hole
+                    | Const::Null
+                    | Const::LitNull(_)
+                    | Const::Bool(_)
+                    | Const::Int8(_)
+                    | Const::Int32(_)
+                    | Const::Float32(_)
+                    | Const::Number(_)
+                    | Const::Int64(_)
+                    | Const::UInt64(_)
+                    | Const::String(_)
+                    | Const::BigInt(_)
+                    | Const::Accessor(_)
+                    | Const::MethodAffiliate(_)
+                    | Const::BuiltinTypeIndex(_)
+                    | Const::EtsImplements(_)
+            )
+        ),
+        Op::BinaryOp { .. }
+        | Op::UnaryOp { .. }
+        | Op::Compare { .. }
+        | Op::DeleteProp { .. }
+        | Op::TestProp { .. }
+        | Op::TestPrivate { .. }
+        | Op::NextPropName { .. }
+        | Op::GetResumeMode { .. } => true,
+        _ => false,
+    }
+}
+fn collect_const_method_refs(module: &Module, root: ConstId) -> Vec<FuncId> {
     let mut out = Vec::new();
-    match module.consts.get(members) {
-        Some(Const::ArrayLiteral(items)) => {
-            for &item_cid in items {
-                if let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(item_cid) {
+    let mut seen_funcs = BTreeSet::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(cid) = stack.pop() {
+        if !visited.insert(cid) {
+            continue;
+        }
+        match module.consts.get(cid) {
+            Some(Const::MethodRef { func: mfid, .. }) => {
+                if seen_funcs.insert(*mfid) {
                     out.push(*mfid);
                 }
             }
+            Some(Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. }) => {
+                for &item_cid in items.iter().rev() {
+                    stack.push(item_cid);
+                }
+            }
+            Some(Const::ObjectLiteral { keys, values }) => {
+                for &item_cid in values.iter().rev() {
+                    stack.push(item_cid);
+                }
+                for &key_cid in keys.iter().rev() {
+                    stack.push(key_cid);
+                }
+            }
+            Some(Const::LiteralBufferRef(inner)) => stack.push(*inner),
+            _ => {}
         }
-        Some(Const::ObjectLiteral { values, .. }) => {
-            for &item_cid in values {
-                if let Some(Const::MethodRef { func: mfid, .. }) = module.consts.get(item_cid) {
-                    out.push(*mfid);
+    }
+    out
+}
+
+/// Extract `(method_sym, mfid, is_static)` entries from a `DefineClass` /
+/// `DefineSendableClass` member buffer.
+fn class_named_methods(
+    module: &Module,
+    cls: &abcd_ir::DefineClassData,
+) -> Vec<(Sym, FuncId, bool)> {
+    let mut out = Vec::new();
+    match module.consts.get(cls.members) {
+        Some(Const::ArrayLiteral(items)) => {
+            let mut pending_name: Option<Sym> = None;
+            let mut pair_idx = 0usize;
+            for &item_cid in items {
+                match module.consts.get(item_cid) {
+                    Some(Const::String(s)) => pending_name = Some(*s),
+                    Some(Const::MethodRef { func: mfid, .. }) => {
+                        let is_static = cls
+                            .member_attrs
+                            .get(pair_idx)
+                            .is_some_and(|attr| attr.is_static);
+                        if let Some(sym) = pending_name.take() {
+                            out.push((sym, *mfid, is_static));
+                        }
+                        pair_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(Const::ObjectLiteral { keys, values }) => {
+            for (idx, (&k_cid, &v_cid)) in keys.iter().zip(values.iter()).enumerate() {
+                if let (Some(Const::String(sym)), Some(Const::MethodRef { func: mfid, .. })) =
+                    (module.consts.get(k_cid), module.consts.get(v_cid))
+                {
+                    let is_static = cls.member_attrs.get(idx).is_some_and(|attr| attr.is_static);
+                    out.push((*sym, *mfid, is_static));
                 }
             }
         }
@@ -494,7 +732,7 @@ fn compute_sliced_bfs(
     module: &Module,
     links: &ModuleLinkTable,
     base: &CallGraph,
-    env_stack_at: &[Arc<[EnvEntry]>],
+    env_stack_at: &[Arc<EnvState>],
     root_funcs: &[FuncId],
     root_keep: &BTreeSet<FuncId>,
     max_base_hop: u8,
@@ -714,22 +952,21 @@ fn compute_sliced_bfs(
                             }
                         }
                     }
-                    Op::GetLexVar { level, kind, .. } if *kind != abcd_ir::LexEnvKind::Patch => {
-                        if let Some(stack) = env_stack_at.get(iid.index())
-                            && (*level as usize) < stack.len()
+                    Op::GetLexVar { level, kind, .. } => {
+                        if let Some(env_state) = env_stack_at.get(iid.index())
+                            && let Some(chain) = env_state.chain(*kind)
+                            && let Some(entry) = chain.at_level(*level)
+                            && !entry.unknown
                         {
-                            let entry = &stack[stack.len() - 1 - *level as usize];
-                            if !entry.unknown {
-                                for &env_site in &entry.sites {
-                                    if let Some(owner_fn) = links.inst_func(module, env_site) {
-                                        enqueue_extra(
-                                            owner_fn,
-                                            next_hop,
-                                            &mut func_hop,
-                                            &mut queue,
-                                            &mut extra_enqueued,
-                                        );
-                                    }
+                            for &env_site in &entry.sites {
+                                if let Some(owner_fn) = links.inst_func(module, env_site) {
+                                    enqueue_extra(
+                                        owner_fn,
+                                        next_hop,
+                                        &mut func_hop,
+                                        &mut queue,
+                                        &mut extra_enqueued,
+                                    );
                                 }
                             }
                         }
@@ -758,7 +995,7 @@ struct Pta<'m> {
     links: &'m ModuleLinkTable,
     base: &'m CallGraph,
     config: &'m PtaConfig,
-    env_stack_at: &'m [Arc<[EnvEntry]>],
+    env_stack_at: &'m [Arc<EnvState>],
     /// Root set when running in demand-driven / root-sliced mode (`None` =
     /// whole-module mode).
     root_keep: Option<BTreeSet<FuncId>>,
@@ -786,18 +1023,26 @@ struct Pta<'m> {
     handlers_by_base: HashMap<Ptr, Vec<u32>>,
     /// `(handler, object)` pairs already fired.
     fired: BTreeSet<(u32, Obj)>,
-    /// Dynamic-read `(handler id, object)` pairs indexed by `(site, ctx)`
+    /// Dynamic-read / copy-src `(handler id, object)` pairs indexed by `(site, ctx)`
     /// (lookup-only map; `BTreeSet` values preserve deterministic `(id, o)` order).
     dyn_loads_by_obj: HashMap<(InstId, Ctx), BTreeSet<(u32, Obj)>>,
     /// Buckets known per object `(site, ctx)` — a NEW bucket re-arms
-    /// the dynamic reads that already fired on the object.
+    /// the dynamic reads / property copies that already fired on the object.
     buckets: BTreeMap<(InstId, Ctx), BTreeSet<Slot>>,
-    /// Wired call edges `(call, caller ctx, callee)`.
+    /// Excluded constant string keys per `CopyProps` / `CopyFromSrc` handler.
+    copy_excluded: Vec<BTreeSet<Sym>>,
+    /// Instance methods `(method_sym, mfid)` per constructor `FuncId`.
+    ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>>,
+    /// Wired internal call edges `(call, caller ctx, callee)`.
     wired: BTreeSet<(InstId, Ctx, FuncId)>,
     /// PTA-resolved call targets `(call, caller ctx)` → bodies.
     call_targets: BTreeMap<(InstId, Ctx), BTreeSet<FuncId>>,
     /// Call-site activations whose callee set contained `Unknown`.
     call_unknown: BTreeSet<(InstId, Ctx)>,
+    /// Scanned call activations `(call, caller ctx)` for completeness checking.
+    scanned_calls: Vec<(InstId, Ctx)>,
+    /// Scanned call activations already tainted for incomplete/external escape.
+    tainted_calls: BTreeSet<(InstId, Ctx)>,
     /// Load-result pointers (the empty-bucket post-pass).
     load_results: Vec<Ptr>,
     /// Lazily populated `FuncId` → returned values (block/inst order).
@@ -811,7 +1056,7 @@ impl<'m> Pta<'m> {
         links: &'m ModuleLinkTable,
         base: &'m CallGraph,
         config: &'m PtaConfig,
-        env_stack_at: &'m [Arc<[EnvEntry]>],
+        env_stack_at: &'m [Arc<EnvState>],
         slice_init: Option<SliceInit>,
     ) -> Self {
         let (root_keep, slice_allow, func_hop, max_dyn_hop) = match slice_init {
@@ -823,6 +1068,17 @@ impl<'m> Pta<'m> {
             ),
             None => (None, None, Vec::new(), MAX_SLICED_DYN_HOP),
         };
+        let mut ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>> = HashMap::new();
+        for inst in &module.insts {
+            if let Op::DefineClass(cls) | Op::DefineSendableClass(cls) = &inst.op {
+                let entry = ctor_inst_methods.entry(cls.ctor).or_default();
+                for (sym, mfid, is_static) in class_named_methods(module, cls) {
+                    if !is_static && !entry.contains(&(sym, mfid)) {
+                        entry.push((sym, mfid));
+                    }
+                }
+            }
+        }
         Pta {
             module,
             links,
@@ -844,9 +1100,13 @@ impl<'m> Pta<'m> {
             fired: BTreeSet::new(),
             dyn_loads_by_obj: HashMap::new(),
             buckets: BTreeMap::new(),
+            copy_excluded: vec![BTreeSet::new()],
+            ctor_inst_methods,
             wired: BTreeSet::new(),
             call_targets: BTreeMap::new(),
             call_unknown: BTreeSet::new(),
+            scanned_calls: Vec::new(),
+            tainted_calls: BTreeSet::new(),
             load_results: Vec::new(),
             returns_of: HashMap::new(),
             stats: PtaStats::default(),
@@ -961,45 +1221,151 @@ impl<'m> Pta<'m> {
                     }
                     let (_, handler) = self.handlers[id as usize];
                     match handler {
-                        Handler::Store { value, slot } => {
-                            let Obj::Site { site, ctx, .. } = o else {
-                                // A store through an unknown base may reach any
-                                // field; the taint layer's own unknown-base
-                                // wildcard already over-approximates that — the
-                                // value's flow is unaffected, nothing to wire.
-                                continue;
-                            };
-                            stack.push(FireStep::AddEdge(value, Ptr::Field(site, ctx, slot)));
-                            let rearm = self.note_bucket_rearms(site, ctx, slot);
-                            for (rid, ro) in rearm.into_iter().rev() {
-                                stack.push(FireStep::Fire(rid, ro));
-                            }
-                        }
-                        Handler::Load { result, read } => {
-                            let Obj::Site { site, ctx, .. } = o else {
-                                self.add_fact(result, Obj::Unknown);
-                                continue;
-                            };
-                            let slots: Vec<Slot> = match read {
-                                Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
-                                Read::Index => vec![Slot::Index, Slot::Dynamic],
-                                Read::All => {
-                                    self.dyn_loads_by_obj
-                                        .entry((site, ctx))
-                                        .or_default()
-                                        .insert((id, o));
-                                    self.buckets
-                                        .get(&(site, ctx))
-                                        .map(|b| b.iter().copied().collect())
-                                        .unwrap_or_default()
+                        Handler::Store { value, slot } => match o {
+                            Obj::Site { site, ctx, .. } => {
+                                stack.push(FireStep::AddEdge(value, Ptr::Field(site, ctx, slot)));
+                                let rearm = self.note_bucket_rearms(site, ctx, slot);
+                                for (rid, ro) in rearm.into_iter().rev() {
+                                    stack.push(FireStep::Fire(rid, ro));
                                 }
-                            };
-                            for slot in slots {
-                                self.add_edge(Ptr::Field(site, ctx, slot), result);
                             }
-                        }
+                            Obj::GlobalThis => match slot {
+                                Slot::Named(name) => {
+                                    stack.push(FireStep::AddEdge(value, Ptr::Global(name)));
+                                }
+                                Slot::Index | Slot::Dynamic => {
+                                    stack.push(FireStep::AddEdge(value, Ptr::GlobalDynamic));
+                                }
+                            },
+                            Obj::Unknown => {}
+                        },
+                        Handler::Load { result, read } => match o {
+                            Obj::Site { site, ctx, .. } => {
+                                let slots: Vec<Slot> = match read {
+                                    Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
+                                    Read::Index => vec![Slot::Index, Slot::Dynamic],
+                                    Read::All => {
+                                        self.dyn_loads_by_obj
+                                            .entry((site, ctx))
+                                            .or_default()
+                                            .insert((id, o));
+                                        self.buckets
+                                            .get(&(site, ctx))
+                                            .map(|b| b.iter().copied().collect())
+                                            .unwrap_or_default()
+                                    }
+                                };
+                                for slot in slots {
+                                    self.add_edge(Ptr::Field(site, ctx, slot), result);
+                                }
+                            }
+                            Obj::GlobalThis => match read {
+                                Read::Named(name) => {
+                                    self.add_edge(Ptr::Global(name), result);
+                                    self.add_edge(Ptr::GlobalDynamic, result);
+                                }
+                                Read::Index | Read::All => {
+                                    self.add_edge(Ptr::GlobalDynamic, result);
+                                    self.add_fact(result, Obj::Unknown);
+                                }
+                            },
+                            Obj::Unknown => {
+                                self.add_fact(result, Obj::Unknown);
+                            }
+                        },
                         Handler::Call { call, caller_ctx } => {
                             self.resolve_call(call, caller_ctx, o);
+                        }
+                        Handler::CopyProps { dst_base, excl_idx } => match o {
+                            Obj::Site { site, ctx, .. } => {
+                                let sub_id = self.handlers.len() as u32;
+                                let sub_h = Handler::CopyFromSrc {
+                                    src_site: site,
+                                    src_ctx: ctx,
+                                    excl_idx,
+                                };
+                                self.handlers.push((dst_base, sub_h));
+                                self.handlers_by_base
+                                    .entry(dst_base)
+                                    .or_default()
+                                    .push(sub_id);
+                                if let Some(dst_objs) = self.pts.get(&dst_base).cloned() {
+                                    for dst_o in dst_objs.into_iter().rev() {
+                                        stack.push(FireStep::Fire(sub_id, dst_o));
+                                    }
+                                }
+                            }
+                            Obj::Unknown | Obj::GlobalThis => {
+                                let sub_id = self.handlers.len() as u32;
+                                self.handlers.push((dst_base, Handler::TaintEscape));
+                                self.handlers_by_base
+                                    .entry(dst_base)
+                                    .or_default()
+                                    .push(sub_id);
+                                if let Some(dst_objs) = self.pts.get(&dst_base).cloned() {
+                                    for dst_o in dst_objs.into_iter().rev() {
+                                        stack.push(FireStep::Fire(sub_id, dst_o));
+                                    }
+                                }
+                            }
+                        },
+                        Handler::CopyFromSrc {
+                            src_site,
+                            src_ctx,
+                            excl_idx,
+                        } => {
+                            let Obj::Site {
+                                site: dst_site,
+                                ctx: dst_ctx,
+                                ..
+                            } = o
+                            else {
+                                continue;
+                            };
+                            self.dyn_loads_by_obj
+                                .entry((src_site, src_ctx))
+                                .or_default()
+                                .insert((id, o));
+                            let src_slots: Vec<Slot> = self
+                                .buckets
+                                .get(&(src_site, src_ctx))
+                                .map(|b| b.iter().copied().collect())
+                                .unwrap_or_default();
+                            for slot in src_slots {
+                                if let Slot::Named(sym) = slot
+                                    && self
+                                        .copy_excluded
+                                        .get(excl_idx as usize)
+                                        .is_some_and(|ex| ex.contains(&sym))
+                                {
+                                    continue;
+                                }
+                                stack.push(FireStep::AddEdge(
+                                    Ptr::Field(src_site, src_ctx, slot),
+                                    Ptr::Field(dst_site, dst_ctx, slot),
+                                ));
+                                let rearm = self.note_bucket_rearms(dst_site, dst_ctx, slot);
+                                for (rid, ro) in rearm.into_iter().rev() {
+                                    stack.push(FireStep::Fire(rid, ro));
+                                }
+                            }
+                        }
+                        Handler::TaintEscape | Handler::TaintEscapeIndex => {
+                            let Obj::Site { site, ctx, .. } = o else {
+                                continue;
+                            };
+                            let slots: &[Slot] = if matches!(handler, Handler::TaintEscapeIndex) {
+                                &[Slot::Index]
+                            } else {
+                                &[Slot::Index, Slot::Dynamic]
+                            };
+                            for &slot in slots {
+                                self.add_fact(Ptr::Field(site, ctx, slot), Obj::Unknown);
+                                let rearm = self.note_bucket_rearms(site, ctx, slot);
+                                for (rid, ro) in rearm.into_iter().rev() {
+                                    stack.push(FireStep::Fire(rid, ro));
+                                }
+                            }
                         }
                     }
                 }
@@ -1119,20 +1485,20 @@ impl<'m> Pta<'m> {
                     self.wire_call(call, caller_ctx, body);
                 }
             }
-            Obj::Site { callable: None, .. } => {}
+            Obj::Site { callable: None, .. } | Obj::GlobalThis => {}
         }
     }
 
     /// Wire call `call` (in `caller_ctx`) into `callee`: activation +
-    /// argument/return edges. Idempotent per triple.
+    /// argument/return edges. Idempotent per internal callee triple.
     fn wire_call(&mut self, call: InstId, caller_ctx: Ctx, callee: FuncId) {
-        if !self.wired.insert((call, caller_ctx, callee)) {
-            return;
-        }
         let Some(fd) = self.module.func(callee) else {
             return;
         };
         if fd.is_external || fd.blocks.is_empty() {
+            return;
+        }
+        if !self.wired.insert((call, caller_ctx, callee)) {
             return;
         }
         let callee_ctx = Some(call);
@@ -1148,10 +1514,6 @@ impl<'m> Pta<'m> {
         };
         let (callee_val, this, args, kind) = (*callee_val, *this, args.clone(), *kind);
         let local = |v: ValueId| Ptr::Local(v, caller_ctx);
-        // For `new Cls(...)` into an internal constructor body, materialize a
-        // concrete instance allocation keyed by the `New` call instruction so
-        // constructor field writes (`this.f = v`) and caller reads (`inst.f`)
-        // meet on a concrete site.
         let constructed_instance =
             matches!(kind, CallKind::New | CallKind::NewSpread).then_some(Obj::Site {
                 site: call,
@@ -1159,51 +1521,89 @@ impl<'m> Pta<'m> {
                 callable: None,
                 keyed: true,
             });
+        if constructed_instance.is_some()
+            && let Some(methods) = self.ctor_inst_methods.get(&callee).cloned()
+        {
+            for (msym, mfid) in methods {
+                self.add_fact(
+                    Ptr::Field(call, caller_ctx, Slot::Named(msym)),
+                    Obj::Site {
+                        site: call,
+                        ctx: None,
+                        callable: Some(mfid),
+                        keyed: false,
+                    },
+                );
+            }
+        }
+        let caller_fn = self
+            .base
+            .edge_at(call)
+            .map(|e| e.caller)
+            .or_else(|| self.links.inst_func(self.module, call));
         let inherited_this = (this.is_none()
             && matches!(
                 kind,
-                CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs
+                CallKind::Super
+                    | CallKind::SuperArrow
+                    | CallKind::SuperSpread
+                    | CallKind::SuperForwardAllArgs
             ))
         .then(|| {
-            let caller = self
-                .base
-                .edge_at(call)
-                .map(|e| e.caller)
-                .or_else(|| self.links.inst_func(self.module, call))?;
+            if kind == CallKind::SuperForwardAllArgs
+                && let Some(&explicit_this) = args.first()
+            {
+                return Some(explicit_this);
+            }
+            let caller = caller_fn?;
             let c_slots = frame_slots_of(self.module, caller)?;
             let c_this_idx = c_slots.this_index()?;
             self.module.func(caller)?.params.get(c_this_idx).copied()
         })
         .flatten();
+        let callee_params = fd.params.clone();
         match frame_slots_of(self.module, callee) {
-            Some(slots) if fd.params.len() >= slots.implicit_count() => {
-                // Implicit slots, ordered func, newTarget, this (N66).
+            Some(slots) if callee_params.len() >= slots.implicit_count() => {
                 if slots.func && !is_super_call_kind(kind) {
-                    self.add_edge(local(callee_val), Ptr::Local(fd.params[0], callee_ctx));
+                    self.add_edge(local(callee_val), Ptr::Local(callee_params[0], callee_ctx));
                 }
                 if let Some(this_idx) = slots.this_index() {
                     if let Some(t) = this.or(inherited_this) {
-                        self.add_edge(local(t), Ptr::Local(fd.params[this_idx], callee_ctx));
+                        self.add_edge(local(t), Ptr::Local(callee_params[this_idx], callee_ctx));
                     } else if let Some(inst_obj) = constructed_instance {
-                        self.add_fact(Ptr::Local(fd.params[this_idx], callee_ctx), inst_obj);
+                        self.add_fact(Ptr::Local(callee_params[this_idx], callee_ctx), inst_obj);
                     }
                 }
                 let formal_base = slots.implicit_count();
                 match kind {
-                    abcd_ir::CallKind::Apply
-                    | abcd_ir::CallKind::SuperSpread
-                    | abcd_ir::CallKind::SuperForwardAllArgs
-                    | abcd_ir::CallKind::NewSpread => {
-                        // Formals come out of an argument array / the
-                        // caller's own frame — opaque at this rung (the
-                        // rung-1 discipline): unknown, never wrong.
-                        for &p in fd.params.iter().skip(formal_base) {
-                            self.add_fact(Ptr::Local(p, callee_ctx), Obj::Unknown);
+                    CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread => {
+                        if !args.is_empty() {
+                            let spread_ptr = Ptr::SpreadElem(call, caller_ctx);
+                            for &p in callee_params.iter().skip(formal_base) {
+                                self.add_edge(spread_ptr, Ptr::Local(p, callee_ctx));
+                            }
+                        }
+                    }
+                    CallKind::SuperForwardAllArgs => {
+                        let caller_formals: Vec<ValueId> = caller_fn
+                            .and_then(|cf| {
+                                let cfd = self.module.func(cf)?;
+                                let c_base = frame_slots_of(self.module, cf)
+                                    .map_or(0, |cs| cs.implicit_count());
+                                Some(cfd.params.iter().skip(c_base).copied().collect())
+                            })
+                            .unwrap_or_default();
+                        for (i, &callee_p) in callee_params.iter().skip(formal_base).enumerate() {
+                            if let Some(&caller_p) = caller_formals.get(i) {
+                                self.add_edge(local(caller_p), Ptr::Local(callee_p, callee_ctx));
+                            } else if caller_ctx.is_none() {
+                                self.add_fact(Ptr::Local(callee_p, callee_ctx), Obj::Unknown);
+                            }
                         }
                     }
                     _ => {
                         for (i, a) in args.iter().enumerate() {
-                            if let Some(&p) = fd.params.get(formal_base + i) {
+                            if let Some(&p) = callee_params.get(formal_base + i) {
                                 self.add_edge(local(*a), Ptr::Local(p, callee_ctx));
                             }
                         }
@@ -1211,15 +1611,22 @@ impl<'m> Pta<'m> {
                 }
             }
             _ => {
-                // No reliable slot model: conservative — every operand
-                // reaches every parameter (the taint layer's
-                // OverApproxAll parity; never silently drop).
+                if matches!(
+                    kind,
+                    CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread
+                ) && !args.is_empty()
+                {
+                    let spread_ptr = Ptr::SpreadElem(call, caller_ctx);
+                    for &p in &callee_params {
+                        self.add_edge(spread_ptr, Ptr::Local(p, callee_ctx));
+                    }
+                }
                 let mut operands = args.clone();
-                if let Some(t) = this {
+                if let Some(t) = this.or(inherited_this) {
                     operands.push(t);
                 }
                 for a in operands {
-                    for &p in &fd.params {
+                    for &p in &callee_params {
                         self.add_edge(local(a), Ptr::Local(p, callee_ctx));
                     }
                 }
@@ -1272,6 +1679,7 @@ impl<'m> Pta<'m> {
                 self.add_fact(Ptr::Local(p, ctx), Obj::Unknown);
             }
         }
+        let func_params = fd.params.clone();
         let blocks = fd.blocks.clone();
         let active_harness_receivers = if is_harness && let Some(rk) = &self.root_keep {
             collect_active_harness_receivers_in(self.module, self.base, &blocks, rk)
@@ -1313,10 +1721,74 @@ impl<'m> Pta<'m> {
                                 },
                             );
                         }
+                        match op {
+                            Op::AllocObject { shape } => {
+                                if let Some(Const::ObjectLiteral { keys, values }) =
+                                    self.module.consts.get(*shape)
+                                {
+                                    let pairs: Vec<(ConstId, ConstId)> =
+                                        keys.iter().copied().zip(values.iter().copied()).collect();
+                                    for (k_cid, v_cid) in pairs {
+                                        let slot = match self.module.consts.get(k_cid) {
+                                            Some(Const::String(sym)) => Slot::Named(*sym),
+                                            _ => Slot::Dynamic,
+                                        };
+                                        match self.module.consts.get(v_cid).cloned() {
+                                            Some(Const::MethodRef { func: mfid, .. }) => {
+                                                self.add_fact(
+                                                    Ptr::Field(iid, ctx, slot),
+                                                    Obj::Site {
+                                                        site: iid,
+                                                        ctx: None,
+                                                        callable: Some(mfid),
+                                                        keyed: false,
+                                                    },
+                                                );
+                                                self.note_bucket(iid, ctx, slot);
+                                                if sliced
+                                                    && self.try_record_dyn_hop(mfid, next_dyn_hop)
+                                                {
+                                                    self.activate(mfid, None);
+                                                }
+                                            }
+                                            Some(
+                                                Const::ObjectLiteral { .. }
+                                                | Const::ArrayLiteral(_)
+                                                | Const::TypedArrayLiteral { .. }
+                                                | Const::LiteralBufferRef(_),
+                                            ) => {
+                                                self.add_fact(
+                                                    Ptr::Field(iid, ctx, slot),
+                                                    Obj::Unknown,
+                                                );
+                                                self.note_bucket(iid, ctx, slot);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            Op::AllocArray { shape: Some(shape) } => {
+                                for mfid in collect_const_method_refs(self.module, *shape) {
+                                    self.add_fact(
+                                        Ptr::Field(iid, ctx, Slot::Index),
+                                        Obj::Site {
+                                            site: iid,
+                                            ctx: None,
+                                            callable: Some(mfid),
+                                            keyed: false,
+                                        },
+                                    );
+                                    self.note_bucket(iid, ctx, Slot::Index);
+                                    if sliced && self.try_record_dyn_hop(mfid, next_dyn_hop) {
+                                        self.activate(mfid, None);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Op::CreateGenerator { func } | Op::CreateAsyncGenerator { func } => {
-                        // Not one of the four keyed allocs (unreported),
-                        // but callable — it resolves like a closure.
                         if let Some(r) = inst.result {
                             self.add_fact(
                                 local(r),
@@ -1346,13 +1818,36 @@ impl<'m> Pta<'m> {
                             self.activate(body_fn, None);
                         }
                     }
-                    Op::DefineMethod { func: inner, .. } => {
+                    Op::DefineMethod {
+                        object,
+                        name,
+                        func: inner,
+                        ..
+                    } => {
+                        let body_opt = callable_body(self.module, *inner);
                         if sliced
-                            && let Some(body_fn) = callable_body(self.module, *inner)
+                            && let Some(body_fn) = body_opt
                             && self.try_record_dyn_hop(body_fn, next_dyn_hop)
                         {
                             self.activate(body_fn, None);
                         }
+                        let method_obj = Obj::Site {
+                            site: iid,
+                            ctx,
+                            callable: body_opt,
+                            keyed: false,
+                        };
+                        if let Some(r) = inst.result {
+                            self.add_fact(local(r), method_obj);
+                        }
+                        let method_ptr = local(*inner);
+                        self.register(
+                            local(*object),
+                            Handler::Store {
+                                value: method_ptr,
+                                slot: Slot::Named(*name),
+                            },
+                        );
                     }
                     Op::DefineGetterSetterByValue { getter, setter, .. } => {
                         if sliced {
@@ -1363,6 +1858,9 @@ impl<'m> Pta<'m> {
                                     self.activate(body_fn, None);
                                 }
                             }
+                        }
+                        if let Some(r) = inst.result {
+                            self.add_fact(local(r), Obj::Unknown);
                         }
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
@@ -1376,21 +1874,45 @@ impl<'m> Pta<'m> {
                                     keyed: false,
                                 },
                             );
+                            for (msym, mfid, is_static) in class_named_methods(self.module, cls) {
+                                if is_static {
+                                    self.add_fact(
+                                        Ptr::Field(iid, ctx, Slot::Named(msym)),
+                                        Obj::Site {
+                                            site: iid,
+                                            ctx: None,
+                                            callable: Some(mfid),
+                                            keyed: false,
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     Op::LoadConst(c) => {
-                        if let Some(Const::MethodRef { func: f, .. }) = self.module.consts.get(*c)
-                            && let Some(r) = inst.result
-                        {
-                            self.add_fact(
-                                local(r),
-                                Obj::Site {
-                                    site: iid,
-                                    ctx,
-                                    callable: Some(*f),
-                                    keyed: false,
-                                },
-                            );
+                        if let Some(r) = inst.result {
+                            if let Some(Const::MethodRef { func: f, .. }) =
+                                self.module.consts.get(*c)
+                            {
+                                let body_fn = *f;
+                                self.add_fact(
+                                    local(r),
+                                    Obj::Site {
+                                        site: iid,
+                                        ctx,
+                                        callable: Some(body_fn),
+                                        keyed: false,
+                                    },
+                                );
+                                if sliced
+                                    && !is_harness
+                                    && self.try_record_dyn_hop(body_fn, next_dyn_hop)
+                                {
+                                    self.activate(body_fn, None);
+                                }
+                            } else if !is_pure_primitive_op(self.module, &inst.op) {
+                                self.add_fact(local(r), Obj::Unknown);
+                            }
                         }
                     }
                     Op::LoadFunction => {
@@ -1406,6 +1928,11 @@ impl<'m> Pta<'m> {
                             );
                         }
                     }
+                    Op::LoadGlobalObject => {
+                        if let Some(r) = inst.result {
+                            self.add_fact(local(r), Obj::GlobalThis);
+                        }
+                    }
                     Op::Mov { src } => {
                         if let Some(r) = inst.result {
                             self.add_edge(local(*src), local(r));
@@ -1413,8 +1940,12 @@ impl<'m> Pta<'m> {
                     }
                     Op::Phi { entries } => {
                         if let Some(r) = inst.result {
-                            for (_, incoming) in entries {
-                                self.add_edge(local(*incoming), local(r));
+                            if entries.is_empty() {
+                                self.add_fact(local(r), Obj::Unknown);
+                            } else {
+                                for (_, incoming) in entries {
+                                    self.add_edge(local(*incoming), local(r));
+                                }
                             }
                         }
                     }
@@ -1496,20 +2027,123 @@ impl<'m> Pta<'m> {
                             },
                         );
                     }
+                    Op::StoreSuper {
+                        key,
+                        this_value,
+                        value,
+                    } => {
+                        let slot = match key {
+                            abcd_ir::SuperKey::Name(name) => Slot::Named(*name),
+                            abcd_ir::SuperKey::Dynamic(_) => Slot::Dynamic,
+                        };
+                        self.register(
+                            local(*this_value),
+                            Handler::Store {
+                                value: local(*value),
+                                slot,
+                            },
+                        );
+                    }
+                    Op::CopyDataProps { dst, src } => {
+                        self.register(
+                            local(*src),
+                            Handler::CopyProps {
+                                dst_base: local(*dst),
+                                excl_idx: 0,
+                            },
+                        );
+                    }
+                    Op::CreateObjectWithExcludedKeys { obj, keys } => {
+                        if let Some(r) = inst.result {
+                            self.add_fact(
+                                local(r),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: None,
+                                    keyed: true,
+                                },
+                            );
+                            let mut excl = BTreeSet::new();
+                            for &k in keys {
+                                if let Some(sym) = const_string_sym(self.module, k) {
+                                    excl.insert(sym);
+                                }
+                            }
+                            let excl_idx = if excl.is_empty() {
+                                0
+                            } else {
+                                let idx = self.copy_excluded.len() as u32;
+                                self.copy_excluded.push(excl);
+                                idx
+                            };
+                            self.register(
+                                local(*obj),
+                                Handler::CopyProps {
+                                    dst_base: local(r),
+                                    excl_idx,
+                                },
+                            );
+                        }
+                    }
+                    Op::ArraySpread { dst, src, .. } => {
+                        let bridge = Ptr::SpreadElem(iid, ctx);
+                        self.register(
+                            local(*src),
+                            Handler::Load {
+                                result: bridge,
+                                read: Read::Index,
+                            },
+                        );
+                        self.register(
+                            local(*dst),
+                            Handler::Store {
+                                value: bridge,
+                                slot: Slot::Index,
+                            },
+                        );
+                    }
+                    Op::GetUnmappedArgs | Op::CopyRestArgs { .. } => {
+                        if let Some(r) = inst.result {
+                            let skip_extra = match &inst.op {
+                                Op::CopyRestArgs { start_index } => *start_index as usize,
+                                _ => 0,
+                            };
+                            self.add_fact(
+                                local(r),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: None,
+                                    keyed: true,
+                                },
+                            );
+                            self.note_bucket(iid, ctx, Slot::Index);
+                            let elem_ptr = Ptr::Field(iid, ctx, Slot::Index);
+                            match frame_slots_of(self.module, func) {
+                                Some(slots) => {
+                                    let start = slots.implicit_count() + skip_extra;
+                                    for &p in func_params.iter().skip(start) {
+                                        self.add_edge(local(p), elem_ptr);
+                                    }
+                                }
+                                None => {
+                                    for &p in &func_params {
+                                        self.add_edge(local(p), elem_ptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Op::StoreGlobal { name, value }
                     | Op::StoreGlobalRecord { name, value, .. }
                     | Op::TryStoreGlobal { name, value } => {
-                        // The record store (N72-C4) and the object store
-                        // feed the same named-global pointer — reads model
-                        // both through `Ptr::Global`.
                         self.add_edge(local(*value), Ptr::Global(*name));
                     }
                     Op::TryGetGlobal { name, .. } => {
                         if let Some(r) = inst.result {
                             self.add_edge(Ptr::Global(*name), local(r));
-                            // Host bindings and absence are opaque —
-                            // eager unknown (module stores still flow
-                            // through the edge).
+                            self.add_edge(Ptr::GlobalDynamic, local(r));
                             self.add_fact(local(r), Obj::Unknown);
                         }
                     }
@@ -1519,30 +2153,39 @@ impl<'m> Pta<'m> {
                         value,
                         kind,
                     } => {
-                        if *kind != abcd_ir::LexEnvKind::Patch {
-                            let env_stack_at = self.env_stack_at;
-                            if let Some(stack) = env_stack_at.get(iid.index())
-                                && (*level as usize) < stack.len()
-                            {
-                                let entry = &stack[stack.len() - 1 - *level as usize];
+                        let lkey = LexKindKey::from(*kind);
+                        let env_stack_at = self.env_stack_at;
+                        match env_stack_at
+                            .get(iid.index())
+                            .and_then(|es| es.chain(*kind))
+                            .and_then(|ch| ch.at_level(*level))
+                        {
+                            Some(entry) => {
                                 for &env_site in &entry.sites {
                                     self.add_edge(
                                         local(*value),
                                         Ptr::LexVar(env_site, *slot, ctx.is_some()),
                                     );
                                 }
+                                if entry.unknown || entry.sites.is_empty() {
+                                    self.add_edge(local(*value), Ptr::UnknownLexVar(lkey, *slot));
+                                }
+                            }
+                            None => {
+                                self.add_edge(local(*value), Ptr::UnknownLexVar(lkey, *slot));
                             }
                         }
                     }
                     Op::GetLexVar { level, slot, kind } => {
                         if let Some(r) = inst.result {
+                            let lkey = LexKindKey::from(*kind);
                             let env_stack_at = self.env_stack_at;
-                            if *kind != abcd_ir::LexEnvKind::Patch
-                                && let Some(stack) = env_stack_at.get(iid.index())
-                                && (*level as usize) < stack.len()
+                            match env_stack_at
+                                .get(iid.index())
+                                .and_then(|es| es.chain(*kind))
+                                .and_then(|ch| ch.at_level(*level))
                             {
-                                let entry = &stack[stack.len() - 1 - *level as usize];
-                                if !entry.unknown && !entry.sites.is_empty() {
+                                Some(entry) => {
                                     for &env_site in &entry.sites {
                                         if sliced
                                             && let Some(owner_fn) =
@@ -1557,11 +2200,15 @@ impl<'m> Pta<'m> {
                                             local(r),
                                         );
                                     }
-                                } else {
+                                    if entry.unknown || entry.sites.is_empty() {
+                                        self.add_edge(Ptr::UnknownLexVar(lkey, *slot), local(r));
+                                        self.add_fact(local(r), Obj::Unknown);
+                                    }
+                                }
+                                None => {
+                                    self.add_edge(Ptr::UnknownLexVar(lkey, *slot), local(r));
                                     self.add_fact(local(r), Obj::Unknown);
                                 }
-                            } else {
-                                self.add_fact(local(r), Obj::Unknown);
                             }
                         }
                     }
@@ -1655,23 +2302,26 @@ impl<'m> Pta<'m> {
                             }
                         }
                     }
-                    Op::Await { value } | Op::AwaitUncaught { value, .. } => {
+                    Op::Await { value }
+                    | Op::AwaitUncaught { value, .. }
+                    | Op::SuspendGenerator { value, .. } => {
                         if let Some(r) = inst.result {
                             self.add_edge(local(*value), local(r));
                         }
                     }
                     Op::ResumeGenerator { genobj } => {
                         if let Some(r) = inst.result {
-                            // Pair async-machine `AwaitUncaught(funcobj, val)` -> `ResumeGenerator(funcobj)`.
-                            for &prev_iid in &bb.insts {
-                                if prev_iid == iid {
-                                    break;
-                                }
-                                if let Some(Op::AwaitUncaught { funcobj, value, .. }) =
-                                    self.module.inst(prev_iid).map(|i| &i.op)
-                                    && funcobj == genobj
-                                {
-                                    self.add_edge(local(*value), local(r));
+                            let vals = crate::control::awaited_values_for_resume(
+                                self.module,
+                                func,
+                                iid,
+                                *genobj,
+                            );
+                            if vals.is_empty() {
+                                self.add_fact(local(r), Obj::Unknown);
+                            } else {
+                                for v in vals {
+                                    self.add_edge(local(v), local(r));
                                 }
                             }
                         }
@@ -1683,6 +2333,10 @@ impl<'m> Pta<'m> {
                         kind,
                     } => {
                         let callee_val = *callee;
+                        let spread_kind = matches!(
+                            kind,
+                            CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread
+                        );
                         if is_harness {
                             let has_non_const_arg =
                                 args.iter().any(|&a| !is_load_const(self.module, a));
@@ -1700,6 +2354,18 @@ impl<'m> Pta<'m> {
                                     .as_ref()
                                     .is_some_and(|rk| base_callees.iter().any(|c| rk.contains(c)));
                             if any_kept {
+                                self.scanned_calls.push((iid, ctx));
+                                if spread_kind && let Some(&arr_val) = args.first() {
+                                    let spread_ptr = Ptr::SpreadElem(iid, ctx);
+                                    self.load_results.push(spread_ptr);
+                                    self.register(
+                                        local(arr_val),
+                                        Handler::Load {
+                                            result: spread_ptr,
+                                            read: Read::Index,
+                                        },
+                                    );
+                                }
                                 self.register(
                                     local(callee_val),
                                     Handler::Call {
@@ -1721,6 +2387,18 @@ impl<'m> Pta<'m> {
                                 }
                             }
                         } else {
+                            self.scanned_calls.push((iid, ctx));
+                            if spread_kind && let Some(&arr_val) = args.first() {
+                                let spread_ptr = Ptr::SpreadElem(iid, ctx);
+                                self.load_results.push(spread_ptr);
+                                self.register(
+                                    local(arr_val),
+                                    Handler::Load {
+                                        result: spread_ptr,
+                                        read: Read::Index,
+                                    },
+                                );
+                            }
                             self.register(
                                 local(callee_val),
                                 Handler::Call {
@@ -1737,18 +2415,61 @@ impl<'m> Pta<'m> {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(r) = inst.result
+                            && !is_pure_primitive_op(self.module, &inst.op)
+                        {
+                            self.add_fact(local(r), Obj::Unknown);
+                        }
+                    }
                 }
             }
         }
     }
 
+    /// Whether a scanned call activation `(call, caller_ctx)` is unresolved,
+    /// partial (`resolution_complete == false`), external, or excluded by
+    /// root-slicing.
+    fn is_call_incomplete(&self, call: InstId, caller_ctx: Ctx) -> bool {
+        if self.call_unknown.contains(&(call, caller_ctx)) {
+            return true;
+        }
+        let is_super = matches!(
+            self.module.inst(call).map(|i| &i.op),
+            Some(Op::Call { kind, .. }) if is_super_call_kind(*kind)
+        );
+        let caller_fn = self
+            .base
+            .edge_at(call)
+            .map(|e| e.caller)
+            .or_else(|| self.links.inst_func(self.module, call));
+        let pta_set = self.call_targets.get(&(call, caller_ctx));
+        let mut all_targets: BTreeSet<FuncId> = pta_set.cloned().unwrap_or_default();
+        for &bc in self.base.callees_of_call_at(call) {
+            if !(is_super && Some(bc) == caller_fn) {
+                all_targets.insert(bc);
+            }
+        }
+        if all_targets.is_empty() {
+            return true;
+        }
+        if pta_set.is_none_or(BTreeSet::is_empty)
+            && self
+                .base
+                .edge_at(call)
+                .is_none_or(|e| !e.resolution_complete)
+        {
+            return true;
+        }
+        all_targets
+            .iter()
+            .any(|&callee| !self.wired.contains(&(call, caller_ctx, callee)))
+    }
+
     /// The main loop: activations (in `(FuncId, ctx)` order) and facts
-    /// (pop-min) through one deterministic worklist, to the fixed
-    /// point (or the budget cut), followed by at most one empty-bucket
-    /// post-pass (adding `Unknown` never empties a bucket).
+    /// (pop-min) through one deterministic worklist, followed by empty-bucket
+    /// and incomplete-call escape post-passes until quiescence or `step_budget`.
     fn pump(&mut self, steps: &mut usize) {
-        let mut post_pass_done = false;
         loop {
             loop {
                 if let Some((func, ctx)) = self.pending_activations.pop_first() {
@@ -1768,7 +2489,6 @@ impl<'m> Pta<'m> {
                     continue;
                 }
                 self.stats.facts += 1;
-                // Delta half one: replay down existing out-edges.
                 let Pta {
                     edges, worklist, ..
                 } = self;
@@ -1777,7 +2497,6 @@ impl<'m> Pta<'m> {
                         worklist.insert((t, o));
                     }
                 }
-                // Statement handlers registered on this base pointer.
                 let handler_len = self.handlers_by_base.get(&p).map_or(0, Vec::len);
                 for hi in 0..handler_len {
                     let Some(&id) = self.handlers_by_base.get(&p).and_then(|ids| ids.get(hi))
@@ -1787,13 +2506,6 @@ impl<'m> Pta<'m> {
                     self.fire(id, o);
                 }
             }
-            if post_pass_done {
-                break;
-            }
-            post_pass_done = true;
-            // The empty-bucket post-pass: a load whose buckets stayed
-            // empty reads an inherited/reflected/native property —
-            // opaque. Runs once: adding Unknown never empties a bucket.
             let mut added = false;
             let results = self.load_results.clone();
             for result in results {
@@ -1802,18 +2514,128 @@ impl<'m> Pta<'m> {
                     added = true;
                 }
             }
+            if added {
+                continue;
+            }
+            let calls = self.scanned_calls.clone();
+            for (call, caller_ctx) in calls {
+                if !self.tainted_calls.contains(&(call, caller_ctx))
+                    && self.is_call_incomplete(call, caller_ctx)
+                {
+                    self.tainted_calls.insert((call, caller_ctx));
+                    added = true;
+                    if let Some(inst) = self.module.inst(call) {
+                        if let Some(r) = inst.result {
+                            self.add_fact(Ptr::Local(r, caller_ctx), Obj::Unknown);
+                        }
+                        if let Op::Call {
+                            callee,
+                            this,
+                            args,
+                            kind,
+                        } = &inst.op
+                        {
+                            let (callee, this, kind, args) = (*callee, *this, *kind, args.clone());
+                            if let Some((recv, stores_args)) =
+                                self.inherited_array_proto_call(callee, this, kind, caller_ctx)
+                            {
+                                let recv_ptr = Ptr::Local(recv, caller_ctx);
+                                self.register(recv_ptr, Handler::TaintEscapeIndex);
+                                if stores_args {
+                                    if kind == CallKind::Apply {
+                                        self.register(
+                                            recv_ptr,
+                                            Handler::Store {
+                                                value: Ptr::SpreadElem(call, caller_ctx),
+                                                slot: Slot::Index,
+                                            },
+                                        );
+                                    } else {
+                                        for a in args {
+                                            self.register(
+                                                recv_ptr,
+                                                Handler::Store {
+                                                    value: Ptr::Local(a, caller_ctx),
+                                                    slot: Slot::Index,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                let mut escape_vals = args;
+                                if let Some(t) = this {
+                                    escape_vals.push(t);
+                                }
+                                for ev in escape_vals {
+                                    self.register(Ptr::Local(ev, caller_ctx), Handler::TaintEscape);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if !added {
                 break;
             }
         }
     }
 
-    fn run(&mut self, roots: Option<&[FuncId]>) {
+    /// Detect an inherited non-callback `Array.prototype` method call on a
+    /// proven `AllocArray` receiver with no own/dynamic shadow on that method,
+    /// returning `(recv, stores_args)`.
+    fn inherited_array_proto_call(
+        &self,
+        callee: ValueId,
+        this: Option<ValueId>,
+        kind: CallKind,
+        caller_ctx: Ctx,
+    ) -> Option<(ValueId, bool)> {
+        if !matches!(kind, CallKind::Direct | CallKind::Dynamic | CallKind::Apply) {
+            return None;
+        }
+        let callee_root = super::heap::peel_movs(self.module, callee);
+        let ValueDef::Inst(load_iid) = self.module.value(callee_root)?.def else {
+            return None;
+        };
+        let Op::LoadProp {
+            object: recv,
+            name: method_sym,
+        } = &self.module.inst(load_iid)?.op
+        else {
+            return None;
+        };
+        if !this.is_some_and(|t| {
+            super::heap::peel_movs(self.module, t) == super::heap::peel_movs(self.module, *recv)
+        }) {
+            return None;
+        }
+        let stores_args = match self.module.sym.resolve(*method_sym)? {
+            "push" | "unshift" | "splice" | "fill" => true,
+            "pop" | "shift" | "slice" | "concat" | "copyWithin" | "reverse" | "join"
+            | "indexOf" | "lastIndexOf" | "includes" | "at" => false,
+            _ => return None,
+        };
+        let objs = self.pts.get(&Ptr::Local(*recv, caller_ctx))?;
+        (!objs.is_empty()
+            && objs.iter().all(|o| {
+                matches!(
+                    o,
+                    Obj::Site { site, ctx, .. }
+                        if matches!(
+                            self.module.inst(*site).map(|i| &i.op),
+                            Some(Op::AllocArray { .. })
+                        ) && !self.buckets.get(&(*site, *ctx)).is_some_and(|b| {
+                            b.contains(&Slot::Named(*method_sym)) || b.contains(&Slot::Dynamic)
+                        })
+                )
+            }))
+        .then_some((*recv, stores_args))
+    }
+
+    fn run(&mut self, roots: Option<&[FuncId]>, steps: &mut usize) {
         match roots {
             None => {
-                // Whole-module seeding: every function with a body gets a base
-                // activation (scope gating §4.1 item 5 — the module is the
-                // program; context activations arrive through resolved edges).
                 for fi in 0..self.module.functions.len() {
                     self.activate(FuncId::new(fi as u32), None);
                 }
@@ -1824,8 +2646,7 @@ impl<'m> Pta<'m> {
                 }
             }
         }
-        let mut steps = 0usize;
-        self.pump(&mut steps);
+        self.pump(steps);
     }
 }
 
@@ -1868,7 +2689,42 @@ pub fn analyze_with_links_and_roots(
     config: &PtaConfig,
     roots: Option<&[FuncId]>,
 ) -> PtaOutcome {
-    let (env_stack_at, env_sites, env_rounds) = env_analysis(module, config.max_env_depth);
+    let root_sliced = roots.is_some_and(|root_funcs| {
+        let rk: BTreeSet<FuncId> = root_funcs.iter().copied().collect();
+        module.functions.iter().enumerate().any(|(fi, fd)| {
+            !fd.is_external && !fd.blocks.is_empty() && !rk.contains(&FuncId::new(fi as u32))
+        })
+    });
+    let mut steps = 0usize;
+    let EnvAnalysisOut {
+        env_stack_at,
+        env_sites,
+        rounds: env_rounds,
+        capped: env_capped,
+    } = env_analysis(module, config.max_env_depth, config.step_budget, &mut steps);
+    if env_capped {
+        let mut answers = Vec::with_capacity(module.values.len());
+        for v in 0..module.values.len() {
+            let vid = ValueId::new(v as u32);
+            answers.push(value_answer(module, vid, None, true));
+        }
+        let empty_env = Arc::new(EnvState::default());
+        return PtaOutcome {
+            graph: base.clone(),
+            tables: Rung2Tables {
+                answers,
+                env_stack_at: vec![empty_env; module.insts.len()],
+                env_sites,
+            },
+            stats: PtaStats {
+                env_rounds,
+                capped: true,
+                root_sliced,
+                ..PtaStats::default()
+            },
+        };
+    }
+
     let slice_init = roots.map(|root_funcs| {
         let max_base_hop = if root_funcs.len() > 128 {
             1
@@ -1898,13 +2754,11 @@ pub fn analyze_with_links_and_roots(
         }
     });
     let mut engine = Pta::new(module, links, base, config, &env_stack_at, slice_init);
-    engine.run(roots);
+    engine.run(roots, &mut steps);
     let stats_engine = engine.stats;
     let scanned_funcs: BTreeSet<FuncId> = engine.scanned.iter().map(|&(f, _)| f).collect();
 
     // ── Graph assembly ───────────────────────────────────────────────
-    // Aggregate the PTA's resolutions per call instruction first (the
-    // per-site scan then stays linear).
     let mut pta_targets: BTreeMap<InstId, BTreeSet<FuncId>> = BTreeMap::new();
     for ((call, _), bodies) in engine.call_targets.iter() {
         pta_targets
@@ -1933,10 +2787,8 @@ pub fn analyze_with_links_and_roots(
         } else {
             let resolution_complete =
                 if roots.is_none() || scanned_funcs.contains(&base_edge.caller) {
-                    // Completeness is the PTA's own: the callee value's set
-                    // contained no Unknown (the PTA subsumes the base trace —
-                    // a base dead-end the PTA closes completely is complete).
                     !pta_partial.contains(&iid)
+                        && (pta_targets.contains_key(&iid) || base_edge.resolution_complete)
                 } else {
                     base_edge.resolution_complete
                 };
@@ -1956,10 +2808,15 @@ pub fn analyze_with_links_and_roots(
     }
     let graph = CallGraph::from_edges(sites);
 
-    // ── Value answers ────────────────────────────────────────────────
-    // Aggregate each value's object union in ONE pass over the
-    // points-to tables: `(all contexts, recorded-contexts-only, has a
-    // recorded context)`.
+    // ── Externally-invocable classification & Value answers ──────────
+    let recorded_funcs: BTreeSet<FuncId> = engine
+        .scanned
+        .iter()
+        .filter_map(|&(f, c)| c.map(|_| f))
+        .collect();
+    let (externally_invocable, value_owner) =
+        compute_externally_invocable(module, links, &engine, &graph, &recorded_funcs, roots);
+
     let mut acc: HashMap<ValueId, (BTreeSet<Obj>, BTreeSet<Obj>, bool)> = HashMap::new();
     for (p, objs) in &engine.pts {
         let Ptr::Local(v, ctx) = p else { continue };
@@ -1973,18 +2830,15 @@ pub fn analyze_with_links_and_roots(
     let mut answers = Vec::with_capacity(module.values.len());
     for v in 0..module.values.len() {
         let vid = ValueId::new(v as u32);
-        answers.push(value_answer(module, vid, acc.get(&vid)));
+        let retain_base = value_owner.get(v).copied().flatten().is_none_or(|fid| {
+            externally_invocable
+                .get(fid.index())
+                .copied()
+                .unwrap_or(true)
+        });
+        answers.push(value_answer(module, vid, acc.get(&vid), retain_base));
     }
 
-    // Balanced lexical-capture answers: when an enclosing function owning
-    // `env_site` has recorded call-site contexts (`ctx.is_some()`), ignore the
-    // synthetic `ctx == None` parameter `Obj::Unknown` marker on its captured
-    // lexical slots (mirroring `value_answer`'s parameter rule).
-    let recorded_funcs: BTreeSet<FuncId> = engine
-        .scanned
-        .iter()
-        .filter_map(|&(f, c)| c.map(|_| f))
-        .collect();
     let lex_funcs: Vec<FuncId> = if roots.is_some() {
         scanned_funcs.iter().copied().collect()
     } else {
@@ -2003,43 +2857,58 @@ pub fn analyze_with_links_and_roots(
                     continue;
                 };
                 if let Op::GetLexVar { level, slot, kind } = &inst.op
-                    && *kind != abcd_ir::LexEnvKind::Patch
                     && let Some(res_vid) = inst.result
-                    && let Some(stack) = env_stack_at.get(iid.index())
-                    && (*level as usize) < stack.len()
+                    && let Some(env_state) = env_stack_at.get(iid.index())
+                    && let Some(chain) = env_state.chain(*kind)
+                    && let Some(entry) = chain.at_level(*level)
+                    && !entry.unknown
+                    && !entry.sites.is_empty()
                 {
-                    let entry = &stack[stack.len() - 1 - *level as usize];
-                    if !entry.unknown && !entry.sites.is_empty() {
-                        let mut union = BTreeSet::new();
-                        for &env_site in &entry.sites {
-                            let use_rec = links
-                                .inst_func(module, env_site)
-                                .is_some_and(|of| recorded_funcs.contains(&of));
-                            if let Some(objs) =
-                                engine.pts.get(&Ptr::LexVar(env_site, *slot, use_rec))
+                    let mut union = BTreeSet::new();
+                    for &env_site in &entry.sites {
+                        let owner_fn = links.inst_func(module, env_site);
+                        let has_rec = owner_fn.is_some_and(|of| recorded_funcs.contains(&of));
+                        let owner_ext = owner_fn.is_none_or(|of| {
+                            externally_invocable
+                                .get(of.index())
+                                .copied()
+                                .unwrap_or(true)
+                        });
+                        if has_rec {
+                            if let Some(objs) = engine.pts.get(&Ptr::LexVar(env_site, *slot, true))
                             {
                                 union.extend(objs.iter().copied());
                             }
+                            if owner_ext
+                                && let Some(objs) =
+                                    engine.pts.get(&Ptr::LexVar(env_site, *slot, false))
+                            {
+                                union.extend(objs.iter().copied());
+                            }
+                        } else if let Some(objs) =
+                            engine.pts.get(&Ptr::LexVar(env_site, *slot, false))
+                        {
+                            union.extend(objs.iter().copied());
                         }
-                        let mut ans = ValueAnswer::default();
-                        for o in &union {
-                            match o {
-                                Obj::Unknown => ans.has_unknown = true,
-                                Obj::Site { site, keyed, .. } => {
-                                    if *keyed {
-                                        ans.sites.union_with(&AllocSiteSet::one(*site));
-                                    } else {
-                                        ans.has_unknown = true;
-                                    }
+                    }
+                    let mut ans = ValueAnswer::default();
+                    for o in &union {
+                        match o {
+                            Obj::Unknown | Obj::GlobalThis => ans.has_unknown = true,
+                            Obj::Site { site, keyed, .. } => {
+                                if *keyed {
+                                    ans.sites.union_with(&AllocSiteSet::one(*site));
+                                } else {
+                                    ans.has_unknown = true;
                                 }
                             }
                         }
-                        if union.is_empty() {
-                            ans.has_unknown = true;
-                        }
-                        if let Some(slot_ans) = answers.get_mut(res_vid.index()) {
-                            *slot_ans = ans;
-                        }
+                    }
+                    if union.is_empty() {
+                        ans.has_unknown = true;
+                    }
+                    if let Some(slot_ans) = answers.get_mut(res_vid.index()) {
+                        *slot_ans = ans;
                     }
                 }
             }
@@ -2048,6 +2917,7 @@ pub fn analyze_with_links_and_roots(
 
     let stats = PtaStats {
         env_rounds,
+        root_sliced,
         ..stats_engine
     };
     PtaOutcome {
@@ -2061,14 +2931,307 @@ pub fn analyze_with_links_and_roots(
     }
 }
 
-/// The stripped answer for one value: keyed sites + completeness,
-/// unioned across contexts (params: across recorded call-site contexts
-/// when any exist — the balanced discipline, folded into the fixed
-/// point).
+/// Classify which functions may be invoked outside resolved contextual
+/// (`ctx = Some(..)`) internal call sites, plus build a dense `ValueId -> Option<FuncId>`
+/// ownership table.
+fn compute_externally_invocable(
+    module: &Module,
+    links: &ModuleLinkTable,
+    engine: &Pta<'_>,
+    graph: &CallGraph,
+    recorded_funcs: &BTreeSet<FuncId>,
+    roots: Option<&[FuncId]>,
+) -> (Vec<bool>, Vec<Option<FuncId>>) {
+    let n_funcs = module.functions.len();
+    let mut ext = vec![false; n_funcs];
+    let mut value_owner = vec![None; module.values.len()];
+    let mut has_harness = false;
+
+    for (fi, fd) in module.functions.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        let fname = module.sym.resolve(fd.name);
+        if fname == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC) {
+            has_harness = true;
+            ext[fi] = true;
+        }
+        if !recorded_funcs.contains(&fid) {
+            ext[fi] = true;
+        }
+        for &p in &fd.params {
+            if let Some(slot) = value_owner.get_mut(p.index()) {
+                *slot = Some(fid);
+            }
+        }
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(inst) = module.inst(iid)
+                    && let Some(r) = inst.result
+                    && let Some(slot) = value_owner.get_mut(r.index())
+                {
+                    *slot = Some(fid);
+                }
+            }
+        }
+    }
+
+    if !has_harness {
+        for &init_fid in links.init_order() {
+            if let Some(slot) = ext.get_mut(init_fid.index()) {
+                *slot = true;
+            }
+        }
+        for (fi, fd) in module.functions.iter().enumerate() {
+            if module.sym.resolve(fd.name) == Some("func_main_0") {
+                ext[fi] = true;
+            }
+        }
+        if let Some(root_funcs) = roots {
+            for &rf in root_funcs {
+                if let Some(slot) = ext.get_mut(rf.index()) {
+                    *slot = true;
+                }
+            }
+        }
+        for comp in crate::ohos_lifecycle::discover_components(module, links, None) {
+            if let Some(slot) = ext.get_mut(comp.ctor.index()) {
+                *slot = true;
+            }
+            for fids in comp.methods.values() {
+                for &mfid in fids {
+                    if let Some(slot) = ext.get_mut(mfid.index()) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Any function targeted by a non-contextual / unresolved / unscanned call edge.
+    for (call_iid, edge) in graph.sites() {
+        if let CallTargets::Resolved(targets) = &edge.targets {
+            let caller_scanned = engine.scanned.iter().any(|&(f, _)| f == edge.caller);
+            if !caller_scanned || !edge.resolution_complete {
+                for &t in targets {
+                    if let Some(slot) = ext.get_mut(t.index()) {
+                        *slot = true;
+                    }
+                }
+            }
+            let _ = call_iid;
+        }
+    }
+
+    // Index object fields `(site, ctx) -> Vec<Ptr::Field>` once so transitive
+    // heap escape runs in linear time over `engine.pts`.
+    let mut fields_by_obj: HashMap<(InstId, Ctx), Vec<Ptr>> = HashMap::new();
+    let mut escaped_objs: BTreeSet<Obj> = BTreeSet::new();
+    let mut obj_queue: VecDeque<Obj> = VecDeque::new();
+    let enqueue_ptr = |p: Ptr,
+                       pts: &BTreeMap<Ptr, BTreeSet<Obj>>,
+                       escaped: &mut BTreeSet<Obj>,
+                       q: &mut VecDeque<Obj>| {
+        if let Some(objs) = pts.get(&p) {
+            for &o in objs {
+                if escaped.insert(o) {
+                    q.push_back(o);
+                }
+            }
+        }
+    };
+
+    for (&p, objs) in &engine.pts {
+        match p {
+            Ptr::Field(site, ctx, _) => {
+                fields_by_obj.entry((site, ctx)).or_default().push(p);
+            }
+            Ptr::Global(_)
+            | Ptr::GlobalDynamic
+            | Ptr::ModuleVar(_, _)
+            | Ptr::UnknownLexVar(_, _) => {
+                for &o in objs {
+                    if escaped_objs.insert(o) {
+                        obj_queue.push_back(o);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Arguments / `this` escaping into incomplete / external calls.
+    for &(call, caller_ctx) in &engine.tainted_calls {
+        if let Some(Op::Call { this, args, .. }) = module.inst(call).map(|i| &i.op) {
+            if let Some(t) = this {
+                enqueue_ptr(
+                    Ptr::Local(*t, caller_ctx),
+                    &engine.pts,
+                    &mut escaped_objs,
+                    &mut obj_queue,
+                );
+            }
+            for &a in args {
+                enqueue_ptr(
+                    Ptr::Local(a, caller_ctx),
+                    &engine.pts,
+                    &mut escaped_objs,
+                    &mut obj_queue,
+                );
+            }
+        }
+    }
+
+    // Stores onto an `Obj::Unknown` receiver escape the stored value.
+    for &(func, ctx) in &engine.scanned {
+        let Some(fd) = module.func(func) else {
+            continue;
+        };
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::StoreProp { object, value, .. }
+                    | Op::StoreOwnPropName { object, value, .. }
+                    | Op::StorePropIdx { object, value, .. }
+                    | Op::StoreOwnPropIdx { object, value, .. }
+                    | Op::StorePropDyn { object, value, .. }
+                    | Op::StoreOwnPropDyn { object, value, .. }
+                    | Op::StoreSuper {
+                        this_value: object,
+                        value,
+                        ..
+                    }
+                    | Op::DefineMethod {
+                        object,
+                        func: value,
+                        ..
+                    } => {
+                        if engine
+                            .pts
+                            .get(&Ptr::Local(*object, ctx))
+                            .is_some_and(|s| s.contains(&Obj::Unknown))
+                        {
+                            enqueue_ptr(
+                                Ptr::Local(*value, ctx),
+                                &engine.pts,
+                                &mut escaped_objs,
+                                &mut obj_queue,
+                            );
+                        }
+                    }
+                    Op::DefineGetterSetterByValue {
+                        obj,
+                        getter,
+                        setter,
+                        ..
+                    } => {
+                        if engine
+                            .pts
+                            .get(&Ptr::Local(*obj, ctx))
+                            .is_some_and(|s| s.contains(&Obj::Unknown))
+                        {
+                            for &v in [getter, setter] {
+                                enqueue_ptr(
+                                    Ptr::Local(v, ctx),
+                                    &engine.pts,
+                                    &mut escaped_objs,
+                                    &mut obj_queue,
+                                );
+                            }
+                        }
+                    }
+                    Op::Throw { value }
+                    | Op::NotifyConcurrentResult { value }
+                    | Op::AsyncResolve { value, .. } => {
+                        enqueue_ptr(
+                            Ptr::Local(*value, ctx),
+                            &engine.pts,
+                            &mut escaped_objs,
+                            &mut obj_queue,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Fixed point over escaped objects and values returned by `ext[fid]` functions.
+    let mut returned_seeded = vec![false; n_funcs];
+    loop {
+        for fi in 0..n_funcs {
+            if ext[fi] && !returned_seeded[fi] {
+                returned_seeded[fi] = true;
+                let fid = FuncId::new(fi as u32);
+                if let Some(fd) = module.func(fid) {
+                    for &b in &fd.blocks {
+                        let Some(bb) = module.block(b) else { continue };
+                        for &iid in &bb.insts {
+                            if let Some(Op::Return { value: Some(rv) }) =
+                                module.inst(iid).map(|i| &i.op)
+                            {
+                                enqueue_ptr(
+                                    Ptr::Local(*rv, None),
+                                    &engine.pts,
+                                    &mut escaped_objs,
+                                    &mut obj_queue,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(o) = obj_queue.pop_front() else {
+            if (0..n_funcs).all(|fi| !ext[fi] || returned_seeded[fi]) {
+                break;
+            }
+            continue;
+        };
+        if let Obj::Site {
+            site,
+            ctx,
+            callable,
+            ..
+        } = o
+        {
+            if let Some(cfid) = callable
+                && let Some(slot) = ext.get_mut(cfid.index())
+            {
+                *slot = true;
+            }
+            if let Some(Op::DefineClass(cls) | Op::DefineSendableClass(cls)) =
+                module.inst(site).map(|i| &i.op)
+            {
+                if let Some(slot) = ext.get_mut(cls.ctor.index()) {
+                    *slot = true;
+                }
+                for mfid in collect_const_method_refs(module, cls.members) {
+                    if let Some(slot) = ext.get_mut(mfid.index()) {
+                        *slot = true;
+                    }
+                }
+            }
+            if let Some(fptrs) = fields_by_obj.get(&(site, ctx)) {
+                for &fp in fptrs {
+                    enqueue_ptr(fp, &engine.pts, &mut escaped_objs, &mut obj_queue);
+                }
+            }
+        }
+    }
+
+    (ext, value_owner)
+}
+/// `retain_base` is `true` (`externally_invocable[owner_fid]`) or no recorded
+/// `ctx = Some(..)` call site exists.
 fn value_answer(
     module: &Module,
     value: ValueId,
     acc: Option<&(BTreeSet<Obj>, BTreeSet<Obj>, bool)>,
+    retain_base: bool,
 ) -> ValueAnswer {
     let unknown = || ValueAnswer {
         has_unknown: true,
@@ -2078,18 +3241,13 @@ fn value_answer(
         return unknown();
     };
     match v.def {
-        // Constants are not heap allocations (rung-0 parity).
         ValueDef::Const(_) => ValueAnswer::default(),
         ValueDef::ExceptionParam(_) => unknown(),
         ValueDef::Param(_) | ValueDef::Inst(_) => {
             let Some((all, recorded, has_recorded)) = acc else {
                 return unknown();
             };
-            let union = if *has_recorded {
-                // Balanced: recorded call-site contexts only — the base
-                // (`ctx == None`) activation's synthetic parameter `Unknown`
-                // marker means "called from nowhere recorded" and applies
-                // only when no recorded context exists.
+            let union = if *has_recorded && !retain_base {
                 recorded
             } else {
                 all
@@ -2097,22 +3255,17 @@ fn value_answer(
             let mut answer = ValueAnswer::default();
             for o in union {
                 match o {
-                    Obj::Unknown => answer.has_unknown = true,
+                    Obj::Unknown | Obj::GlobalThis => answer.has_unknown = true,
                     Obj::Site { site, keyed, .. } => {
                         if *keyed {
                             answer.sites.union_with(&AllocSiteSet::one(*site));
                         } else {
-                            // Unkeyed objects (function values,
-                            // generators) are never reported — the
-                            // rung-0 parity for unkeyed allocs.
                             answer.has_unknown = true;
                         }
                     }
                 }
             }
             if union.is_empty() {
-                // Opaque definitions (unmodeled ops, never-bound
-                // params): no keyed site, and not provably object-free.
                 answer.has_unknown = true;
             }
             answer
@@ -2121,94 +3274,157 @@ fn value_answer(
 }
 
 /// Apply one instruction's lexical-environment transfer to `state`, returning
-/// `true` iff `state` mutated.
-fn step_env_inst(op: &Op, iid: InstId, max_depth: usize, state: &mut Vec<EnvEntry>) -> bool {
+/// `true` iff `state` mutated. `Plain` (`newlexenv`/`newlexenvwithname`/
+/// `poplexenv`) and `Sendable` (`callruntime.newsendableenv`) evolve on
+/// separate stacks; `PopLexEnv` NEVER pops `Sendable`.
+fn step_env_inst(op: &Op, iid: InstId, max_depth: usize, state: &mut EnvState) -> bool {
     match op {
+        Op::NewLexEnv {
+            kind: abcd_ir::LexEnvKind::Sendable,
+            ..
+        } => {
+            state.sendable.push_site(iid, max_depth);
+            true
+        }
         Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
-            state.push(EnvEntry {
-                sites: BTreeSet::from([iid]),
-                unknown: false,
-            });
-            // Depth cap: drop the OUTERMOST environments (level indexing is
-            // from the innermost end).
-            if state.len() > max_depth {
-                let overflow = state.len() - max_depth;
-                state.drain(0..overflow);
-            }
+            state.plain.push_site(iid, max_depth);
             true
         }
         Op::PopLexEnv => {
-            if state.pop().is_none() {
-                state.push(EnvEntry {
-                    sites: BTreeSet::new(),
-                    unknown: true,
-                });
-            }
+            state.plain.pop_frame();
             true
         }
         _ => false,
     }
 }
 
-/// The lexical-environment analysis: per-instruction environment stacks
-/// plus the capture fixed point (see module docs). Context-insensitive:
-/// recursion merges; the depth cap drops outer environments (deep
-/// levels answer unknown — sound).
-fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec<bool>, usize) {
-    // Environment allocation sites per instruction; capture points
-    // (AllocClosure/CreateGenerator sites + unwrapped DefineFunc sites)
-    // per defined body; per-function lexical-op presence and block reachability.
+/// Precomputed CFG metadata for one function in `env_analysis`.
+struct EnvFuncCfg {
+    /// Reachable blocks in Reverse Post-Order starting at `f.blocks[0]`.
+    rpo: Vec<abcd_ir::BlockId>,
+    /// Block → position in `rpo` (for reachable blocks owned by `f`).
+    rpo_pos: HashMap<abcd_ir::BlockId, usize>,
+    /// Prebuilt dense exception-handler map when `has_lex_ops && !try_regions.is_empty()`.
+    exc_map: Option<abcd_ir::ExceptionHandlerMap>,
+}
+
+/// Outcome of `env_analysis` (including optional `step_budget` cutoff).
+struct EnvAnalysisOut {
+    env_stack_at: Vec<Arc<EnvState>>,
+    env_sites: Vec<bool>,
+    rounds: usize,
+    capped: bool,
+}
+
+/// The lexical-environment analysis: per-instruction dual environment stacks
+/// (`Plain` + `Sendable`) plus the monotone capture fixed point, charged
+/// against `step_budget`.
+fn env_analysis(
+    module: &Module,
+    max_depth: usize,
+    step_budget: usize,
+    steps: &mut usize,
+) -> EnvAnalysisOut {
     let mut env_sites = vec![false; module.insts.len()];
     let mut has_lex_ops = vec![false; module.functions.len()];
-    let mut block_func = vec![None; module.blocks.len()];
-    let mut block_reached = vec![false; module.blocks.len()];
     let mut inst_reached = vec![false; module.insts.len()];
-    // body → capture instructions (in deterministic discovery order).
+    let mut inst_owner: Vec<Option<usize>> = vec![None; module.insts.len()];
     let mut capture_points: BTreeMap<FuncId, BTreeSet<InstId>> = BTreeMap::new();
+    let mut func_cfgs: Vec<EnvFuncCfg> = Vec::with_capacity(module.functions.len());
 
     for (fi, f) in module.functions.iter().enumerate() {
         let func = FuncId::new(fi as u32);
-        for &b in &f.blocks {
-            if let Some(slot) = block_func.get_mut(b.index()) {
-                *slot = Some(func);
+        if f.is_external || f.blocks.is_empty() {
+            func_cfgs.push(EnvFuncCfg {
+                rpo: Vec::new(),
+                rpo_pos: HashMap::new(),
+                exc_map: None,
+            });
+            continue;
+        }
+        let exc_map = (!f.try_regions.is_empty())
+            .then(|| abcd_ir::ExceptionHandlerMap::build(module, func))
+            .flatten();
+        let func_block_set: std::collections::HashSet<abcd_ir::BlockId> =
+            f.blocks.iter().copied().collect();
+
+        // Iterative post-order DFS from `f.blocks[0]` over Normal edges +
+        // `ExceptionHandlerMap` edges from protected blocks that contain at
+        // least one non-phi `may_throw` instruction.
+        let entry = f.blocks[0];
+        let block_succs_aug = |b: abcd_ir::BlockId| -> Vec<abcd_ir::BlockId> {
+            let mut out = Vec::new();
+            let Some(bb) = module.block(b) else {
+                return out;
+            };
+            if let Some(&last_iid) = bb.insts.last()
+                && let Some(last_inst) = module.inst(last_iid)
+            {
+                let (targets, count) = abcd_ir::normal_succs_inline(&last_inst.op);
+                for &t in &targets[..count] {
+                    if func_block_set.contains(&t) && !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+            if let Some(map) = &exc_map {
+                let handlers = map.handlers_of(b);
+                if !handlers.is_empty() {
+                    let has_throw = bb.insts.iter().any(|&iid| {
+                        module
+                            .inst(iid)
+                            .is_some_and(|i| !i.op.is_phi() && i.op.effects_in(module).may_throw)
+                    });
+                    if has_throw {
+                        for &h in handlers {
+                            if func_block_set.contains(&h) && !out.contains(&h) {
+                                out.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mut visited = std::collections::HashSet::with_capacity(f.blocks.len());
+        let mut post_order = Vec::with_capacity(f.blocks.len());
+        visited.insert(entry);
+        let mut dfs_stack: Vec<(abcd_ir::BlockId, Vec<abcd_ir::BlockId>, usize)> =
+            vec![(entry, block_succs_aug(entry), 0)];
+        while let Some((node, succs, idx)) = dfs_stack.last_mut() {
+            if *idx < succs.len() {
+                let s = succs[*idx];
+                *idx += 1;
+                if visited.insert(s) {
+                    let next_succs = block_succs_aug(s);
+                    dfs_stack.push((s, next_succs, 0));
+                }
+            } else {
+                post_order.push(*node);
+                dfs_stack.pop();
             }
         }
-        let mut sweeps = 0usize;
-        loop {
-            let mut changed = false;
-            sweeps += 1;
-            for &b in &f.blocks {
-                if block_reached.get(b.index()).copied().unwrap_or(false) {
-                    continue;
-                }
-                let Some(bb) = module.block(b) else { continue };
-                let reached = bb.preds.is_empty()
-                    || bb.preds.iter().any(|pred| {
-                        block_func.get(pred.from.index()) == Some(&Some(func))
-                            && block_reached
-                                .get(pred.from.index())
-                                .copied()
-                                .unwrap_or(false)
-                    });
-                if reached && let Some(slot) = block_reached.get_mut(b.index()) {
-                    *slot = true;
-                    changed = true;
-                }
-            }
-            if !changed || sweeps >= 64 {
-                break;
-            }
+        post_order.reverse();
+        let mut rpo_pos = HashMap::with_capacity(post_order.len());
+        for (pos, &b) in post_order.iter().enumerate() {
+            rpo_pos.insert(b, pos);
         }
 
         for &b in &f.blocks {
             let Some(bb) = module.block(b) else { continue };
-            let b_reached = block_reached.get(b.index()).copied().unwrap_or(false);
+            let b_reached = rpo_pos.contains_key(&b);
             for &iid in &bb.insts {
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
-                if b_reached && let Some(slot) = inst_reached.get_mut(iid.index()) {
-                    *slot = true;
+                if b_reached {
+                    if let Some(slot) = inst_reached.get_mut(iid.index()) {
+                        *slot = true;
+                    }
+                    if let Some(slot) = inst_owner.get_mut(iid.index()) {
+                        *slot = Some(fi);
+                    }
                 }
                 match &inst.op {
                     Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
@@ -2228,8 +3444,6 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                         }
                     }
                     Op::DefineFunc { body, .. } => {
-                        // A bare function value also captures (it may be
-                        // called without an AllocClosure wrapper).
                         capture_points.entry(*body).or_default().insert(iid);
                     }
                     Op::DefineMethod { func, .. } => {
@@ -2246,7 +3460,17 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         capture_points.entry(cls.ctor).or_default().insert(iid);
-                        for mfid in class_member_funcs(module, cls.members) {
+                        for mfid in collect_const_method_refs(module, cls.members) {
+                            capture_points.entry(mfid).or_default().insert(iid);
+                        }
+                    }
+                    Op::AllocObject { shape } => {
+                        for mfid in collect_const_method_refs(module, *shape) {
+                            capture_points.entry(mfid).or_default().insert(iid);
+                        }
+                    }
+                    Op::AllocArray { shape: Some(shape) } => {
+                        for mfid in collect_const_method_refs(module, *shape) {
                             capture_points.entry(mfid).or_default().insert(iid);
                         }
                     }
@@ -2254,196 +3478,284 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                 }
             }
         }
+        func_cfgs.push(EnvFuncCfg {
+            rpo: post_order,
+            rpo_pos: if has_lex_ops[fi] {
+                rpo_pos
+            } else {
+                HashMap::new()
+            },
+            exc_map: if has_lex_ops[fi] { exc_map } else { None },
+        });
     }
 
-    let empty_stack: Arc<[EnvEntry]> = Arc::from([]);
-    let mut func_stacks: Vec<Arc<[EnvEntry]>> = vec![Arc::clone(&empty_stack); module.insts.len()];
+    let empty_state = Arc::new(EnvState::default());
+    let mut func_stacks: Vec<Arc<EnvState>> = vec![Arc::clone(&empty_state); module.insts.len()];
 
     // Recompute one function's instruction stacks in `func_stacks` given its
-    // entry capture chain.
-    let compute_func_stacks =
-        |fi: usize, entry_state: &[EnvEntry], func_stacks: &mut [Arc<[EnvEntry]>]| {
-            let f = &module.functions[fi];
-            if !has_lex_ops[fi] {
-                // Fast path: without NewLexEnv/PopLexEnv inside `f`, every
-                // reachable instruction shares the entry stack identically.
-                let entry_arc: Arc<[EnvEntry]> = if entry_state.is_empty() {
-                    Arc::clone(&empty_stack)
-                } else {
-                    Arc::from(entry_state)
-                };
-                for &b in &f.blocks {
-                    if !block_reached.get(b.index()).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    let Some(bb) = module.block(b) else { continue };
-                    for &iid in &bb.insts {
-                        if module.inst(iid).is_some()
-                            && let Some(slot) = func_stacks.get_mut(iid.index())
-                        {
-                            *slot = Arc::clone(&entry_arc);
-                        }
-                    }
-                }
-                return;
-            }
-
-            // Phase 1: converge block `out_state` to fixed point without touching
-            // per-instruction `func_stacks` on intermediate sweeps.
-            let mut in_state: HashMap<abcd_ir::BlockId, Vec<EnvEntry>> = HashMap::new();
-            let mut out_state: HashMap<abcd_ir::BlockId, Vec<EnvEntry>> = HashMap::new();
-            let mut changed = true;
-            let mut sweeps = 0usize;
-            while changed && sweeps < 64 {
-                changed = false;
-                sweeps += 1;
-                for &b in &f.blocks {
-                    let Some(bb) = module.block(b) else { continue };
-                    let mut state: Option<Vec<EnvEntry>> = if bb.preds.is_empty() {
-                        Some(entry_state.to_vec())
-                    } else {
-                        None
-                    };
-                    for pred in &bb.preds {
-                        if let Some(ps) = out_state.get(&pred.from) {
-                            state = Some(match state.take() {
-                                None => ps.clone(),
-                                Some(cur) => join_stacks(&cur, ps),
-                            });
-                        }
-                    }
-                    let Some(mut state) = state else {
-                        continue;
-                    };
-                    in_state.insert(b, state.clone());
-                    for &iid in &bb.insts {
-                        let Some(inst) = module.inst(iid) else {
-                            continue;
-                        };
-                        step_env_inst(&inst.op, iid, max_depth, &mut state);
-                    }
-                    if out_state.get(&b) != Some(&state) {
-                        out_state.insert(b, state);
-                        changed = true;
-                    }
-                }
-            }
-
-            // Phase 2: materialize per-instruction `Arc<[EnvEntry]>` in ONE final
-            // pass, reusing `Arc::clone` across consecutive non-lex instructions.
-            for &b in &f.blocks {
+    // entry capture state, returning `Err(())` if `step_budget` is exceeded.
+    let compute_func_stacks = |fi: usize,
+                               entry_state: &EnvState,
+                               func_stacks: &mut [Arc<EnvState>],
+                               steps: &mut usize|
+     -> Result<(), ()> {
+        let cfg = &func_cfgs[fi];
+        if cfg.rpo.is_empty() {
+            return Ok(());
+        }
+        if !has_lex_ops[fi] {
+            let entry_arc = if *entry_state == EnvState::default() {
+                Arc::clone(&empty_state)
+            } else {
+                Arc::new(entry_state.clone())
+            };
+            for &b in &cfg.rpo {
                 let Some(bb) = module.block(b) else { continue };
-                let Some(entry_vec) = in_state.get(&b) else {
-                    continue;
-                };
-                let mut state = entry_vec.clone();
-                let mut cur_arc: Arc<[EnvEntry]> = if state.is_empty() {
-                    Arc::clone(&empty_stack)
-                } else {
-                    Arc::from(state.as_slice())
-                };
                 for &iid in &bb.insts {
-                    let Some(inst) = module.inst(iid) else {
-                        continue;
-                    };
-                    if let Some(slot) = func_stacks.get_mut(iid.index()) {
-                        *slot = Arc::clone(&cur_arc);
+                    if module.inst(iid).is_some()
+                        && let Some(slot) = func_stacks.get_mut(iid.index())
+                    {
+                        *slot = Arc::clone(&entry_arc);
                     }
-                    if step_env_inst(&inst.op, iid, max_depth, &mut state) {
-                        cur_arc = if state.is_empty() {
-                            Arc::clone(&empty_stack)
-                        } else {
-                            Arc::from(state.as_slice())
-                        };
+                }
+            }
+            return Ok(());
+        }
+
+        // Phase 1: RPO worklist seeding `entry_state` into `in_state[entry]`
+        // (`cfg.rpo[0]`) BEFORE joining predecessor / pre-throw handler edges.
+        let n_rpo = cfg.rpo.len();
+        let mut in_state: Vec<Option<EnvState>> = vec![None; n_rpo];
+        in_state[0] = Some(entry_state.clone());
+        let mut worklist: BTreeSet<usize> = BTreeSet::from([0]);
+
+        let join_edge = |target: abcd_ir::BlockId,
+                         incoming: &EnvState,
+                         in_state: &mut [Option<EnvState>],
+                         worklist: &mut BTreeSet<usize>| {
+            let Some(&pos) = cfg.rpo_pos.get(&target) else {
+                return;
+            };
+            match &mut in_state[pos] {
+                None => {
+                    in_state[pos] = Some(incoming.clone());
+                    worklist.insert(pos);
+                }
+                Some(cur) => {
+                    if cur.join_into(incoming) {
+                        worklist.insert(pos);
                     }
                 }
             }
         };
 
-    // The capture fixed point: captured[body] = union of the stacks at
-    // the body's capture points. Monotone over a finite lattice
-    // (entries are subsets of the finite env-site set, depth capped).
-    let mut captured: BTreeMap<FuncId, Vec<EnvEntry>> = BTreeMap::new();
+        while let Some(rpo_idx) = worklist.pop_first() {
+            *steps += 1;
+            if *steps > step_budget {
+                return Err(());
+            }
+            let b = cfg.rpo[rpo_idx];
+            let Some(bb) = module.block(b) else { continue };
+            let Some(mut state) = in_state[rpo_idx].clone() else {
+                continue;
+            };
+            let handlers = cfg
+                .exc_map
+                .as_ref()
+                .map_or(&[][..], |map| map.handlers_of(b));
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if !handlers.is_empty() && !inst.op.is_phi() && inst.op.effects_in(module).may_throw
+                {
+                    for &h in handlers {
+                        join_edge(h, &state, &mut in_state, &mut worklist);
+                    }
+                }
+                step_env_inst(&inst.op, iid, max_depth, &mut state);
+            }
+            if let Some(&last_iid) = bb.insts.last()
+                && let Some(last_inst) = module.inst(last_iid)
+            {
+                let (targets, count) = abcd_ir::normal_succs_inline(&last_inst.op);
+                for &succ in &targets[..count] {
+                    join_edge(succ, &state, &mut in_state, &mut worklist);
+                }
+            }
+        }
+
+        // Phase 2: materialize per-instruction `Arc<EnvState>` in ONE final pass.
+        for (rpo_idx, &b) in cfg.rpo.iter().enumerate() {
+            let Some(bb) = module.block(b) else { continue };
+            let Some(mut state) = in_state[rpo_idx].clone() else {
+                continue;
+            };
+            let mut cur_arc = if state == EnvState::default() {
+                Arc::clone(&empty_state)
+            } else {
+                Arc::new(state.clone())
+            };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Some(slot) = func_stacks.get_mut(iid.index()) {
+                    *slot = Arc::clone(&cur_arc);
+                }
+                if step_env_inst(&inst.op, iid, max_depth, &mut state) {
+                    cur_arc = if state == EnvState::default() {
+                        Arc::clone(&empty_state)
+                    } else {
+                        Arc::new(state.clone())
+                    };
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Monotone capture fixed point: functions with capture sites start at `⊥`
+    // (`func_computed[fi] == false`) so unseeded outer closures never pollute
+    // nested closures with a spurious empty stack before their own capture
+    // arrives; `entry_stacks[body]` joins monotonically across rounds.
+    let default_env = EnvState::default();
+    let mut entry_stacks: BTreeMap<FuncId, EnvState> = BTreeMap::new();
+    let mut func_computed = vec![false; module.functions.len()];
     let mut dirty_funcs = vec![false; module.functions.len()];
     let mut rounds = 0usize;
     loop {
         rounds += 1;
         if rounds == 1 {
-            // Round 1: `captured` is empty everywhere — functions without lex
-            // ops already hold `empty_stack`, so only compute `has_lex_ops[fi]`.
             for (fi, &has_lex) in has_lex_ops.iter().enumerate() {
-                if has_lex {
-                    compute_func_stacks(fi, &[], &mut func_stacks);
+                let fid = FuncId::new(fi as u32);
+                if !capture_points.contains_key(&fid) {
+                    func_computed[fi] = true;
+                    if has_lex
+                        && compute_func_stacks(fi, &default_env, &mut func_stacks, steps).is_err()
+                    {
+                        return EnvAnalysisOut {
+                            env_stack_at: func_stacks,
+                            env_sites,
+                            rounds,
+                            capped: true,
+                        };
+                    }
                 }
             }
         } else {
             for (fi, dirty) in dirty_funcs.iter_mut().enumerate() {
                 if *dirty {
                     *dirty = false;
+                    func_computed[fi] = true;
                     let func = FuncId::new(fi as u32);
-                    let entry = captured.get(&func).map_or(&[][..], Vec::as_slice);
-                    compute_func_stacks(fi, entry, &mut func_stacks);
+                    let entry = entry_stacks.get(&func).unwrap_or(&default_env);
+                    if compute_func_stacks(fi, entry, &mut func_stacks, steps).is_err() {
+                        return EnvAnalysisOut {
+                            env_stack_at: func_stacks,
+                            env_sites,
+                            rounds,
+                            capped: true,
+                        };
+                    }
                 }
             }
         }
 
         let mut changed = false;
-        for (body, points) in &capture_points {
-            // Alternative capture points UNION (the body may be defined
-            // at any of them). The first alternative seeds the chain;
-            // later ones join with unknown-padding (one-sided positions
-            // are genuinely uncertain — a may-semantics union).
-            let mut chain: Option<Vec<EnvEntry>> = None;
-            for p in points {
+        for (&body, points) in &capture_points {
+            let mut round_chain: Option<EnvState> = None;
+            for &p in points {
                 if inst_reached.get(p.index()).copied().unwrap_or(false)
+                    && inst_owner
+                        .get(p.index())
+                        .copied()
+                        .flatten()
+                        .is_some_and(|owner_fi| func_computed[owner_fi])
                     && let Some(stack) = func_stacks.get(p.index())
                 {
-                    chain = Some(match chain.take() {
-                        None => stack.to_vec(),
-                        Some(cur) => join_stacks(&cur, stack),
-                    });
+                    *steps += 1;
+                    if *steps > step_budget {
+                        return EnvAnalysisOut {
+                            env_stack_at: func_stacks,
+                            env_sites,
+                            rounds,
+                            capped: true,
+                        };
+                    }
+                    match &mut round_chain {
+                        None => round_chain = Some((**stack).clone()),
+                        Some(cur) => {
+                            let _ = cur.join_into(stack);
+                        }
+                    }
                 }
             }
-            let chain = chain.unwrap_or_default();
-            let prev_effective = captured.get(body).map_or(&[][..], Vec::as_slice);
-            if prev_effective != chain.as_slice()
-                && let Some(slot) = dirty_funcs.get_mut(body.index())
-            {
-                *slot = true;
-            }
-            if captured.get(body) != Some(&chain) {
-                captured.insert(*body, chain);
+            let Some(candidate) = round_chain else {
+                continue;
+            };
+            let advanced = match entry_stacks.get_mut(&body) {
+                None => {
+                    entry_stacks.insert(body, candidate);
+                    true
+                }
+                Some(prev) => prev.join_into(&candidate),
+            };
+            if advanced {
                 changed = true;
+                if let Some(slot) = dirty_funcs.get_mut(body.index()) {
+                    *slot = true;
+                }
             }
         }
         if !changed {
-            return (func_stacks, env_sites, rounds);
+            // Seed any remaining unreached/isolated self-capturing closure components
+            // at `default_env` so their own internal `NewLexEnv`/`PopLexEnv` ops run.
+            let mut seeded_uncomputed = false;
+            for (fi, computed) in func_computed.iter().enumerate() {
+                if !*computed {
+                    let fid = FuncId::new(fi as u32);
+                    entry_stacks.entry(fid).or_default();
+                    dirty_funcs[fi] = true;
+                    seeded_uncomputed = true;
+                }
+            }
+            if !seeded_uncomputed {
+                return EnvAnalysisOut {
+                    env_stack_at: func_stacks,
+                    env_sites,
+                    rounds,
+                    capped: false,
+                };
+            }
         }
     }
 }
 
-/// Join two environment stacks at a CFG merge (or between alternative
-/// capture chains): bottom-aligned elementwise union; positions present
-/// on only one side become unknown entries (genuinely different shapes
-/// are uncertainty — a may-semantics union).
-fn join_stacks(a: &[EnvEntry], b: &[EnvEntry]) -> Vec<EnvEntry> {
-    let len = a.len().max(b.len());
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        match (a.get(i), b.get(i)) {
-            (Some(x), Some(y)) => out.push(EnvEntry {
+/// Top-aligned join of two environment chains (`level = 0` is the innermost top
+/// `frames[len - 1]`). Positions present on only one side become `unknown = true`
+/// while retaining known sites; `truncated_outer` joins disjunctively.
+fn join_chains(a: &EnvChain, b: &EnvChain) -> EnvChain {
+    let len = a.frames.len().max(b.frames.len());
+    let mut frames = Vec::with_capacity(len);
+    for rev_pos in (0..len).rev() {
+        let level = rev_pos as u16;
+        match (a.at_level(level), b.at_level(level)) {
+            (Some(x), Some(y)) => frames.push(EnvEntry {
                 sites: x.sites.union(&y.sites).copied().collect(),
                 unknown: x.unknown || y.unknown,
             }),
-            (Some(x), None) | (None, Some(x)) => out.push(EnvEntry {
+            (Some(x), None) | (None, Some(x)) => frames.push(EnvEntry {
                 sites: x.sites.clone(),
                 unknown: true,
             }),
-            // Unreachable: `len = max(a.len(), b.len())`, so for `i < len` at least one side is `Some`.
             (None, None) => unreachable!(),
         }
     }
-    out
+    EnvChain {
+        frames,
+        truncated_outer: a.truncated_outer || b.truncated_outer,
+    }
 }
 
 /// The rung-2 oracle: whole-module PTA answers behind the same seam —
@@ -2522,41 +3834,40 @@ impl<'m> Rung2AliasOracle<'m> {
 
     /// The lexical environment a `GetLexVar`/`PutLexVar` at `at` with
     /// scope-chain `level` denotes (see module docs).
+    ///
+    /// Inspects the instruction at `at` to select the matching
+    /// [`abcd_ir::LexEnvKind`] chain (`Plain`, `Sendable`, or `Patch`),
+    /// defaulting to `Plain` when `at` is not a lexical-slot op.
     pub fn lex_env_at(&self, at: InstId, level: u16) -> EnvAnswer {
-        if matches!(
-            self.module.inst(at).map(|i| &i.op),
-            Some(
-                Op::GetLexVar {
-                    kind: abcd_ir::LexEnvKind::Patch,
-                    ..
-                } | Op::PutLexVar {
-                    kind: abcd_ir::LexEnvKind::Patch,
-                    ..
-                }
-            )
-        ) {
-            return EnvAnswer {
-                has_unknown: true,
-                ..EnvAnswer::default()
-            };
-        }
-        let Some(stack) = self.tables.env_stack_at.get(at.index()) else {
+        let kind = match self.module.inst(at).map(|i| &i.op) {
+            Some(Op::GetLexVar { kind, .. } | Op::PutLexVar { kind, .. }) => *kind,
+            _ => abcd_ir::LexEnvKind::Plain,
+        };
+        self.lex_env_at_kind(at, level, kind)
+    }
+
+    /// The `Sendable` lexical environment at `at` with scope-chain `level`.
+    pub fn sendable_env_at(&self, at: InstId, level: u16) -> EnvAnswer {
+        self.lex_env_at_kind(at, level, abcd_ir::LexEnvKind::Sendable)
+    }
+
+    /// Kind-explicit lexical-environment query at `at` and scope-chain `level`.
+    pub fn lex_env_at_kind(&self, at: InstId, level: u16, kind: abcd_ir::LexEnvKind) -> EnvAnswer {
+        let Some(entry) = self
+            .tables
+            .env_stack_at
+            .get(at.index())
+            .and_then(|state| state.chain(kind))
+            .and_then(|chain| chain.at_level(level))
+        else {
             return EnvAnswer {
                 has_unknown: true,
                 ..EnvAnswer::default()
             };
         };
-        let level = level as usize;
-        if level >= stack.len() {
-            return EnvAnswer {
-                has_unknown: true,
-                ..EnvAnswer::default()
-            };
-        }
-        let entry = &stack[stack.len() - 1 - level];
         let mut sites = AllocSiteSet::new();
-        for s in &entry.sites {
-            sites.union_with(&AllocSiteSet::one(*s));
+        for &s in &entry.sites {
+            sites.union_with(&AllocSiteSet::one(s));
         }
         EnvAnswer {
             sites,
@@ -2576,12 +3887,7 @@ impl<'m> Rung2AliasOracle<'m> {
     }
 }
 
-impl<F> AliasOracle<F> for Rung2AliasOracle<'_> {
-    fn inject_calling_context(&mut self, _call: InstId, _callee: FuncId, _fact: &F) {
-        // The fixed point already co-evolved every context the module
-        // records — there is nothing per-query left to learn.
-    }
-}
+impl<F> AliasOracle<F> for Rung2AliasOracle<'_> {}
 
 #[cfg(test)]
 mod tests;

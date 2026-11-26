@@ -9,8 +9,10 @@
 //!   check). `abcd-ir` cannot depend on `abcd-analysis` (one-way
 //!   layering), so the pin between the two implementations lives here.
 
-// Each test binary uses a different subset.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared integration test helper module; each test binary uses a subset"
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

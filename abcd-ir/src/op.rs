@@ -212,12 +212,16 @@ pub enum ModuleVarKind {
 }
 
 impl ModuleVarKind {
-    /// `true` when the slot belongs to the current module's own export table
-    /// (`Local` or `SendableLocal`), i.e. the same index space written by
-    /// [`Op::StoreModuleVar`].
+    /// `true` when the slot belongs to the current module's own local export
+    /// table (`Local`, `SendableLocal`, or `SendableClass`), i.e. the 0-based
+    /// local export slot space written by [`Op::StoreModuleVar`] rather than
+    /// `ImportDecl::Regular` (`#82`).
     #[must_use]
     pub const fn is_local(self) -> bool {
-        matches!(self, Self::Local | Self::SendableLocal)
+        matches!(
+            self,
+            Self::Local | Self::SendableLocal | Self::SendableClass
+        )
     }
 
     /// `true` when reading the binding may trigger lazy module evaluation
@@ -2653,5 +2657,20 @@ mod tests {
             94,
             "test must cover all 94 Op variants"
         );
+    }
+
+    #[test]
+    fn module_var_kind_local_and_lazy_predicates() {
+        assert!(ModuleVarKind::Local.is_local());
+        assert!(ModuleVarKind::SendableLocal.is_local());
+        assert!(ModuleVarKind::SendableClass.is_local());
+        assert!(!ModuleVarKind::External.is_local());
+        assert!(!ModuleVarKind::SendableExternal.is_local());
+        assert!(!ModuleVarKind::Lazy.is_local());
+        assert!(!ModuleVarKind::LazySendable.is_local());
+
+        assert!(ModuleVarKind::Lazy.is_lazy());
+        assert!(ModuleVarKind::LazySendable.is_lazy());
+        assert!(!ModuleVarKind::SendableClass.is_lazy());
     }
 }

@@ -23,9 +23,8 @@ expression recovery, control-flow folding, and AST emission live in
 | Module | Responsibility |
 |---|---|
 | `control` | Normal (`block_succs`, `inst_succs`) and exception-augmented (`augmented_succs`) CFG relations, iterative reverse post-order (`compute_rpo`), BFS reachability (`reachable_blocks`), Cooper–Harvey–Kennedy `Dominators` / `PostDominators` with $O(1)$ Euler-tour ancestry intervals, natural-loop detection (`back_edges`, `natural_loop`), and dense-bitset pattern-independent region structuring (`structure_regions`, `structure_subgraph`). |
-| `frame` | Analysis-side adapter over `abcd_ir::frame::FrameSlots` (`[func][new.target][this]` implicit parameter slots): decodes `L_ESCallTypeAnnotation;` when present, applies the `0xF` default for `STATIC` callees, and returns `None` for unannotated non-static functions so conservative clients over-approximate rather than drop parameter bindings. |
-| `dataflow::framework` | Generic monotone forward/backward block-level dataflow solver (`MonotoneFramework`, `solve`) over arbitrary successor relations with deterministic RPO / reverse-RPO worklist scheduling. |
-| `dataflow::usedef` | Per-function `UseDefChains` (plain operand uses and edge-carrying SSA `Phi` uses) plus `AnalysisStore` with explicit invalidation. |
+| `frame` | Analysis-side adapter over `abcd_ir::frame::FrameSlots`: decodes `L_ESCallTypeAnnotation;` when present, uses canonical `StaticArkTS` (`H = 0` static / `H = 1` instance) frames on ArkTS methods, applies the `0xF` default for `DynamicEcma` `STATIC` callees, and returns `None` for unannotated non-static `DynamicEcma` functions (`N66`). |
+| `dataflow::usedef` | Per-function `UseDefChains` (plain operand uses and edge-carrying SSA `Phi` uses). |
 | `dataflow::ifds` | Binary-lattice Reps–Horwitz–Sagiv IFDS tabulation solver (`IfdsProblem`, `IfdsSolver`) with Naeem–Lhoták–Rodriguez practical extensions: start-anchored path edges, `incoming` / `end_summary` second-arriver replay, zero-fact (`Λ`) preservation with optional `IfdsProblem::propagate_zero_to_callee` call-edge gating, multi-return-site exceptional edges, and `CallGraphOracle` decoupling. |
 | `dataflow::heap` | Rung-0 allocation-site keying (`HeapRef`, `AllocSiteSet`, `FieldChain`, `UpdateKind`, `AliasOracle<F>`, `Rung0AliasOracle`). |
 | `dataflow::alias` | Rung-1 demand-driven backward alias queries (`Rung1AliasOracle`, `QueryAnswer`, `AliasEngineStats`). |
@@ -52,7 +51,7 @@ expression recovery, control-flow folding, and AST emission live in
   call-stack usage on deeply nested inputs (verified on `256 KiB` threads).
 - **Byte-Identical Determinism (`N20`)**: Worklists and iterated sets use
   deterministic ordering (`BTreeMap` / `BTreeSet`, dense `BlockId`-sorted
-  `BitSet`s, RPO slices, or insertion-ordered `VecSet`s); hash tables are
+  `BitSet`s, RPO slices, or insertion-ordered compact sets); hash tables are
   lookup-only and never iterated to produce output.
 - **Frame-Slot Discipline (`N66` / `N67`)**: Interprocedural parameter
   binding honors ArkCompiler's `[func][new.target][this]` convention

@@ -1,7 +1,9 @@
 //! Shared IR module scaffolding for `abcd-taint` integration tests.
 
-// Each test module uses a subset of helpers.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test scaffolding helpers; individual test modules use subsets"
+)]
 
 use abcd_ir::consts::Const;
 use abcd_ir::function::{Block, Catch, FunctionData, Inst, TryRegion, Value};

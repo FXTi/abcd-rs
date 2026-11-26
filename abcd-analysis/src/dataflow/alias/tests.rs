@@ -481,6 +481,116 @@ fn answers_are_deterministic() {
     assert_eq!(a.query(result, call), first);
 }
 
+#[test]
+fn new_constructor_includes_implicit_this_and_explicit_object_returns() {
+    let mut m = mk_module();
+    let ctor_void = add_func_named(&mut m, "CtorVoid");
+    {
+        let b = entry_of(&m, ctor_void);
+        m.func_mut(ctor_void).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+        add_param(&mut m, ctor_void, 0);
+        add_param(&mut m, ctor_void, 1);
+        add_param(&mut m, ctor_void, 2);
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    let ctor_mixed = add_func_named(&mut m, "CtorMixed");
+    let explicit_obj;
+    {
+        let b = entry_of(&m, ctor_mixed);
+        m.func_mut(ctor_mixed).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+        let t = add_block(&mut m, ctor_mixed);
+        let e = add_block(&mut m, ctor_mixed);
+        add_param(&mut m, ctor_mixed, 0);
+        add_param(&mut m, ctor_mixed, 1);
+        add_param(&mut m, ctor_mixed, 2);
+        let cond = load_number(&mut m, b, 1.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::CondBranch {
+                cond,
+                true_dest: t,
+                false_dest: e,
+            },
+        );
+        explicit_obj = alloc_object(&mut m, t);
+        emit_void(
+            &mut m,
+            t,
+            Op::Return {
+                value: Some(explicit_obj),
+            },
+        );
+        emit_void(&mut m, e, Op::Return { value: None });
+        link(&mut m, b, t);
+        link(&mut m, b, e);
+    }
+
+    let caller = add_func_named(&mut m, "caller");
+    let entry = entry_of(&m, caller);
+    let df_void = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: ctor_void,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    let clo_void = emit(&mut m, entry, Op::AllocClosure { func: df_void });
+    let inst_void = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: clo_void,
+            this: None,
+            args: vec![],
+            kind: CallKind::New,
+        },
+    );
+    let new_void_iid = inst_void.inst_of(&m);
+
+    let df_mixed = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: ctor_mixed,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    let clo_mixed = emit(&mut m, entry, Op::AllocClosure { func: df_mixed });
+    let inst_mixed = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: clo_mixed,
+            this: None,
+            args: vec![],
+            kind: CallKind::New,
+        },
+    );
+    let new_mixed_iid = inst_mixed.inst_of(&m);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let graph = CallGraph::build(&m);
+    let oracle = Rung1AliasOracle::new(&m, &graph);
+
+    let ans_void = oracle.query(inst_void, new_void_iid);
+    assert!(ans_void.is_single_precise(), "{ans_void:?}");
+    assert_eq!(
+        ans_void.sites.iter().collect::<Vec<_>>(),
+        vec![new_void_iid]
+    );
+
+    let ans_mixed = oracle.query(inst_mixed, new_mixed_iid);
+    assert!(ans_mixed.precise_for_keying() && ans_mixed.has_phi);
+    let mut expected = vec![new_mixed_iid, explicit_obj.inst_of(&m)];
+    expected.sort();
+    assert_eq!(ans_mixed.sites.iter().collect::<Vec<_>>(), expected);
+}
+
 /// A `TryGetGlobal` helper for tests (the lifter's global-load shape).
 fn try_get_global(m: &mut Module, b: abcd_ir::BlockId, name: &str) -> ValueId {
     let sym = m.sym.intern(name);

@@ -2,6 +2,7 @@
 name = "abcd-analysis"
 description = "Analysis infrastructure on the SSA IR: dominators, region trees, IFDS solver, rungs 0–2 PTA, call graph"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
@@ -17,3 +18,6 @@ abcd-ir = { workspace = true }
 [dev-dependencies]
 abcd-file = { workspace = true }
 abcd-lift = { workspace = true }
+
+[lints]
+workspace = true

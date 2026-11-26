@@ -234,27 +234,19 @@ fn resolve_iterative(
                         stack.push(ResolveStep::Enter { func, value: *src });
                     }
                     Some(Op::ResumeGenerator { genobj }) => {
-                        // Pair async-machine `AwaitUncaught(funcobj, awaited)` -> `ResumeGenerator(funcobj)`
-                        // so `const rdb = await relationalStore.getRdbStore(...); rdb.executeSql(...)`
-                        // preserves receiver provenance across `await`.
-                        if let Some(inst) = module.inst(iid)
-                            && let Some(bb) = module.block(inst.block)
-                        {
-                            let mut awaited_vals = Vec::new();
-                            for &prev_iid in &bb.insts {
-                                if prev_iid == iid {
-                                    break;
-                                }
-                                if let Some(Op::AwaitUncaught { funcobj, value }) =
-                                    module.inst(prev_iid).map(|i| &i.op)
-                                    && funcobj == genobj
-                                {
-                                    awaited_vals.push(*value);
-                                }
-                            }
-                            for val in awaited_vals.into_iter().rev() {
-                                stack.push(ResolveStep::Enter { func, value: val });
-                            }
+                        // Pair async-machine `AwaitUncaught` / `SuspendGenerator` ->
+                        // `ResumeGenerator` across predecessor blocks so
+                        // `const rdb = await relationalStore.getRdbStore(...); rdb.executeSql(...)`
+                        // preserves receiver provenance across multi-block `await`s.
+                        let owner = links.and_then(|l| l.inst_func(module, iid)).unwrap_or(func);
+                        let awaited_vals = abcd_analysis::control::awaited_values_for_resume(
+                            module, owner, iid, *genobj,
+                        );
+                        for val in awaited_vals.into_iter().rev() {
+                            stack.push(ResolveStep::Enter {
+                                func: owner,
+                                value: val,
+                            });
                         }
                     }
                     Some(Op::Phi { entries }) => {
@@ -533,36 +525,29 @@ fn scan_class_prop_stores(module: &Module, cid: ClassId, prop_name: Sym) -> Vec<
     stores
 }
 
-fn peel_namespace_index(module: &Module, mut v: ValueId) -> Option<u32> {
-    for _ in 0..8 {
-        let ValueDef::Inst(iid) = module.value(v)?.def else {
-            return None;
-        };
-        match &module.inst(iid)?.op {
-            Op::Mov { src } => v = *src,
-            Op::GetModuleNamespace { index } => return Some(*index),
-            _ => return None,
-        }
+fn peel_namespace_index(module: &Module, v: ValueId) -> Option<u32> {
+    let v = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let ValueDef::Inst(iid) = module.value(v)?.def else {
+        return None;
+    };
+    match &module.inst(iid)?.op {
+        Op::GetModuleNamespace { index } => Some(*index),
+        _ => None,
     }
-    None
 }
 
-fn is_this_or_lex_receiver(module: &Module, mut v: ValueId) -> bool {
-    for _ in 0..8 {
-        let Some(val) = module.value(v) else {
-            return false;
-        };
-        match val.def {
-            ValueDef::Param(_) => return true,
-            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => v = *src,
-                Some(Op::GetLexVar { .. }) => return true,
-                _ => return false,
-            },
-            _ => return false,
+fn is_this_or_lex_receiver(module: &Module, v: ValueId) -> bool {
+    let v = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let Some(val) = module.value(v) else {
+        return false;
+    };
+    match val.def {
+        ValueDef::Param(_) => true,
+        ValueDef::Inst(iid) => {
+            matches!(module.inst(iid).map(|i| &i.op), Some(Op::GetLexVar { .. }))
         }
+        _ => false,
     }
-    false
 }
 
 fn is_viewpu_intrinsic(leaf: &str) -> bool {

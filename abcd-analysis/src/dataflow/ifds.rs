@@ -43,13 +43,13 @@
 //!   blocks construct engine errors carrying no user SSA values, so they are
 //!   not modeled as value-carrying exits (handlers still observe them via
 //!   `ExceptionParam` when protected).
-//! - Determinism (N20): FIFO worklist + insertion-ordered sets
-//!   ([`VecSet`]) everywhere the solver iterates; `HashMap`s are lookup-only
-//!   and never iterated.
+//! - Determinism (N20): FIFO worklist + insertion-ordered compact sets
+//!   (`CompactU32Set`, `CompactPairSet`) everywhere the solver iterates;
+//!   `HashMap`s are lookup-only and never iterated.
 //!
 //! ## The client contract ([`IfdsProblem`])
 //!
-//! Downstream clients (`abcd-taint`) plug in their fact type + the four flow
+//! Downstream clients (`abcd-taint`) plug in their fact type + the flow
 //! functions + seeds without touching solver internals. The solver owns the
 //! worklist, start-point anchoring, unconditional zero-fact (`Λ`)
 //! preservation (whenever the source is `zero()`, `zero()` is automatically
@@ -62,62 +62,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::OnceLock;
 
+use abcd_ir::cfg::ExceptionHandlerMap;
 use abcd_ir::{BlockId, FuncId, InstId, Module, Op};
-
-/// An insertion-ordered set (`design/decisions.md` N20): membership is
-/// `O(1)`, iteration follows insertion order. Every structure the solver
-/// ITERATES is a `VecSet` or `Vec`; `HashMap`s are lookup-only.
-#[derive(Clone, Debug)]
-pub struct VecSet<T> {
-    items: Vec<T>,
-    index: HashMap<T, usize>,
-}
-
-impl<T: Clone + Eq + Hash> Default for VecSet<T> {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            index: HashMap::new(),
-        }
-    }
-}
-
-impl<T: Clone + Eq + Hash> VecSet<T> {
-    /// Insert; `true` iff the element was new.
-    pub fn insert(&mut self, item: T) -> bool {
-        if self.index.contains_key(&item) {
-            return false;
-        }
-        self.index.insert(item.clone(), self.items.len());
-        self.items.push(item);
-        true
-    }
-
-    /// Whether `item` is present.
-    pub fn contains(&self, item: &T) -> bool {
-        self.index.contains_key(item)
-    }
-
-    /// The elements in insertion order.
-    pub fn items(&self) -> &[T] {
-        &self.items
-    }
-
-    /// Number of elements.
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    /// Whether the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// Iterate in insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.items.iter()
-    }
-}
 
 /// The call-graph seam the solver consumes (`design/analysis.md`:
 /// consuming call edges strictly through query methods keeps batch vs
@@ -130,20 +76,6 @@ pub trait CallGraphOracle {
 
     /// The call sites that may call `func` (for unbalanced returns).
     fn callers_of(&self, func: FuncId) -> &[InstId];
-}
-
-/// An oracle with no edges at all (every call is unknown, every function
-/// uncalled) — for purely intraprocedural clients and tests.
-pub struct EmptyCallGraph;
-
-impl CallGraphOracle for EmptyCallGraph {
-    fn callees_of_call_at(&self, _call: InstId) -> &[FuncId] {
-        &[]
-    }
-
-    fn callers_of(&self, _func: FuncId) -> &[InstId] {
-        &[]
-    }
 }
 
 /// Compact inline instruction-successor list (most instructions have 1 or 2
@@ -190,8 +122,10 @@ struct Supergraph<'m> {
     start_points: Vec<Option<InstId>>,
     /// Instruction arena index → is a `Call` instruction.
     is_call: Vec<bool>,
-    /// Instruction arena index → is a function exit (`Return` terminator or
-    /// `Op::Throw`).
+    /// Instruction arena index → is a `Call` in a block without a catch-all handler.
+    call_may_throw_uncaught: Vec<bool>,
+    /// Instruction arena index → is a function exit (`Return` terminator, or
+    /// `Op::Throw` in a block without a catch-all handler).
     is_exit: Vec<bool>,
 }
 
@@ -201,7 +135,9 @@ impl<'m> Supergraph<'m> {
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
             for &b in &f.blocks {
-                block_func[b.index()] = Some(func);
+                if let Some(slot) = block_func.get_mut(b.index()) {
+                    *slot = Some(func);
+                }
             }
         }
 
@@ -212,44 +148,43 @@ impl<'m> Supergraph<'m> {
         let mut inst_succs = vec![InstSuccs::Empty; module.insts.len()];
         let mut start_points = vec![None; module.functions.len()];
         let mut is_call = vec![false; module.insts.len()];
+        let mut call_may_throw_uncaught = vec![false; module.insts.len()];
         let mut is_exit = vec![false; module.insts.len()];
         let mut succs_buf = Vec::new();
 
         for (fi, f) in module.functions.iter().enumerate() {
-            // Precompute per-function block membership and per-block exceptional
-            // handler blocks ONCE per function (preserving exact region/catch order).
-            let mut block_exc_handlers: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-            if !f.try_regions.is_empty() {
-                let func_blocks: HashSet<BlockId> = f.blocks.iter().copied().collect();
+            let func_id = FuncId::new(fi as u32);
+            let exc_map = ExceptionHandlerMap::build(module, func_id);
+            let mut block_has_catch_all = vec![false; f.blocks.len()];
+            if let Some(map) = &exc_map {
                 for region in &f.try_regions {
-                    for &prot_block in &region.protected {
-                        if !func_blocks.contains(&prot_block) {
-                            continue;
-                        }
-                        let handlers = block_exc_handlers.entry(prot_block).or_default();
-                        for catch in &region.catches {
-                            if func_blocks.contains(&catch.handler)
-                                && !handlers.contains(&catch.handler)
-                            {
-                                handlers.push(catch.handler);
+                    let region_catch_all = region
+                        .catches
+                        .iter()
+                        .any(|c| c.type_class.is_none() && map.block_index(c.handler).is_some());
+                    if region_catch_all {
+                        for &prot_block in &region.protected {
+                            if let Some(bi) = map.block_index(prot_block) {
+                                block_has_catch_all[bi] = true;
                             }
                         }
                     }
                 }
             }
 
-            for &b in &f.blocks {
+            for (bi, &b) in f.blocks.iter().enumerate() {
                 let Some(bb) = module.block(b) else {
                     continue;
                 };
-                let exc_handlers = block_exc_handlers.get(&b);
+                let has_catch_all = block_has_catch_all.get(bi).copied().unwrap_or(false);
+                let exc_handlers = exc_map
+                    .as_ref()
+                    .map_or(&[][..], |map| map.handlers_of_index(bi));
                 for (pos, &iid) in bb.insts.iter().enumerate() {
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
                     succs_buf.clear();
-                    // Normal successor: next instruction, or the first
-                    // instruction of each terminator-successor block.
                     if pos + 1 < bb.insts.len() {
                         succs_buf.push(bb.insts[pos + 1]);
                     } else {
@@ -259,12 +194,8 @@ impl<'m> Supergraph<'m> {
                             }
                         }
                     }
-                    // Exceptional successors: any may-throw instruction in
-                    // a protected block may dispatch to a handler.
-                    if inst.op.effects().may_throw
-                        && let Some(handlers) = exc_handlers
-                    {
-                        for &h in handlers {
+                    if !exc_handlers.is_empty() && inst.op.effects_in(module).may_throw {
+                        for &h in exc_handlers {
                             if let Some(first) = first_inst(h)
                                 && !succs_buf.contains(&first)
                             {
@@ -274,11 +205,20 @@ impl<'m> Supergraph<'m> {
                     }
                     inst_succs[iid.index()] = InstSuccs::from_slice(&succs_buf);
 
-                    if matches!(&inst.op, Op::Call { .. }) {
-                        is_call[iid.index()] = true;
-                    }
-                    if matches!(&inst.op, Op::Return { .. } | Op::Throw { .. }) {
-                        is_exit[iid.index()] = true;
+                    match &inst.op {
+                        Op::Call { .. } => {
+                            is_call[iid.index()] = true;
+                            if !has_catch_all {
+                                call_may_throw_uncaught[iid.index()] = true;
+                            }
+                        }
+                        Op::Return { .. } => {
+                            is_exit[iid.index()] = true;
+                        }
+                        Op::Throw { .. } if !has_catch_all => {
+                            is_exit[iid.index()] = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -291,6 +231,7 @@ impl<'m> Supergraph<'m> {
             inst_succs,
             start_points,
             is_call,
+            call_may_throw_uncaught,
             is_exit,
         }
     }
@@ -306,6 +247,13 @@ impl<'m> Supergraph<'m> {
 
     fn is_call(&self, inst: InstId) -> bool {
         self.is_call.get(inst.index()).copied().unwrap_or(false)
+    }
+
+    fn call_may_throw_uncaught(&self, call: InstId) -> bool {
+        self.call_may_throw_uncaught
+            .get(call.index())
+            .copied()
+            .unwrap_or(false)
     }
 
     fn is_exit(&self, inst: InstId) -> bool {
@@ -374,9 +322,10 @@ pub trait IfdsProblem {
     /// returns of caller-less functions (the flow function is still invoked
     /// — it may record an external-return sink — and must tolerate `None`
     /// call/return sites).
-    // Each argument is a distinct IFDS return-flow input; a bundling
-    // struct would only rename the plumbing.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct IFDS return-flow inputs"
+    )]
     fn return_flow(
         &self,
         module: &Module,
@@ -398,6 +347,20 @@ pub trait IfdsProblem {
         source: &Self::Fact,
         out: &mut Vec<Self::Fact>,
     );
+
+    /// Uncaught-exception propagation out of `callee`'s `callee_exit` when
+    /// `call_site` is not covered by a catch-all handler in its caller
+    /// (`#79` `R4-D3`).
+    fn call_uncaught_exit_flow(
+        &self,
+        _module: &Module,
+        _call_site: InstId,
+        _callee: FuncId,
+        _callee_exit: InstId,
+        _source: &Self::Fact,
+        _out: &mut Vec<Self::Fact>,
+    ) {
+    }
 
     /// Whether the tautological zero fact (`Λ`) should propagate as `Λ -> Λ`
     /// across `call` into `callee`. Defaults to `true`.
@@ -637,6 +600,11 @@ pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
     end_summary: HashMap<(InstId, u32), CompactPairSet>,
     /// The worklist (deterministic single-threaded FIFO queue).
     worklist: VecDeque<(u32, InstId, u32)>,
+    /// Iterative queue of uncaught-throw call-site exits awaiting `process_exit`
+    /// (`256 KiB`-stack safe across arbitrarily deep call chains).
+    exit_worklist: VecDeque<(u32, InstId, u32)>,
+    /// Reusable transfer-output scratch buffer avoiding per-edge heap allocations.
+    scratch_facts: Vec<P::Fact>,
     /// Propagation order record (the result).
     ordered_edges: Vec<(u32, InstId, u32)>,
     /// Target instruction index → reached target fact ids.
@@ -665,6 +633,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             incoming: HashMap::new(),
             end_summary: HashMap::new(),
             worklist: VecDeque::new(),
+            exit_worklist: VecDeque::new(),
+            scratch_facts: Vec::new(),
             ordered_edges: Vec::new(),
             reached: vec![CompactU32Set::default(); module.insts.len()],
         }
@@ -688,7 +658,9 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         if !self.edge_set.insert(key) {
             return;
         }
-        if self.graph.is_call(target_node) {
+        if self.graph.is_call(target_node)
+            && !self.callgraph.callees_of_call_at(target_node).is_empty()
+        {
             self.by_target
                 .entry((target_node, target_fact))
                 .or_default()
@@ -703,6 +675,27 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         self.worklist.push_back(key);
     }
 
+    /// Record an uncaught-exception exit `(caller_entry, call_site, uncaught_fact)`
+    /// without inserting into `by_target` or running `process_call` bypass edges,
+    /// and schedule it for immediate `process_exit` replay.
+    fn propagate_uncaught_exit(
+        &mut self,
+        caller_entry: u32,
+        call_site: InstId,
+        uncaught_fact: u32,
+    ) {
+        let key = (caller_entry, call_site, uncaught_fact);
+        if self.edge_set.insert(key) {
+            if call_site.index() >= self.reached.len() {
+                self.reached
+                    .resize_with(call_site.index() + 1, CompactU32Set::default);
+            }
+            self.reached[call_site.index()].insert(uncaught_fact);
+            self.ordered_edges.push(key);
+        }
+        self.exit_worklist.push_back(key);
+    }
+
     /// Compute a flow function's interned target fact IDs, enforcing
     /// unconditional zero (`Λ`) preservation: whenever `source == zero_id`,
     /// `zero_id` is guaranteed to remain among the output facts.
@@ -711,7 +704,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         source: u32,
         f: impl FnOnce(&P, &Module, &P::Fact, &mut Vec<P::Fact>),
     ) -> Vec<u32> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.scratch_facts);
+        out.clear();
         f(
             self.problem,
             self.module,
@@ -720,16 +714,43 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         );
         let mut ids = Vec::with_capacity(out.len() + usize::from(source == self.zero_id));
         let mut saw_zero = false;
-        for fact in out {
+        for fact in out.drain(..) {
             let id = self.intern_fact(fact);
             if id == self.zero_id {
                 saw_zero = true;
             }
             ids.push(id);
         }
+        self.scratch_facts = out;
         if source == self.zero_id && !saw_zero {
             ids.push(self.zero_id);
         }
+        ids
+    }
+
+    /// Compute `call_uncaught_exit_flow` target fact IDs without injecting `Λ`.
+    fn compute_uncaught_targets(
+        &mut self,
+        call_site: InstId,
+        callee: FuncId,
+        callee_exit: InstId,
+        source: u32,
+    ) -> Vec<u32> {
+        let mut out = std::mem::take(&mut self.scratch_facts);
+        out.clear();
+        self.problem.call_uncaught_exit_flow(
+            self.module,
+            call_site,
+            callee,
+            callee_exit,
+            &self.facts[source as usize],
+            &mut out,
+        );
+        let mut ids = Vec::with_capacity(out.len());
+        for fact in out.drain(..) {
+            ids.push(self.intern_fact(fact));
+        }
+        self.scratch_facts = out;
         ids
     }
 
@@ -738,7 +759,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
     /// [`IfdsProblem::propagate_zero_to_callee`] while still invoking
     /// `call_flow` on `Λ` for any direct `Λ -> d` seed edges.
     fn compute_call_targets(&mut self, call: InstId, callee: FuncId, source: u32) -> Vec<u32> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.scratch_facts);
+        out.clear();
         self.problem.call_flow(
             self.module,
             call,
@@ -750,17 +772,24 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             source == self.zero_id && self.problem.propagate_zero_to_callee(call, callee);
         let mut ids = Vec::with_capacity(out.len() + usize::from(keep_zero));
         let mut saw_zero = false;
-        for fact in out {
+        for fact in out.drain(..) {
             let id = self.intern_fact(fact);
             if id == self.zero_id {
                 saw_zero = true;
             }
             ids.push(id);
         }
+        self.scratch_facts = out;
         if keep_zero && !saw_zero {
             ids.push(self.zero_id);
         }
         ids
+    }
+
+    fn drain_exit_worklist(&mut self) {
+        while let Some(exit_edge) = self.exit_worklist.pop_front() {
+            self.process_exit(exit_edge);
+        }
     }
 
     /// Run tabulation to the fixed point and return the reachability result.
@@ -777,7 +806,11 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             self.propagate(zero_id, sp, fact_id);
         }
 
-        while let Some(edge) = self.worklist.pop_front() {
+        loop {
+            self.drain_exit_worklist();
+            let Some(edge) = self.worklist.pop_front() else {
+                break;
+            };
             let n = edge.1;
             if self.graph.is_call(n) {
                 // A call node is NEVER normal-flow processed: the
@@ -787,7 +820,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                 if self.graph.is_exit(n) {
                     self.process_exit(edge);
                 }
-                // An exit node with successors (a `Throw` in a protected
+                // An exit node with successors (a `Throw` in a typed-catch
                 // block) ALSO gets normal flow — both handlers run.
                 if !self.graph.normal_succs(n).is_empty() {
                     self.process_normal(edge);
@@ -861,9 +894,16 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                             self.propagate(d1, ret_site, d5);
                         }
                     }
+                    if self.graph.call_may_throw_uncaught(n) {
+                        let d_uncaughts = self.compute_uncaught_targets(n, callee, ep, d4);
+                        for d_unc in d_uncaughts {
+                            self.propagate_uncaught_exit(d1, n, d_unc);
+                        }
+                    }
                 }
             }
         }
+        self.drain_exit_worklist();
 
         // Call-to-return flow: facts the callee cannot affect bypass the
         // call. This also covers UNKNOWN callees — caller-side facts always
@@ -881,7 +921,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
     }
 
     /// Callee-side tabulation: record the summary edge, then apply return
-    /// flow to every recorded caller.
+    /// flow (and uncaught-throw propagation) to every recorded caller.
     fn process_exit(&mut self, edge: (u32, InstId, u32)) {
         let (d1, n, d2) = edge;
         let Some(func) = self.graph.func_of(n) else {
@@ -891,10 +931,14 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             return;
         };
 
-        self.end_summary
+        if !self
+            .end_summary
             .entry((sp, d1))
             .or_default()
-            .insert((n, d2));
+            .insert((n, d2))
+        {
+            return;
+        }
 
         let inc_len = self.incoming.get(&(sp, d1)).map_or(0, CompactPairSet::len);
 
@@ -911,8 +955,6 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                     p.return_flow(m, Some(call_site), func, n, Some(ret_site), src, out);
                 });
                 for d5 in d5s {
-                    // Continue every caller-side path `(d3 -> call_site, d4)`
-                    // recorded in the reverse path-edge index.
                     let callers_len = self
                         .by_target
                         .get(&(call_site, d4))
@@ -926,6 +968,25 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                             break;
                         };
                         self.propagate(d3, ret_site, d5);
+                    }
+                }
+            }
+            if self.graph.call_may_throw_uncaught(call_site) {
+                let d_uncaughts = self.compute_uncaught_targets(call_site, func, n, d2);
+                for d_unc in d_uncaughts {
+                    let callers_len = self
+                        .by_target
+                        .get(&(call_site, d4))
+                        .map_or(0, CompactU32Set::len);
+                    for ci in 0..callers_len {
+                        let Some(&d3) = self
+                            .by_target
+                            .get(&(call_site, d4))
+                            .and_then(|s| s.items().get(ci))
+                        else {
+                            break;
+                        };
+                        self.propagate_uncaught_exit(d3, call_site, d_unc);
                     }
                 }
             }
@@ -951,6 +1012,12 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                         });
                         for d5 in d5s {
                             self.propagate(self.zero_id, ret_site, d5);
+                        }
+                    }
+                    if self.graph.call_may_throw_uncaught(call_site) {
+                        let d_uncaughts = self.compute_uncaught_targets(call_site, func, n, d2);
+                        for d_unc in d_uncaughts {
+                            self.propagate_uncaught_exit(self.zero_id, call_site, d_unc);
                         }
                     }
                 }

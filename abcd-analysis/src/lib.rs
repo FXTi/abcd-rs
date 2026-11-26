@@ -11,15 +11,14 @@
 //!   Cooper–Harvey–Kennedy dominators/post-dominators, back-edge and
 //!   natural-loop detection, and pattern-independent region trees
 //!   ([`control::structure_regions`]).
-//! - [`dataflow`] — a generic monotone forward/backward framework, cached
-//!   use-def chains, the deterministic IFDS tabulation solver
+//! - [`dataflow`] — use-def chains, the deterministic IFDS tabulation solver
 //!   ([`dataflow::ifds`]), alloc-site heap keying ([`dataflow::heap`], rung 0),
 //!   the on-demand backward alias engine ([`dataflow::alias`], rung 1), and the
 //!   whole-module `k=1` context-sensitive pointer analysis ([`dataflow::pta`],
 //!   rung 2, co-evolving with the call graph).
 //! - [`frame`] — the ArkCompiler frame-slot model: identifies which leading
-//!   `params` slots hold the implicit `[func][new.target][this]` values for
-//!   interprocedural argument↔parameter binding.
+//!   `params` slots hold the implicit `[func][new.target][this]` values (or
+//!   static ArkTS receiver slots) for interprocedural argument↔parameter binding.
 //! - [`callgraph`] — the on-the-fly call graph: direct calls resolve
 //!   statically; dynamic callees trace backward through
 //!   `Mov`/`Phi`/`LoadConst`/`AllocClosure` definition chains; unresolved sites
@@ -32,6 +31,7 @@
 //! in `abcd-taint`. See `abcd-analysis/README.md` for the module map and
 //! precision ladder.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 

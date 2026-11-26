@@ -78,7 +78,7 @@ pub mod symbol;
 pub mod ty;
 pub mod verify;
 
-pub use cfg::{DomTree, ExceptionHandlerMap, normal_succs_inline};
+pub use cfg::{DomTree, ExceptionHandlerMap, IndexedDom, normal_succs_inline};
 pub use consts::{Const, ConstPool, LitMethodKind, TypedArrayTag};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use frame::{FrameSlots, this_param_index};

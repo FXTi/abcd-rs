@@ -13,6 +13,20 @@ use abcd_ir::{BlockId, ClassId, Const, EdgeKind, FunctionKind, Op, ValueId};
 enum Fact {
     Zero,
     V(ValueId),
+    UncaughtThrow,
+}
+
+/// Test-local intraprocedural empty call-graph oracle (`#83`).
+struct NoCalls;
+
+impl CallGraphOracle for NoCalls {
+    fn callees_of_call_at(&self, _call: InstId) -> &[FuncId] {
+        &[]
+    }
+
+    fn callers_of(&self, _func: FuncId) -> &[InstId] {
+        &[]
+    }
 }
 
 /// A map-backed call-graph oracle for tests.
@@ -129,6 +143,7 @@ impl IfdsProblem for MicroTaint {
                     out.push(Fact::V(exc));
                 }
             }
+            Fact::UncaughtThrow => {}
         }
     }
 
@@ -175,6 +190,12 @@ impl IfdsProblem for MicroTaint {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
+        if *source == Fact::UncaughtThrow {
+            if let Some(exc) = return_site.and_then(|r| Self::handler_param(module, r)) {
+                out.push(Fact::V(exc));
+            }
+            return;
+        }
         let Fact::V(v) = *source else { return };
         let Some(exit_inst) = module.inst(exit) else {
             return;
@@ -197,6 +218,29 @@ impl IfdsProblem for MicroTaint {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn call_uncaught_exit_flow(
+        &self,
+        module: &Module,
+        _call_site: InstId,
+        _callee: FuncId,
+        callee_exit: InstId,
+        source: &Fact,
+        out: &mut Vec<Fact>,
+    ) {
+        match *source {
+            Fact::UncaughtThrow => out.push(Fact::UncaughtThrow),
+            Fact::V(v) => {
+                if matches!(
+                    module.inst(callee_exit).map(|i| &i.op),
+                    Some(Op::Throw { value }) if *value == v
+                ) {
+                    out.push(Fact::UncaughtThrow);
+                }
+            }
+            Fact::Zero => {}
         }
     }
 
@@ -254,6 +298,17 @@ fn solve_micro(module: &Module, cg: &MapCallGraph, seeds: Vec<(FuncId, Fact)>) -
             out: &mut Vec<Fact>,
         ) {
             self.inner.call_to_return_flow(m, c, r, src, out);
+        }
+        fn call_uncaught_exit_flow(
+            &self,
+            m: &Module,
+            cs: InstId,
+            f: FuncId,
+            ce: InstId,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            self.inner.call_uncaught_exit_flow(m, cs, f, ce, src, out);
         }
     }
     let problem = Seeded {
@@ -883,4 +938,116 @@ fn propagate_zero_to_callee_false_skips_zero_preserving_arg_and_seed_edges() {
 
     // Caller `Λ` still bypasses calls via `call_to_return_flow`.
     assert!(result.is_reached(caller_ret, &Fact::Zero));
+}
+
+/// 3-frame uncaught `Throw` (`f0 -> f1 -> f2` where `f2` throws `secret`, `f1`
+/// does not catch, and `f0` catches `e` and passes `e` to `sink`) propagates
+/// through `f1`'s call site into `f0`'s catch handler, while a locally
+/// catch-all-caught `Throw` in `swallow` stays isolated inside `swallow` (`#79`).
+#[test]
+fn three_frame_uncaught_throw_propagates_and_local_catch_all_isolates() {
+    let mut m = mk_module();
+    let sink = add_external_sink(&mut m, "sink");
+
+    // `f2(p2) { throw p2; }`
+    let f2 = add_func_named(&mut m, "f2");
+    let f2_entry = entry_of(&m, f2);
+    add_param(&mut m, f2, 0);
+    let p2 = add_param(&mut m, f2, 1);
+    emit_void(&mut m, f2_entry, Op::Throw { value: p2 });
+    emit_void(&mut m, f2_entry, Op::Unreachable);
+
+    // `f1(p1) { f2(p1); return; }` (no try/catch around `f2(p1)`)
+    let f1 = add_func_named(&mut m, "f1");
+    let f1_entry = entry_of(&m, f1);
+    add_param(&mut m, f1, 0);
+    let p1 = add_param(&mut m, f1, 1);
+    let f2_ref = load_method_ref(&mut m, f1_entry, f2);
+    let call_f2 = emit_void_call(&mut m, f1_entry, f2_ref, vec![p1]);
+    let f1_ret = emit_void(&mut m, f1_entry, Op::Return { value: None });
+
+    // `swallow(ps) { try { throw ps; } catch (es) { return; } }` (catch-all caught locally!)
+    let swallow = add_func_named(&mut m, "swallow");
+    let sw_entry = entry_of(&m, swallow);
+    let sw_handler = add_block(&mut m, swallow);
+    add_param(&mut m, swallow, 0);
+    let ps = add_param(&mut m, swallow, 1);
+    emit_void(&mut m, sw_entry, Op::Throw { value: ps });
+    emit_void(&mut m, sw_entry, Op::Unreachable);
+    let es = add_exception_param(&mut m, sw_handler);
+    emit_void(&mut m, sw_handler, Op::Return { value: None });
+    add_try(&mut m, swallow, vec![sw_entry], sw_handler, es);
+
+    // Intraprocedural sanity check using `NoCalls`.
+    let intra = IfdsSolver::new(
+        &m,
+        &MicroTaint,
+        &NoCalls,
+        IfdsConfig {
+            follow_returns_past_seeds: false,
+        },
+    )
+    .solve();
+    assert_eq!(intra.path_edge_count(), 0);
+
+    // `f0`:
+    //   1) `try { swallow(secret) } catch (e_swallow) { sink(e_swallow) }` -> MUST NOT taint `e_swallow`!
+    //   2) `try { f1(secret) } catch (e_uncaught) { sink(e_uncaught) }` -> MUST taint `e_uncaught`!
+    let f0 = add_func_named(&mut m, "f0");
+    let b_sw = entry_of(&m, f0);
+    let h_sw = add_block(&mut m, f0);
+    let b_f1 = add_block(&mut m, f0);
+    let h_f1 = add_block(&mut m, f0);
+    let b_done = add_block(&mut m, f0);
+    add_param(&mut m, f0, 0);
+
+    let sec1 = load_string(&mut m, b_sw, "secret");
+    let sw_ref = load_method_ref(&mut m, b_sw, swallow);
+    let call_sw = emit_void_call(&mut m, b_sw, sw_ref, vec![sec1]);
+    emit_void(&mut m, b_sw, Op::Branch { dest: b_f1 });
+
+    let e_sw = add_exception_param(&mut m, h_sw);
+    let sink_ref1 = load_method_ref(&mut m, h_sw, sink);
+    let sink_sw = emit_void_call(&mut m, h_sw, sink_ref1, vec![e_sw]);
+    emit_void(&mut m, h_sw, Op::Branch { dest: b_f1 });
+
+    let sec2 = load_string(&mut m, b_f1, "secret");
+    let f1_ref = load_method_ref(&mut m, b_f1, f1);
+    let call_f1 = emit_void_call(&mut m, b_f1, f1_ref, vec![sec2]);
+    emit_void(&mut m, b_f1, Op::Branch { dest: b_done });
+
+    let e_f1 = add_exception_param(&mut m, h_f1);
+    let sink_ref2 = load_method_ref(&mut m, h_f1, sink);
+    let sink_f1 = emit_void_call(&mut m, h_f1, sink_ref2, vec![e_f1]);
+    emit_void(&mut m, h_f1, Op::Branch { dest: b_done });
+
+    emit_void(&mut m, b_done, Op::Return { value: None });
+
+    link(&mut m, b_sw, b_f1);
+    link(&mut m, h_sw, b_f1);
+    link(&mut m, b_f1, b_done);
+    link(&mut m, h_f1, b_done);
+    add_try(&mut m, f0, vec![b_sw], h_sw, e_sw);
+    add_try(&mut m, f0, vec![b_f1], h_f1, e_f1);
+
+    let mut cg = MapCallGraph::default();
+    cg.add(call_sw, swallow);
+    cg.add(call_f1, f1);
+    cg.add(call_f2, f2);
+    cg.add(sink_sw, sink);
+    cg.add(sink_f1, sink);
+
+    let result = solve_micro(&m, &cg, vec![(f0, Fact::Zero)]);
+
+    // 3-frame uncaught throw reaches `call_f2` as `UncaughtThrow`, does NOT leak
+    // onto `f1`'s normal return, and taints `e_f1` at `sink_f1` in `f0`.
+    assert!(result.is_reached(call_f2, &Fact::UncaughtThrow));
+    assert!(!result.is_reached(f1_ret, &Fact::UncaughtThrow));
+    assert!(result.is_reached(sink_f1, &Fact::V(e_f1)));
+
+    // Locally catch-all-caught throw in `swallow` reaches `sw_handler`, NEVER
+    // escapes `swallow` to `e_sw` in `f0`.
+    let sw_first = m.block(sw_handler).unwrap().insts[0];
+    assert!(result.is_reached(sw_first, &Fact::V(es)));
+    assert!(!result.is_reached(sink_sw, &Fact::V(e_sw)));
 }

@@ -22,7 +22,7 @@ tabulation solver over `abcd_ir::Module`:
 | [`gap`](src/gap.rs) | Eager callback-gap propagator (`GapCallGraph`) materializing synthetic IFDS call edges into user closures passed to higher-order builtins. |
 | [`prototype`](src/prototype.rs) | Receiver prototype-family resolver (`Array`, `Object`, `RegExp`, `Function`, `String`, `Number`, `Boolean`, `Iterator`, `Promise`). |
 | [`oracle`](src/oracle.rs) | Uniform point-aware adapter (`Oracle`) over Alias Oracle Rungs `0`, `1`, and `2`. |
-| [`problem`](src/problem.rs) | `TaintProblem` flow functions (`normal`, `call`, `return`, `call_to_return`), `ExceptionParam` catch dispatch, and JSBridge seed discovery. |
+| [`problem`](src/problem.rs) | `TaintProblem` flow functions (`normal`, `call`, `return`, `call_to_return`, `call_uncaught_exit`), multi-frame uncaught exception propagation (`UNCAUGHT_EXCEPTION_VALUE`), `ExceptionParam` catch dispatch, and JSBridge seed discovery. |
 | [`ohos`](src/ohos.rs) | Versioned OpenHarmony (`@ohos.*` / `@kit.*`) sources, sinks, and ArkUI declarative component summaries (`ohos_preset`). |
 | [`driver`](src/driver.rs) | Pipeline driver (`run_taint`), `ohos_lifecycle` harness synthesis, sink matching, and backward-BFS witness-path reconstruction. |
 
@@ -43,24 +43,30 @@ with one of five bases:
 
 ### Fallback Ladder, Summaries, Callback Gaps & Receiver Prototype Resolver
 Each call site is classified once in strict precedence order:
-1. **Direct-name summary** — matches candidate names from `names.rs`; `exclusive`
-   summaries kill the callee-body call edge and unmodeled operand bypass taints.
+1. **Direct-name user summary** (`TaintConfig::extra_summaries` / `SummaryRegistry::register`) —
+   overrides both preloaded builtins and resolved function bodies; `exclusive` summaries kill the
+   callee-body call edge and field-bearing operand bypass taints while preserving scalar
+   pass-by-value caller locals unless explicitly cleared.
 2. **Resolved user body** — steps into non-external `FunctionData` bodies via normal
-   IFDS call/return edges (concrete user code takes precedence over receiver heuristics).
-3. **Receiver prototype summary** — `PrototypeResolver` infers receiver families from
+   IFDS call/return edges (concrete user code takes precedence over preloaded builtin summaries
+   and receiver heuristics; incomplete or mixed external/body call edges additionally retain
+   conservative caller bypass and `native_identity` flows).
+3. **Direct-name builtin summary** (`SummaryRegistry::with_builtins`) — applies preloaded
+   ECMAScript/builtin propagation rules when no user summary or concrete body overrides the site.
+4. **Receiver prototype summary** — `PrototypeResolver` infers receiver families from
    `Alloc*` ops, literal constants, global-store provenance, builtin `GetIterator`,
    `new` builtin constructors, and `Promise`/`async` chains to apply
    `Family.prototype.method` **additively**.
-4. **Named native keep** / **5. Unnamed unknown keep** — conservatively retains
+5. **Named native keep** / **6. Unnamed unknown keep** — conservatively retains
    incoming taint and (when `native_identity` is enabled) propagates tainted operands
    to the call result while recording named misses in `RegistryStats::misses_named`.
 
-Higher-order summaries (`Array.prototype.{forEach,map,filter}`, `String.prototype.replace`, `Promise.prototype.then`, ArkUI `ViewPU` / UI events) pre-scan resolved closure arguments into static `GapCallGraph` edges, wiring `GapEnter` endpoints into callback formals and `return_to_result` chains back to the caller's result.
+Higher-order summaries (`Array.prototype.{forEach,map,filter}`, `String.prototype.replace`, `Promise.prototype.then`, ArkUI `ViewPU` / UI events) pre-scan resolved closure arguments into static `GapCallGraph` edges, wiring `GapEnter` endpoints into callback formals and `return_to_result` chains back to the caller's result. Uncaught `Op::Throw` exceptions propagate across arbitrarily deep unprotected call chains via `IfdsProblem::call_uncaught_exit_flow` (`UNCAUGHT_EXCEPTION_VALUE`) into enclosing `catch` handlers without blinding normal or summary return flows inside `catch` blocks.
 
 ### Alias Oracle Rungs (`0` / `1` / `2`) & OpenHarmony Rule Pack
 - **Rung 0** (`Rung0AliasOracle`): intraprocedural SSA def-chain allocation-site walk (the universal sound fallback floor).
 - **Rung 1** (`Rung1AliasOracle`): memoized demand-driven backward `points_to` with balanced call-site context stacks plus one-pass `CallGraph::refine_with_points_to`.
-- **Rung 2** (`Rung2AliasOracle`, default `alias_rung = 2`): `k=1` call-site-sensitive Andersen PTA (whole-module on `<= 512`-function modules, demand-driven root-sliced across source/sink caller cones and cross-module ES import forward closures on `> 512`-function bundles) with on-the-fly call-graph co-evolution, `NewLexEnv` capture disambiguation, and fresh summary-container call-site keying.
+- **Rung 2** (`Rung2AliasOracle`, default `alias_rung = 2`): `k=1` call-site-sensitive Andersen PTA (whole-module on `<= 512`-function modules, demand-driven root-sliced across source/sink caller cones and cross-module ES import forward closures on `> 512`-function bundles, reported via `TaintReport::pta_root_sliced`) with on-the-fly call-graph co-evolution, `NewLexEnv` capture disambiguation, and fresh summary-container call-site keying. `TaintProblem` transfer functions and precomputed `HeapSiteIndex` / `PropTouchIndex` cones enforce **zero `512`-function semantic cliffs** across all module sizes and rungs.
 - **OpenHarmony (`ohos_preset` + `ohos_lifecycle`)**: synthesizes Stage/FA `UIAbility`, `*ExtensionAbility`, and ArkUI `ViewPU` entry harnesses (`__abcd_ohos_harness__`), seeds tainted `Want` / `deviceInfo` / privacy SDK returns and `WebviewController.registerJavaScriptProxy` JSBridge methods, and tracks sync, `Promise`, `AwaitUncaught`/`ResumeGenerator`, and `(err, data)` callback flows into network, WebView, filesystem, IPC, RDB, and HiLog sinks.
 
 ## 3. Soundness & Determinism Invariants

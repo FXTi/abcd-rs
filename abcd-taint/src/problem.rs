@@ -32,20 +32,20 @@
 //! operand→result rule.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
 use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
 use abcd_analysis::module_link::ModuleLinkTable;
-use abcd_ir::op::{PropKey, SuperKey};
+use abcd_ir::op::SuperKey;
 use abcd_ir::{
     BlockId, CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId,
 };
 
-use crate::driver::{SourceSpec, TaintConfig};
-use crate::fact::{Fact, TaintBase, TaintFact};
+use crate::driver::{SinkSpec, SourceSpec, TaintConfig};
+use crate::fact::{Fact, TaintBase, TaintFact, UNCAUGHT_EXCEPTION_VALUE};
 use crate::gap;
 use crate::names::{
     ClassPropStores, call_base_value, call_method_leaf, callee_name_candidates_indexed,
@@ -114,10 +114,17 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
 }
 
 type ModuleSlotUsers = HashMap<(ClassId, u32), Vec<FuncId>>;
+type JsBridgePropIndex = HashMap<ValueId, Vec<(Sym, ValueId)>>;
 
 struct PropTouchIndex {
     by_prop: HashMap<Sym, Vec<FuncId>>,
     dyn_funcs: Vec<FuncId>,
+}
+
+struct HeapSiteIndex {
+    by_site: HashMap<InstId, Vec<FuncId>>,
+    unknown_deref_cone: Vec<bool>,
+    imprecise_lex_cone: Vec<bool>,
 }
 
 /// The taint problem over a module + call graph + the rung-selected
@@ -131,10 +138,8 @@ pub struct TaintProblem<'m> {
     global_stores: HashMap<Sym, Vec<ValueId>>,
     /// Dense `BlockId::index() -> Option<FuncId>` owning-function index.
     block_to_func: Vec<Option<FuncId>>,
-    /// Dense `BlockId::index() -> Option<ValueId>` catch-handler exception parameter
-    /// (first matching catch in function/region/catch order, matching `handler_exception_at`).
-    handler_block_exc: Vec<Option<ValueId>>,
-    /// Scoped `(FuncId, handler BlockId) -> exception ValueId` for intraprocedural throws.
+    /// Scoped `(FuncId, handler BlockId) -> exception ValueId` for intraprocedural
+    /// and per-call exceptional dispatch.
     func_handler_exc: HashMap<(FuncId, BlockId), ValueId>,
     /// Per-function backward SSA local liveness for pruning dead `TaintBase::Local` facts.
     liveness: LocalLiveness,
@@ -148,21 +153,26 @@ pub struct TaintProblem<'m> {
     oracle: RefCell<Oracle<'m>>,
     registry: &'m SummaryRegistry,
     config: &'m TaintConfig,
+    /// Final `.`-segment leaves of configured [`SinkSpec::Call`] targets.
+    sink_leaves: HashSet<String>,
+    /// Per-function `(InstId, Option<start_index>)` of `GetUnmappedArgs` (`None`)
+    /// and `CopyRestArgs` (`Some(start_index)`) instructions.
+    variadic_ops: Vec<Vec<(InstId, Option<u16>)>>,
     /// `(func, param indices)` seeds, resolved from the config's
     /// function-name source specs and JSBridge proxy registrations at construction.
     param_seeds: Vec<(FuncId, Vec<ValueId>)>,
-    /// Module-interned names whose `TryGetGlobal` results are sources.
+    /// Module-interned names whose `TryGetGlobal` / `globalThis.<name>` results are sources.
     global_sources: HashSet<Sym>,
-    /// Call sites whose return values are tainted via `SourceSpec::CallReturn`.
-    call_return_sources: HashSet<InstId>,
+    /// Call sites whose return values are tainted via `SourceSpec::CallReturn` (`N20` ordered).
+    call_return_sources: BTreeSet<InstId>,
     /// Trailing `(err, data)` / `(data)` callback edges at `CallReturn` source sites.
     source_cb_edges: BTreeMap<InstId, Vec<FuncId>>,
     /// `(ClassId, ext_slot)` external imports tainted via `SourceSpec::ModuleImport`:
     /// `None` = whole-value taint, `Some(syms)` = field-sensitive namespace taint.
     module_import_sources: HashMap<(ClassId, u32), Option<Vec<Sym>>>,
-    /// Async-machine `ResumeGenerator` instruction -> awaited `ValueId` from
-    /// preceding `AwaitUncaught` in the same block.
-    await_resume: HashMap<InstId, ValueId>,
+    /// Async-machine `ResumeGenerator` instruction -> backward-paired awaited
+    /// `ValueId`s from preceding `AwaitUncaught` / `SuspendGenerator` instructions.
+    await_resume: HashMap<InstId, Vec<ValueId>>,
     /// Per-site fallback-ladder classification (memo).
     site_class: RefCell<HashMap<InstId, SiteClass>>,
     /// Sites already counted (counters are per-site, not per-fact).
@@ -180,13 +190,13 @@ pub struct TaintProblem<'m> {
     /// the solver's call graph (`GapCallGraph`); the flow functions
     /// consult them to recognize gap edges.
     gap_edges: BTreeMap<InstId, Vec<FuncId>>,
-    /// Fresh-result memo (rung 2; [`TaintProblem::fresh_result_site`]).
+    /// Fresh-result memo ([`TaintProblem::fresh_result_site`]).
     fresh_memo: RefCell<HashMap<ValueId, Option<InstId>>>,
     /// Callback-gap counters: call
     /// sites whose callback summary applied AND the callback value
     /// resolved to at least one user body.
     gap_resolved: usize,
-    /// Callback-summary sites whose callback value did NOT resolve —
+    /// Callback-gap sites whose callback value did NOT resolve —
     /// the honest fallback (mini-gap tag only; gap.rs module docs).
     gap_unresolved: usize,
     /// Dense `FuncId::index() -> bool` backward caller cone of functions that
@@ -205,14 +215,14 @@ pub struct TaintProblem<'m> {
     /// Lazily memoized `sym -> Vec<bool>` of functions that can transitively
     /// reach an `Op::TryGetGlobal` reader of `sym`.
     global_readers: RefCell<HashMap<Sym, Vec<bool>>>,
-    /// One-time lazy index `site_iid -> Vec<FuncId>` of functions holding or
-    /// lexically reading `site_iid` on large (`> 512`-function) Rung-2 bundles.
-    heap_site_users: RefCell<Option<HashMap<InstId, Vec<FuncId>>>>,
-    /// Lazily memoized `site_iid -> Vec<bool>` backward caller cone of `heap_site_users`.
+    /// One-time lazy heap-site dereference index across all rungs (`0`/`1`/`2`),
+    /// with precomputed `O(1)` `unknown_deref_cone` and `imprecise_lex_cone`.
+    heap_site_index: RefCell<Option<HeapSiteIndex>>,
+    /// Lazily memoized `site_iid -> Vec<bool>` backward caller cone of `HeapSiteIndex::by_site`.
     heap_site_cone: RefCell<HashMap<InstId, Vec<bool>>>,
     /// Lazily memoized `Vec<bool>` backward caller cone of `Op::GetLexVar` readers.
     lex_var_readers: RefCell<Option<Vec<bool>>>,
-    /// One-time lazy index of functions touching named/dynamic properties (`> 512`-function bundles).
+    /// One-time lazy index of functions touching named/dynamic properties.
     prop_touch_index: RefCell<Option<PropTouchIndex>>,
     /// Lazily memoized `prop_sym -> Vec<bool>` backward caller cone of `prop_touch_index`.
     prop_touch_cone: RefCell<HashMap<Sym, Vec<bool>>>,
@@ -290,8 +300,16 @@ impl<'m> TaintProblem<'m> {
             }
         }
         let global_stores = build_global_stores_map(module);
-        let (block_to_func, handler_block_exc, func_handler_exc) = build_exception_indexes(module);
+        let (block_to_func, func_handler_exc) = build_exception_indexes(module);
         let module_import_sources = resolve_module_import_sources(module, &links, config);
+        let sink_leaves: HashSet<String> = config
+            .sinks
+            .iter()
+            .map(|s| match s {
+                SinkSpec::Call { name } => name.rsplit('.').next().unwrap_or(name).to_owned(),
+            })
+            .collect();
+        let variadic_ops = build_variadic_ops_index(module);
 
         let call_source_names: HashSet<&str> = config
             .sources
@@ -302,8 +320,9 @@ impl<'m> TaintProblem<'m> {
             })
             .collect();
 
-        let mut call_return_sources = HashSet::new();
+        let mut call_return_sources = BTreeSet::new();
         let mut source_cb_edges: BTreeMap<InstId, Vec<FuncId>> = BTreeMap::new();
+        let mut jsbridge_props: Option<JsBridgePropIndex> = None;
         if !call_source_names.is_empty() || config.ohos_lifecycle {
             let mut wanted_leaves: HashSet<&str> = call_source_names
                 .iter()
@@ -371,9 +390,12 @@ impl<'m> TaintProblem<'m> {
                         .any(|c| c == "@ohos.web.webview.WebviewController.registerJavaScriptProxy")
                     && let Some(&proxy_obj) = args.first()
                 {
+                    let prop_idx =
+                        jsbridge_props.get_or_insert_with(|| build_jsbridge_prop_index(module));
                     collect_jsbridge_seeds(
                         module,
                         &oracle,
+                        prop_idx,
                         proxy_obj,
                         args.get(2).copied(),
                         call,
@@ -383,7 +405,7 @@ impl<'m> TaintProblem<'m> {
             }
         }
 
-        let await_resume = build_await_resume_map(module);
+        let await_resume = abcd_analysis::control::build_await_resume_map(module);
         let liveness = LocalLiveness::build(module);
         let value_keep_flag = RefCell::new(vec![0u8; module.values.len()]);
         let func_alias_loads = RefCell::new((0..module.functions.len()).map(|_| None).collect());
@@ -396,7 +418,6 @@ impl<'m> TaintProblem<'m> {
             prop_stores,
             global_stores,
             block_to_func,
-            handler_block_exc,
             func_handler_exc,
             liveness,
             value_keep_flag,
@@ -405,6 +426,8 @@ impl<'m> TaintProblem<'m> {
             oracle: RefCell::new(oracle),
             registry,
             config,
+            sink_leaves,
+            variadic_ops,
             param_seeds,
             global_sources,
             call_return_sources,
@@ -426,7 +449,7 @@ impl<'m> TaintProblem<'m> {
             module_slot_users: RefCell::new(None),
             module_var_readers: RefCell::new(HashMap::new()),
             global_readers: RefCell::new(HashMap::new()),
-            heap_site_users: RefCell::new(None),
+            heap_site_index: RefCell::new(None),
             heap_site_cone: RefCell::new(HashMap::new()),
             lex_var_readers: RefCell::new(None),
             prop_touch_index: RefCell::new(None),
@@ -518,6 +541,11 @@ impl<'m> TaintProblem<'m> {
                         let matched = match &inst.op {
                             Op::TryGetGlobal { name, .. } => {
                                 inst.result.is_some() && self.global_sources.contains(name)
+                            }
+                            Op::LoadProp { object, name } => {
+                                inst.result.is_some()
+                                    && self.global_sources.contains(name)
+                                    && is_global_object(self.module, *object)
                             }
                             Op::LoadModuleVar { index, kind } => {
                                 inst.result.is_some()
@@ -775,66 +803,110 @@ impl<'m> TaintProblem<'m> {
         })
     }
 
-    fn func_derefs_site_rung0(&self, fid: FuncId, site: InstId) -> bool {
-        let Some(f) = self.module.func(fid) else {
-            return false;
+    fn call_resolution_incomplete(&self, call: InstId) -> bool {
+        let Some(edge) = self.callgraph.edge_at(call) else {
+            return true;
         };
-        if matches!(
-            self.module.inst(site).map(|i| &i.op),
-            Some(Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. })
-        ) {
-            for &b in &f.blocks {
-                let Some(bb) = self.module.block(b) else {
-                    continue;
-                };
-                for &iid in &bb.insts {
-                    if matches!(
-                        self.module.inst(iid).map(|i| &i.op),
-                        Some(Op::GetLexVar { .. } | Op::PutLexVar { .. })
-                    ) {
-                        return true;
-                    }
-                }
-            }
+        if !edge.resolution_complete {
+            return true;
+        }
+        self.callgraph.callees_of_call_at(call).iter().any(|&f| {
+            self.module
+                .func(f)
+                .is_none_or(|fd| fd.is_external || fd.blocks.is_empty())
+        })
+    }
+
+    fn call_matches_sink_leaf(&self, caller: FuncId, call: InstId, inst: &abcd_ir::Inst) -> bool {
+        if self.sink_leaves.is_empty() {
             return false;
         }
-        let oracle = self.oracle.borrow();
-        let has_site = |v: ValueId| oracle.resolve(v).sites.iter().any(|s| s == site);
-        for &b in &f.blocks {
+        let Op::Call { callee, .. } = &inst.op else {
+            return false;
+        };
+        if let Some(leaf) = call_method_leaf(self.module, inst)
+            && self
+                .module
+                .sym
+                .resolve(leaf)
+                .map(|s| s.rsplit('.').next().unwrap_or(s))
+                .is_some_and(|l| self.sink_leaves.contains(l))
+        {
+            return true;
+        }
+        if self.callgraph.callees_of_call_at(call).iter().any(|&f| {
+            self.module
+                .func(f)
+                .and_then(|fd| self.module.sym.resolve(fd.name))
+                .map(|s| s.rsplit('.').next().unwrap_or(s))
+                .is_some_and(|l| self.sink_leaves.contains(l))
+        }) {
+            return true;
+        }
+        if let Some(leaf_sym) =
+            quick_callee_leaf_sym(self.module, &self.links, &self.prop_stores, caller, *callee)
+        {
+            return self
+                .module
+                .sym
+                .resolve(leaf_sym)
+                .map(|s| s.rsplit('.').next().unwrap_or(s))
+                .is_some_and(|l| self.sink_leaves.contains(l));
+        }
+        callee_name_candidates_indexed(
+            self.module,
+            &self.links,
+            Some(&self.prop_stores),
+            caller,
+            *callee,
+        )
+        .iter()
+        .any(|c| self.sink_leaves.contains(c.rsplit('.').next().unwrap_or(c)))
+    }
+
+    fn callee_may_return_this(&self, callee: FuncId) -> bool {
+        let Some(fd) = self.module.func(callee) else {
+            return false;
+        };
+        let this_v = match param_binding(self.module, callee) {
+            ParamBinding::OverApproxAll => return true,
+            ParamBinding::Precise {
+                this_slot: Some(slot),
+                ..
+            } => match fd.params.get(slot).copied() {
+                Some(v) => v,
+                None => return false,
+            },
+            ParamBinding::Precise {
+                this_slot: None, ..
+            } => return false,
+        };
+        for &b in &fd.blocks {
             let Some(bb) = self.module.block(b) else {
                 continue;
             };
             for &iid in &bb.insts {
-                let Some(inst) = self.module.inst(iid) else {
-                    continue;
-                };
-                match &inst.op {
-                    Op::LoadProp { object, .. }
-                    | Op::LoadPropIdx { object, .. }
-                    | Op::LoadPropDyn { object, .. }
-                    | Op::StoreProp { object, .. }
-                    | Op::StoreOwnPropName { object, .. }
-                    | Op::StorePropIdx { object, .. }
-                    | Op::StoreOwnPropIdx { object, .. }
-                    | Op::StorePropDyn { object, .. }
-                    | Op::StoreOwnPropDyn { object, .. }
-                    | Op::GetIterator { obj: object } => {
-                        if has_site(*object) {
-                            return true;
-                        }
+                if let Some(Op::Return { value: Some(rv) }) = self.module.inst(iid).map(|i| &i.op) {
+                    let root = abcd_analysis::dataflow::heap::peel_movs(self.module, *rv);
+                    if root == this_v {
+                        return true;
                     }
-                    Op::Call { args, .. }
-                        if !self.call_has_body_callee(iid)
-                            && (call_base_value(self.module, inst).is_some_and(has_site)
-                                || args.iter().copied().any(has_site)) =>
+                    if let Some(ValueDef::Inst(def_iid)) = self.module.value(root).map(|v| v.def)
+                        && matches!(
+                            self.module.inst(def_iid).map(|i| &i.op),
+                            Some(Op::Phi { .. })
+                        )
                     {
                         return true;
                     }
-                    _ => {}
                 }
             }
         }
         false
+    }
+
+    fn can_callee_touch_this_prop(&self, prop: Sym, callee: FuncId) -> bool {
+        self.can_callee_touch_prop(prop, callee) || self.callee_may_return_this(callee)
     }
 
     fn can_callee_touch_prop(&self, prop: Sym, callee: FuncId) -> bool {
@@ -861,7 +933,15 @@ impl<'m> TaintProblem<'m> {
                         match &inst.op {
                             Op::LoadProp { name, .. }
                             | Op::StoreProp { name, .. }
-                            | Op::StoreOwnPropName { name, .. } => {
+                            | Op::StoreOwnPropName { name, .. }
+                            | Op::LoadSuper {
+                                key: SuperKey::Name(name),
+                                ..
+                            }
+                            | Op::StoreSuper {
+                                key: SuperKey::Name(name),
+                                ..
+                            } => {
                                 let list = by_prop.entry(*name).or_default();
                                 if list.last() != Some(&fid) {
                                     list.push(fid);
@@ -873,17 +953,28 @@ impl<'m> TaintProblem<'m> {
                             | Op::StoreOwnPropIdx { .. }
                             | Op::StorePropDyn { .. }
                             | Op::StoreOwnPropDyn { .. }
+                            | Op::LoadSuper {
+                                key: SuperKey::Dynamic(_),
+                                ..
+                            }
+                            | Op::StoreSuper {
+                                key: SuperKey::Dynamic(_),
+                                ..
+                            }
                             | Op::GetIterator { .. }
-                            | Op::CopyDataProps { .. } => {
+                            | Op::CopyDataProps { .. }
+                            | Op::ArraySpread { .. }
+                            | Op::CreateObjectWithExcludedKeys { .. }
+                            | Op::Throw { .. } => {
                                 has_dyn = true;
                             }
                             Op::Call { .. } => {
-                                if let Some(leaf) = call_method_leaf(self.module, inst)
-                                    && matches!(
-                                        self.module.sym.resolve(leaf),
-                                        Some(
-                                            "assign" | "stringify" | "keys" | "values" | "entries"
-                                        )
+                                if !self.call_has_body_callee(iid)
+                                    || self.call_resolution_incomplete(iid)
+                                    || self.call_matches_sink_leaf(fid, iid, inst)
+                                    || matches!(
+                                        self.compute_class(iid, true).0,
+                                        SiteClass::Summary { .. }
                                     )
                                 {
                                     has_dyn = true;
@@ -932,92 +1023,221 @@ impl<'m> TaintProblem<'m> {
         ans
     }
 
-    fn can_callee_use_heap_site(&self, site: InstId, callee: FuncId) -> bool {
-        if let Some(reach) = self.heap_site_cone.borrow().get(&site) {
-            return reach.get(callee.index()).copied().unwrap_or(false);
+    fn ensure_heap_site_index(&self) {
+        if self.heap_site_index.borrow().is_some() {
+            return;
         }
-        if self.heap_site_users.borrow().is_none() {
-            let mut site_to_funcs: HashMap<InstId, Vec<FuncId>> = HashMap::new();
-            {
-                let oracle_ref = self.oracle.borrow();
-                if let Oracle::Rung2(o) = &*oracle_ref {
-                    let mut push_fn = |s: InstId, fid: FuncId| {
-                        let list = site_to_funcs.entry(s).or_default();
-                        if list.last() != Some(&fid) {
-                            list.push(fid);
-                        }
+        let n_funcs = self.module.functions.len();
+        let mut by_site: HashMap<InstId, Vec<FuncId>> = HashMap::new();
+        let mut unknown_deref_cone = vec![false; n_funcs];
+        let mut unk_queue = VecDeque::new();
+        let mut imprecise_lex_cone = vec![false; n_funcs];
+        let mut lex_queue = VecDeque::new();
+
+        fn push_fn(by_site: &mut HashMap<InstId, Vec<FuncId>>, s: InstId, fid: FuncId) {
+            let list = by_site.entry(s).or_default();
+            if list.last() != Some(&fid) {
+                list.push(fid);
+            }
+        }
+
+        for (fi, f) in self.module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                continue;
+            }
+            let mut has_unknown_deref = false;
+            let mut has_imprecise_lex = false;
+
+            for &b in &f.blocks {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    let Some(inst) = self.module.inst(iid) else {
+                        continue;
                     };
-                    for (fi, f) in self.module.functions.iter().enumerate() {
-                        let fid = FuncId::new(fi as u32);
-                        if Some(fid) == self.harness.fid || f.blocks.is_empty() {
-                            continue;
-                        }
-                        for &b in &f.blocks {
-                            let Some(bb) = self.module.block(b) else {
-                                continue;
+                    let record_deref =
+                        |v: ValueId, by_site: &mut HashMap<InstId, Vec<FuncId>>, unk: &mut bool| {
+                            let (info, may) = {
+                                let oracle = self.oracle.borrow();
+                                (oracle.site_info_at(v, iid), oracle.may_sites_at(v, iid))
                             };
-                            for &iid in &bb.insts {
-                                let Some(inst) = self.module.inst(iid) else {
-                                    continue;
-                                };
-                                match &inst.op {
-                                    Op::LoadProp { object, .. }
-                                    | Op::LoadPropIdx { object, .. }
-                                    | Op::LoadPropDyn { object, .. }
-                                    | Op::StoreProp { object, .. }
-                                    | Op::StoreOwnPropName { object, .. }
-                                    | Op::StorePropIdx { object, .. }
-                                    | Op::StoreOwnPropIdx { object, .. }
-                                    | Op::StorePropDyn { object, .. }
-                                    | Op::StoreOwnPropDyn { object, .. }
-                                    | Op::GetIterator { obj: object } => {
-                                        for s in o.query(*object, iid).sites.iter() {
-                                            push_fn(s, fid);
-                                        }
-                                    }
-                                    Op::Call { args, .. } if !self.call_has_body_callee(iid) => {
-                                        if let Some(bv) = call_base_value(self.module, inst) {
-                                            for s in o.query(bv, iid).sites.iter() {
-                                                push_fn(s, fid);
-                                            }
-                                        }
-                                        for &a in args {
-                                            for s in o.query(a, iid).sites.iter() {
-                                                push_fn(s, fid);
-                                            }
-                                        }
-                                    }
-                                    Op::GetLexVar { level, .. } | Op::PutLexVar { level, .. } => {
-                                        for s in o.lex_env_at(iid, *level).sites.iter() {
-                                            push_fn(s, fid);
-                                        }
-                                    }
-                                    _ => {}
+                            for s in info.sites.iter() {
+                                push_fn(by_site, s, fid);
+                            }
+                            for s in may.iter() {
+                                push_fn(by_site, s, fid);
+                            }
+                            if info.has_unknown {
+                                match self.fresh_result_site(v) {
+                                    Some(fs) => push_fn(by_site, fs, fid),
+                                    None => *unk = true,
+                                }
+                            }
+                        };
+                    let record_val_sites =
+                        |v: ValueId, by_site: &mut HashMap<InstId, Vec<FuncId>>| {
+                            let (info_sites, may, known) = {
+                                let oracle = self.oracle.borrow();
+                                (
+                                    oracle.site_info_at(v, iid).sites,
+                                    oracle.may_sites_at(v, iid),
+                                    oracle.known_sites_at(v, iid),
+                                )
+                            };
+                            for s in info_sites.iter() {
+                                push_fn(by_site, s, fid);
+                            }
+                            for s in may.iter() {
+                                push_fn(by_site, s, fid);
+                            }
+                            for s in known.iter() {
+                                push_fn(by_site, s, fid);
+                            }
+                            if let Some(fs) = self.fresh_result_site(v) {
+                                push_fn(by_site, fs, fid);
+                            }
+                        };
+
+                    match &inst.op {
+                        Op::LoadProp { object, .. }
+                        | Op::LoadPropIdx { object, .. }
+                        | Op::LoadPropDyn { object, .. }
+                        | Op::LoadSuper {
+                            this_value: object, ..
+                        }
+                        | Op::GetIterator { obj: object }
+                        | Op::CopyDataProps { src: object, .. }
+                        | Op::CreateObjectWithExcludedKeys { obj: object, .. }
+                        | Op::ArraySpread { src: object, .. } => {
+                            record_deref(*object, &mut by_site, &mut has_unknown_deref);
+                        }
+                        Op::StoreProp { object, .. }
+                        | Op::StoreOwnPropName { object, .. }
+                        | Op::StorePropIdx { object, .. }
+                        | Op::StoreOwnPropIdx { object, .. }
+                        | Op::StorePropDyn { object, .. }
+                        | Op::StoreOwnPropDyn { object, .. }
+                        | Op::StoreSuper {
+                            this_value: object, ..
+                        } => {
+                            record_val_sites(*object, &mut by_site);
+                        }
+                        Op::Throw { value } => {
+                            record_val_sites(*value, &mut by_site);
+                        }
+                        Op::Call {
+                            callee,
+                            this,
+                            args,
+                            kind,
+                        } => {
+                            if matches!(
+                                kind,
+                                CallKind::Apply | CallKind::NewSpread | CallKind::SuperSpread
+                            ) && let Some(&arr) = args.first()
+                            {
+                                record_deref(arr, &mut by_site, &mut has_unknown_deref);
+                            }
+                            if !self.call_has_body_callee(iid)
+                                || self.call_resolution_incomplete(iid)
+                                || self.call_matches_sink_leaf(fid, iid, inst)
+                                || self.gap_edges.contains_key(&iid)
+                                || matches!(
+                                    self.compute_class(iid, true).0,
+                                    SiteClass::Summary { .. }
+                                )
+                            {
+                                record_val_sites(*callee, &mut by_site);
+                                if let Some(t) = this {
+                                    record_val_sites(*t, &mut by_site);
+                                }
+                                if let Some(bv) = call_base_value(self.module, inst) {
+                                    record_val_sites(bv, &mut by_site);
+                                }
+                                for &a in args {
+                                    record_val_sites(a, &mut by_site);
                                 }
                             }
                         }
+                        Op::GetLexVar { level, .. } => {
+                            if let Some(env) = self.oracle.borrow().lex_env_at(iid, *level) {
+                                for s in env.sites.iter() {
+                                    push_fn(&mut by_site, s, fid);
+                                }
+                                if env.has_unknown || env.sites.is_empty() {
+                                    has_imprecise_lex = true;
+                                }
+                            }
+                        }
+                        Op::PutLexVar { level, .. } => {
+                            if let Some(env) = self.oracle.borrow().lex_env_at(iid, *level) {
+                                for s in env.sites.iter() {
+                                    push_fn(&mut by_site, s, fid);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            *self.heap_site_users.borrow_mut() = Some(site_to_funcs);
+
+            if has_unknown_deref {
+                unknown_deref_cone[fi] = true;
+                unk_queue.push_back(fid);
+            }
+            if has_imprecise_lex {
+                imprecise_lex_cone[fi] = true;
+                lex_queue.push_back(fid);
+            }
+        }
+
+        self.expand_backward_callers(&mut unknown_deref_cone, &mut unk_queue);
+        self.expand_backward_callers(&mut imprecise_lex_cone, &mut lex_queue);
+
+        *self.heap_site_index.borrow_mut() = Some(HeapSiteIndex {
+            by_site,
+            unknown_deref_cone,
+            imprecise_lex_cone,
+        });
+    }
+
+    fn can_callee_use_heap_site(&self, site: InstId, callee: FuncId) -> bool {
+        self.ensure_heap_site_index();
+        let is_env = self.oracle.borrow().is_env_site(site);
+        {
+            let idx_borrow = self.heap_site_index.borrow();
+            if let Some(idx) = idx_borrow.as_ref() {
+                if is_env {
+                    if idx
+                        .imprecise_lex_cone
+                        .get(callee.index())
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                } else if idx
+                    .unknown_deref_cone
+                    .get(callee.index())
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+        if let Some(reach) = self.heap_site_cone.borrow().get(&site) {
+            return reach.get(callee.index()).copied().unwrap_or(false);
         }
 
         let n_funcs = self.module.functions.len();
         let mut reach = vec![false; n_funcs];
         let mut fn_queue = VecDeque::new();
-        let is_rung2 = matches!(*self.oracle.borrow(), Oracle::Rung2(_));
-        if let Some(owner_fid) = self.links.inst_func(self.module, site)
-            && Some(owner_fid) != self.harness.fid
-            && (!is_rung2 || self.func_derefs_site_rung0(owner_fid, site))
-            && let Some(slot) = reach.get_mut(owner_fid.index())
-            && !*slot
         {
-            *slot = true;
-            fn_queue.push_back(owner_fid);
-        }
-        {
-            let users_borrow = self.heap_site_users.borrow();
-            if let Some(funcs) = users_borrow.as_ref().and_then(|m| m.get(&site)) {
+            let idx_borrow = self.heap_site_index.borrow();
+            if let Some(funcs) = idx_borrow.as_ref().and_then(|idx| idx.by_site.get(&site)) {
                 for &fid in funcs {
                     if let Some(slot) = reach.get_mut(fid.index())
                         && !*slot
@@ -1035,8 +1255,9 @@ impl<'m> TaintProblem<'m> {
     }
 
     /// Gate state-base facts entering `callee` across any call edge (reader-cone
-    /// pruning for monotone `ModuleVar`, `Global`, `LexVar`, and large-bundle
-    /// `Heap` state, plus synthetic `__abcd_ohos_harness__` component isolation).
+    /// pruning for monotone `ModuleVar`, `Global`, `LexVar`, and `Heap` state
+    /// across all module sizes and rungs, plus synthetic `__abcd_ohos_harness__`
+    /// component isolation).
     fn allow_state_into_callee(&self, call: InstId, callee: FuncId, fact: &TaintFact) -> bool {
         match &fact.base {
             TaintBase::ModuleVar(src_cid, src_slot) => {
@@ -1049,12 +1270,10 @@ impl<'m> TaintProblem<'m> {
                     return false;
                 }
             }
-            TaintBase::LexVar(_, _)
-                if self.module.functions.len() > 512 && !self.can_callee_read_lex_var(callee) =>
-            {
+            TaintBase::LexVar(_, _) if !self.can_callee_read_lex_var(callee) => {
                 return false;
             }
-            TaintBase::Heap(sites) if !sites.is_empty() && self.module.functions.len() > 512 => {
+            TaintBase::Heap(sites) if !sites.is_empty() => {
                 if !sites
                     .iter()
                     .any(|s| self.can_callee_use_heap_site(s, callee))
@@ -1255,32 +1474,28 @@ impl<'m> TaintProblem<'m> {
 
     /// The k-limit for field chains.
     fn cap(&self) -> usize {
-        if self.module.functions.len() > 512 {
-            self.config.max_field_chain.min(1)
-        } else {
-            self.config.max_field_chain
-        }
+        self.config.max_field_chain
     }
 
     /// Classify a call site on the fallback ladder (memoized; counters
-    /// fire exactly once per site).
+    /// fire once per site).
     ///
     /// The lookup precedence (`design/analysis.md`):
     ///
-    /// 1. **direct name match** — a summary registered under one of
-    ///    the callee's def-chain name candidates wins (exclusive
-    ///    summaries also win over resolved bodies — never merged);
+    /// 1. **direct user summary** (`SummaryRegistry::register` /
+    ///    `TaintConfig::extra_summaries`) — overrides both builtins and
+    ///    resolved bodies (`exclusive` kills the callee-body edge);
     /// 2. **resolved user body** — a callee the call graph resolved to
-    ///    a function with a body is stepped into (USER CODE beats the
-    ///    builtin assumption of the prototype path — the receiver
-    ///    type is a may-answer, the body is evidence);
-    /// 3. **prototype-resolution path** — the receiver's alloc-kind /
+    ///    a function with a body is stepped into (concrete user code
+    ///    beats preloaded builtin summaries and prototype heuristics);
+    /// 3. **direct builtin summary** (`SummaryRegistry::with_builtins`);
+    /// 4. **prototype-resolution path** — the receiver's alloc-kind /
     ///    constant / global-provenance family qualifies the method
     ///    leaf (`a.pop` + Array ⇒ `Array.prototype.pop`);
     ///    prototype-applied summaries are ALWAYS applied
     ///    non-exclusively (additive: flows are added, incoming taint
     ///    is retained — a may-typed receiver must never kill);
-    /// 4. **native keep** (named) / **unknown keep** (no name).
+    /// 5. **native keep** (named) / **unknown keep** (no name).
     fn classify(&self, call: InstId) -> SiteClass {
         if let Some(c) = self.site_class.borrow().get(&call) {
             return c.clone();
@@ -1346,9 +1561,15 @@ impl<'m> TaintProblem<'m> {
             caller,
             *callee,
         );
-        // Resolved callees contribute their FunctionData names (directly
-        // resolved internal functions named like a builtin match too).
         let callees = self.callgraph.callees_of_call_at(call);
+        let has_body = callees.iter().any(|f| {
+            self.module
+                .func(*f)
+                .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
+        });
+        // Resolved callees contribute their FunctionData names (directly
+        // resolved internal functions named like a user-summarized callable
+        // match too; preloaded builtins yield to concrete user bodies).
         for f in callees {
             if let Some(fd) = self.module.func(*f)
                 && let Some(n) = self.module.sym.resolve(fd.name)
@@ -1364,6 +1585,9 @@ impl<'m> TaintProblem<'m> {
         let mut tried: Vec<String> = Vec::new();
         let mut found = None;
         for n in &names {
+            if has_body && self.registry.is_builtin_hit(n, argc) {
+                continue;
+            }
             let hit = if peek {
                 self.registry.peek(n, argc)
             } else {
@@ -1378,11 +1602,6 @@ impl<'m> TaintProblem<'m> {
         let class = match found {
             Some((name, exclusive)) => SiteClass::Summary { name, exclusive },
             None => {
-                let has_body = callees.iter().any(|f| {
-                    self.module
-                        .func(*f)
-                        .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
-                });
                 if has_body {
                     SiteClass::BodyStep
                 } else if let Some(name) =
@@ -1451,16 +1670,17 @@ impl<'m> TaintProblem<'m> {
         hit
     }
 
-    /// Whether `return_site` is the entry instruction of a catch handler
-    /// of the calling function (then the callee's RETURN value does not
-    /// flow there — only thrown values do). Returns the handler's
-    /// exception binding when it is one (`O(1)` pre-indexed lookup).
-    fn handler_exception_at(&self, return_site: InstId) -> Option<ValueId> {
+    /// Returns `Some(exc)` iff `return_site` is the first instruction of a catch
+    /// handler block covering `call`'s block (`R4-H4` — normal continuations of
+    /// calls inside a `catch` block are never mistaken for handler entries).
+    fn exceptional_handler_for_call(&self, call: InstId, return_site: InstId) -> Option<ValueId> {
+        let call_inst = self.module.inst(call)?;
         let rs_inst = self.module.inst(return_site)?;
-        self.handler_block_exc
-            .get(rs_inst.block.index())
-            .copied()
-            .flatten()
+        let rs_block = self.module.block(rs_inst.block)?;
+        if rs_block.insts.first().copied() != Some(return_site) {
+            return None;
+        }
+        self.handler_exception_for(call_inst.block, rs_inst.block)
     }
 
     /// The catch binding of the handler whose entry block is
@@ -1476,18 +1696,10 @@ impl<'m> TaintProblem<'m> {
     }
 
     /// Whether `TaintBase::Local(v)` must survive pass-through onto `target_inst`.
-    ///
-    /// - If `v` has at least one direct or implicit SSA use at or after `target_inst`
-    ///   in `target_inst`'s function, it stays live (`true`).
-    /// - Entry `ValueDef::Param` and `ValueDef::Const` values (`O(1)` per function)
-    ///   stay live so parameter-seeded functions continue classifying reachable calls.
-    /// - Dead instruction-defined temporaries (`ValueDef::Inst`) and handler
-    ///   `ExceptionParam`s can only ever match downstream via `load_rule`'s
-    ///   `local_alias_evidence(v, object, at)` (`object != v`). Unless `v`'s
-    ///   allocation sites positively intersect `site_info_at(object).sites` at
-    ///   some `LoadProp*` instruction reachable at or after `target_inst`, `v`
-    ///   is soundly pruned (`false`).
     fn should_retain_local_at(&self, v: ValueId, target_inst: InstId) -> bool {
+        if v == UNCAUGHT_EXCEPTION_VALUE {
+            return false;
+        }
         if self
             .liveness
             .is_live_at(self.module, &self.await_resume, target_inst, v)
@@ -1589,56 +1801,85 @@ impl<'m> TaintProblem<'m> {
         out.push(source.clone());
     }
 
-    /// Whether a load through `object` may pick up a heap fact keyed by
-    /// `sites` (positive intersection, or either side unknown — the
-    /// conservative may-alias answer for unknown bases; the refined
-    /// rungs sharpen `object`'s sites through their engines).
-    ///
-    /// Rung 2 addition (probe e13 mechanism): when `object`'s sites
-    /// are unknown BUT it is the result of a summary call whose result
-    /// no static flow reaches (a FRESH container — [`TaintProblem`]'s
-    /// `fresh_result_site`), the load base keys by the call site: a
-    /// VM-allocated `map` result no longer may-aliases the source
-    /// array's heap fact through the wildcard.
-    fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId, at: InstId) -> bool {
-        if self.module.functions.len() > 512 {
-            if sites.is_empty() {
-                return false;
-            }
-            let known = self.oracle.borrow().known_sites_at(object, at);
-            if !known.is_empty() {
-                return sites.intersects(&known);
-            }
-            return match self.fresh_result_site(object) {
-                Some(site) => sites.iter().any(|s| s == site),
-                None => false,
-            };
+    /// Map incoming facts arriving at the first instruction of a block across
+    /// **all** leading `Op::Phi` instructions in that block simultaneously
+    /// (`R4-C1`), keyed by `from_block`.
+    fn apply_block_entry_phis(
+        &self,
+        from_block: BlockId,
+        target_inst: InstId,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(target) = self.module.inst(target_inst) else {
+            return;
+        };
+        let Some(bb) = self.module.block(target.block) else {
+            return;
+        };
+        if bb.insts.first().copied() != Some(target_inst) {
+            return;
         }
+        let initial_len = out.len();
+        if initial_len == 0 {
+            return;
+        }
+        for &iid in &bb.insts {
+            let Some(phi_inst) = self.module.inst(iid) else {
+                break;
+            };
+            let Op::Phi { entries } = &phi_inst.op else {
+                break;
+            };
+            let Some(phi_res) = phi_inst.result else {
+                continue;
+            };
+            for idx in 0..initial_len {
+                let rebased = match &out[idx] {
+                    Fact::Taint(tf) => match tf.local_base() {
+                        Some(v)
+                            if entries
+                                .iter()
+                                .any(|(edge, val)| *val == v && edge.from == from_block) =>
+                        {
+                            Some(Fact::of(tf.rebased(TaintBase::Local(phi_res))))
+                        }
+                        _ => None,
+                    },
+                    Fact::Zero => None,
+                };
+                if let Some(fact) = rebased {
+                    out.push(fact);
+                }
+            }
+        }
+    }
+
+    /// Whether a load through `object` may pick up a heap fact keyed by
+    /// `sites` (positive intersection, or unknown-provenance wildcard
+    /// modulo [`Self::fresh_result_site`]).
+    fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId, at: InstId) -> bool {
         if sites.is_empty() {
             return true;
         }
         let obj = self.oracle.borrow().site_info_at(object, at);
-        if !obj.sites.is_empty() {
-            return sites.intersects(&obj.sites);
+        if sites.intersects(&obj.sites) {
+            return true;
         }
-        match self.fresh_result_site(object) {
-            Some(site) => sites.iter().any(|s| s == site),
-            None => true, // the unknown-base wildcard
+        if obj.has_unknown {
+            match self.fresh_result_site(object) {
+                Some(site) => sites.iter().any(|s| s == site),
+                None => true,
+            }
+        } else {
+            false
         }
     }
 
-    /// Fresh summary-result keying (probe e13): the call instruction of
-    /// a summary application whose
-    /// result NO static flow reaches (`Param/Base/Field → Return*`
-    /// would mean the result derives from — may alias — an input, and
-    /// gap return channels key their facts precisely on the local
-    /// result, so they do not count as aliasing either). Rung-2-gated:
-    /// the wildcard discipline of rungs 0/1 is unchanged. Memoized;
-    /// classification is peeked (counter-free).
+    /// Fresh container keying: instructions that unconditionally allocate a
+    /// fresh container (`CreateObjectWithExcludedKeys`, `CopyRestArgs`,
+    /// `GetUnmappedArgs`) across all rungs (`0`/`1`/`2`), plus summary call
+    /// results with no static `Return*` inflow at rung 2 (probe e13).
     fn fresh_result_site(&self, value: ValueId) -> Option<InstId> {
-        if self.config.alias_rung < 2 {
-            return None;
-        }
         if let Some(hit) = self.fresh_memo.borrow().get(&value) {
             return *hit;
         }
@@ -1654,6 +1895,15 @@ impl<'m> TaintProblem<'m> {
         };
         let inst = self.module.inst(iid)?;
         if inst.result != Some(value) {
+            return None;
+        }
+        if matches!(
+            inst.op,
+            Op::CreateObjectWithExcludedKeys { .. } | Op::CopyRestArgs { .. } | Op::GetUnmappedArgs
+        ) {
+            return Some(iid);
+        }
+        if self.config.alias_rung < 2 {
             return None;
         }
         let Op::Call { args, .. } = &inst.op else {
@@ -1685,14 +1935,40 @@ impl<'m> TaintProblem<'m> {
         !a.sites.is_empty() && a.sites.intersects(&b.sites)
     }
 
+    /// Whether call operand `v` at instruction `at` carries `fact` (either
+    /// directly as `TaintBase::Local(v)` or via a tainted heap allocation site
+    /// reachable from `v`).
+    pub(crate) fn operand_matches_fact(&self, v: ValueId, fact: &TaintFact, at: InstId) -> bool {
+        match &fact.base {
+            TaintBase::Local(lv) => *lv == v,
+            TaintBase::Heap(sites) => {
+                if sites.is_empty() {
+                    return false;
+                }
+                let (known, may, info) = {
+                    let oracle = self.oracle.borrow();
+                    (
+                        oracle.known_sites_at(v, at),
+                        oracle.may_sites_at(v, at),
+                        oracle.site_info_at(v, at).sites,
+                    )
+                };
+                sites.intersects(&known)
+                    || sites.intersects(&may)
+                    || sites.intersects(&info)
+                    || self
+                        .fresh_result_site(v)
+                        .is_some_and(|fs| sites.iter().any(|s| s == fs))
+            }
+            _ => false,
+        }
+    }
+
     /// Access-path leading-field cut: what
     /// remains of `fields` after reading `key`. An empty chain means the
     /// base itself was tainted — any property read is tainted one step.
     fn cut_first(&self, fields: &FieldChain, key: FieldKey) -> Option<FieldChain> {
         if fields.is_empty() {
-            if self.module.functions.len() > 512 {
-                return Some(FieldChain::new());
-            }
             return Some(FieldChain::new().pushed(key, self.cap()));
         }
         let first = fields.elements()[0];
@@ -1746,15 +2022,8 @@ impl<'m> TaintProblem<'m> {
 
     /// Access-path store rule: `object.key = value` at instruction `at`.
     /// Returns whether the incoming fact survives (strong kills return
-    /// false for the killed fact).
-    ///
-    /// Rung 1 changes BOTH decisions through the engine's memoized query
-    /// ([`Oracle::site_info_at`] / [`Oracle::aliases_of_store`]): the
-    /// strong-kill proof may come from an interprocedural def chain (the
-    /// a5 case — a sanitizing store through a call-result alias), and the
-    /// stored taint's heap key may be refined from an unknown base to
-    /// precise sites (the a4 case). Any imprecise answer falls back to
-    /// the rung-0 local walk — never silently wrong.
+    /// false for the killed fact, restricted to matching `FieldKey::Named`
+    /// properties per `R4-H1`).
     fn store_rule(
         &self,
         fact: &TaintFact,
@@ -1765,7 +2034,6 @@ impl<'m> TaintProblem<'m> {
         out: &mut Vec<Fact>,
     ) -> bool {
         let mut survive = true;
-        // Strong kill: the old value at exactly this location is dead.
         let obj_info = self.oracle.borrow().site_info_at(object, at);
         if update_kind(&obj_info) == UpdateKind::Strong {
             let site = obj_info.sites;
@@ -1776,29 +2044,17 @@ impl<'m> TaintProblem<'m> {
             };
             if at_location && !fact.fields.is_empty() {
                 let first = fact.fields.elements()[0];
-                let same_key = match (first, key) {
-                    (FieldKey::Named(a), FieldKey::Named(b)) => a == b,
-                    _ => true,
-                };
-                if same_key {
+                if matches!((first, key), (FieldKey::Named(a), FieldKey::Named(b)) if a == b) {
                     survive = false;
                 }
             }
         }
-        // The stored value's taint is re-keyed into the heap: store-base
-        // alias resolution (`Oracle::aliases_of_store`) — rung 1/2 injects
-        // the REFINED key and the baseline is skipped; otherwise the
-        // rung-0 keying stands (empty-site unknown-base wildcard
-        // included — sound by construction).
         if fact.base == TaintBase::Local(value) {
             let mut chain = FieldChain::new().pushed(key, self.cap());
             for &k in fact.fields.elements() {
                 chain = chain.pushed(k, self.cap());
             }
             if let Some(this_param) = self.new_ctor_this_param(object, at) {
-                // Keep constructor `this.field = v` local to `this_param`
-                // until `return_flow` binds it to the specific `CallKind::New`
-                // call site via IFDS's context-sensitive summary replay.
                 out.push(Fact::of(TaintFact {
                     base: TaintBase::Local(this_param),
                     fields: chain,
@@ -1812,18 +2068,14 @@ impl<'m> TaintProblem<'m> {
                     out.extend(injected.into_iter().map(Fact::of));
                 } else {
                     let sites = self.oracle.borrow().resolve(object).sites;
-                    let base = if sites.is_empty() && self.module.functions.len() > 512 {
-                        let known = self.oracle.borrow().known_sites_at(object, at);
-                        if known.is_empty() {
-                            TaintBase::Local(object)
-                        } else {
-                            TaintBase::Heap(known)
-                        }
-                    } else {
-                        TaintBase::Heap(sites)
-                    };
+                    if sites.is_empty() {
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(object),
+                            fields: chain.clone(),
+                        }));
+                    }
                     out.push(Fact::of(TaintFact {
-                        base,
+                        base: TaintBase::Heap(sites),
                         fields: chain,
                     }));
                 }
@@ -1861,13 +2113,58 @@ impl<'m> TaintProblem<'m> {
         ctor_this_of_module(self.module, fid)
     }
 
+    fn emit_excess_variadic_arg(
+        &self,
+        callee: FuncId,
+        arg_idx: usize,
+        fields: &FieldChain,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(entries) = self.variadic_ops.get(callee.index()) else {
+            return;
+        };
+        for &(var_iid, min_start) in entries {
+            if min_start.is_none_or(|s| arg_idx >= s as usize) {
+                let mut chain = FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+                for &k in fields.elements() {
+                    chain = chain.pushed(k, self.cap());
+                }
+                out.push(Fact::of(TaintFact {
+                    base: TaintBase::Heap(AllocSiteSet::one(var_iid)),
+                    fields: chain,
+                }));
+            }
+        }
+    }
+
+    fn emit_spread_variadic_arg(
+        &self,
+        callee: FuncId,
+        elem_fields: &FieldChain,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(entries) = self.variadic_ops.get(callee.index()) else {
+            return;
+        };
+        for &(var_iid, _) in entries {
+            let mut chain = FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+            for &k in elem_fields.elements() {
+                chain = chain.pushed(k, self.cap());
+            }
+            out.push(Fact::of(TaintFact {
+                base: TaintBase::Heap(AllocSiteSet::one(var_iid)),
+                fields: chain,
+            }));
+        }
+    }
+
     /// The generic operand→result rule (Mov/binop/unop/compare/
     /// coercion/iterator families — everything with a result that is not
     /// in an explicitly handled family).
     fn generic_propagate(&self, inst: &abcd_ir::Inst, fact: &TaintFact, out: &mut Vec<Fact>) {
         let Some(result) = inst.result else { return };
         let Some(v) = fact.local_base() else { return };
-        if !op_uses_value(&inst.op, v) {
+        if !inst.op.has_operand(v) {
             return;
         }
         match &inst.op {
@@ -1899,15 +2196,33 @@ impl<'m> TaintProblem<'m> {
         base: Option<ValueId>,
     ) -> Option<FieldChain> {
         let local = fact.local_base()?;
-        let (value, path) = match endpoint {
-            Endpoint::Param(i) => (*args.get(*i as usize)?, None),
-            Endpoint::Base => (base?, None),
+        let path = match endpoint {
+            Endpoint::Param(i) => {
+                if *args.get(*i as usize)? != local {
+                    return None;
+                }
+                None
+            }
+            Endpoint::AnyParamFrom(start) => {
+                if !args.get(*start as usize..)?.contains(&local) {
+                    return None;
+                }
+                None
+            }
+            Endpoint::Base => {
+                if base? != local {
+                    return None;
+                }
+                None
+            }
             Endpoint::Return | Endpoint::ReturnField(_) => return None,
-            Endpoint::Field(path) => (base?, Some(path)),
+            Endpoint::Field(path) => {
+                if base? != local {
+                    return None;
+                }
+                Some(path)
+            }
         };
-        if local != value {
-            return None;
-        }
         match path {
             None => Some(fact.fields.clone()),
             Some(path) => {
@@ -1971,20 +2286,60 @@ impl<'m> TaintProblem<'m> {
         if sites.is_empty() {
             return None;
         }
-        let (value, path) = match endpoint {
-            Endpoint::Param(i) => (*args.get(*i as usize)?, None),
-            Endpoint::Base => (base?, None),
-            Endpoint::Field(path) => (base?, Some(path)),
+        let path = match endpoint {
+            Endpoint::Param(i) => {
+                let value = *args.get(*i as usize)?;
+                let pts = if may {
+                    self.oracle.borrow().may_sites_at(value, at)
+                } else {
+                    self.oracle.borrow().site_info_at(value, at).sites
+                };
+                if pts.is_empty() || !pts.intersects(sites) {
+                    return None;
+                }
+                None
+            }
+            Endpoint::AnyParamFrom(start) => {
+                let slice = args.get(*start as usize..)?;
+                let matched = slice.iter().any(|&value| {
+                    let pts = if may {
+                        self.oracle.borrow().may_sites_at(value, at)
+                    } else {
+                        self.oracle.borrow().site_info_at(value, at).sites
+                    };
+                    !pts.is_empty() && pts.intersects(sites)
+                });
+                if !matched {
+                    return None;
+                }
+                None
+            }
+            Endpoint::Base => {
+                let value = base?;
+                let pts = if may {
+                    self.oracle.borrow().may_sites_at(value, at)
+                } else {
+                    self.oracle.borrow().site_info_at(value, at).sites
+                };
+                if pts.is_empty() || !pts.intersects(sites) {
+                    return None;
+                }
+                None
+            }
+            Endpoint::Field(path) => {
+                let value = base?;
+                let pts = if may {
+                    self.oracle.borrow().may_sites_at(value, at)
+                } else {
+                    self.oracle.borrow().site_info_at(value, at).sites
+                };
+                if pts.is_empty() || !pts.intersects(sites) {
+                    return None;
+                }
+                Some(path)
+            }
             Endpoint::Return | Endpoint::ReturnField(_) => return None,
         };
-        let pts = if may {
-            self.oracle.borrow().may_sites_at(value, at)
-        } else {
-            self.oracle.borrow().site_info_at(value, at).sites
-        };
-        if pts.is_empty() || !pts.intersects(sites) {
-            return None;
-        }
         let leftover = match path {
             None => fact.fields.clone(),
             Some(p) => {
@@ -2011,9 +2366,10 @@ impl<'m> TaintProblem<'m> {
     }
 
     /// Substitute a sink endpoint at the call site.
-    // Each parameter is a distinct facet of the call-site context;
-    // grouping them would obscure the flow logic.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct call-site substitution facet"
+    )]
     fn substitute(
         &self,
         endpoint: &Endpoint,
@@ -2052,6 +2408,16 @@ impl<'m> TaintProblem<'m> {
                         base: value_key(v),
                         fields: leftover.clone(),
                     }));
+                }
+            }
+            Endpoint::AnyParamFrom(start) => {
+                if let Some(slice) = args.get(*start as usize..) {
+                    for &v in slice {
+                        out.push(Fact::of(TaintFact {
+                            base: value_key(v),
+                            fields: leftover.clone(),
+                        }));
+                    }
                 }
             }
             Endpoint::Base => {
@@ -2109,7 +2475,10 @@ impl<'m> TaintProblem<'m> {
     /// the heap key was about the receiver's storage, not the
     /// extracted element. `OverApproxAll` binding taints every formal
     /// (never silently drop a flow).
-    #[allow(clippy::too_many_arguments)] // gap-edge context facets; see substitute()
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each parameter is a distinct gap-edge context facet"
+    )]
     fn gap_enter(
         &self,
         call: InstId,
@@ -2195,13 +2564,21 @@ impl IfdsProblem for TaintProblem<'_> {
         // zero fact (`Λ`), anchoring every generated source fact at `(func, Zero)`
         // rather than cross-multiplying unrelated incoming procedure-entry facts.
         let Fact::Taint(fact) = source else {
-            if let Op::TryGetGlobal { name, .. } = &curr_inst.op
-                && self.global_sources.contains(name)
+            let global_hit_name = match &curr_inst.op {
+                Op::TryGetGlobal { name, .. } if self.global_sources.contains(name) => Some(*name),
+                Op::LoadProp { object, name }
+                    if self.global_sources.contains(name) && is_global_object(module, *object) =>
+                {
+                    Some(*name)
+                }
+                _ => None,
+            };
+            if let Some(name) = global_hit_name
                 && let Some(result) = curr_inst.result
             {
                 out.push(Fact::of(TaintFact::local(result)));
                 if self.config.ohos_lifecycle
-                    && module.sym.resolve(*name)
+                    && module.sym.resolve(name)
                         == Some(abcd_analysis::ohos_lifecycle::OHOS_WANT_GLOBAL)
                 {
                     let d1 = TaintFact::local(result).pushed(FieldKey::AnyDynamic, self.cap());
@@ -2227,51 +2604,31 @@ impl IfdsProblem for TaintProblem<'_> {
                     }
                 }
             }
+            self.apply_block_entry_phis(curr_inst.block, succ, out);
             return;
         };
 
-        // ── Phi-entry edges: an incoming value listed for THIS edge
-        // additionally maps to the phi result (phi merges union sites via
-        // the heap oracle; the SSA value mapping is exact per edge).
-        // Non-matching locals PASS THROUGH — a phi edge is a block
-        // boundary, not a kill: the value's taint is path-insensitively
-        // true wherever the value is in scope.
-        if let Op::Phi { entries } = &succ_inst.op {
-            if let Some(v) = fact.local_base() {
-                for (edge, val) in entries {
-                    if *val == v
-                        && edge.from == curr_inst.block
-                        && let Some(result) = succ_inst.result
-                    {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+        match &curr_inst.op {
+            Op::Phi { .. } => {
+                self.push_passthrough_at(source, succ, out);
+            }
+            // ── Exception dispatch: `throw v` taints the catch binding (T5).
+            Op::Throw { value } => {
+                self.push_passthrough_at(source, succ, out);
+                if self.operand_matches_fact(*value, fact, curr)
+                    && let Some(exc) = self.handler_exception_for(curr_inst.block, succ_inst.block)
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
                 }
             }
-            self.push_passthrough_at(source, succ, out);
-            return;
-        }
-
-        // ── Exception dispatch: `throw v` taints the catch binding (T5).
-        if let Op::Throw { value } = &curr_inst.op {
-            self.push_passthrough_at(source, succ, out);
-            if fact.base == TaintBase::Local(*value)
-                && let Some(exc) = self.handler_exception_for(curr_inst.block, succ_inst.block)
-            {
-                out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
-            }
-            return;
-        }
-
-        match &curr_inst.op {
             // ── Global bindings ──────────────────────────────────────
             Op::TryGetGlobal { name, .. } => {
-                // Pick up a previously stored global taint.
                 if fact.base == TaintBase::Global(*name)
                     && let Some(result) = curr_inst.result
                 {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
-                self.generic_propagate(curr_inst, fact, out); // the `default` operand
+                self.generic_propagate(curr_inst, fact, out);
                 self.push_passthrough_at(source, succ, out);
             }
             Op::StoreGlobal { name, value }
@@ -2321,21 +2678,11 @@ impl IfdsProblem for TaintProblem<'_> {
                 {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
-                // The rung-2 environment-identity channel (b2): a
-                // PRECISE writer keys the slot by its NewLexEnv site's
-                // abstract object (`Heap(env).[AnyIndex]`), so two
-                // functions' colliding (level, slot) captures no longer
-                // merge. A precise reader matches by env-site
-                // intersection; an imprecise reader (env unknown) falls
-                // back to matching ANY env-keyed fact — the
-                // may-direction rule that keeps the channel sound when
-                // the env analysis gives up (the rung-1 unbalanced
-                // discipline's analogue).
                 if let Some(env) = self.oracle.borrow().lex_env_at(curr, *level)
                     && let TaintBase::Heap(sites) = &fact.base
                 {
                     let precise = !env.has_unknown && !env.sites.is_empty();
-                    let hits = if precise || self.module.functions.len() > 512 {
+                    let hits = if precise {
                         env.sites.intersects(sites)
                     } else {
                         let oracle = self.oracle.borrow();
@@ -2356,13 +2703,6 @@ impl IfdsProblem for TaintProblem<'_> {
                 level, slot, value, ..
             } => {
                 if fact.base == TaintBase::Local(*value) {
-                    // Rung 2 keys the slot by the environment's
-                    // abstract object when the env analysis is precise
-                    // (b2 — see the GetLexVar arm); the legacy
-                    // function-agnostic `(level, slot)` keying stands
-                    // otherwise and on rungs 0/1. Slots within one
-                    // environment merge under `AnyIndex` (the b2
-                    // collision is ACROSS environments — documented).
                     let keyed_env = self
                         .oracle
                         .borrow()
@@ -2389,17 +2729,6 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             // ── Iterator protocol objects ───────────────────────────
             Op::GetIterator { obj } => {
-                // `it = getiterator(obj)`: the iterator yields obj's
-                // elements, so obj's taint state transfers to it.
-                // LOCAL facts ride the generic rule below with their
-                // chain intact (empty = whole-source taint;
-                // `[AnyIndex]` = the "elements of" tag the
-                // `Iterator.prototype.next` summary consumes). HEAP
-                // facts re-key onto the result by positive site
-                // intersection (heap reads are otherwise opaque —
-                // this is the one builtin op whose element channel is
-                // static): `Heap(site(a)).[AnyIndex]` ⇒
-                // `Local(it).[AnyIndex]`.
                 if let Some(result) = curr_inst.result
                     && let TaintBase::Heap(sites) = &fact.base
                     && self.heap_may_reach(sites, *obj, curr)
@@ -2409,18 +2738,23 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.generic_propagate(curr_inst, fact, out);
                 self.push_passthrough_at(source, succ, out);
             }
-            // ── Loads (access-path cut + namespace export lookup) ────
+            // ── Loads (access-path cut + namespace/globalThis lookup) ─
             Op::LoadProp { object, name } => {
                 self.load_rule(fact, *object, FieldKey::Named(*name), curr, out);
-                if let Some(result) = curr_inst.result
-                    && let Some(cid) = self.links.inst_class(module, curr)
-                    && let Some(req_idx) = peel_ns_index(module, *object)
-                    && let Some(slots) = self.links.resolve_namespace_member(cid, req_idx, *name)
-                    && slots
-                        .iter()
-                        .any(|sr| fact.base == TaintBase::ModuleVar(sr.class_id, sr.slot))
-                {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                if let Some(result) = curr_inst.result {
+                    if is_global_object(module, *object) && fact.base == TaintBase::Global(*name) {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
+                    if let Some(cid) = self.links.inst_class(module, curr)
+                        && let Some(req_idx) = peel_ns_index(module, *object)
+                        && let Some(slots) =
+                            self.links.resolve_namespace_member(cid, req_idx, *name)
+                        && slots
+                            .iter()
+                            .any(|sr| fact.base == TaintBase::ModuleVar(sr.class_id, sr.slot))
+                    {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
                 }
                 self.push_passthrough_at(source, succ, out);
             }
@@ -2430,6 +2764,14 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             Op::LoadPropDyn { object, .. } => {
                 self.load_rule(fact, *object, FieldKey::AnyDynamic, curr, out);
+                self.push_passthrough_at(source, succ, out);
+            }
+            Op::LoadSuper { key, this_value } => {
+                let fk = match key {
+                    SuperKey::Name(s) => FieldKey::Named(*s),
+                    SuperKey::Dynamic(_) => FieldKey::AnyDynamic,
+                };
+                self.load_rule(fact, *this_value, fk, curr, out);
                 self.push_passthrough_at(source, succ, out);
             }
             // ── Stores (heap re-keying + strong/weak kills) ──────────
@@ -2444,6 +2786,9 @@ impl IfdsProblem for TaintProblem<'_> {
                 value,
                 ..
             } => {
+                if is_global_object(module, *object) && fact.base == TaintBase::Local(*value) {
+                    out.push(Fact::of(fact.rebased(TaintBase::Global(*name))));
+                }
                 if self.store_rule(fact, *object, FieldKey::Named(*name), *value, curr, out) {
                     self.push_passthrough_at(source, succ, out);
                 }
@@ -2458,16 +2803,138 @@ impl IfdsProblem for TaintProblem<'_> {
                     self.push_passthrough_at(source, succ, out);
                 }
             }
-            // ── Object-family ops with bespoke taint semantics ───────
+            Op::StoreSuper {
+                key,
+                this_value,
+                value,
+            } => {
+                let fk = match key {
+                    SuperKey::Name(s) => FieldKey::Named(*s),
+                    SuperKey::Dynamic(_) => FieldKey::AnyDynamic,
+                };
+                if self.store_rule(fact, *this_value, fk, *value, curr, out) {
+                    self.push_passthrough_at(source, succ, out);
+                }
+            }
+            // ── Object / array / variadic-args bespoke ops ───────────
+            Op::ArraySpread { dst, src, .. } => {
+                // `starrayspread` writes the updated integer index to `result`
+                // and mutates `*dst`'s elements (`R4-H5`).
+                let matches_src = match &fact.base {
+                    TaintBase::Local(v) => self.local_alias_evidence(*v, *src, curr),
+                    TaintBase::Heap(sites) => self.heap_may_reach(sites, *src, curr),
+                    _ => false,
+                };
+                if matches_src {
+                    let elem_tail = if fact.fields.is_empty() {
+                        Some(&[][..])
+                    } else if matches!(
+                        fact.fields.elements()[0],
+                        FieldKey::AnyIndex | FieldKey::AnyDynamic
+                    ) {
+                        Some(&fact.fields.elements()[1..])
+                    } else {
+                        None
+                    };
+                    if let Some(tail) = elem_tail {
+                        let mut dst_chain =
+                            FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+                        for &k in tail {
+                            dst_chain = dst_chain.pushed(k, self.cap());
+                        }
+                        let dst_sites = self.oracle.borrow().site_info_at(*dst, curr).sites;
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(*dst),
+                            fields: dst_chain.clone(),
+                        }));
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Heap(dst_sites),
+                            fields: dst_chain,
+                        }));
+                    }
+                }
+                self.push_passthrough_at(source, succ, out);
+            }
             Op::CopyDataProps { dst, src } => {
-                // Object spread: src's taint (object + fields) copies to dst.
-                if fact.base == TaintBase::Local(*src) {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(*dst))));
+                let matches_src = match &fact.base {
+                    TaintBase::Local(v) => self.local_alias_evidence(*v, *src, curr),
+                    TaintBase::Heap(sites) => self.heap_may_reach(sites, *src, curr),
+                    _ => false,
+                };
+                if matches_src {
+                    let dst_sites = self.oracle.borrow().site_info_at(*dst, curr).sites;
+                    if dst_sites.is_empty() || fact.base == TaintBase::Local(*src) {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(*dst))));
+                    }
+                    out.push(Fact::of(fact.rebased(TaintBase::Heap(dst_sites))));
+                }
+                self.push_passthrough_at(source, succ, out);
+            }
+            Op::CreateObjectWithExcludedKeys { obj, keys } => {
+                if let Some(result) = curr_inst.result {
+                    let matches_obj = match &fact.base {
+                        TaintBase::Local(v) => self.local_alias_evidence(*v, *obj, curr),
+                        TaintBase::Heap(sites) => self.heap_may_reach(sites, *obj, curr),
+                        _ => false,
+                    };
+                    if matches_obj {
+                        let excluded = match fact.fields.elements().first() {
+                            Some(&FieldKey::Named(prop)) => keys
+                                .iter()
+                                .any(|&kv| const_string_sym(module, kv) == Some(prop)),
+                            _ => false,
+                        };
+                        if !excluded {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                            out.push(Fact::of(
+                                fact.rebased(TaintBase::Heap(AllocSiteSet::one(curr))),
+                            ));
+                        }
+                    }
+                }
+                self.push_passthrough_at(source, succ, out);
+            }
+            Op::GetUnmappedArgs | Op::CopyRestArgs { .. } => {
+                let start_idx = match &curr_inst.op {
+                    Op::CopyRestArgs { start_index } => *start_index as usize,
+                    _ => 0,
+                };
+                if let Some(result) = curr_inst.result {
+                    if let TaintBase::Heap(sites) = &fact.base
+                        && sites.iter().any(|s| s == curr)
+                    {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    } else if let Some(v) = fact.local_base()
+                        && let Some(fid) = self.links.inst_func(module, curr)
+                        && let Some(fd) = module.func(fid)
+                    {
+                        let matched_param = match param_binding(module, fid) {
+                            ParamBinding::Precise { formal_base, .. } => fd
+                                .params
+                                .get(formal_base + start_idx..)
+                                .is_some_and(|slice| slice.contains(&v)),
+                            ParamBinding::OverApproxAll => fd.params.contains(&v),
+                        };
+                        if matched_param {
+                            let mut chain =
+                                FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+                            for &k in fact.fields.elements() {
+                                chain = chain.pushed(k, self.cap());
+                            }
+                            out.push(Fact::of(TaintFact {
+                                base: TaintBase::Local(result),
+                                fields: chain.clone(),
+                            }));
+                            out.push(Fact::of(TaintFact {
+                                base: TaintBase::Heap(AllocSiteSet::one(curr)),
+                                fields: chain,
+                            }));
+                        }
+                    }
                 }
                 self.push_passthrough_at(source, succ, out);
             }
             Op::SetObjectWithProto { proto, obj } => {
-                // obj's prototype chain now reads through proto.
                 if fact.base == TaintBase::Local(*proto) {
                     out.push(Fact::of(
                         TaintFact::local(*obj).pushed(FieldKey::AnyDynamic, self.cap()),
@@ -2476,8 +2943,6 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.push_passthrough_at(source, succ, out);
             }
             Op::StorePrivate { obj, value, .. } | Op::DefinePrivate { obj, value, .. } => {
-                // No FieldKey for private names at rung 0: record "some
-                // property of obj is tainted".
                 if fact.base == TaintBase::Local(*value) {
                     let sites = self.oracle.borrow().resolve(*obj).sites;
                     if sites.is_empty() {
@@ -2499,14 +2964,9 @@ impl IfdsProblem for TaintProblem<'_> {
             Op::DefineMethod { object, func, .. } => {
                 if fact.base == TaintBase::Local(*func) {
                     let sites = self.oracle.borrow().resolve(*object).sites;
-                    let base = if sites.is_empty() && self.module.functions.len() > 512 {
-                        TaintBase::Local(*object)
-                    } else {
-                        TaintBase::Heap(sites)
-                    };
                     out.push(Fact::of(
                         TaintFact {
-                            base,
+                            base: TaintBase::Heap(sites),
                             fields: FieldChain::new(),
                         }
                         .pushed(FieldKey::AnyDynamic, self.cap()),
@@ -2515,22 +2975,18 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.push_passthrough_at(source, succ, out);
             }
             Op::DefineFunc { .. } => {
-                // Captured taint marks the closure value with an EMPTY
-                // chain ("this function closes over tainted data").
-                // Lexical captures propagate into the body via
-                // `GetLexVar`/`PutLexVar` (and `NewLexEnv` sites at rung 2;
-                // `design/analysis.md`), not via the function-object value.
                 let is_capture = fact
                     .local_base()
-                    .is_some_and(|v| op_uses_value(&curr_inst.op, v));
+                    .is_some_and(|v| curr_inst.op.has_operand(v));
                 if is_capture && let Some(result) = curr_inst.result {
                     out.push(Fact::of(TaintFact::local(result)));
                 }
                 self.push_passthrough_at(source, succ, out);
             }
             Op::ResumeGenerator { .. } => {
-                if let Some(&awaited_val) = self.await_resume.get(&curr)
-                    && fact.base == TaintBase::Local(awaited_val)
+                if let Some(awaited_vals) = self.await_resume.get(&curr)
+                    && let Some(v) = fact.local_base()
+                    && awaited_vals.contains(&v)
                     && let Some(result) = curr_inst.result
                 {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
@@ -2544,6 +3000,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.push_passthrough_at(source, succ, out);
             }
         }
+        self.apply_block_entry_phis(curr_inst.block, succ, out);
     }
 
     fn call_flow(
@@ -2587,10 +3044,6 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         }
         let gap = self.gap_at(call, callee);
-        // Exclusive summaries kill the call edge into the callee body —
-        // never merged (`design/analysis.md`). The GAP edge into the user
-        // callback is NOT killed (gap.rs §"Interaction with exclusive":
-        // exclusive-with-callback still runs the callback).
         if gap.is_none()
             && matches!(
                 self.classify(call),
@@ -2620,16 +3073,6 @@ impl IfdsProblem for TaintProblem<'_> {
         };
 
         // ── Callback-gap edge ────────────────────────────────────────
-        // The summary call site virtually invokes the callback with
-        // (element, index, array) — the summary call's operands are NOT
-        // the callback's arguments, so the normal arg→param binding does
-        // not run here; only the gap's `enter` rules bind. Function-
-        // global state crosses unchanged (same as a normal edge). The
-        // oracle's calling-context injection is deliberately skipped:
-        // the rung-1 engine reads the BASE call graph, which has no gap
-        // edges — a query inside the callback that tries to hop through
-        // the gap call finds no recorded caller and falls back to the
-        // rung-0 floor (sound; documented in gap.rs).
         if let Some(gap) = &gap {
             if fact.is_state_base() && self.allow_state_into_callee(call, callee, fact) {
                 out.push(source.clone());
@@ -2639,60 +3082,69 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         }
 
-        // The oracle learns the calling context (rung 0: no-op; `design/analysis.md`).
-        abcd_analysis::dataflow::heap::AliasOracle::inject_calling_context(
-            &mut *self.oracle.borrow_mut(),
-            call,
-            callee,
-            fact,
-        );
-
         match &fact.base {
             TaintBase::Local(v) => {
-                // N66: bind through the vendored frame-slot model
-                // ([func][newTarget][this][formals…], per the callee's
-                // callType annotation or the 0xF static default) —
-                // args[i] → params[formal_base + i], NOT params[i + 1]
-                // (the pre-N66 table was written for a normalized ABI
-                // the lift never produced).
-                let allow_this_prop = if self.module.functions.len() > 512
-                    && !matches!(kind, CallKind::New | CallKind::NewSpread)
+                let allow_this_prop = if !matches!(kind, CallKind::New | CallKind::NewSpread)
                     && !args.contains(v)
                     && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
                 {
-                    self.can_callee_touch_prop(prop, callee)
+                    self.can_callee_touch_this_prop(prop, callee)
                 } else {
                     true
                 };
                 let binding = param_binding(module, callee);
                 if binding == ParamBinding::OverApproxAll {
-                    // Conservative: a tainted this/arg taints EVERY
-                    // param (never silently drop a flow).
-                    let on_operands =
-                        (allow_this_prop && this.is_some_and(|t| t == *v)) || args.contains(v);
+                    let on_operands = match kind {
+                        CallKind::SuperForwardAllArgs => {
+                            let in_caller_params = self
+                                .links
+                                .inst_func(module, call)
+                                .and_then(|cf| module.func(cf))
+                                .is_some_and(|cfd| cfd.params.contains(v));
+                            (allow_this_prop && (this.is_some_and(|t| t == *v) || args.contains(v)))
+                                || in_caller_params
+                        }
+                        _ => (allow_this_prop && this.is_some_and(|t| t == *v)) || args.contains(v),
+                    };
                     if on_operands {
                         for &p in &fd.params {
                             out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
                         }
+                        self.emit_spread_variadic_arg(callee, &fact.fields, out);
                     }
                 } else {
-                    // `this` → the this slot (T4 binding convention).
-                    if allow_this_prop
-                        && let ParamBinding::Precise {
-                            this_slot: Some(slot),
-                            ..
-                        } = binding
-                        && this.is_some_and(|t| t == *v)
-                        && let Some(&p) = fd.params.get(slot)
-                    {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
-                    }
-                    let formal_base = match binding {
-                        ParamBinding::Precise { formal_base, .. } => formal_base,
-                        // unreachable: the else branch guarantees Precise
-                        // (OverApproxAll was handled and returned above).
+                    let (this_slot, formal_base) = match binding {
+                        ParamBinding::Precise {
+                            this_slot,
+                            formal_base,
+                        } => (this_slot, formal_base),
                         ParamBinding::OverApproxAll => unreachable!(),
                     };
+                    if allow_this_prop
+                        && let Some(slot) = this_slot
+                        && let Some(&p) = fd.params.get(slot)
+                    {
+                        let matches_this = if *kind == CallKind::SuperForwardAllArgs {
+                            let caller_this = self.links.inst_func(module, call).and_then(|cf| {
+                                let cfd = module.func(cf)?;
+                                match param_binding(module, cf) {
+                                    ParamBinding::Precise {
+                                        this_slot: Some(cs),
+                                        ..
+                                    } => cfd.params.get(cs).copied(),
+                                    _ => None,
+                                }
+                            });
+                            this.is_some_and(|t| t == *v)
+                                || args.first() == Some(v)
+                                || caller_this == Some(*v)
+                        } else {
+                            this.is_some_and(|t| t == *v)
+                        };
+                        if matches_this {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                        }
+                    }
                     match kind {
                         CallKind::Direct
                         | CallKind::Dynamic
@@ -2701,36 +3153,90 @@ impl IfdsProblem for TaintProblem<'_> {
                         | CallKind::SuperArrow
                         | CallKind::ClassInit => {
                             for (i, &a) in args.iter().enumerate() {
-                                if a == *v
-                                    && let Some(&p) = fd.params.get(formal_base + i)
-                                {
-                                    out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                                if a == *v {
+                                    if let Some(&p) = fd.params.get(formal_base + i) {
+                                        out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                                    } else {
+                                        self.emit_excess_variadic_arg(callee, i, &fact.fields, out);
+                                    }
                                 }
                             }
                         }
                         CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread => {
-                            // args[0] is an ARRAY spread over the formals: a
-                            // tainted array conservatively taints every formal.
                             if args.first() == Some(v) {
-                                for &p in fd.params.iter().skip(formal_base) {
-                                    out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                                let elem_fields = if fact.fields.is_empty() {
+                                    Some(FieldChain::new())
+                                } else if matches!(
+                                    fact.fields.elements()[0],
+                                    FieldKey::AnyIndex | FieldKey::AnyDynamic
+                                ) {
+                                    let mut rest = FieldChain::new();
+                                    for &k in &fact.fields.elements()[1..] {
+                                        rest = rest.pushed(k, self.cap());
+                                    }
+                                    Some(rest)
+                                } else {
+                                    None
+                                };
+                                if let Some(ef) = elem_fields {
+                                    for &p in fd.params.iter().skip(formal_base) {
+                                        out.push(Fact::of(TaintFact {
+                                            base: TaintBase::Local(p),
+                                            fields: ef.clone(),
+                                        }));
+                                    }
+                                    self.emit_spread_variadic_arg(callee, &ef, out);
                                 }
                             }
                         }
                         CallKind::SuperForwardAllArgs => {
-                            // The forwarded arguments are the caller's own
-                            // formals — not operands of this call. Rung 0
-                            // models nothing here (documented gap).
+                            if let Some(caller_fid) = self.links.inst_func(module, call)
+                                && let Some(caller_fd) = module.func(caller_fid)
+                            {
+                                match param_binding(module, caller_fid) {
+                                    ParamBinding::Precise {
+                                        formal_base: caller_fb,
+                                        ..
+                                    } => {
+                                        for (i, &cp) in
+                                            caller_fd.params.iter().skip(caller_fb).enumerate()
+                                        {
+                                            if cp == *v {
+                                                if let Some(&p) = fd.params.get(formal_base + i) {
+                                                    out.push(Fact::of(
+                                                        fact.rebased(TaintBase::Local(p)),
+                                                    ));
+                                                } else {
+                                                    self.emit_excess_variadic_arg(
+                                                        callee,
+                                                        i,
+                                                        &fact.fields,
+                                                        out,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ParamBinding::OverApproxAll => {
+                                        if caller_fd.params.contains(v) {
+                                            for &p in fd.params.iter().skip(formal_base) {
+                                                out.push(Fact::of(
+                                                    fact.rebased(TaintBase::Local(p)),
+                                                ));
+                                            }
+                                            self.emit_spread_variadic_arg(
+                                                callee,
+                                                &fact.fields,
+                                                out,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                // The mini-gap channel: a callback value tagged
-                // `[AnyIndex, ...]` by a summary (forEach-style) seeds
-                // its first formal when user code calls it directly.
-                // N66: the first FORMAL is `params[formal_base]` (the
-                // implicit frame slots lead), not `params[1]`;
-                // OverApproxAll taints every formal (never silently
-                // drop).
+                // Mini-gap channel: `[AnyIndex, ...]` tag on direct callee calls.
                 if *v == *callee_val
                     && !fact.fields.is_empty()
                     && fact.fields.elements()[0] == FieldKey::AnyIndex
@@ -2756,12 +3262,54 @@ impl IfdsProblem for TaintProblem<'_> {
                         }
                     }
                 }
-                // A tainted callee value with an EMPTY chain (function-
-                // object taint, e.g. a closure over tainted captures) is
-                // dropped at the boundary — function-object taint is not
-                // data taint (documented rung-0 gap).
             }
-            // Heap/global/module/lexical state flows into the callee.
+            TaintBase::Heap(sites) => {
+                if matches!(
+                    kind,
+                    CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread
+                ) && let Some(&arr) = args.first()
+                    && self.heap_may_reach(sites, arr, call)
+                {
+                    let elem_fields = if fact.fields.is_empty() {
+                        Some(FieldChain::new())
+                    } else if matches!(
+                        fact.fields.elements()[0],
+                        FieldKey::AnyIndex | FieldKey::AnyDynamic
+                    ) {
+                        let mut rest = FieldChain::new();
+                        for &k in &fact.fields.elements()[1..] {
+                            rest = rest.pushed(k, self.cap());
+                        }
+                        Some(rest)
+                    } else {
+                        None
+                    };
+                    if let Some(ef) = elem_fields {
+                        match param_binding(module, callee) {
+                            ParamBinding::Precise { formal_base, .. } => {
+                                for &p in fd.params.iter().skip(formal_base) {
+                                    out.push(Fact::of(TaintFact {
+                                        base: TaintBase::Local(p),
+                                        fields: ef.clone(),
+                                    }));
+                                }
+                            }
+                            ParamBinding::OverApproxAll => {
+                                for &p in &fd.params {
+                                    out.push(Fact::of(TaintFact {
+                                        base: TaintBase::Local(p),
+                                        fields: ef.clone(),
+                                    }));
+                                }
+                            }
+                        }
+                        self.emit_spread_variadic_arg(callee, &ef, out);
+                    }
+                }
+                if self.allow_state_into_callee(call, callee, fact) {
+                    out.push(source.clone());
+                }
+            }
             _ => {
                 if self.allow_state_into_callee(call, callee, fact) {
                     out.push(source.clone());
@@ -2784,99 +3332,198 @@ impl IfdsProblem for TaintProblem<'_> {
         let Some(exit_inst) = module.inst(exit) else {
             return;
         };
+        let gap = call_site.and_then(|c| self.gap_at(c, callee));
+        if gap.is_none()
+            && call_site.is_some_and(|c| {
+                matches!(
+                    self.classify(c),
+                    SiteClass::Summary {
+                        exclusive: true,
+                        ..
+                    }
+                )
+            })
+        {
+            return;
+        }
 
-        // State bases are function-global: they cross returns unchanged
-        // (also for unbalanced returns with `None` endpoints — and
-        // across gap edges: the callback's side effects on heap/global
-        // state persist at the summary call's continuation).
         if fact.is_state_base() {
             if call_site.is_none_or(|c| {
                 !self.is_harness_call(c) || self.allow_state_across_harness(c, callee, fact, false)
             }) {
                 out.push(source.clone());
             }
+            if let Op::Throw { value } = &exit_inst.op
+                && let (Some(call), Some(rs)) = (call_site, return_site)
+                && self.operand_matches_fact(*value, fact, exit)
+                && let Some(exc) = self.exceptional_handler_for_call(call, rs)
+            {
+                out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
+            }
+            if let (Some(call), Some(rs)) = (call_site, return_site)
+                && let Some(call_inst) = module.inst(call)
+            {
+                self.apply_block_entry_phis(call_inst.block, rs, out);
+            }
             return;
         }
+
         let Some(v) = fact.local_base() else { return };
-        // Callback-gap return channel (gap.rs): at a gap edge the
-        // callback's RETURN value maps per the summary's
-        // `return_to_result` instead of the normal value→result
-        // rebasing (map: the result array's `[AnyIndex]` elements;
-        // forEach: `None` — the callback return dies with the undefined
-        // result).
-        let gap = call_site.and_then(|c| self.gap_at(c, callee));
 
         match &exit_inst.op {
             Op::Return { value } => {
-                // Context-sensitive `CallKind::New` constructor `this.field`
-                // exit wiring: re-key `Local(this_param).fields` onto THIS
-                // specific `New` call site (`Heap({call})` + `Local(result)`).
-                if !fact.fields.is_empty()
-                    && self.ctor_this_of(callee) == Some(v)
-                    && let (Some(call), Some(rs)) = (call_site, return_site)
-                    && self.handler_exception_at(rs).is_none()
-                    && matches!(
-                        module.inst(call).map(|i| &i.op),
-                        Some(Op::Call {
-                            kind: CallKind::New | CallKind::NewSpread,
-                            ..
-                        })
-                    )
+                if let (Some(call), Some(rs)) = (call_site, return_site)
+                    && self.exceptional_handler_for_call(call, rs).is_none()
+                    && let Some(call_inst) = module.inst(call)
                 {
-                    out.push(Fact::of(TaintFact {
-                        base: TaintBase::Heap(AllocSiteSet::one(call)),
-                        fields: fact.fields.clone(),
-                    }));
-                    if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
-                    return;
-                }
-                if value != &Some(v) {
-                    return; // callee-local taint that is not returned dies here
-                }
-                let (Some(call), Some(rs)) = (call_site, return_site) else {
-                    return; // unbalanced: no result value to rebase onto
-                };
-                // The return VALUE flows only to the normal continuation,
-                // never to handler entries.
-                if self.handler_exception_at(rs).is_some() {
-                    return;
-                }
-                if let Some(gap) = &gap {
-                    if let Some(chain) = &gap.return_to_result
-                        && let Some(Some(result)) = module.inst(call).map(|i| i.result)
-                    {
-                        let mut fields = FieldChain::new();
-                        for &k in chain.elements() {
-                            fields = fields.pushed(k, self.cap());
-                        }
-                        for &k in fact.fields.elements() {
-                            fields = fields.pushed(k, self.cap());
-                        }
+                    let is_new_ctor_this = !fact.fields.is_empty()
+                        && self.ctor_this_of(callee) == Some(v)
+                        && matches!(
+                            call_inst.op,
+                            Op::Call {
+                                kind: CallKind::New | CallKind::NewSpread,
+                                ..
+                            }
+                        );
+                    if is_new_ctor_this {
                         out.push(Fact::of(TaintFact {
-                            base: TaintBase::Local(result),
-                            fields,
+                            base: TaintBase::Heap(AllocSiteSet::one(call)),
+                            fields: fact.fields.clone(),
                         }));
+                        if let Some(result) = call_inst.result {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                        }
+                    } else if let Some(gap) = &gap {
+                        if value == &Some(v)
+                            && let Some(chain) = &gap.return_to_result
+                            && let Some(result) = call_inst.result
+                        {
+                            let mut fields = FieldChain::new();
+                            for &k in chain.elements() {
+                                fields = fields.pushed(k, self.cap());
+                            }
+                            for &k in fact.fields.elements() {
+                                fields = fields.pushed(k, self.cap());
+                            }
+                            out.push(Fact::of(TaintFact {
+                                base: TaintBase::Local(result),
+                                fields,
+                            }));
+                        }
+                    } else {
+                        // `R4-H3`: map surviving field-bearing `Local(param).fields`
+                        // (and non-`New` `this_slot`) back to caller `Local(arg)` / `Local(this)`.
+                        if !fact.fields.is_empty()
+                            && let Op::Call {
+                                this, args, kind, ..
+                            } = &call_inst.op
+                            && let Some(fd) = module.func(callee)
+                        {
+                            match param_binding(module, callee) {
+                                ParamBinding::Precise {
+                                    this_slot,
+                                    formal_base,
+                                } => {
+                                    if !matches!(kind, CallKind::New | CallKind::NewSpread)
+                                        && let Some(slot) = this_slot
+                                        && fd.params.get(slot) == Some(&v)
+                                    {
+                                        if let Some(caller_this) = *this {
+                                            out.push(Fact::of(
+                                                fact.rebased(TaintBase::Local(caller_this)),
+                                            ));
+                                        } else if *kind == CallKind::SuperForwardAllArgs
+                                            && let Some(&v_this) = args.first()
+                                        {
+                                            out.push(Fact::of(
+                                                fact.rebased(TaintBase::Local(v_this)),
+                                            ));
+                                        }
+                                    }
+                                    for (i, &p) in fd.params.iter().skip(formal_base).enumerate() {
+                                        if p != v {
+                                            continue;
+                                        }
+                                        match kind {
+                                            CallKind::Direct
+                                            | CallKind::Dynamic
+                                            | CallKind::New
+                                            | CallKind::Super
+                                            | CallKind::SuperArrow
+                                            | CallKind::ClassInit => {
+                                                if let Some(&caller_arg) = args.get(i) {
+                                                    out.push(Fact::of(
+                                                        fact.rebased(TaintBase::Local(caller_arg)),
+                                                    ));
+                                                }
+                                            }
+                                            CallKind::SuperForwardAllArgs => {
+                                                if let Some(cf) = self.links.inst_func(module, call)
+                                                    && let Some(cfd) = module.func(cf)
+                                                    && let ParamBinding::Precise {
+                                                        formal_base: cfb,
+                                                        ..
+                                                    } = param_binding(module, cf)
+                                                    && let Some(&cp) = cfd.params.get(cfb + i)
+                                                {
+                                                    out.push(Fact::of(
+                                                        fact.rebased(TaintBase::Local(cp)),
+                                                    ));
+                                                }
+                                            }
+                                            CallKind::Apply
+                                            | CallKind::SuperSpread
+                                            | CallKind::NewSpread => {}
+                                        }
+                                    }
+                                }
+                                ParamBinding::OverApproxAll => {
+                                    if fd.params.contains(&v) {
+                                        if !matches!(kind, CallKind::New | CallKind::NewSpread)
+                                            && let Some(caller_this) = *this
+                                        {
+                                            out.push(Fact::of(
+                                                fact.rebased(TaintBase::Local(caller_this)),
+                                            ));
+                                        }
+                                        for &a in args {
+                                            out.push(Fact::of(fact.rebased(TaintBase::Local(a))));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if value == &Some(v)
+                            && let Some(result) = call_inst.result
+                        {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                        }
                     }
-                    return;
-                }
-                if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
             }
             Op::Throw { value } => {
-                if value != &v {
-                    return;
+                if v == *value
+                    && let (Some(call), Some(rs)) = (call_site, return_site)
+                    && let Some(exc) = self.exceptional_handler_for_call(call, rs)
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
                 }
-                let Some(rs) = return_site else { return };
-                // Thrown taint lands on the catch binding of whichever
-                // handler entry this return site is (T5/T10).
-                if let Some(exc) = self.handler_exception_at(rs) {
+            }
+            Op::Call { .. } => {
+                if v == UNCAUGHT_EXCEPTION_VALUE
+                    && let (Some(call), Some(rs)) = (call_site, return_site)
+                    && let Some(exc) = self.exceptional_handler_for_call(call, rs)
+                {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
                 }
             }
             _ => {}
+        }
+
+        if let (Some(call), Some(rs)) = (call_site, return_site)
+            && let Some(call_inst) = module.inst(call)
+        {
+            self.apply_block_entry_phis(call_inst.block, rs, out);
         }
     }
 
@@ -2888,131 +3535,171 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
+        let Some(call_inst) = module.inst(call) else {
+            return;
+        };
         let Fact::Taint(fact) = source else {
             if self.call_return_sources.contains(&call)
-                && self.handler_exception_at(return_site).is_none()
-                && let Some(result) = module.inst(call).and_then(|i| i.result)
+                && self
+                    .exceptional_handler_for_call(call, return_site)
+                    .is_none()
+                && let Some(result) = call_inst.result
             {
                 out.push(Fact::of(TaintFact::local(result)));
             }
-            return;
-        };
-        let Some(call_inst) = module.inst(call) else {
+            self.apply_block_entry_phis(call_inst.block, return_site, out);
             return;
         };
         let Op::Call { args, kind, .. } = &call_inst.op else {
             return;
         };
-        let is_handler_site = self.handler_exception_at(return_site).is_some();
+        let is_handler_site = self
+            .exceptional_handler_for_call(call, return_site)
+            .is_some();
         let on_operand = fact
             .local_base()
-            .is_some_and(|v| op_uses_value(&call_inst.op, v));
+            .is_some_and(|v| call_inst.op.has_operand(v));
 
         match self.classify(call) {
             SiteClass::Summary { name, exclusive } => {
                 let base = call_base_value(module, call_inst);
                 let result = call_inst.result;
-                let Some(summary) = self.registry.lookup(&name, args.len()) else {
-                    return;
-                };
-                // Clears are evaluated before flows.
-                let cleared = summary
-                    .clears
-                    .iter()
-                    .any(|c| Self::match_endpoint(c, fact, args, base).is_some());
-                if !cleared {
-                    for flow in &summary.flows {
-                        if let Some((leftover, from_heap)) =
-                            self.match_flow_endpoint(&flow.from, fact, args, base, call, false)
+                if let Some(summary) = self.registry.lookup(&name, args.len()) {
+                    let cleared = summary
+                        .clears
+                        .iter()
+                        .any(|c| Self::match_endpoint(c, fact, args, base).is_some());
+                    if !cleared {
+                        for flow in &summary.flows {
+                            if let Some((leftover, from_heap)) =
+                                self.match_flow_endpoint(&flow.from, fact, args, base, call, false)
+                            {
+                                self.substitute(
+                                    &flow.to,
+                                    &leftover,
+                                    args,
+                                    base,
+                                    result,
+                                    is_handler_site,
+                                    from_heap,
+                                    call,
+                                    out,
+                                );
+                            }
+                        }
+                        if let Some(cb_gap) = &summary.callback
+                            && Self::match_endpoint(&Endpoint::Base, fact, args, base).is_some()
+                            && let Some(&cbv) = args.get(cb_gap.param as usize)
                         {
-                            self.substitute(
-                                &flow.to,
-                                &leftover,
-                                args,
-                                base,
-                                result,
-                                is_handler_site,
-                                from_heap,
-                                call,
-                                out,
-                            );
+                            out.push(Fact::of(
+                                TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
+                            ));
                         }
                     }
-                    // Mini-gap: tag the callback value with `[AnyIndex]`
-                    // (the may-call-user-code marker). The FULL gap
-                    // propagator's enter/return channels live on the
-                    // gap call/return edges (gap.rs); this tag remains
-                    // the channel for DIRECT user calls of the callback
-                    // value and the unresolved-callback fallback.
-                    if let Some(cb_gap) = &summary.callback
-                        && Self::match_endpoint(&Endpoint::Base, fact, args, base).is_some()
-                        && let Some(&cbv) = args.get(cb_gap.param as usize)
-                    {
-                        out.push(Fact::of(
-                            TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
-                        ));
+                    // Exclusive summaries kill field-bearing operand bypass taints
+                    // (`!fact.fields.is_empty()`), while scalar pass-by-value caller
+                    // locals survive unless explicitly listed in `clears` (`R4-H3`).
+                    let retain = !(cleared || (exclusive && on_operand && !fact.fields.is_empty()));
+                    if retain {
+                        self.push_passthrough_at(source, return_site, out);
                     }
-                }
-                // The incoming taint is RETAINED unless cleared; exclusive
-                // summaries additionally kill incoming operand taints the
-                // flows did not re-add: the summary is the complete model
-                // of the operands' fate.
-                let retain = !(cleared || exclusive && on_operand);
-                if retain {
-                    self.push_passthrough_at(source, return_site, out);
-                }
-                // Log once per (site, fact-free) application (`O(1)` dedup).
-                if self.applied_seen.borrow_mut().insert(call) {
-                    self.applied.borrow_mut().push((call, name));
+                    if self.applied_seen.borrow_mut().insert(call) {
+                        self.applied.borrow_mut().push((call, name));
+                    }
                 }
             }
             SiteClass::BodyStep => {
-                // The callee body carries operand taints through the
-                // call/return edges; caller SSA values with empty field
-                // chains also survive (JS/ArkTS passes arguments by value,
-                // so a callee cannot rebind or sanitize the caller's SSA
-                // register, while non-empty `Local(v).f` chains defer to
-                // the callee body for Rung-0 field strong-kills unless no
-                // callee touches `f` on large bundles).
-                let untouched_this_prop = if self.module.functions.len() > 512
-                    && !matches!(kind, CallKind::New | CallKind::NewSpread)
-                    && let Some(v) = fact.local_base()
-                    && !args.contains(&v)
-                    && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
-                {
-                    self.callgraph
-                        .callees_of_call_at(call)
-                        .iter()
-                        .all(|&c| !self.can_callee_touch_prop(prop, c))
-                } else {
-                    false
-                };
-                if !on_operand || fact.fields.is_empty() || untouched_this_prop {
+                if self.call_resolution_incomplete(call) {
                     self.push_passthrough_at(source, return_site, out);
+                    if self.config.native_identity
+                        && on_operand
+                        && !is_handler_site
+                        && let Some(result) = call_inst.result
+                    {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
+                } else {
+                    let untouched_this_prop =
+                        if !matches!(kind, CallKind::New | CallKind::NewSpread)
+                            && let Some(v) = fact.local_base()
+                            && !args.contains(&v)
+                            && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
+                        {
+                            self.callgraph
+                                .callees_of_call_at(call)
+                                .iter()
+                                .any(|&c| !self.can_callee_touch_this_prop(prop, c))
+                        } else {
+                            false
+                        };
+                    let is_spread_arg = matches!(
+                        kind,
+                        CallKind::Apply | CallKind::NewSpread | CallKind::SuperSpread
+                    ) && fact.local_base() == args.first().copied();
+                    if !on_operand || fact.fields.is_empty() || untouched_this_prop || is_spread_arg
+                    {
+                        self.push_passthrough_at(source, return_site, out);
+                    }
                 }
             }
             SiteClass::NativeKeep | SiteClass::UnknownKeep => {
-                // Conservative keep: taint passes through untouched —
-                // never sanitizes. Plus the optional identity heuristic:
-                // tainted operand ⇒ tainted return.
                 self.push_passthrough_at(source, return_site, out);
                 if self.config.native_identity
                     && on_operand
                     && !is_handler_site
                     && let Some(result) = call_inst.result
                 {
-                    if self.module.functions.len() > 512 {
-                        if fact
-                            .local_base()
-                            .is_some_and(|v| fact.fields.is_empty() || args.contains(&v))
-                        {
-                            out.push(Fact::of(TaintFact::local(result)));
-                        }
-                    } else {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
             }
+        }
+        self.apply_block_entry_phis(call_inst.block, return_site, out);
+    }
+
+    fn call_uncaught_exit_flow(
+        &self,
+        module: &Module,
+        call_site: InstId,
+        callee: FuncId,
+        callee_exit: InstId,
+        source: &Fact,
+        out: &mut Vec<Fact>,
+    ) {
+        let Fact::Taint(fact) = source else { return };
+        if self.gap_at(call_site, callee).is_none()
+            && matches!(
+                self.classify(call_site),
+                SiteClass::Summary {
+                    exclusive: true,
+                    ..
+                }
+            )
+        {
+            return;
+        }
+        let Some(exit_inst) = module.inst(callee_exit) else {
+            return;
+        };
+        if fact.is_state_base()
+            && (!self.is_harness_call(call_site)
+                || self.allow_state_across_harness(call_site, callee, fact, false))
+        {
+            out.push(source.clone());
+        }
+        match &exit_inst.op {
+            Op::Throw { value } => {
+                if self.operand_matches_fact(*value, fact, callee_exit) {
+                    out.push(Fact::of(
+                        fact.rebased(TaintBase::Local(UNCAUGHT_EXCEPTION_VALUE)),
+                    ));
+                }
+            }
+            Op::Call { .. } => {
+                if fact.local_base() == Some(UNCAUGHT_EXCEPTION_VALUE) {
+                    out.push(source.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3256,258 +3943,66 @@ fn ctor_this_of_module(module: &Module, fid: FuncId) -> Option<ValueId> {
     fd.params.get(slot).copied()
 }
 
-/// Visit every SSA [`ValueId`] operand of `op` in [`Op::operands`] order
-/// without heap allocation.
-pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
-    use Op::*;
-    match op {
-        BinaryOp { left, right, .. } | Compare { left, right, .. } => {
-            f(*left);
-            f(*right);
-        }
-        UnaryOp { operand, .. } => f(*operand),
-        Mov { src } => f(*src),
-        LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => {}
-        AllocClosure { func } => f(*func),
-        LoadProp { object, .. } => f(*object),
-        StoreProp { object, value, .. } | StoreOwnPropName { object, value, .. } => {
-            f(*object);
-            f(*value);
-        }
-        LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
-            f(*object);
-            f(*index);
-        }
-        StorePropIdx {
-            object,
-            index,
-            value,
-        }
-        | StorePropDyn {
-            object,
-            key: index,
-            value,
-        }
-        | StoreOwnPropDyn {
-            object,
-            key: index,
-            value,
-            ..
-        }
-        | StoreOwnPropIdx {
-            object,
-            index,
-            value,
-            ..
-        } => {
-            f(*object);
-            f(*index);
-            f(*value);
-        }
-        DefineMethod { object, func, .. } => {
-            f(*object);
-            f(*func);
-        }
-        DeleteProp { object, key } => {
-            f(*object);
-            f(*key);
-        }
-        TestProp { object, key } => {
-            f(*object);
-            match key {
-                PropKey::Name(_) => {}
-                PropKey::Index(k) | PropKey::Dynamic(k) => f(*k),
-            }
-        }
-        CopyDataProps { dst, src } => {
-            f(*dst);
-            f(*src);
-        }
-        SetObjectWithProto { proto, obj } => {
-            f(*proto);
-            f(*obj);
-        }
-        ArraySpread { dst, index, src } => {
-            f(*dst);
-            f(*index);
-            f(*src);
-        }
-        CreateObjectWithExcludedKeys { obj, keys } => {
-            f(*obj);
-            for &k in keys {
-                f(k);
-            }
-        }
-        DefineGetterSetterByValue {
-            obj,
-            key,
-            getter,
-            setter,
-            set_name,
-        } => {
-            f(*obj);
-            f(*key);
-            f(*getter);
-            f(*setter);
-            f(*set_name);
-        }
-        GetTemplateObject { literal } => f(*literal),
-        CreateIterResultObj { value, done } => {
-            f(*value);
-            f(*done);
-        }
-        GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => f(*obj),
-        IteratorNext { iterator }
-        | IteratorReturn { iterator }
-        | IteratorThrow { iterator }
-        | NextPropName { iterator } => f(*iterator),
-        NewLexEnv { .. }
-        | NewLexEnvWithName { .. }
-        | PopLexEnv
-        | GetLexVar { .. }
-        | CreatePrivateNames { .. }
-        | LoadSymbol
-        | LoadNewTarget
-        | LoadGlobalObject
-        | LoadFunction
-        | GetUnmappedArgs
-        | CopyRestArgs { .. }
-        | AsyncFunctionEnter
-        | ThrowNotExists
-        | ThrowPatternNonCoercible
-        | ThrowDeleteSuperProperty
-        | Debugger
-        | LoadModuleVar { .. }
-        | GetModuleNamespace { .. }
-        | Branch { .. }
-        | Unreachable => {}
-        PutLexVar { value, .. }
-        | StoreGlobal { value, .. }
-        | StoreGlobalRecord { value, .. }
-        | TryStoreGlobal { value, .. }
-        | StoreModuleVar { value, .. } => f(*value),
-        TryGetGlobal { default, .. } => {
-            if let Some(d) = default {
-                f(*d);
-            }
-        }
-        DynamicImport { specifier } => f(*specifier),
-        Call {
-            callee, this, args, ..
-        } => {
-            f(*callee);
-            if let Some(t) = this {
-                f(*t);
-            }
-            for &a in args {
-                f(a);
-            }
-        }
-        DefineFunc { captures, .. } => {
-            for &(_, v) in captures {
-                f(v);
-            }
-        }
-        DefineClass(data) | DefineSendableClass(data) => {
-            if let Some(h) = data.heritage {
-                f(h);
-            }
-        }
-        LoadPrivate { obj, .. } | TestPrivate { obj, .. } => f(*obj),
-        StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
-            f(*obj);
-            f(*value);
-        }
-        Throw { value }
-        | ThrowIfSuperNotCalled { value, .. }
-        | ThrowConstAssignment { name: value }
-        | ThrowIfNotObject { value }
-        | ThrowUndefinedIfHoleWithName { value, .. }
-        | Await { value }
-        | NotifyConcurrentResult { value } => f(*value),
-        AwaitUncaught { funcobj, value }
-        | AsyncResolve { funcobj, value }
-        | AsyncReject { funcobj, value }
-        | AsyncGeneratorReject {
-            genobj: funcobj,
-            value,
-        } => {
-            f(*funcobj);
-            f(*value);
-        }
-        AsyncGeneratorResolve {
-            genobj,
-            value,
-            done,
-        } => {
-            f(*genobj);
-            f(*value);
-            f(*done);
-        }
-        ThrowUndefinedIfHole { name, value } => {
-            f(*name);
-            f(*value);
-        }
-        CreateGenerator { func } | CreateAsyncGenerator { func } => f(*func),
-        SuspendGenerator { genobj, value } => {
-            f(*genobj);
-            f(*value);
-        }
-        ResumeGenerator { genobj }
-        | GetResumeMode { genobj }
-        | SetGeneratorState { genobj, .. } => f(*genobj),
-        LoadSuper { key, this_value } => {
-            if let SuperKey::Dynamic(k) = key {
-                f(*k);
-            }
-            f(*this_value);
-        }
-        StoreSuper {
-            key,
-            this_value,
-            value,
-        } => {
-            f(*value);
-            f(*this_value);
-            if let SuperKey::Dynamic(k) = key {
-                f(*k);
-            }
-        }
-        CondBranch { cond, .. } => f(*cond),
-        Return { value } => {
-            if let Some(v) = value {
-                f(*v);
-            }
-        }
-        Phi { entries } => {
-            for &(_, v) in entries {
-                f(v);
-            }
-        }
+fn is_global_object(module: &Module, v: ValueId) -> bool {
+    let root = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let Some(ValueDef::Inst(iid)) = module.value(root).map(|val| val.def) else {
+        return false;
+    };
+    matches!(module.inst(iid).map(|i| &i.op), Some(Op::LoadGlobalObject))
+}
+
+fn const_string_sym(module: &Module, v: ValueId) -> Option<Sym> {
+    let root = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let cid = match module.value(root)?.def {
+        ValueDef::Const(c) => c,
+        ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+            Op::LoadConst(c) => *c,
+            _ => return None,
+        },
+        ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return None,
+    };
+    match module.consts.get(cid) {
+        Some(Const::String(s)) => Some(*s),
+        _ => None,
     }
 }
 
-/// Zero-allocation check equivalent to `op.operands().contains(&target)`.
-pub(crate) fn op_uses_value(op: &Op, target: ValueId) -> bool {
-    let mut found = false;
-    for_each_op_operand(op, |v| {
-        if v == target {
-            found = true;
+fn build_variadic_ops_index(module: &Module) -> Vec<Vec<(InstId, Option<u16>)>> {
+    let mut out = vec![Vec::new(); module.functions.len()];
+    for (fi, f) in module.functions.iter().enumerate() {
+        if f.blocks.is_empty() {
+            continue;
         }
-    });
-    found
+        let mut entries = Vec::new();
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if inst.result.is_none() {
+                    continue;
+                }
+                match &inst.op {
+                    Op::GetUnmappedArgs => entries.push((iid, None)),
+                    Op::CopyRestArgs { start_index } => entries.push((iid, Some(*start_index))),
+                    _ => {}
+                }
+            }
+        }
+        out[fi] = entries;
+    }
+    out
 }
 
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "internal one-shot tuple builder returning precomputed exception tables"
+)]
 fn build_exception_indexes(
     module: &Module,
-) -> (
-    Vec<Option<FuncId>>,
-    Vec<Option<ValueId>>,
-    HashMap<(FuncId, BlockId), ValueId>,
-) {
+) -> (Vec<Option<FuncId>>, HashMap<(FuncId, BlockId), ValueId>) {
     let mut block_to_func = vec![None; module.blocks.len()];
-    let mut handler_block_exc = vec![None; module.blocks.len()];
     let mut func_handler_exc = HashMap::new();
     for (fi, f) in module.functions.iter().enumerate() {
         let fid = FuncId::new(fi as u32);
@@ -3518,16 +4013,13 @@ fn build_exception_indexes(
         }
         for region in &f.try_regions {
             for catch in &region.catches {
-                if let Some(slot) = handler_block_exc.get_mut(catch.handler.index()) {
-                    slot.get_or_insert(catch.exception);
-                }
                 func_handler_exc
                     .entry((fid, catch.handler))
                     .or_insert(catch.exception);
             }
         }
     }
-    (block_to_func, handler_block_exc, func_handler_exc)
+    (block_to_func, func_handler_exc)
 }
 
 fn build_global_stores_map(module: &Module) -> HashMap<Sym, Vec<ValueId>> {
@@ -3543,6 +4035,19 @@ fn build_global_stores_map(module: &Module) -> HashMap<Sym, Vec<ValueId>> {
                     Op::StoreGlobal { name, value }
                     | Op::StoreGlobalRecord { name, value, .. }
                     | Op::TryStoreGlobal { name, value } => {
+                        out.entry(*name).or_default().push(*value);
+                    }
+                    Op::StoreProp {
+                        object,
+                        name,
+                        value,
+                    }
+                    | Op::StoreOwnPropName {
+                        object,
+                        name,
+                        value,
+                        ..
+                    } if is_global_object(module, *object) => {
                         out.entry(*name).or_default().push(*value);
                     }
                     _ => {}
@@ -3583,7 +4088,7 @@ impl FuncLiveness {
         }
     }
 
-    fn build(module: &Module, fid: FuncId, await_resume: &HashMap<InstId, ValueId>) -> Self {
+    fn build(module: &Module, fid: FuncId, await_resume: &HashMap<InstId, Vec<ValueId>>) -> Self {
         let Some(f) = module.func(fid) else {
             return Self::empty();
         };
@@ -3628,16 +4133,18 @@ impl FuncLiveness {
                 if let Some(res) = inst.result {
                     intern_val(res);
                 }
-                for_each_op_operand(&inst.op, &mut intern_val);
+                inst.op.for_each_operand(&mut intern_val);
                 if matches!(inst.op, Op::Call { .. })
                     && let Some(base_v) = call_base_value(module, inst)
                 {
                     intern_val(base_v);
                 }
                 if matches!(inst.op, Op::ResumeGenerator { .. })
-                    && let Some(&aw) = await_resume.get(&iid)
+                    && let Some(aws) = await_resume.get(&iid)
                 {
-                    intern_val(aw);
+                    for &aw in aws {
+                        intern_val(aw);
+                    }
                 }
                 if matches!(inst.op, Op::Return { .. })
                     && let Some(ct) = ctor_this
@@ -3748,7 +4255,7 @@ impl FuncLiveness {
                     kill_slice[w] |= mask;
                 }
                 let pos_u32 = pos as u32;
-                for_each_op_operand(&inst.op, |u| {
+                inst.op.for_each_operand(|u| {
                     record_use(u, pos_u32, gen_slice, kill_slice);
                 });
                 if matches!(inst.op, Op::Call { .. })
@@ -3757,9 +4264,11 @@ impl FuncLiveness {
                     record_use(base_v, pos_u32, gen_slice, kill_slice);
                 }
                 if matches!(inst.op, Op::ResumeGenerator { .. })
-                    && let Some(&aw) = await_resume.get(&iid)
+                    && let Some(aws) = await_resume.get(&iid)
                 {
-                    record_use(aw, pos_u32, gen_slice, kill_slice);
+                    for &aw in aws {
+                        record_use(aw, pos_u32, gen_slice, kill_slice);
+                    }
                 }
                 if matches!(inst.op, Op::Return { .. })
                     && let Some(ct) = ctor_this
@@ -3914,7 +4423,7 @@ impl LocalLiveness {
     fn is_live_at(
         &self,
         module: &Module,
-        await_resume: &HashMap<InstId, ValueId>,
+        await_resume: &HashMap<InstId, Vec<ValueId>>,
         at_inst: InstId,
         v: ValueId,
     ) -> bool {
@@ -4152,42 +4661,43 @@ impl FuncAliasLoads {
     }
 }
 
-pub(crate) fn peel_ns_index(module: &Module, mut v: ValueId) -> Option<u32> {
-    for _ in 0..8 {
-        let ValueDef::Inst(iid) = module.value(v)?.def else {
-            return None;
-        };
-        match &module.inst(iid)?.op {
-            Op::Mov { src } => v = *src,
-            Op::GetModuleNamespace { index } => return Some(*index),
-            _ => return None,
-        }
+pub(crate) fn peel_ns_index(module: &Module, v: ValueId) -> Option<u32> {
+    let root = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let ValueDef::Inst(iid) = module.value(root)?.def else {
+        return None;
+    };
+    match &module.inst(iid)?.op {
+        Op::GetModuleNamespace { index } => Some(*index),
+        _ => None,
     }
-    None
 }
 
-fn build_await_resume_map(module: &Module) -> HashMap<InstId, ValueId> {
-    let mut out = HashMap::new();
-    for bb in &module.blocks {
-        let mut last_await: HashMap<ValueId, ValueId> = HashMap::new();
-        for &iid in &bb.insts {
-            let Some(inst) = module.inst(iid) else {
-                continue;
-            };
-            match &inst.op {
-                Op::AwaitUncaught { funcobj, value } => {
-                    last_await.insert(*funcobj, *value);
-                }
-                Op::ResumeGenerator { genobj } => {
-                    if let Some(&val) = last_await.get(genobj) {
-                        out.insert(iid, val);
-                    }
-                }
-                _ => {}
+fn build_jsbridge_prop_index(module: &Module) -> JsBridgePropIndex {
+    let mut index: JsBridgePropIndex = HashMap::new();
+    for inst in &module.insts {
+        match &inst.op {
+            Op::StoreProp {
+                object,
+                name,
+                value,
             }
+            | Op::StoreOwnPropName {
+                object,
+                name,
+                value,
+                ..
+            } => {
+                index.entry(*object).or_default().push((*name, *value));
+            }
+            Op::DefineMethod {
+                object, name, func, ..
+            } => {
+                index.entry(*object).or_default().push((*name, *func));
+            }
+            _ => {}
         }
     }
-    out
+    index
 }
 
 /// Discover methods exposed on `proxy_obj` via
@@ -4196,6 +4706,7 @@ fn build_await_resume_map(module: &Module) -> HashMap<InstId, ValueId> {
 fn collect_jsbridge_seeds(
     module: &Module,
     oracle: &Oracle,
+    prop_index: &JsBridgePropIndex,
     proxy_obj: ValueId,
     method_list: Option<ValueId>,
     at: InstId,
@@ -4257,42 +4768,16 @@ fn collect_jsbridge_seeds(
                         }
                     }
                 }
-                if let Some(obj_val) = site_inst.result {
-                    for inst in &module.insts {
-                        match &inst.op {
-                            Op::StoreProp {
-                                object,
-                                name,
-                                value,
+                if let Some(obj_val) = site_inst.result
+                    && let Some(props) = prop_index.get(&obj_val)
+                {
+                    for &(name, fn_val) in props {
+                        if let Some(mname) = module.sym.resolve(name)
+                            && name_allowed(mname)
+                        {
+                            for f in gap::resolve_callback_funcs(module, oracle, fn_val, at) {
+                                candidate_funcs.push(f);
                             }
-                            | Op::StoreOwnPropName {
-                                object,
-                                name,
-                                value,
-                                ..
-                            } if *object == obj_val => {
-                                if let Some(mname) = module.sym.resolve(*name)
-                                    && name_allowed(mname)
-                                {
-                                    for f in gap::resolve_callback_funcs(module, oracle, *value, at)
-                                    {
-                                        candidate_funcs.push(f);
-                                    }
-                                }
-                            }
-                            Op::DefineMethod {
-                                object, name, func, ..
-                            } if *object == obj_val => {
-                                if let Some(mname) = module.sym.resolve(*name)
-                                    && name_allowed(mname)
-                                {
-                                    for f in gap::resolve_callback_funcs(module, oracle, *func, at)
-                                    {
-                                        candidate_funcs.push(f);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -4341,367 +4826,6 @@ fn collect_jsbridge_seeds(
         };
         if !formals.is_empty() {
             param_seeds.push((mfid, formals));
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use abcd_ir::op::{BinOp, CmpOp, LexEnvKind, ModuleVarKind, OwnStoreKind, SuperCheck, UnOp};
-    use abcd_ir::{ConstId, DefineClassData, Edge, EdgeKind};
-
-    #[test]
-    fn op_uses_value_and_visitor_match_operands_table() {
-        let v0 = ValueId::new(10);
-        let v1 = ValueId::new(11);
-        let v2 = ValueId::new(12);
-        let v3 = ValueId::new(13);
-        let v4 = ValueId::new(14);
-        let absent = ValueId::new(99);
-        let s = Sym::new(0);
-        let c = ConstId::new(0);
-        let b = BlockId::new(0);
-        let f = FuncId::new(0);
-        let edge = Edge {
-            from: b,
-            kind: EdgeKind::Normal,
-        };
-
-        let ops = vec![
-            Op::BinaryOp {
-                op: BinOp::Add,
-                left: v0,
-                right: v1,
-            },
-            Op::UnaryOp {
-                op: UnOp::Minus,
-                operand: v0,
-            },
-            Op::UnaryOp {
-                op: UnOp::ToPropertyKey,
-                operand: v0,
-            },
-            Op::UnaryOp {
-                op: UnOp::JumpEqz,
-                operand: v0,
-            },
-            Op::UnaryOp {
-                op: UnOp::JumpNez,
-                operand: v0,
-            },
-            Op::Compare {
-                op: CmpOp::Eq,
-                left: v0,
-                right: v1,
-            },
-            Op::Mov { src: v0 },
-            Op::LoadConst(c),
-            Op::AllocObject { shape: c },
-            Op::AllocArray { shape: Some(c) },
-            Op::AllocRegExp {
-                pattern: s,
-                flags: 0,
-            },
-            Op::AllocClosure { func: v0 },
-            Op::LoadProp {
-                object: v0,
-                name: s,
-            },
-            Op::StoreProp {
-                object: v0,
-                name: s,
-                value: v1,
-            },
-            Op::LoadPropIdx {
-                object: v0,
-                index: v1,
-            },
-            Op::StorePropIdx {
-                object: v0,
-                index: v1,
-                value: v2,
-            },
-            Op::LoadPropDyn {
-                object: v0,
-                key: v1,
-            },
-            Op::StorePropDyn {
-                object: v0,
-                key: v1,
-                value: v2,
-            },
-            Op::StoreOwnPropName {
-                object: v0,
-                name: s,
-                value: v1,
-                kind: OwnStoreKind::OwnProp,
-            },
-            Op::StoreOwnPropDyn {
-                object: v0,
-                key: v1,
-                value: v2,
-                kind: OwnStoreKind::OwnProp,
-            },
-            Op::StoreOwnPropIdx {
-                object: v0,
-                index: v1,
-                value: v2,
-                kind: OwnStoreKind::OwnProp,
-            },
-            Op::DefineMethod {
-                object: v0,
-                name: s,
-                func: v1,
-                length: 1,
-            },
-            Op::DeleteProp {
-                object: v0,
-                key: v1,
-            },
-            Op::TestProp {
-                object: v0,
-                key: PropKey::Name(s),
-            },
-            Op::TestProp {
-                object: v0,
-                key: PropKey::Index(v1),
-            },
-            Op::TestProp {
-                object: v0,
-                key: PropKey::Dynamic(v1),
-            },
-            Op::CopyDataProps { dst: v0, src: v1 },
-            Op::SetObjectWithProto { proto: v0, obj: v1 },
-            Op::ArraySpread {
-                dst: v0,
-                index: v1,
-                src: v2,
-            },
-            Op::CreateObjectWithExcludedKeys {
-                obj: v0,
-                keys: vec![v1, v2],
-            },
-            Op::DefineGetterSetterByValue {
-                obj: v0,
-                key: v1,
-                getter: v2,
-                setter: v3,
-                set_name: v4,
-            },
-            Op::GetTemplateObject { literal: v0 },
-            Op::CreateIterResultObj {
-                value: v0,
-                done: v1,
-            },
-            Op::GetIterator { obj: v0 },
-            Op::GetAsyncIterator { obj: v0 },
-            Op::IteratorNext { iterator: v0 },
-            Op::IteratorReturn { iterator: v0 },
-            Op::IteratorThrow { iterator: v0 },
-            Op::GetPropIterator { obj: v0 },
-            Op::NextPropName { iterator: v0 },
-            Op::NewLexEnv {
-                num_vars: 2,
-                kind: LexEnvKind::Plain,
-            },
-            Op::NewLexEnvWithName {
-                num_vars: 2,
-                scope_names: c,
-            },
-            Op::PopLexEnv,
-            Op::GetLexVar {
-                level: 0,
-                slot: 1,
-                kind: LexEnvKind::Plain,
-            },
-            Op::PutLexVar {
-                level: 0,
-                slot: 1,
-                value: v0,
-                kind: LexEnvKind::Plain,
-            },
-            Op::TryGetGlobal {
-                name: s,
-                default: None,
-            },
-            Op::TryGetGlobal {
-                name: s,
-                default: Some(v0),
-            },
-            Op::StoreGlobal { name: s, value: v0 },
-            Op::StoreGlobalRecord {
-                name: s,
-                value: v0,
-                is_const: true,
-            },
-            Op::TryStoreGlobal { name: s, value: v0 },
-            Op::LoadModuleVar {
-                index: 0,
-                kind: ModuleVarKind::Local,
-            },
-            Op::StoreModuleVar {
-                index: 0,
-                value: v0,
-            },
-            Op::GetModuleNamespace { index: 0 },
-            Op::DynamicImport { specifier: v0 },
-            Op::Call {
-                callee: v0,
-                this: Some(v1),
-                args: vec![v2, v3],
-                kind: CallKind::Dynamic,
-            },
-            Op::Call {
-                callee: v0,
-                this: None,
-                args: vec![],
-                kind: CallKind::Direct,
-            },
-            Op::DefineFunc {
-                body: f,
-                captures: vec![(s, v0), (s, v1)],
-                length: 0,
-            },
-            Op::DefineClass(Box::new(DefineClassData {
-                ctor: f,
-                heritage: Some(v0),
-                members: c,
-                member_attrs: Vec::new(),
-                count: 0,
-            })),
-            Op::DefineSendableClass(Box::new(DefineClassData {
-                ctor: f,
-                heritage: None,
-                members: c,
-                member_attrs: Vec::new(),
-                count: 0,
-            })),
-            Op::LoadPrivate {
-                level: 0,
-                slot: 0,
-                obj: v0,
-            },
-            Op::StorePrivate {
-                level: 0,
-                slot: 0,
-                obj: v0,
-                value: v1,
-            },
-            Op::DefinePrivate {
-                level: 0,
-                slot: 0,
-                obj: v0,
-                value: v1,
-            },
-            Op::TestPrivate {
-                level: 0,
-                slot: 0,
-                obj: v0,
-            },
-            Op::CreatePrivateNames { count: 1, names: c },
-            Op::Throw { value: v0 },
-            Op::ThrowIfSuperNotCalled {
-                value: v0,
-                kind: SuperCheck::NotCalled,
-            },
-            Op::ThrowUndefinedIfHole {
-                name: v0,
-                value: v1,
-            },
-            Op::ThrowUndefinedIfHoleWithName { name: s, value: v0 },
-            Op::ThrowNotExists,
-            Op::ThrowPatternNonCoercible,
-            Op::ThrowDeleteSuperProperty,
-            Op::ThrowConstAssignment { name: v0 },
-            Op::ThrowIfNotObject { value: v0 },
-            Op::CreateGenerator { func: v0 },
-            Op::CreateAsyncGenerator { func: v0 },
-            Op::SetGeneratorState {
-                genobj: v0,
-                state: 1,
-            },
-            Op::SuspendGenerator {
-                genobj: v0,
-                value: v1,
-            },
-            Op::ResumeGenerator { genobj: v0 },
-            Op::GetResumeMode { genobj: v0 },
-            Op::Await { value: v0 },
-            Op::AwaitUncaught {
-                funcobj: v0,
-                value: v1,
-            },
-            Op::AsyncFunctionEnter,
-            Op::AsyncResolve {
-                funcobj: v0,
-                value: v1,
-            },
-            Op::AsyncReject {
-                funcobj: v0,
-                value: v1,
-            },
-            Op::AsyncGeneratorResolve {
-                genobj: v0,
-                value: v1,
-                done: v2,
-            },
-            Op::AsyncGeneratorReject {
-                genobj: v0,
-                value: v1,
-            },
-            Op::NotifyConcurrentResult { value: v0 },
-            Op::LoadSymbol,
-            Op::LoadNewTarget,
-            Op::LoadGlobalObject,
-            Op::LoadFunction,
-            Op::GetUnmappedArgs,
-            Op::CopyRestArgs { start_index: 0 },
-            Op::LoadSuper {
-                key: SuperKey::Name(s),
-                this_value: v0,
-            },
-            Op::LoadSuper {
-                key: SuperKey::Dynamic(v1),
-                this_value: v0,
-            },
-            Op::StoreSuper {
-                key: SuperKey::Name(s),
-                this_value: v0,
-                value: v1,
-            },
-            Op::StoreSuper {
-                key: SuperKey::Dynamic(v2),
-                this_value: v0,
-                value: v1,
-            },
-            Op::Branch { dest: b },
-            Op::CondBranch {
-                cond: v0,
-                true_dest: b,
-                false_dest: b,
-            },
-            Op::Return { value: Some(v0) },
-            Op::Return { value: None },
-            Op::Phi {
-                entries: vec![(edge, v0), (edge, v1)],
-            },
-            Op::Unreachable,
-            Op::Debugger,
-        ];
-
-        for op in &ops {
-            let expected = op.operands();
-            let mut visited = Vec::new();
-            for_each_op_operand(op, |v| visited.push(v));
-            assert_eq!(visited, expected, "visitor mismatch on {op:?}");
-            for cand in [v0, v1, v2, v3, v4, absent] {
-                assert_eq!(
-                    op_uses_value(op, cand),
-                    expected.contains(&cand),
-                    "op_uses_value mismatch on {op:?} for {cand:?}"
-                );
-            }
         }
     }
 }

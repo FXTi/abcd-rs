@@ -2,6 +2,7 @@
 name = "abcd-taint"
 description = "Interprocedural IFDS taint analysis on the SSA IR: access-path facts, summaries, callback gaps, prototype resolution"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
@@ -19,3 +20,6 @@ abcd-analysis = { workspace = true }
 [dev-dependencies]
 abcd-file = { workspace = true }
 abcd-lift = { workspace = true }
+
+[lints]
+workspace = true

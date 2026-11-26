@@ -1772,3 +1772,1385 @@ fn patch_lex_vars_stay_isolated_and_new_spread_constructs_opaque_formals() {
     let formal_ans = oracle.query(formal_val, env_site);
     assert!(formal_ans.has_unknown);
 }
+
+// ── Sub-batch 1B regressions (R4-P1 / R4-P3 / R4-D4 / R4-H5) ─────────
+
+#[test]
+fn r4_p1_self_referencing_closure_with_pop_lex_env_terminates() {
+    let mut m = mk_module();
+    let (rec, _) = add_static_func(&mut m, "rec", 0);
+    let rec_get_iid = {
+        let b = entry_of(&m, rec);
+        emit_void(&mut m, b, Op::PopLexEnv);
+        let _self_clo = closure_of(&mut m, b, rec);
+        let g = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(g) });
+        match m.value(g).unwrap().def {
+            ValueDef::Inst(i) => i,
+            _ => panic!(),
+        }
+    };
+
+    let main = add_func_named(&mut m, "func_main_0");
+    {
+        let b = entry_of(&m, main);
+        let _outer_env = new_lex_env(&mut m, b);
+        let obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: obj,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let clo = closure_of(&mut m, b, rec);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: clo,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    let base = CallGraph::build(&m);
+    let out = analyze(&m, &base, &PtaConfig::default());
+    assert!(!out.stats().capped);
+    assert!(
+        out.stats().env_rounds <= 4,
+        "monotone lattice must converge in O(1) rounds, got {}",
+        out.stats().env_rounds
+    );
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+    let env_ans = oracle.lex_env_at(rec_get_iid, 0);
+    assert!(
+        env_ans.has_unknown,
+        "after PopLexEnv + self-recapture, level 0 must be conservative: {env_ans:?}"
+    );
+
+    // Also build a multi-closure self-referencing PopLexEnv ring and verify
+    // `step_budget = 10` halts immediately with `capped == true` and sound fallback.
+    let mut big = mk_module();
+    let mut ring_fns = Vec::new();
+    for idx in 0..8 {
+        let (f, _) = add_static_func(&mut big, &format!("ring_{idx}"), 0);
+        ring_fns.push(f);
+    }
+    let mut probe_get_iid = InstId::new(0);
+    for idx in 0..8 {
+        let f = ring_fns[idx];
+        let next = ring_fns[(idx + 1) % 8];
+        let b = entry_of(&big, f);
+        let _e = new_lex_env(&mut big, b);
+        emit_void(&mut big, b, Op::PopLexEnv);
+        let _self_c = closure_of(&mut big, b, f);
+        let _next_c = closure_of(&mut big, b, next);
+        let g = emit(
+            &mut big,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        if idx == 0 {
+            probe_get_iid = match big.value(g).unwrap().def {
+                ValueDef::Inst(i) => i,
+                _ => panic!(),
+            };
+        }
+        emit_void(&mut big, b, Op::Return { value: Some(g) });
+    }
+    let big_base = CallGraph::build(&big);
+    let capped_out = analyze(
+        &big,
+        &big_base,
+        &PtaConfig {
+            step_budget: 10,
+            ..PtaConfig::default()
+        },
+    );
+    assert!(capped_out.stats().capped);
+    let (_, capped_tables, capped_stats) = capped_out.into_parts();
+    let capped_oracle = Rung2AliasOracle::new(&big, capped_tables, capped_stats);
+    assert!(capped_oracle.lex_env_at(probe_get_iid, 0).has_unknown);
+}
+
+#[test]
+fn r4_p3_sendable_vs_plain_top_aligned_join_and_pre_throw_catch_env() {
+    let inst_of = |m: &Module, v: ValueId| match m.value(v).unwrap().def {
+        ValueDef::Inst(i) => i,
+        _ => panic!(),
+    };
+
+    // 1. Direct unit check on top-aligned `join_chains`.
+    let mut depth2 = EnvChain::default();
+    depth2.push_site(InstId::new(10), 16); // outer (level 1)
+    depth2.push_site(InstId::new(11), 16); // inner (level 0)
+    let mut depth1 = EnvChain::default();
+    depth1.push_site(InstId::new(20), 16); // inner (level 0)
+    let joined = join_chains(&depth2, &depth1);
+    let lvl0 = joined.at_level(0).expect("level 0");
+    assert_eq!(
+        lvl0.sites,
+        BTreeSet::from([InstId::new(11), InstId::new(20)])
+    );
+    assert!(!lvl0.unknown, "both branches provide level 0");
+    let lvl1 = joined.at_level(1).expect("level 1");
+    assert_eq!(lvl1.sites, BTreeSet::from([InstId::new(10)]));
+    assert!(lvl1.unknown, "only one branch provides level 1");
+
+    // 2. End-to-end CFG check:
+    //    (a) `Sendable` env survives `PopLexEnv` while `Plain` env is popped;
+    //    (b) diamond CFG top-aligns `level = 0` (`!has_unknown`) and marks `level = 1` unknown;
+    //    (c) catch handler joins pre-throw env states BEFORE `PopLexEnv` runs at try-block end.
+    let mut m = mk_module();
+    let (child_send, _) = add_static_func(&mut m, "child_send", 0);
+    let child_send_get = {
+        let b = entry_of(&m, child_send);
+        let g = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Sendable,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(g) });
+        g
+    };
+
+    let f_dual = add_func_named(&mut m, "dual_env");
+    let (send_env_iid, send_obj, plain_obj, send_read, plain_read) = {
+        let b = entry_of(&m, f_dual);
+        let se_val = emit(
+            &mut m,
+            b,
+            Op::NewLexEnv {
+                num_vars: 1,
+                kind: abcd_ir::LexEnvKind::Sendable,
+            },
+        );
+        let se_iid = inst_of(&m, se_val);
+        let s_obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: s_obj,
+                kind: abcd_ir::LexEnvKind::Sendable,
+            },
+        );
+
+        let _pe_iid = new_lex_env(&mut m, b);
+        let p_obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: p_obj,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+
+        // `PopLexEnv` pops ONLY the `Plain` frame; `Sendable` stays intact.
+        emit_void(&mut m, b, Op::PopLexEnv);
+
+        let s_read = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Sendable,
+            },
+        );
+        let p_read = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let clo = closure_of(&mut m, b, child_send);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: clo,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+        (se_iid, s_obj, p_obj, s_read, p_read)
+    };
+
+    // Diamond function testing top-aligned join in CFG.
+    let f_diamond = add_func_named(&mut m, "diamond_env");
+    let (outer_t, inner_t, inner_f, obj_t, obj_f, join_get0, join_get1) = {
+        let entry = entry_of(&m, f_diamond);
+        let bt = add_block(&mut m, f_diamond);
+        let bf = add_block(&mut m, f_diamond);
+        let bjoin = add_block(&mut m, f_diamond);
+        let cond = load_number(&mut m, entry, 1.0);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond,
+                true_dest: bt,
+                false_dest: bf,
+            },
+        );
+
+        let out_t = new_lex_env(&mut m, bt);
+        let in_t = new_lex_env(&mut m, bt);
+        let ot = alloc_object(&mut m, bt);
+        emit_void(
+            &mut m,
+            bt,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: ot,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, bt, Op::Branch { dest: bjoin });
+
+        let in_f = new_lex_env(&mut m, bf);
+        let of_ = alloc_object(&mut m, bf);
+        emit_void(
+            &mut m,
+            bf,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: of_,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, bf, Op::Branch { dest: bjoin });
+
+        link(&mut m, entry, bt);
+        link(&mut m, entry, bf);
+        link(&mut m, bt, bjoin);
+        link(&mut m, bf, bjoin);
+
+        let g0 = emit(
+            &mut m,
+            bjoin,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let g1 = emit(
+            &mut m,
+            bjoin,
+            Op::GetLexVar {
+                level: 1,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, bjoin, Op::Return { value: None });
+        (out_t, in_t, in_f, ot, of_, g0, g1)
+    };
+
+    // Try/catch function testing pre-throw env join inside a protected block
+    // whose normal path pops `inner_try_env` before block exit.
+    let f_try = add_func_named(&mut m, "try_catch_env");
+    let (try_outer_env, try_inner_env, try_outer_obj, try_inner_obj, catch_get0, catch_get1) = {
+        let entry = entry_of(&m, f_try);
+        let btry = add_block(&mut m, f_try);
+        let bcatch = add_block(&mut m, f_try);
+        let bexit = add_block(&mut m, f_try);
+        let prop_sym = intern(&mut m, "mayThrowProp");
+
+        let outer_e = new_lex_env(&mut m, entry);
+        let outer_o = alloc_object(&mut m, entry);
+        emit_void(
+            &mut m,
+            entry,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: outer_o,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, entry, Op::Branch { dest: btry });
+
+        // Throw point #1: `outer_e` is at level 0.
+        let _ = emit(
+            &mut m,
+            btry,
+            Op::LoadProp {
+                object: outer_o,
+                name: prop_sym,
+            },
+        );
+        let inner_e = new_lex_env(&mut m, btry);
+        let inner_o = alloc_object(&mut m, btry);
+        emit_void(
+            &mut m,
+            btry,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: inner_o,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        // Throw point #2: `inner_e` is at level 0, `outer_e` is at level 1.
+        let _ = emit(
+            &mut m,
+            btry,
+            Op::LoadProp {
+                object: inner_o,
+                name: prop_sym,
+            },
+        );
+        // Normal fallthrough pops `inner_e` before leaving `btry`!
+        emit_void(&mut m, btry, Op::PopLexEnv);
+        emit_void(&mut m, btry, Op::Branch { dest: bexit });
+
+        let exc = add_exception_param(&mut m, bcatch);
+        let cg0 = emit(
+            &mut m,
+            bcatch,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let cg1 = emit(
+            &mut m,
+            bcatch,
+            Op::GetLexVar {
+                level: 1,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let _ = exc;
+        emit_void(&mut m, bcatch, Op::Branch { dest: bexit });
+        emit_void(&mut m, bexit, Op::Return { value: None });
+
+        link(&mut m, entry, btry);
+        link(&mut m, btry, bexit);
+        link(&mut m, bcatch, bexit);
+        add_try(&mut m, f_try, vec![btry], bcatch, exc);
+
+        (outer_e, inner_e, outer_o, inner_o, cg0, cg1)
+    };
+
+    let out = run(&m);
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+
+    // Verify (a): Sendable vs Plain separation across PopLexEnv.
+    let send_read_iid = inst_of(&m, send_read);
+    let plain_read_iid = inst_of(&m, plain_read);
+    let send_env_ans = oracle.lex_env_at(send_read_iid, 0);
+    assert!(!send_env_ans.has_unknown);
+    assert_eq!(send_env_ans.sites, AllocSiteSet::one(send_env_iid));
+    assert_eq!(oracle.sendable_env_at(plain_read_iid, 0), send_env_ans);
+
+    let send_val_ans = oracle.query(send_read, send_read_iid);
+    assert!(!send_val_ans.has_unknown);
+    assert_eq!(
+        send_val_ans.sites,
+        oracle.query(send_obj, send_read_iid).sites
+    );
+    assert_ne!(
+        send_val_ans.sites,
+        oracle.query(plain_obj, send_read_iid).sites
+    );
+
+    let child_send_iid = inst_of(&m, child_send_get);
+    let child_send_ans = oracle.query(child_send_get, child_send_iid);
+    assert!(!child_send_ans.has_unknown);
+    assert_eq!(
+        child_send_ans.sites,
+        oracle.query(send_obj, send_read_iid).sites
+    );
+
+    let plain_env_ans = oracle.lex_env_at(plain_read_iid, 0);
+    assert!(plain_env_ans.has_unknown && plain_env_ans.sites.is_empty());
+    assert!(oracle.query(plain_read, plain_read_iid).has_unknown);
+
+    // Verify (b): Diamond top-aligned join.
+    let join_g0_iid = inst_of(&m, join_get0);
+    let join_g1_iid = inst_of(&m, join_get1);
+    let d_env0 = oracle.lex_env_at(join_g0_iid, 0);
+    assert!(!d_env0.has_unknown, "{d_env0:?}");
+    let mut expected_d0 = AllocSiteSet::one(inner_t);
+    expected_d0.union_with(&AllocSiteSet::one(inner_f));
+    assert_eq!(d_env0.sites, expected_d0);
+
+    let d_val0 = oracle.query(join_get0, join_g0_iid);
+    assert!(!d_val0.has_unknown);
+    let mut expected_objs = oracle.query(obj_t, join_g0_iid).sites;
+    expected_objs.union_with(&oracle.query(obj_f, join_g0_iid).sites);
+    assert_eq!(d_val0.sites, expected_objs);
+
+    let d_env1 = oracle.lex_env_at(join_g1_iid, 1);
+    assert!(d_env1.has_unknown);
+    assert_eq!(d_env1.sites, AllocSiteSet::one(outer_t));
+
+    // Verify (c): Catch handler pre-throw join retains `try_inner_env` despite block-end `PopLexEnv`.
+    let cg0_iid = inst_of(&m, catch_get0);
+    let cg1_iid = inst_of(&m, catch_get1);
+    let c_env0 = oracle.lex_env_at(cg0_iid, 0);
+    assert!(!c_env0.has_unknown, "{c_env0:?}");
+    let mut expected_catch0 = AllocSiteSet::one(try_outer_env);
+    expected_catch0.union_with(&AllocSiteSet::one(try_inner_env));
+    assert_eq!(c_env0.sites, expected_catch0);
+
+    let c_val0 = oracle.query(catch_get0, cg0_iid);
+    assert!(!c_val0.has_unknown);
+    let mut expected_catch_objs = oracle.query(try_outer_obj, cg0_iid).sites;
+    expected_catch_objs.union_with(&oracle.query(try_inner_obj, cg0_iid).sites);
+    assert_eq!(c_val0.sites, expected_catch_objs);
+
+    let c_env1 = oracle.lex_env_at(cg1_iid, 1);
+    assert!(c_env1.has_unknown);
+    assert_eq!(c_env1.sites, AllocSiteSet::one(try_outer_env));
+}
+
+#[test]
+fn r4_d4_incomplete_ops_arr_push_and_dual_external_internal_callback() {
+    let mut m = mk_module();
+    let ext_fn = add_func_named(&mut m, "extRegister");
+    m.func_mut(ext_fn).unwrap().is_external = true;
+    m.func_mut(ext_fn).unwrap().blocks.clear();
+
+    let f_sym = intern(&mut m, "f");
+    let push_sym = intern(&mut m, "push");
+
+    // Purely-internal helper: called ONLY from an internal resolved call site.
+    let (internal_only, internal_params) = add_static_func(&mut m, "internal_only", 1);
+    let internal_read = {
+        let b = entry_of(&m, internal_only);
+        let r = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: internal_params[3],
+                name: f_sym,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(r) });
+        r
+    };
+
+    // Dual callback: called internally AND passed to `extRegister(dual_cb)`.
+    // Also writes a `ctx == None` property + lexical slot read by `inner_reader`
+    // and reads `param.f` (which is unknown when invoked externally in `ctx == None`).
+    let (inner_reader, _) = add_static_func(&mut m, "inner_reader", 0);
+    let inner_loaded_f = {
+        let b = entry_of(&m, inner_reader);
+        let box_v = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let lf = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: box_v,
+                name: f_sym,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(lf) });
+        lf
+    };
+
+    let (dual_cb, dual_params) = add_static_func(&mut m, "dual_cb", 1);
+    let (dual_param_read, dual_default_obj) = {
+        let b = entry_of(&m, dual_cb);
+        let _env = new_lex_env(&mut m, b);
+        let cb_box = alloc_object(&mut m, b);
+        let def_obj = alloc_object(&mut m, b);
+        // Stored unconditionally (including in `ctx == None` base activation).
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: cb_box,
+                name: f_sym,
+                value: def_obj,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: cb_box,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let pr = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: dual_params[3],
+                name: f_sym,
+            },
+        );
+        let inner_clo = closure_of(&mut m, b, inner_reader);
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(inner_clo),
+            },
+        );
+        (pr, def_obj)
+    };
+
+    // Separate module-init store in `ctx == None` read inside an escaped+internal reader.
+    let (shared_reader, _) = add_static_func(&mut m, "shared_reader", 0);
+    let shared_reader_val = {
+        let b = entry_of(&m, shared_reader);
+        let holder = emit(
+            &mut m,
+            b,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let v = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: holder,
+                name: f_sym,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(v) });
+        v
+    };
+
+    let main = add_func_named(&mut m, "func_main_0");
+    let (
+        unmodeled_val,
+        ext_ret,
+        arr_elem_after_push,
+        known_elem,
+        internal_payload,
+        ctx_none_payload,
+    ) = {
+        let b = entry_of(&m, main);
+
+        // 1) Unmodeled non-primitive op (`GetIterator`) -> `has_unknown == true`.
+        let iter_src = alloc_array(&mut m, b);
+        let unmodeled = emit(&mut m, b, Op::GetIterator { obj: iter_src });
+
+        // 2) External call return + callback registration -> `has_unknown == true`.
+        let ext_callee = load_method_ref(&mut m, b, ext_fn);
+        let dual_clo = closure_of(&mut m, b, dual_cb);
+        let ext_r = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: ext_callee,
+                this: None,
+                args: vec![dual_clo],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        // 3) `arr.push(x)` (`LoadProp(arr, "push")` + `CallKind::Dynamic` with `this: Some(arr)`) taints `arr` elements.
+        let arr = alloc_array(&mut m, b);
+        let k_elem = alloc_object(&mut m, b);
+        let idx0 = load_number(&mut m, b, 0.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::StorePropIdx {
+                object: arr,
+                index: idx0,
+                value: k_elem,
+            },
+        );
+        let pushed_elem = alloc_object(&mut m, b);
+        let push_fn = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: arr,
+                name: push_sym,
+            },
+        );
+        let _push_ret = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: push_fn,
+                this: Some(arr),
+                args: vec![pushed_elem],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let elem_after = emit(
+            &mut m,
+            b,
+            Op::LoadPropIdx {
+                object: arr,
+                index: idx0,
+            },
+        );
+
+        // 4) Internal call to both `internal_only` and `dual_cb`, plus `ctx == None` lexical holder store.
+        let caller_box = alloc_object(&mut m, b);
+        let i_payload = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: caller_box,
+                name: f_sym,
+                value: i_payload,
+            },
+        );
+        let int_clo = closure_of(&mut m, b, internal_only);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: int_clo,
+                this: None,
+                args: vec![caller_box],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: dual_clo,
+                this: None,
+                args: vec![caller_box],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        let _main_env = new_lex_env(&mut m, b);
+        let none_holder = alloc_object(&mut m, b);
+        let none_payload = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: none_holder,
+                name: f_sym,
+                value: none_payload,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: none_holder,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let sr_clo = closure_of(&mut m, b, shared_reader);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: ext_callee,
+                this: None,
+                args: vec![sr_clo],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: sr_clo,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        emit_void(&mut m, b, Op::Return { value: None });
+        (
+            unmodeled,
+            ext_r,
+            elem_after,
+            k_elem,
+            i_payload,
+            none_payload,
+        )
+    };
+
+    let out = run(&m);
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+    let at = InstId::new(0);
+
+    // Unmodeled op & external call return `has_unknown == true`.
+    assert!(oracle.query(unmodeled_val, at).has_unknown);
+    assert!(oracle.query(ext_ret, at).has_unknown);
+
+    // `arr.push(x)` marks `arr`'s element reads incomplete (`has_unknown == true`) while keeping `known_elem`.
+    let arr_ans = oracle.query(arr_elem_after_push, at);
+    assert!(
+        arr_ans.has_unknown,
+        "arr.push(x) must taint receiver elements: {arr_ans:?}"
+    );
+    assert!(
+        arr_ans
+            .sites
+            .intersects(&oracle.query(known_elem, at).sites)
+    );
+
+    // Purely-internal `internal_only` drops `ctx == None` and resolves `param.f` precisely.
+    let int_ans = oracle.query(internal_read, at);
+    assert!(!int_ans.has_unknown, "{int_ans:?}");
+    assert_eq!(int_ans.sites, oracle.query(internal_payload, at).sites);
+
+    // Escaped+internal `dual_cb` retains `ctx == None` (`has_unknown == true` on `param.f`,
+    // plus `ctx == None` property/lexical stores remain visible to `inner_reader` & `shared_reader`).
+    let dual_ans = oracle.query(dual_param_read, at);
+    assert!(
+        dual_ans.has_unknown,
+        "externally-invocable callback must retain ctx == None unknown param flow: {dual_ans:?}"
+    );
+    assert!(
+        dual_ans
+            .sites
+            .intersects(&oracle.query(internal_payload, at).sites)
+    );
+
+    let inner_ans = oracle.query(inner_loaded_f, at);
+    assert!(!inner_ans.has_unknown);
+    assert_eq!(inner_ans.sites, oracle.query(dual_default_obj, at).sites);
+
+    let sr_ans = oracle.query(shared_reader_val, at);
+    assert!(!sr_ans.has_unknown);
+    assert_eq!(sr_ans.sites, oracle.query(ctx_none_payload, at).sites);
+}
+
+#[test]
+fn r4_h5_spread_copy_props_excluded_keys_apply_super_forward_rest_global_and_split_resume() {
+    let mut m = mk_module();
+    let a_sym = intern(&mut m, "a");
+    let keep_sym = intern(&mut m, "keep");
+    let drop_sym = intern(&mut m, "drop");
+    let f_sym = intern(&mut m, "f");
+    let g_sym = intern(&mut m, "globalProp");
+
+    // 1) `Apply` spread callee: returns formal 0 (`params[3]`).
+    let (apply_fn, apply_params) = add_static_func(&mut m, "apply_fn", 1);
+    {
+        let b = entry_of(&m, apply_fn);
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(apply_params[3]),
+            },
+        );
+    }
+
+    // 2) `SuperForwardAllArgs` derived constructor -> base constructor.
+    let (base_ctor, base_params) = add_static_func(&mut m, "BaseCtor", 1);
+    {
+        let b = entry_of(&m, base_ctor);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: base_params[2],
+                name: f_sym,
+                value: base_params[3],
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+    let (sub_ctor, sub_params) = add_static_func(&mut m, "SubCtor", 1);
+    {
+        let b = entry_of(&m, sub_ctor);
+        let super_ret = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: sub_params[0],
+                this: None,
+                args: vec![sub_params[2]],
+                kind: CallKind::SuperForwardAllArgs,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(super_ret),
+            },
+        );
+    }
+
+    // 3) `CopyRestArgs { start_index: 1 }` skipping formal 0 and capturing formal 1.
+    let (rest_fn, _rest_params) = add_static_func(&mut m, "rest_fn", 2);
+    let rest_arr_val = {
+        let b = entry_of(&m, rest_fn);
+        let rest_arr = emit(&mut m, b, Op::CopyRestArgs { start_index: 1 });
+        let r_idx0 = load_number(&mut m, b, 0.0);
+        let elem0 = emit(
+            &mut m,
+            b,
+            Op::LoadPropIdx {
+                object: rest_arr,
+                index: r_idx0,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(elem0) });
+        rest_arr
+    };
+
+    // 4) Split-block `ResumeGenerator` across protected `b0 -> b1 -> b2` try blocks.
+    let (async_fn, _) = add_static_func(&mut m, "split_async", 0);
+    let (awaited_obj, resumed_val) = {
+        let b0 = entry_of(&m, async_fn);
+        let b1 = add_block(&mut m, async_fn);
+        let b2 = add_block(&mut m, async_fn);
+        let bcatch = add_block(&mut m, async_fn);
+
+        let genobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+        let aw_obj = alloc_object(&mut m, b0);
+        let aw = emit(
+            &mut m,
+            b0,
+            Op::AwaitUncaught {
+                funcobj: genobj,
+                value: aw_obj,
+            },
+        );
+        emit_void(&mut m, b0, Op::Branch { dest: b1 });
+
+        let _ = emit(&mut m, b1, Op::SuspendGenerator { genobj, value: aw });
+        emit_void(&mut m, b1, Op::Branch { dest: b2 });
+
+        let resumed = emit(&mut m, b2, Op::ResumeGenerator { genobj });
+        emit_void(
+            &mut m,
+            b2,
+            Op::Return {
+                value: Some(resumed),
+            },
+        );
+
+        let exc = add_exception_param(&mut m, bcatch);
+        emit_void(&mut m, bcatch, Op::Return { value: Some(exc) });
+
+        link(&mut m, b0, b1);
+        link(&mut m, b1, b2);
+        add_try(&mut m, async_fn, vec![b0, b1, b2], bcatch, exc);
+        (aw_obj, resumed)
+    };
+
+    let main = add_func_named(&mut m, "func_main_0");
+    let (
+        spread_elem,
+        spread_loaded,
+        copied_val,
+        copied_loaded,
+        kept_val,
+        excl_val,
+        rest_obj,
+        rest_keep_loaded,
+        rest_drop_loaded,
+        apply_arg,
+        apply_res,
+        super_arg,
+        super_loaded_f,
+        skipped_arg,
+        kept_rest_arg,
+        rest_call_res,
+        global_obj,
+        global_val,
+        global_prop_loaded,
+        try_get_global_loaded,
+    ) = {
+        let b = entry_of(&m, main);
+
+        // `ArraySpread`: `src_arr[0] -> dst_arr[..]`.
+        let src_arr = alloc_array(&mut m, b);
+        let s_elem = alloc_object(&mut m, b);
+        let zero = load_number(&mut m, b, 0.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::StorePropIdx {
+                object: src_arr,
+                index: zero,
+                value: s_elem,
+            },
+        );
+        let dst_arr = alloc_array(&mut m, b);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::ArraySpread {
+                dst: dst_arr,
+                index: zero,
+                src: src_arr,
+            },
+        );
+        let s_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadPropIdx {
+                object: dst_arr,
+                index: zero,
+            },
+        );
+
+        // `CopyDataProps`: `src_obj.a -> dst_obj.a`.
+        let src_obj = alloc_object(&mut m, b);
+        let c_val = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: src_obj,
+                name: a_sym,
+                value: c_val,
+            },
+        );
+        let dst_obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::CopyDataProps {
+                dst: dst_obj,
+                src: src_obj,
+            },
+        );
+        let c_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: dst_obj,
+                name: a_sym,
+            },
+        );
+
+        // `CreateObjectWithExcludedKeys`: copies `keep`, excludes `drop`.
+        let full_obj = alloc_object(&mut m, b);
+        let k_val = alloc_object(&mut m, b);
+        let x_val = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: full_obj,
+                name: keep_sym,
+                value: k_val,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: full_obj,
+                name: drop_sym,
+                value: x_val,
+            },
+        );
+        let drop_key = load_string(&mut m, b, "drop");
+        let r_obj = emit(
+            &mut m,
+            b,
+            Op::CreateObjectWithExcludedKeys {
+                obj: full_obj,
+                keys: vec![drop_key],
+            },
+        );
+        let rk_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: r_obj,
+                name: keep_sym,
+            },
+        );
+        let rd_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: r_obj,
+                name: drop_sym,
+            },
+        );
+
+        // `CallKind::Apply` spread args.
+        let apply_arr = alloc_array(&mut m, b);
+        let a_arg = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StorePropIdx {
+                object: apply_arr,
+                index: zero,
+                value: a_arg,
+            },
+        );
+        let apply_clo = closure_of(&mut m, b, apply_fn);
+        let a_res = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: apply_clo,
+                this: None,
+                args: vec![apply_arr],
+                kind: CallKind::Apply,
+            },
+        );
+
+        // `SuperForwardAllArgs` class construction.
+        let empty_mem = m.consts.push_array(Vec::new());
+        let base_cls = emit(
+            &mut m,
+            b,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: base_ctor,
+                heritage: None,
+                members: empty_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        let sub_cls = emit(
+            &mut m,
+            b,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: sub_ctor,
+                heritage: Some(base_cls),
+                members: empty_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        let sup_arg = alloc_object(&mut m, b);
+        let sub_inst = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: sub_cls,
+                this: None,
+                args: vec![sup_arg],
+                kind: CallKind::New,
+            },
+        );
+        let sup_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: sub_inst,
+                name: f_sym,
+            },
+        );
+
+        // `CopyRestArgs`.
+        let sk_arg = alloc_object(&mut m, b);
+        let kr_arg = alloc_object(&mut m, b);
+        let rest_clo = closure_of(&mut m, b, rest_fn);
+        let r_call_res = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: rest_clo,
+                this: None,
+                args: vec![sk_arg, kr_arg],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        // `LoadGlobalObject` <-> `Ptr::Global` bridge.
+        let g_obj = emit(&mut m, b, Op::LoadGlobalObject);
+        let g_val = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: g_obj,
+                name: g_sym,
+                value: g_val,
+            },
+        );
+        let gp_loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: g_obj,
+                name: g_sym,
+            },
+        );
+        let tgg_loaded = emit(
+            &mut m,
+            b,
+            Op::TryGetGlobal {
+                name: g_sym,
+                default: None,
+            },
+        );
+
+        // Trigger `async_fn` too.
+        let async_clo = closure_of(&mut m, b, async_fn);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: async_clo,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        emit_void(&mut m, b, Op::Return { value: None });
+        (
+            s_elem, s_loaded, c_val, c_loaded, k_val, x_val, r_obj, rk_loaded, rd_loaded, a_arg,
+            a_res, sup_arg, sup_loaded, sk_arg, kr_arg, r_call_res, g_obj, g_val, gp_loaded,
+            tgg_loaded,
+        )
+    };
+
+    let out = run(&m);
+    assert!(!out.stats().capped);
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+    let at = InstId::new(0);
+
+    // ArraySpread
+    let spread_ans = oracle.query(spread_loaded, at);
+    assert!(!spread_ans.has_unknown);
+    assert_eq!(spread_ans.sites, oracle.query(spread_elem, at).sites);
+
+    // CopyDataProps
+    let copy_ans = oracle.query(copied_loaded, at);
+    assert!(!copy_ans.has_unknown);
+    assert_eq!(copy_ans.sites, oracle.query(copied_val, at).sites);
+
+    // CreateObjectWithExcludedKeys
+    let rest_obj_ans = oracle.query(rest_obj, at);
+    assert!(rest_obj_ans.is_single_precise());
+    let keep_ans = oracle.query(rest_keep_loaded, at);
+    assert!(!keep_ans.has_unknown);
+    assert_eq!(keep_ans.sites, oracle.query(kept_val, at).sites);
+    let drop_ans = oracle.query(rest_drop_loaded, at);
+    assert!(
+        !drop_ans.sites.intersects(&oracle.query(excl_val, at).sites),
+        "excluded key must not propagate: {drop_ans:?}"
+    );
+    assert!(drop_ans.has_unknown && drop_ans.sites.is_empty());
+
+    // CallKind::Apply spread args
+    let apply_ans = oracle.query(apply_res, at);
+    assert!(!apply_ans.has_unknown);
+    assert_eq!(apply_ans.sites, oracle.query(apply_arg, at).sites);
+
+    // CallKind::SuperForwardAllArgs:
+    // - Whole-module (`roots = None`): 2-hop `main -> SubCtor -> BaseCtor` forwards `super_arg`
+    //   into `BaseCtor`'s formal alongside `(SubCtor, None)`'s unrecorded base formal.
+    // - Rooted at `main` (`Some(&[main])`): `(SubCtor, None)` is not seeded, so `sub_inst.f`
+    //   resolves single-precisely (`!has_unknown`) to `super_arg`.
+    let super_ans = oracle.query(super_loaded_f, at);
+    assert_eq!(super_ans.sites, oracle.query(super_arg, at).sites);
+    let links = ModuleLinkTable::build(&m);
+    let base_cg = CallGraph::build_with_links(&m, &links);
+    let (_, rooted_tables, rooted_stats) =
+        analyze_with_links_and_roots(&m, &links, &base_cg, &PtaConfig::default(), Some(&[main]))
+            .into_parts();
+    let rooted_oracle = Rung2AliasOracle::new(&m, rooted_tables, rooted_stats);
+    let rooted_super = rooted_oracle.query(super_loaded_f, at);
+    assert!(!rooted_super.has_unknown, "{rooted_super:?}");
+    assert_eq!(rooted_super.sites, rooted_oracle.query(super_arg, at).sites);
+
+    // CopyRestArgs
+    let rest_arr_ans = oracle.query(rest_arr_val, at);
+    assert!(!rest_arr_ans.has_unknown && !rest_arr_ans.sites.is_empty());
+    let rest_res_ans = oracle.query(rest_call_res, at);
+    assert!(!rest_res_ans.has_unknown);
+    assert_eq!(rest_res_ans.sites, oracle.query(kept_rest_arg, at).sites);
+    assert!(
+        !rest_res_ans
+            .sites
+            .intersects(&oracle.query(skipped_arg, at).sites)
+    );
+
+    // LoadGlobalObject
+    let g_obj_ans = oracle.query(global_obj, at);
+    assert!(g_obj_ans.has_unknown && g_obj_ans.sites.is_empty());
+    let gp_ans = oracle.query(global_prop_loaded, at);
+    assert!(!gp_ans.has_unknown);
+    assert_eq!(gp_ans.sites, oracle.query(global_val, at).sites);
+    let tgg_ans = oracle.query(try_get_global_loaded, at);
+    assert!(tgg_ans.has_unknown);
+    assert_eq!(tgg_ans.sites, oracle.query(global_val, at).sites);
+
+    // Split-block ResumeGenerator
+    let resume_ans = oracle.query(resumed_val, at);
+    assert!(!resume_ans.has_unknown, "{resume_ans:?}");
+    assert_eq!(resume_ans.sites, oracle.query(awaited_obj, at).sites);
+}
+
+#[test]
+fn array_proto_mutator_preserves_own_named_method_shadow() {
+    // `const a = []; a.push(x); a.pop = () => 7; a.pop()` (`e7-own-method-shadow`):
+    // `a.push(x)` taints `a[Slot::Index]` (`a[0]` has `has_unknown == true` while
+    // retaining `x`), without poisoning `Slot::Dynamic` or `Slot::Named("pop")`, so
+    // `a.pop` resolves precisely (`has_unknown == false`, `resolution_complete == true`).
+    let mut m = mk_module();
+    let push_sym = intern(&mut m, "push");
+    let pop_sym = intern(&mut m, "pop");
+
+    let (shadow_pop, _) = add_static_func(&mut m, "shadow_pop", 0);
+    {
+        let b = entry_of(&m, shadow_pop);
+        let seven = load_number(&mut m, b, 7.0);
+        emit_void(&mut m, b, Op::Return { value: Some(seven) });
+    }
+
+    let main = add_func_named(&mut m, "func_main_0");
+    let b = entry_of(&m, main);
+    let a = alloc_array(&mut m, b);
+    let x = alloc_object(&mut m, b);
+
+    let push_fn = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: a,
+            name: push_sym,
+        },
+    );
+    let _push_ret = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: push_fn,
+            this: Some(a),
+            args: vec![x],
+            kind: CallKind::Dynamic,
+        },
+    );
+
+    let pop_clo = closure_of(&mut m, b, shadow_pop);
+    emit_void(
+        &mut m,
+        b,
+        Op::StoreProp {
+            object: a,
+            name: pop_sym,
+            value: pop_clo,
+        },
+    );
+
+    let pop_fn = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: a,
+            name: pop_sym,
+        },
+    );
+    let pop_call = push_inst(
+        &mut m,
+        b,
+        Op::Call {
+            callee: pop_fn,
+            this: Some(a),
+            args: vec![],
+            kind: CallKind::Dynamic,
+        },
+    );
+
+    let zero = load_number(&mut m, b, 0.0);
+    let elem0 = emit(
+        &mut m,
+        b,
+        Op::LoadPropIdx {
+            object: a,
+            index: zero,
+        },
+    );
+    emit_void(&mut m, b, Op::Return { value: None });
+
+    let out = run(&m);
+    let pop_edge = out.graph().edge_at(pop_call).expect("pop call edge");
+    assert_eq!(pop_edge.targets, CallTargets::Resolved(vec![shadow_pop]));
+    assert!(
+        pop_edge.resolution_complete,
+        "own method shadow call must stay complete: {pop_edge:?}"
+    );
+
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+    let at = InstId::new(0);
+
+    let elem_ans = oracle.query(elem0, at);
+    assert!(
+        elem_ans.has_unknown,
+        "a[0] must stay conservative after a.push(x): {elem_ans:?}"
+    );
+    assert!(
+        elem_ans.sites.intersects(&oracle.query(x, at).sites),
+        "pushed argument x must flow into a[Slot::Index]: {elem_ans:?}"
+    );
+
+    let pop_ans = oracle.query(pop_fn, at);
+    assert!(
+        !pop_ans.has_unknown,
+        "LoadProp(a, \"pop\") must resolve precisely: {pop_ans:?}"
+    );
+    assert_eq!(pop_ans.sites, oracle.query(pop_clo, at).sites);
+}

@@ -20,31 +20,21 @@
 //! [`natural_loop`]), and pattern-independent region structuring
 //! ([`structure_regions`] — `design/decompile.md` §4.2).
 //!
-//! ## The dominance contract with `abcd-ir`'s verifier
+//! ## Dominance delegation and verifier agreement
 //!
-//! `abcd-ir::verify` keeps its own private, minimal iterative dominator
-//! computation (the N45 use-def check) because the layering is one-way:
-//! `abcd-ir` must never depend on `abcd-analysis`. The two implementations
-//! are pinned to agree by the agreement tests (`tests/lift-analysis/`
-//! `corpus_dom_agreement.rs` corpus-wide and `dom_agreement_crafted.rs` on
-//! hand-built shapes), which re-implement the verifier's set-based
-//! algorithm verbatim as the reference. The contract:
+//! [`Dominators`] and [`PostDominators`] delegate directly to
+//! [`abcd_ir::cfg::DomTree`] and [`abcd_ir::cfg::IndexedDom`] (iterative
+//! Cooper–Harvey–Kennedy dominance with `O(1)` Euler-interval ancestry
+//! queries), sharing the exact engine that `abcd-ir::verify` uses for SSA
+//! dominance verification (`N45`, `N64`).
 //!
-//! > Over all blocks BOTH implementations consider Normal-reachable —
-//! > reachable from the entry in the [`Dominators`] tree AND containing
-//! > the entry in the verifier's `dom[b]` — the two compute the same
-//! > dominator SETS.
-//!
-//! Two divergence classes are documented and excluded (both dead-code
-//! shapes the verifier's N45 check exempts anyway): (1) unreachable
-//! Normal-edge cycles keep the verifier's initial "everything" set while
-//! the tree reports them unreachable; (2) a reachable block with an
-//! unreachable Normal predecessor is *polluted* by the verifier's all-set
-//! initialization (the intersection with the dead predecessor's set
-//! empties it, so the verifier treats the block as unreachable) while the
-//! CHK tree computes dominators on the reachable subgraph — the
-//! graph-theoretic answer. The divergence always weakens the verifier's
-//! check, never strengthens it.
+//! The agreement suites (`tests/lift-analysis/corpus_dom_agreement.rs`
+//! corpus-wide and `dom_agreement_crafted.rs` on hand-built shapes) cross-check
+//! [`Dominators::normal`] against textbook iterative set-intersection dataflow:
+//! over all blocks both algorithms consider Normal-reachable (excluding
+//! unreachable cycles and blocks polluted by dead-predecessor all-set
+//! initialization in textbook set intersection), both compute identical
+//! dominator sets.
 
 mod dom;
 mod loops;
@@ -61,4 +51,7 @@ pub use regions::{
     RegionError, RegionId, RegionNode, RegionTree, TryPlan, structure_regions, structure_subgraph,
 };
 pub use rpo::compute_rpo;
-pub use succs::{augmented_succs, block_succs, inst_succs};
+pub use succs::{
+    augmented_succs, augmented_succs_with_map, awaited_values_for_resume, block_succs,
+    build_await_resume_map, inst_succs,
+};

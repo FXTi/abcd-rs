@@ -12,7 +12,7 @@
 //!   definition chains (`TryGetGlobal`/`LoadProp` → qualified name candidates),
 //!   enabling name-keyed summaries and sinks on dynamic JS/ArkTS call sites.
 //! - [`summary`] — builtin and library summary registry (`Map<(Sym, Arity), Summary>`):
-//!   endpoint flows over `{param(i), base, return, field(path), return-field(path)}`,
+//!   endpoint flows over `{param(i), any-param-from(start), base, return, field(path), return-field(path)}`,
 //!   clears, `is_alias`, callback gap specifications, `exclusive` dispatch,
 //!   negative caching, and hit/miss telemetry.
 //! - [`gap`] — callback-gap propagation: summary call sites taking higher-order
@@ -32,6 +32,7 @@
 //! Library `[dependencies]` reference only `abcd-ir` and `abcd-analysis`,
 //! preserving strict format independence.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
@@ -46,7 +47,7 @@ pub mod prototype;
 pub mod summary;
 
 pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
-pub use fact::{Fact, TaintBase, TaintFact};
+pub use fact::{Fact, TaintBase, TaintFact, UNCAUGHT_EXCEPTION_VALUE};
 pub use gap::GapCallGraph;
 pub use ohos::{OHOS_PRESET_VERSION, apply_ohos_preset, ohos_preset};
 pub use oracle::Oracle;

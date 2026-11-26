@@ -19,13 +19,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use abcd_ir::op::{MemberAttrs, ModuleVarKind, SuperKey};
+use abcd_ir::cfg::ExceptionHandlerMap;
+use abcd_ir::op::{LexEnvKind, MemberAttrs, ModuleVarKind, SuperKey};
+use abcd_ir::ty::{StaticTy, Ty};
 use abcd_ir::{
-    BlockId, CallKind, ClassId, Const, ConstId, FuncId, FunctionKind, InstId, Module, Op, Sym,
-    ValueDef, ValueId,
+    BlockId, CallKind, ClassId, Const, ConstId, FuncId, FunctionKind, InstId, Modifiers, Module,
+    Op, SourceLang, Sym, ValueDef, ValueId,
 };
 
-use crate::control::augmented_succs;
+use crate::control::{augmented_succs_with_map, awaited_values_for_resume};
+use crate::dataflow::heap::peel_movs;
 use crate::frame::frame_slots_of;
 use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
 
@@ -72,19 +75,17 @@ pub(crate) enum Prov {
     ModuleNs(ClassId),
 }
 
-/// Indexed class metadata from `Op::DefineClass` / `Op::DefineSendableClass`
-/// and same-function prototype/static attachments.
+/// Indexed class metadata from `Op::DefineClass` / `Op::DefineSendableClass`,
+/// static `ClassData` records, and same-function prototype/static attachments.
 #[derive(Clone, Debug)]
 struct ClassDef {
-    ctor: FuncId,
-    enclosing_func: FuncId,
-    #[allow(dead_code)]
-    record_class: ClassId,
-    #[allow(dead_code)]
-    class_val: Option<ValueId>,
+    ctor: Option<FuncId>,
+    enclosing_func: Option<FuncId>,
+    static_record: Option<ClassId>,
     heritage: Option<ValueId>,
     is_sendable: bool,
     super_classes: Vec<ClassDefId>,
+    sub_classes: Vec<ClassDefId>,
     instance_methods: BTreeMap<Sym, Vec<FuncId>>,
     static_methods: BTreeMap<Sym, Vec<FuncId>>,
     instance_getters: BTreeMap<Sym, Vec<FuncId>>,
@@ -102,19 +103,26 @@ struct ObjLitProp {
 
 type EnvStack = Vec<Vec<InstId>>;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DualEnvStack {
+    plain: EnvStack,
+    sendable: EnvStack,
+}
+
 /// Whole-module class hierarchy, lexical-slot, and bounded field/return index.
 pub(crate) struct ClassHierarchyIndex<'m> {
     module: &'m Module,
     links: &'m ModuleLinkTable,
     classes: Vec<ClassDef>,
     class_by_inst: Vec<Option<ClassDefId>>,
+    record_to_class_def: Vec<Option<ClassDefId>>,
     ctor_to_classes: Vec<Vec<ClassDefId>>,
     method_owner: Vec<Option<(ClassDefId, bool)>>,
     super_owner: Vec<Option<(ClassDefId, bool)>>,
     this_param_of: Vec<Option<ValueId>>,
     func_obj_param_of: Vec<Option<ValueId>>,
     enclosing_sendable_class: Vec<Option<ClassDefId>>,
-    obj_lits: HashMap<(InstId, Sym), ObjLitProp>,
+    obj_lits: BTreeMap<(InstId, Sym), ObjLitProp>,
     get_lex_sites: HashMap<InstId, Vec<InstId>>,
     lex_stores: HashMap<(InstId, u16), Vec<(FuncId, ValueId)>>,
     instance_fields: HashMap<(ClassDefId, Sym), BTreeSet<Prov>>,
@@ -128,9 +136,11 @@ enum LexAccessKind {
         level: u16,
         slot: u16,
         value: ValueId,
+        sendable: bool,
     },
     Get {
         level: u16,
+        sendable: bool,
     },
 }
 
@@ -170,10 +180,28 @@ impl<'m> ClassHierarchyIndex<'m> {
 
         let mut classes: Vec<ClassDef> = Vec::new();
         let mut class_by_inst: Vec<Option<ClassDefId>> = vec![None; num_insts];
+        let mut record_to_class_def: Vec<Option<ClassDefId>> = vec![None; module.classes.len()];
         let mut ctor_to_classes: Vec<Vec<ClassDefId>> = vec![Vec::new(); num_funcs];
         let mut method_owner: Vec<Option<(ClassDefId, bool)>> = vec![None; num_funcs];
         let mut enclosing_sendable_class: Vec<Option<ClassDefId>> = vec![None; num_funcs];
-        let mut obj_lits: HashMap<(InstId, Sym), ObjLitProp> = HashMap::new();
+        let mut obj_lits: BTreeMap<(InstId, Sym), ObjLitProp> = BTreeMap::new();
+
+        // Index static `ClassData` records (`super_class`, `interfaces`, static ArkTS classes).
+        let referenced_static = collect_referenced_static_classes(module);
+        for (ci, cls_data) in module.classes.iter().enumerate() {
+            let rcid = ClassId::new(ci as u32);
+            if should_index_static_class(module, cls_data, referenced_static[ci]) {
+                let cdef_id = index_static_class_data(
+                    module,
+                    rcid,
+                    cls_data,
+                    &mut classes,
+                    &mut ctor_to_classes,
+                    &mut method_owner,
+                );
+                record_to_class_def[ci] = Some(cdef_id);
+            }
+        }
 
         // Collected during the single Pass-1 scan for Pass 1B, 1C, and Pass 2.
         let mut prop_stores: Vec<(FuncId, ValueId, Sym, ValueId)> = Vec::new();
@@ -189,7 +217,6 @@ impl<'m> ClassHierarchyIndex<'m> {
         // ── Pass 1A: Linear `(FuncId, BlockId, InstId)` scan ─────────────
         for (fi, f) in module.functions.iter().enumerate() {
             let fid = FuncId::new(fi as u32);
-            let record_class = f.class_id;
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else {
                     continue;
@@ -205,8 +232,6 @@ impl<'m> ClassHierarchyIndex<'m> {
                             let cid = index_class_def(
                                 module,
                                 fid,
-                                record_class,
-                                inst.result,
                                 cls.ctor,
                                 cls.heritage,
                                 cls.members,
@@ -229,8 +254,6 @@ impl<'m> ClassHierarchyIndex<'m> {
                             let cid = index_class_def(
                                 module,
                                 fid,
-                                record_class,
-                                inst.result,
                                 cls.ctor,
                                 cls.heritage,
                                 cls.members,
@@ -321,7 +344,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                             slot,
                             value,
                             kind,
-                        } if *kind != abcd_ir::LexEnvKind::Patch => {
+                        } if *kind != LexEnvKind::Patch => {
                             mark_lex_or_cap = true;
                             lex_accesses.push((
                                 iid,
@@ -330,14 +353,19 @@ impl<'m> ClassHierarchyIndex<'m> {
                                     level: *level,
                                     slot: *slot,
                                     value: *value,
+                                    sendable: *kind == LexEnvKind::Sendable,
                                 },
                             ));
                         }
-                        Op::GetLexVar { level, kind, .. }
-                            if *kind != abcd_ir::LexEnvKind::Patch =>
-                        {
+                        Op::GetLexVar { level, kind, .. } if *kind != LexEnvKind::Patch => {
                             mark_lex_or_cap = true;
-                            lex_accesses.push((iid, LexAccessKind::Get { level: *level }));
+                            lex_accesses.push((
+                                iid,
+                                LexAccessKind::Get {
+                                    level: *level,
+                                    sendable: *kind == LexEnvKind::Sendable,
+                                },
+                            ));
                         }
                         Op::Return { value: Some(v) } | Op::AsyncResolve { value: v, .. } => {
                             return_values.push((fid, *v));
@@ -356,7 +384,7 @@ impl<'m> ClassHierarchyIndex<'m> {
 
         // ── Pass 1B: Prototype/static attachments & object-literal stores ─
         for &(func, object, name, val_or_func) in prop_stores.iter().chain(define_methods.iter()) {
-            let root_obj = peel_mov(module, object);
+            let root_obj = peel_movs(module, object);
             let Some(ValueDef::Inst(obj_iid)) = module.value(root_obj).map(|v| v.def) else {
                 continue;
             };
@@ -380,7 +408,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                     object: proto_base,
                     name: prop_name,
                 }) if module.sym.resolve(*prop_name) == Some("prototype") => {
-                    let cls_root = peel_mov(module, *proto_base);
+                    let cls_root = peel_movs(module, *proto_base);
                     if let Some(ValueDef::Inst(cls_iid)) = module.value(cls_root).map(|v| v.def)
                         && let Some(cid) = class_by_inst.get(cls_iid.index()).copied().flatten()
                         && let Some(mfid) = peel_closure_func(module, val_or_func)
@@ -471,25 +499,28 @@ impl<'m> ClassHierarchyIndex<'m> {
             }
         }
 
-        // ── Pass 1C: Fast lexical-slot index (RPO + 2 capture rounds) ────
-        let mut rpo_by_func: Vec<Vec<BlockId>> = Vec::with_capacity(num_funcs);
+        // ── Pass 1C: Fast lexical-slot index (monotonic RPO worklist + 2 capture rounds) ────
+        let mut rpo_by_func: Vec<Option<(Vec<BlockId>, ExceptionHandlerMap)>> =
+            Vec::with_capacity(num_funcs);
         for (fi, &has_mut) in has_env_mut_ops.iter().enumerate() {
-            if has_mut {
-                rpo_by_func.push(compute_augmented_rpo(module, FuncId::new(fi as u32)));
+            let fid = FuncId::new(fi as u32);
+            if has_mut && let Some(exc_map) = ExceptionHandlerMap::build(module, fid) {
+                let rpo = compute_augmented_rpo(module, fid, &exc_map);
+                rpo_by_func.push(Some((rpo, exc_map)));
             } else {
-                rpo_by_func.push(Vec::new());
+                rpo_by_func.push(None);
             }
         }
 
-        let mut captured_entry: Vec<EnvStack> = vec![Vec::new(); num_funcs];
-        let mut stack_at: HashMap<InstId, EnvStack> = HashMap::new();
+        let mut captured_entry: Vec<DualEnvStack> = vec![DualEnvStack::default(); num_funcs];
+        let mut stack_at: HashMap<InstId, DualEnvStack> = HashMap::new();
 
-        for (fi, &has_mut) in has_env_mut_ops.iter().enumerate() {
-            if has_mut {
+        for (fi, rpo_entry) in rpo_by_func.iter().enumerate() {
+            if let Some((rpo, exc_map)) = rpo_entry {
                 compute_func_env_stacks(
                     module,
-                    FuncId::new(fi as u32),
-                    &rpo_by_func[fi],
+                    rpo,
+                    exc_map,
                     &captured_entry[fi],
                     &is_lex_or_cap,
                     &mut stack_at,
@@ -502,7 +533,7 @@ impl<'m> ClassHierarchyIndex<'m> {
             for &(cap_iid, child_fn) in &capture_sites {
                 if let Some(cap_stack) = stack_at.get(&cap_iid).cloned()
                     && let Some(dst) = captured_entry.get_mut(child_fn.index())
-                    && merge_env_stacks(dst, &cap_stack)
+                    && merge_dual_env_stacks(dst, &cap_stack)
                     && let Some(d) = dirty.get_mut(child_fn.index())
                 {
                     *d = true;
@@ -515,11 +546,11 @@ impl<'m> ClassHierarchyIndex<'m> {
                 if !is_dirty {
                     continue;
                 }
-                if has_env_mut_ops[fi] {
+                if let Some((rpo, exc_map)) = &rpo_by_func[fi] {
                     compute_func_env_stacks(
                         module,
-                        FuncId::new(fi as u32),
-                        &rpo_by_func[fi],
+                        rpo,
+                        exc_map,
                         &captured_entry[fi],
                         &is_lex_or_cap,
                         &mut stack_at,
@@ -527,7 +558,14 @@ impl<'m> ClassHierarchyIndex<'m> {
                 } else {
                     let entry_stack = &captured_entry[fi];
                     for &iid in &func_lex_or_cap_insts[fi] {
-                        stack_at.insert(iid, entry_stack.clone());
+                        match stack_at.get_mut(&iid) {
+                            Some(existing) => {
+                                merge_dual_env_stacks(existing, entry_stack);
+                            }
+                            None => {
+                                stack_at.insert(iid, entry_stack.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -536,7 +574,7 @@ impl<'m> ClassHierarchyIndex<'m> {
         let mut get_lex_sites: HashMap<InstId, Vec<InstId>> = HashMap::new();
         let mut lex_stores: HashMap<(InstId, u16), Vec<(FuncId, ValueId)>> = HashMap::new();
         for (iid, access) in lex_accesses {
-            let Some(stack) = stack_at.get(&iid) else {
+            let Some(dual) = stack_at.get(&iid) else {
                 continue;
             };
             match access {
@@ -545,7 +583,13 @@ impl<'m> ClassHierarchyIndex<'m> {
                     level,
                     slot,
                     value,
+                    sendable,
                 } => {
+                    let stack = if sendable {
+                        &dual.sendable
+                    } else {
+                        &dual.plain
+                    };
                     let lvl = level as usize;
                     if lvl < stack.len() {
                         for &env_site in &stack[stack.len() - 1 - lvl] {
@@ -556,7 +600,12 @@ impl<'m> ClassHierarchyIndex<'m> {
                         }
                     }
                 }
-                LexAccessKind::Get { level } => {
+                LexAccessKind::Get { level, sendable } => {
+                    let stack = if sendable {
+                        &dual.sendable
+                    } else {
+                        &dual.plain
+                    };
                     let lvl = level as usize;
                     if lvl < stack.len() {
                         let sites = &stack[stack.len() - 1 - lvl];
@@ -573,6 +622,7 @@ impl<'m> ClassHierarchyIndex<'m> {
             links,
             classes,
             class_by_inst,
+            record_to_class_def,
             ctor_to_classes,
             method_owner,
             super_owner,
@@ -587,23 +637,59 @@ impl<'m> ClassHierarchyIndex<'m> {
             func_returns: vec![BTreeSet::new(); num_funcs],
         };
 
-        // ── Pass 2A: Resolve `super_classes` ─────────────────────────────
+        // ── Pass 2A: Resolve `super_classes` & `sub_classes` ─────────────
         for ci in 0..index.classes.len() {
-            let Some(h) = index.classes[ci].heritage else {
-                continue;
-            };
             let self_cid = ClassDefId(ci as u32);
-            let enclosing = index.classes[ci].enclosing_func;
-            let provs = index.infer_prov(enclosing, h);
             let mut supers = BTreeSet::new();
-            for p in provs {
-                if let Prov::ClassObj(sc) = p
+            if let Some(rcid) = index.classes[ci].static_record
+                && let Some(cls_data) = module.class(rcid)
+            {
+                if let Some(sup_rcid) = cls_data.super_class
+                    && let Some(sc) = index
+                        .record_to_class_def
+                        .get(sup_rcid.index())
+                        .copied()
+                        .flatten()
                     && sc != self_cid
                 {
                     supers.insert(sc);
                 }
+                for &iface_rcid in &cls_data.interfaces {
+                    if let Some(ic) = index
+                        .record_to_class_def
+                        .get(iface_rcid.index())
+                        .copied()
+                        .flatten()
+                        && ic != self_cid
+                    {
+                        supers.insert(ic);
+                    }
+                }
+            }
+            if let (Some(enclosing), Some(h)) =
+                (index.classes[ci].enclosing_func, index.classes[ci].heritage)
+            {
+                for p in index.infer_prov(enclosing, h) {
+                    if let Prov::ClassObj(sc) = p
+                        && sc != self_cid
+                    {
+                        supers.insert(sc);
+                    }
+                }
             }
             index.classes[ci].super_classes = supers.into_iter().collect();
+        }
+        let mut subs_by_class = vec![BTreeSet::new(); index.classes.len()];
+        for (ci, cls) in index.classes.iter().enumerate() {
+            let sub_id = ClassDefId(ci as u32);
+            for &sup_id in &cls.super_classes {
+                if let Some(set) = subs_by_class.get_mut(sup_id.index()) {
+                    set.insert(sub_id);
+                }
+            }
+        }
+        for (ci, subs) in subs_by_class.into_iter().enumerate() {
+            index.classes[ci].sub_classes = subs.into_iter().collect();
         }
 
         // ── Pass 2B: 3 bounded monotone rounds of field/return provenance ─
@@ -675,8 +761,10 @@ impl<'m> ClassHierarchyIndex<'m> {
                     for &cid in owned_ctors {
                         if let Some(cls) = self.classes.get(cid.index()) {
                             for &sc in &cls.super_classes {
-                                if let Some(scls) = self.classes.get(sc.index()) {
-                                    targets.insert(scls.ctor);
+                                if let Some(ctor) =
+                                    self.classes.get(sc.index()).and_then(|scls| scls.ctor)
+                                {
+                                    targets.insert(ctor);
                                 }
                             }
                         }
@@ -694,10 +782,13 @@ impl<'m> ClassHierarchyIndex<'m> {
                                     for &cid in f_ctors {
                                         if let Some(cls) = self.classes.get(cid.index()) {
                                             for &sc in &cls.super_classes {
-                                                if let Some(scls) = self.classes.get(sc.index())
-                                                    && scls.ctor != caller
+                                                if let Some(ctor) = self
+                                                    .classes
+                                                    .get(sc.index())
+                                                    .and_then(|scls| scls.ctor)
+                                                    && ctor != caller
                                                 {
-                                                    targets.insert(scls.ctor);
+                                                    targets.insert(ctor);
                                                 }
                                             }
                                         }
@@ -707,13 +798,45 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 }
                             }
                             Prov::ClassObj(sc) => {
-                                if let Some(scls) = self.classes.get(sc.index())
-                                    && scls.ctor != caller
+                                let caller_cls = self
+                                    .super_owner
+                                    .get(caller.index())
+                                    .copied()
+                                    .flatten()
+                                    .map(|(c, _)| c);
+                                if caller_cls == Some(sc) {
+                                    if let Some(cls) = self.classes.get(sc.index()) {
+                                        for &sup in &cls.super_classes {
+                                            if let Some(ctor) =
+                                                self.classes.get(sup.index()).and_then(|s| s.ctor)
+                                                && ctor != caller
+                                            {
+                                                targets.insert(ctor);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(ctor) =
+                                    self.classes.get(sc.index()).and_then(|scls| scls.ctor)
+                                    && ctor != caller
                                 {
-                                    targets.insert(scls.ctor);
+                                    targets.insert(ctor);
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    if targets.is_empty()
+                        && let Some((cid, _)) =
+                            self.super_owner.get(caller.index()).copied().flatten()
+                        && let Some(cls) = self.classes.get(cid.index())
+                    {
+                        for &sc in &cls.super_classes {
+                            if let Some(ctor) =
+                                self.classes.get(sc.index()).and_then(|scls| scls.ctor)
+                                && ctor != caller
+                            {
+                                targets.insert(ctor);
+                            }
                         }
                     }
                 }
@@ -722,8 +845,9 @@ impl<'m> ClassHierarchyIndex<'m> {
                 for p in self.infer_prov(caller, callee) {
                     match p {
                         Prov::ClassObj(c) => {
-                            if let Some(cls) = self.classes.get(c.index()) {
-                                targets.insert(cls.ctor);
+                            if let Some(ctor) = self.classes.get(c.index()).and_then(|cls| cls.ctor)
+                            {
+                                targets.insert(ctor);
                             }
                         }
                         Prov::Callable(f) => {
@@ -774,6 +898,15 @@ impl<'m> ClassHierarchyIndex<'m> {
                 let Some(v) = self.module.value(val) else {
                     continue;
                 };
+                if let Ty::Static(StaticTy::Reference(rcid)) = &v.ty
+                    && let Some(cid) = self
+                        .record_to_class_def
+                        .get(rcid.index())
+                        .copied()
+                        .flatten()
+                {
+                    insert_prov(&mut frames[top_idx].out, Prov::ClassInst(cid));
+                }
                 match v.def {
                     ValueDef::Param(_) => {
                         if self.this_param_of.get(func.index()).copied().flatten() == Some(val) {
@@ -824,18 +957,10 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 frames[top_idx].work.push((func, *src));
                             }
                             Op::ResumeGenerator { genobj } => {
-                                if let Some(bb) = self.module.block(inst.block) {
-                                    for &prev_iid in &bb.insts {
-                                        if prev_iid == iid {
-                                            break;
-                                        }
-                                        if let Some(Op::AwaitUncaught { funcobj, value, .. }) =
-                                            self.module.inst(prev_iid).map(|i| &i.op)
-                                            && funcobj == genobj
-                                        {
-                                            frames[top_idx].work.push((func, *value));
-                                        }
-                                    }
+                                for awaited in
+                                    awaited_values_for_resume(self.module, func, iid, *genobj)
+                                {
+                                    frames[top_idx].work.push((func, awaited));
                                 }
                             }
                             Op::Phi { entries } => {
@@ -903,6 +1028,12 @@ impl<'m> ClassHierarchyIndex<'m> {
                                         {
                                             frames[top_idx].work.push((def_fn, def_val));
                                         }
+                                    }
+                                    for &ns_cid in &target.namespace_classes {
+                                        insert_prov(
+                                            &mut frames[top_idx].out,
+                                            Prov::ModuleNs(ns_cid),
+                                        );
                                     }
                                 }
                             }
@@ -1041,6 +1172,13 @@ impl<'m> ClassHierarchyIndex<'m> {
                             }
                         }
                     }
+                    if let Some(subs) = self.links.namespace_submodules(target_cid)
+                        && let Some(sub_cids) = subs.get(&name)
+                    {
+                        for &scid in sub_cids {
+                            insert_prov(&mut frame.out, Prov::ModuleNs(scid));
+                        }
+                    }
                 }
                 Prov::Callable(_) => {}
             }
@@ -1070,8 +1208,9 @@ impl<'m> ClassHierarchyIndex<'m> {
         }
     }
 
-    /// Lookup `name` on `start_cid` (and `super_classes` ancestors with cycle
-    /// guard and `<= 64` step cap) for instance (`!is_static`) or static
+    /// Lookup `name` on `start_cid` (and `super_classes` ancestors — plus
+    /// static-hierarchy `sub_classes` overrides/implementors — with cycle guard
+    /// and `<= 64` step cap) for instance (`!is_static`) or static
     /// (`is_static`) methods, fields, and getters.
     fn lookup_class_member(
         &self,
@@ -1080,12 +1219,28 @@ impl<'m> ClassHierarchyIndex<'m> {
         name: Sym,
         out: &mut BTreeSet<Prov>,
     ) {
-        // 1. Methods: lookup on `c`, falling back to `super_classes` on miss.
+        let mut concrete_methods = BTreeSet::new();
+        let mut abstract_methods = BTreeSet::new();
+        let record_method =
+            |mfid: FuncId, concrete: &mut BTreeSet<FuncId>, abs: &mut BTreeSet<FuncId>| {
+                let is_bodyless_abstract = self.module.func(mfid).is_some_and(|fd| {
+                    fd.modifiers.contains(Modifiers::ABSTRACT)
+                        && fd.blocks.is_empty()
+                        && !fd.is_external
+                });
+                if is_bodyless_abstract {
+                    abs.insert(mfid);
+                } else {
+                    concrete.insert(mfid);
+                }
+            };
+
+        // 1a. Upward lookup on `start_cid`, falling back to `super_classes` on miss.
         let mut method_q = VecDeque::from([start_cid]);
         let mut visited_m = HashSet::from([start_cid]);
         let mut steps = 0usize;
         while let Some(cur) = method_q.pop_front() {
-            if steps >= MAX_STEPS || out.len() >= MAX_PROV_SET {
+            if steps >= MAX_STEPS || concrete_methods.len() >= MAX_PROV_SET {
                 break;
             }
             steps += 1;
@@ -1101,7 +1256,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                 && !found.is_empty()
             {
                 for &m in found {
-                    insert_prov(out, Prov::Callable(m));
+                    record_method(m, &mut concrete_methods, &mut abstract_methods);
                 }
             } else {
                 for &sc in &cls.super_classes {
@@ -1110,6 +1265,53 @@ impl<'m> ClassHierarchyIndex<'m> {
                     }
                 }
             }
+        }
+
+        // 1b. Static `ClassData` hierarchy CHA: collect subtype overrides/implementations.
+        if !is_static
+            && self
+                .classes
+                .get(start_cid.index())
+                .is_some_and(|c| c.static_record.is_some())
+        {
+            let mut sub_q = VecDeque::new();
+            let mut visited_sub = HashSet::from([start_cid]);
+            if let Some(start_cls) = self.classes.get(start_cid.index()) {
+                for &sub in &start_cls.sub_classes {
+                    if visited_sub.insert(sub) {
+                        sub_q.push_back(sub);
+                    }
+                }
+            }
+            let mut sub_steps = 0usize;
+            while let Some(cur) = sub_q.pop_front() {
+                if sub_steps >= MAX_STEPS || concrete_methods.len() >= MAX_PROV_SET {
+                    break;
+                }
+                sub_steps += 1;
+                let Some(cls) = self.classes.get(cur.index()) else {
+                    continue;
+                };
+                if let Some(found) = cls.instance_methods.get(&name) {
+                    for &m in found {
+                        record_method(m, &mut concrete_methods, &mut abstract_methods);
+                    }
+                }
+                for &sub in &cls.sub_classes {
+                    if visited_sub.insert(sub) {
+                        sub_q.push_back(sub);
+                    }
+                }
+            }
+        }
+
+        let chosen = if !concrete_methods.is_empty() {
+            &concrete_methods
+        } else {
+            &abstract_methods
+        };
+        for &m in chosen {
+            insert_prov(out, Prov::Callable(m));
         }
 
         // 2. Fields & getters across `c` and ancestors (`c_or_anc`).
@@ -1232,12 +1434,149 @@ impl<'m> ClassHierarchyIndex<'m> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn collect_referenced_static_classes(module: &Module) -> Vec<bool> {
+    let n = module.classes.len();
+    let mut referenced = vec![false; n];
+    for cls in &module.classes {
+        if let Some(sup) = cls.super_class
+            && let Some(slot) = referenced.get_mut(sup.index())
+        {
+            *slot = true;
+        }
+        for &iface in &cls.interfaces {
+            if let Some(slot) = referenced.get_mut(iface.index()) {
+                *slot = true;
+            }
+        }
+    }
+    for val in &module.values {
+        if let Ty::Static(StaticTy::Reference(rcid)) = &val.ty
+            && let Some(slot) = referenced.get_mut(rcid.index())
+        {
+            *slot = true;
+        }
+    }
+    referenced
+}
+
+fn should_index_static_class(
+    module: &Module,
+    cls_data: &abcd_ir::ClassData,
+    is_referenced: bool,
+) -> bool {
+    if cls_data.modifiers.contains(Modifiers::ANNOTATION) {
+        return false;
+    }
+    let desc = module.sym.resolve(cls_data.descriptor).unwrap_or("");
+    if matches!(
+        desc,
+        "L_ESModuleRecord;"
+            | "L_ESScopeNamesRecord;"
+            | "L_ModuleRequestPhaseRecord;"
+            | "L_ESSlotNumberAnnotation;"
+            | "L_ESConcurrentModuleRequestsAnnotation;"
+            | "L_ESCallTypeAnnotation;"
+    ) {
+        return false;
+    }
+    if cls_data.super_class.is_some() || !cls_data.interfaces.is_empty() || is_referenced {
+        return true;
+    }
+    cls_data.es_module.is_none()
+        && desc != "L_GLOBAL;"
+        && desc != "LETSGLOBAL;"
+        && !desc.ends_with("/ETSGLOBAL;")
+        && (cls_data.source_lang == SourceLang::ArkTS
+            || cls_data.modifiers.contains(Modifiers::INTERFACE))
+}
+
+fn index_static_class_data(
+    module: &Module,
+    rcid: ClassId,
+    cls_data: &abcd_ir::ClassData,
+    classes: &mut Vec<ClassDef>,
+    ctor_to_classes: &mut [Vec<ClassDefId>],
+    method_owner: &mut [Option<(ClassDefId, bool)>],
+) -> ClassDefId {
+    let cid = ClassDefId(classes.len() as u32);
+    let mut ctor: Option<FuncId> = None;
+    let mut instance_methods: BTreeMap<Sym, Vec<FuncId>> = BTreeMap::new();
+    let mut static_methods: BTreeMap<Sym, Vec<FuncId>> = BTreeMap::new();
+    let mut instance_getters: BTreeMap<Sym, Vec<FuncId>> = BTreeMap::new();
+    let mut static_getters: BTreeMap<Sym, Vec<FuncId>> = BTreeMap::new();
+
+    for &mfid in &cls_data.methods {
+        let Some(fd) = module.func(mfid) else {
+            continue;
+        };
+        let mname = module.sym.resolve(fd.name).unwrap_or("");
+        if fd.kind == FunctionKind::Constructor || mname == "<ctor>" {
+            if ctor.is_none() {
+                ctor = Some(mfid);
+            }
+            if let Some(list) = ctor_to_classes.get_mut(mfid.index()) {
+                list.push(cid);
+            }
+            if let Some(slot) = method_owner.get_mut(mfid.index())
+                && slot.is_none()
+            {
+                *slot = Some((cid, false));
+            }
+            continue;
+        }
+        if mname == "func_main_0" || mname == "<cctor>" {
+            continue;
+        }
+        let is_static = fd.modifiers.contains(Modifiers::STATIC);
+        if let Some(slot) = method_owner.get_mut(mfid.index())
+            && slot.is_none()
+        {
+            *slot = Some((cid, is_static));
+        }
+        match fd.kind {
+            FunctionKind::Setter => {}
+            FunctionKind::Getter => {
+                let map = if is_static {
+                    &mut static_getters
+                } else {
+                    &mut instance_getters
+                };
+                map.entry(fd.name).or_default().push(mfid);
+            }
+            _ => {
+                let map = if is_static {
+                    &mut static_methods
+                } else {
+                    &mut instance_methods
+                };
+                map.entry(fd.name).or_default().push(mfid);
+            }
+        }
+    }
+
+    classes.push(ClassDef {
+        ctor,
+        enclosing_func: None,
+        static_record: Some(rcid),
+        heritage: None,
+        is_sendable: false,
+        super_classes: Vec::new(),
+        sub_classes: Vec::new(),
+        instance_methods,
+        static_methods,
+        instance_getters,
+        static_getters,
+    });
+    cid
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat arena index tables passed directly during single-pass class scan"
+)]
 fn index_class_def(
     module: &Module,
     enclosing_func: FuncId,
-    record_class: ClassId,
-    class_val: Option<ValueId>,
     ctor: FuncId,
     heritage: Option<ValueId>,
     members: ConstId,
@@ -1357,13 +1696,13 @@ fn index_class_def(
     }
 
     classes.push(ClassDef {
-        ctor,
-        enclosing_func,
-        record_class,
-        class_val,
+        ctor: Some(ctor),
+        enclosing_func: Some(enclosing_func),
+        static_record: None,
         heritage,
         is_sendable,
         super_classes: Vec::new(),
+        sub_classes: Vec::new(),
         instance_methods,
         static_methods,
         instance_getters,
@@ -1372,7 +1711,10 @@ fn index_class_def(
     cid
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat arena index tables passed directly during prototype/static attachment"
+)]
 fn attach_class_member(
     module: &Module,
     cls: &mut ClassDef,
@@ -1428,25 +1770,9 @@ fn push_unique_func(list: &mut Vec<FuncId>, f: FuncId) {
     }
 }
 
-fn peel_mov(module: &Module, mut v: ValueId) -> ValueId {
-    for _ in 0..16 {
-        let Some(ValueDef::Inst(iid)) = module.value(v).map(|val| val.def) else {
-            break;
-        };
-        let Some(Op::Mov { src }) = module.inst(iid).map(|i| &i.op) else {
-            break;
-        };
-        v = *src;
-    }
-    v
-}
-
 fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
     let mut visited = HashSet::new();
-    for _ in 0..16 {
-        if !visited.insert(v) {
-            return None;
-        }
+    while visited.insert(v) {
         let val = module.value(v)?;
         match val.def {
             ValueDef::Const(c) => {
@@ -1456,8 +1782,10 @@ fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
                 };
             }
             ValueDef::Inst(iid) => match &module.inst(iid)?.op {
-                Op::Mov { src }
-                | Op::AllocClosure { func: src }
+                Op::Mov { src } => {
+                    v = peel_movs(module, *src);
+                }
+                Op::AllocClosure { func: src }
                 | Op::CreateGenerator { func: src }
                 | Op::CreateAsyncGenerator { func: src }
                 | Op::DefineMethod { func: src, .. } => {
@@ -1478,7 +1806,11 @@ fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
     None
 }
 
-fn compute_augmented_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
+fn compute_augmented_rpo(
+    module: &Module,
+    func_id: FuncId,
+    exc_map: &ExceptionHandlerMap,
+) -> Vec<BlockId> {
     let Some(func) = module.func(func_id) else {
         return Vec::new();
     };
@@ -1488,14 +1820,19 @@ fn compute_augmented_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     let mut visited = HashSet::new();
     let mut post_order = Vec::new();
     visited.insert(entry);
-    let mut stack: Vec<(BlockId, std::vec::IntoIter<BlockId>)> =
-        vec![(entry, augmented_succs(module, func_id, entry).into_iter())];
+    let mut stack: Vec<(BlockId, std::vec::IntoIter<BlockId>)> = vec![(
+        entry,
+        augmented_succs_with_map(module, exc_map, entry).into_iter(),
+    )];
     while let Some((node, succs)) = stack.last_mut() {
         let node = *node;
         match succs.next() {
             Some(succ) => {
                 if visited.insert(succ) {
-                    stack.push((succ, augmented_succs(module, func_id, succ).into_iter()));
+                    stack.push((
+                        succ,
+                        augmented_succs_with_map(module, exc_map, succ).into_iter(),
+                    ));
                 }
             }
             None => {
@@ -1515,55 +1852,109 @@ fn compute_augmented_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
 
 fn compute_func_env_stacks(
     module: &Module,
-    func_id: FuncId,
     rpo: &[BlockId],
-    entry_stack: &EnvStack,
+    exc_map: &ExceptionHandlerMap,
+    entry_stack: &DualEnvStack,
     is_lex_or_cap: &[bool],
-    stack_at: &mut HashMap<InstId, EnvStack>,
+    stack_at: &mut HashMap<InstId, DualEnvStack>,
 ) {
-    let Some(&entry) = rpo.first() else {
+    if rpo.is_empty() {
         return;
-    };
-    let mut in_stacks: HashMap<BlockId, EnvStack> = HashMap::new();
-    in_stacks.insert(entry, entry_stack.clone());
+    }
+    let mut block_to_rpo: HashMap<BlockId, usize> = HashMap::with_capacity(rpo.len());
+    for (idx, &b) in rpo.iter().enumerate() {
+        block_to_rpo.entry(b).or_insert(idx);
+    }
 
-    for &b in rpo {
-        let Some(bb) = module.block(b) else {
-            continue;
-        };
-        let mut cur = in_stacks
-            .get(&b)
-            .cloned()
-            .unwrap_or_else(|| entry_stack.clone());
-        for &iid in &bb.insts {
-            let Some(inst) = module.inst(iid) else {
+    let mut in_stacks: Vec<Option<DualEnvStack>> = vec![None; rpo.len()];
+    let mut wl: BTreeSet<usize> = BTreeSet::new();
+    let mut next_seed = 0usize;
+
+    loop {
+        while next_seed < rpo.len() && in_stacks[next_seed].is_some() {
+            next_seed += 1;
+        }
+        if next_seed >= rpo.len() {
+            break;
+        }
+        in_stacks[next_seed] = Some(entry_stack.clone());
+        wl.insert(next_seed);
+
+        while let Some(rpo_idx) = wl.pop_first() {
+            let b = rpo[rpo_idx];
+            let Some(bb) = module.block(b) else {
                 continue;
             };
-            if is_lex_or_cap.get(iid.index()).copied().unwrap_or(false) {
-                stack_at.insert(iid, cur.clone());
-            }
-            match &inst.op {
-                Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
-                    cur.push(vec![iid]);
-                    if cur.len() > MAX_ENV_DEPTH {
-                        let overflow = cur.len() - MAX_ENV_DEPTH;
-                        cur.drain(0..overflow);
+            let mut cur = in_stacks[rpo_idx]
+                .clone()
+                .unwrap_or_else(|| entry_stack.clone());
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if is_lex_or_cap.get(iid.index()).copied().unwrap_or(false) {
+                    match stack_at.get_mut(&iid) {
+                        Some(existing) => {
+                            merge_dual_env_stacks(existing, &cur);
+                        }
+                        None => {
+                            stack_at.insert(iid, cur.clone());
+                        }
                     }
                 }
-                Op::PopLexEnv => {
-                    cur.pop();
+                match &inst.op {
+                    Op::NewLexEnv {
+                        kind: LexEnvKind::Sendable,
+                        ..
+                    } => {
+                        push_env_site(&mut cur.sendable, iid);
+                    }
+                    Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
+                        push_env_site(&mut cur.plain, iid);
+                    }
+                    Op::PopLexEnv => {
+                        // `PopLexEnv` (`poplexenv`) pops only `Plain` lexical environments;
+                        // `Sendable` environments are NOT popped by `PopLexEnv`.
+                        cur.plain.pop();
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        for succ in augmented_succs(module, func_id, b) {
-            let dst = in_stacks.entry(succ).or_default();
-            merge_env_stacks(dst, &cur);
+            for succ in augmented_succs_with_map(module, exc_map, b) {
+                let Some(&succ_idx) = block_to_rpo.get(&succ) else {
+                    continue;
+                };
+                let changed = match &mut in_stacks[succ_idx] {
+                    Some(dst) => merge_dual_env_stacks(dst, &cur),
+                    slot @ None => {
+                        *slot = Some(cur.clone());
+                        true
+                    }
+                };
+                if changed {
+                    wl.insert(succ_idx);
+                }
+            }
         }
     }
 }
 
+fn push_env_site(stack: &mut EnvStack, site: InstId) {
+    stack.push(vec![site]);
+    if stack.len() > MAX_ENV_DEPTH {
+        let overflow = stack.len() - MAX_ENV_DEPTH;
+        stack.drain(0..overflow);
+    }
+}
+
+fn merge_dual_env_stacks(dst: &mut DualEnvStack, src: &DualEnvStack) -> bool {
+    let c_plain = merge_env_stacks(&mut dst.plain, &src.plain);
+    let c_sendable = merge_env_stacks(&mut dst.sendable, &src.sendable);
+    c_plain || c_sendable
+}
+
 fn merge_env_stacks(dst: &mut EnvStack, src: &[Vec<InstId>]) -> bool {
+    let src = &src[src.len().saturating_sub(MAX_ENV_DEPTH)..];
     if src.is_empty() {
         return false;
     }
@@ -1590,10 +1981,6 @@ fn merge_env_stacks(dst: &mut EnvStack, src: &[Vec<InstId>]) -> bool {
                 changed = true;
             }
         }
-    }
-    if dst.len() > MAX_ENV_DEPTH {
-        let overflow = dst.len() - MAX_ENV_DEPTH;
-        dst.drain(0..overflow);
     }
     changed
 }

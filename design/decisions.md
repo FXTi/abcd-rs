@@ -1,10 +1,10 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-19`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-20`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-19`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-20`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
 - **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; `Catch::type_class: Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
@@ -26,8 +26,8 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   4. **Exception-augmented SSA dominance & constant propagation (`N27`, `N38`, `N45`, `N64`, `R2-H2`)**: `verify_module` checks SSA value dominance over the `<= 2B`-point pre-throw / post-normal-exit augmented CFG (`Normal ∪ Exceptional`, exempting only dead islands unreachable from `entry`, `N64`), validates `ExceptionParam(h)` by augmented dominance from `h`, rejects reachable zero-predecessor phis (`N27`), and `SCCP` forces multi-value catch-handler phis to `Bottom` (`N38`).
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-decompile`.
 
-### ADR-05 — Vendored Frame-Slot Calling Convention (`N66`, `N67`)
-- **Ruling**: Dynamic ECMAScript functions receive leading implicit parameter slots `[func][new.target][this]` (`H = 3` under the `0xF` default, or the subset declared by `L_ESCallTypeAnnotation;`), followed by explicit source formals at `params[H..]`. `ldthis` binds to the `this`-role parameter slot (`N67`). Static ArkTS methods (`SourceLang::ArkTs` / static ABI) carry `H = 0` implicit JS slots (`abcd_ir::frame`).
+### ADR-05 — Vendored Frame-Slot Calling Convention (`N66`, `N67`, `R4-D6`)
+- **Ruling**: Dynamic ECMAScript functions receive leading implicit parameter slots `[func][new.target][this]` (`H = 3` under the `0xF` default, or the subset declared by `L_ESCallTypeAnnotation;`), followed by explicit source formals at `params[H..]`; unannotated non-static `DynamicEcma` callees return `None` in `abcd_analysis::frame::frame_slots_of` (`OverApproxAll`). `ldthis` binds to the `this`-role parameter slot (`N67`). Static ArkTS methods (`Dialect::StaticArkTS` / `SourceLang::ArkTS`) carry `H = 0` implicit slots on `static` methods and explicit `this` at `params[0]` (`H = 1`) on instance methods and constructors (`abcd_ir::frame::FrameSlots`).
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`.
 
 ### ADR-06 — Vendor Operand Order & ECMA-262 Numeric Semantics (`N36`–`N42`, `N65`, `N68`, `N72-C4`)
@@ -110,6 +110,14 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   2. `abcd-opt` evaluates `BinOp::Exp` (`**`) via `ecma_pow` backed by pure-Rust `libm = { version = "0.2", default-features = false }` (`0` C/transitive deps) + ECMA-262 §6.1.6.1.3 boundary rules, canonicalizes all folded `NaN` bit patterns to `0x7ff8_0000_0000_0000` across x86 and ARM (`#60`), compares `-0.0` via `to_bits()` in `SCCP::meet` (`R3-H5`), and runs `O(B + I)` union-find chain contraction in `CfgSimplify` (`R3-A1`).
   3. `abcd-lower::regalloc` computes backward liveness over dense `[u64]` bitsets with `ExceptionHandlerMap` and pre-grouped phi lists (`R3-A2`), and `isel` elides fallthrough `jmp`s to the immediately-following RPO block (`R3-A7`).
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`.
+
+### ADR-20 — Sound Static-Analysis Floor, Multi-Frame IFDS Exceptions & Zero-Cliff Scaling (`R4-D1`–`R4-D6`, `#79`–`#83`)
+- **Ruling**:
+  1. **Zero silent `> 512` semantic cliffs (`R4-D1`, `#80`)**: `abcd-taint` enforces uniform `TaintConfig::max_field_chain` depth, unknown-base `Heap(∅)` / `has_unknown` load-store soundness, and all-rung `heap_site_users` + unknown-deref cone gating regardless of module size, surfacing Rung-2 root-cone slicing explicitly via `PtaStats::root_sliced` and `TaintReport::pta_root_sliced`.
+  2. **Multi-frame IFDS uncaught exceptions & multi-phi headers (`R4-D3`, `#79`)**: `IfdsSolver` excludes catch-all-protected `Op::Throw`s from procedure exits, propagates uncaught callee exceptions iteratively across arbitrary unprotected call chains via `IfdsProblem::call_uncaught_exit_flow` (`UNCAUGHT_EXCEPTION_VALUE`), evaluates all leading `Op::Phi` instructions on block-entry edges after predecessor transfers, and restricts strong-update kills to concrete `FieldKey::Named` properties.
+  3. **Guaranteed-terminating dual-env PTA & `Obj::Unknown` completeness (`R4-D4`, `#81`, `#82`)**: `abcd-analysis::pta` runs a finite-height monotonic `Plain` + `Sendable` lexical-environment prepass accounted against `step_budget`, seeds `Obj::Unknown` on unmodeled/escaped values and incomplete calls (`!resolution_complete`), retains `ctx == None` base-activation answers for externally-invocable functions, and models spread/rest/generator/super/global-object IR operations end-to-end.
+  4. **Shared `DomTree` / `IndexedDom` & pruned K3 surface (`R4-D5`, `#83`)**: `abcd-analysis` delegates dominance to `abcd_ir::cfg::{DomTree, IndexedDom}` and removes dead unconsumed `MonotoneFramework` / `AnalysisStore` / `VecSet` / `EmptyCallGraph` / `inject_calling_context` scaffolding.
+- **Crates**: `abcd-ir`, `abcd-analysis`, `abcd-taint`.
 
 ---
 

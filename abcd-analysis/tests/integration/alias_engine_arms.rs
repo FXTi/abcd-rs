@@ -9,7 +9,6 @@
 use crate::common;
 use abcd_analysis::callgraph::{CallGraph, CallTargets};
 use abcd_analysis::dataflow::alias::Rung1AliasOracle;
-use abcd_analysis::dataflow::heap::AliasOracle;
 use abcd_ir::{CallKind, Const, Edge, EdgeKind, FuncId, InstId, Op, ValueDef, ValueId};
 use common::*;
 
@@ -777,26 +776,6 @@ fn no_slot_model_is_leaf_unknown() {
     let oracle = Rung1AliasOracle::new(&m, &graph);
     let ans = oracle.query(r, inst_of(&m, r));
     assert!(ans.has_unknown && ans.sites.is_empty(), "{ans:?}");
-}
-
-/// The §5.2 calling-context seam: the rung-1 engine records the edge
-/// (answers are per-query context stacks, so this changes nothing).
-#[test]
-fn inject_calling_context_records_without_changing_answers() {
-    let mut m = mk_module();
-    let f = add_func_named(&mut m, "f");
-    let entry = entry_of(&m, f);
-    let o = alloc_object(&mut m, entry);
-    let site = inst_of(&m, o);
-    emit_void(&mut m, entry, Op::Return { value: None });
-
-    let graph = CallGraph::build(&m);
-    let mut oracle = Rung1AliasOracle::new(&m, &graph);
-    AliasOracle::<()>::inject_calling_context(&mut oracle, InstId::new(0), f, &());
-    AliasOracle::<()>::inject_calling_context(&mut oracle, InstId::new(0), f, &());
-    let ans = oracle.query(o, InstId::new(0));
-    assert_eq!(ans.sites.iter().collect::<Vec<_>>(), vec![site]);
-    assert!(ans.is_single_precise());
 }
 
 /// Engine construction over a module with dangling inst ids in a

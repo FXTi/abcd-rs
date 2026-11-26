@@ -191,6 +191,7 @@ enum QueryTask {
     Call {
         key: QueryKey,
         call: InstId,
+        is_new: bool,
         pending: VecDeque<(FuncId, ValueId)>,
         acc: QueryAnswer,
     },
@@ -236,15 +237,12 @@ pub struct Rung1AliasOracle<'m> {
     /// Function → its returned values (`Return { value: Some(v) }`), in
     /// block/inst order (deterministic).
     returns_of: HashMap<FuncId, Vec<ValueId>>,
+    /// Functions containing at least one `Op::Return { value: None }`.
+    has_void_return: HashSet<FuncId>,
     /// The query memo (lookup-only — never iterated).
     memo: RefCell<HashMap<QueryKey, QueryAnswer>>,
     /// In-progress queries (the recursion-cycle guard).
     in_progress: RefCell<HashSet<QueryKey>>,
-    /// Call edges the client told us about (the §5.2
-    /// `inject_calling_context` seam — recorded for the rung-2
-    /// co-evolution discipline; rung-1 answers carry their context
-    /// per-query, so this does not change answers).
-    seen_contexts: RefCell<std::collections::BTreeSet<(InstId, FuncId)>>,
     // Counters.
     queries: Cell<usize>,
     memo_hits: Cell<usize>,
@@ -265,6 +263,7 @@ impl<'m> Rung1AliasOracle<'m> {
         let mut block_func = vec![None; module.blocks.len()];
         let mut value_func = vec![None; module.values.len()];
         let mut returns_of: HashMap<FuncId, Vec<ValueId>> = HashMap::new();
+        let mut has_void_return: HashSet<FuncId> = HashSet::new();
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
             for &b in &f.blocks {
@@ -283,8 +282,12 @@ impl<'m> Rung1AliasOracle<'m> {
                     if let Some(v) = inst.result {
                         value_func[v.index()] = Some(func);
                     }
-                    if let Op::Return { value: Some(v) } = &inst.op {
-                        returns.push(*v);
+                    match &inst.op {
+                        Op::Return { value: Some(v) } => returns.push(*v),
+                        Op::Return { value: None } => {
+                            has_void_return.insert(func);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -309,9 +312,9 @@ impl<'m> Rung1AliasOracle<'m> {
             block_func,
             value_func,
             returns_of,
+            has_void_return,
             memo: RefCell::new(HashMap::new()),
             in_progress: RefCell::new(HashSet::new()),
-            seen_contexts: RefCell::new(std::collections::BTreeSet::new()),
             queries: Cell::new(0),
             memo_hits: Cell::new(0),
             capped: Cell::new(0),
@@ -431,15 +434,21 @@ impl<'m> Rung1AliasOracle<'m> {
                 QueryTask::Call {
                     key,
                     call,
+                    is_new,
                     mut pending,
                     mut acc,
                 } => {
-                    acc.union_with(&results.pop().expect("callee return answer"));
+                    let child_ans = results.pop().expect("callee return answer");
+                    if is_new && child_ans.sites.is_empty() && !child_ans.has_unknown {
+                        acc.sites.union_with(&AllocSiteSet::one(call));
+                    }
+                    acc.union_with(&child_ans);
                     match pending.pop_front() {
                         Some((callee, v)) => {
                             stack.push(QueryTask::Call {
                                 key,
                                 call,
+                                is_new,
                                 pending,
                                 acc,
                             });
@@ -450,6 +459,9 @@ impl<'m> Rung1AliasOracle<'m> {
                         }
                         None => {
                             ctx.pop();
+                            if is_new && acc.sites.len() > 1 {
+                                acc.has_phi = true;
+                            }
                             self.finish_query(key, acc, &mut results);
                         }
                     }
@@ -648,6 +660,13 @@ impl<'m> Rung1AliasOracle<'m> {
         // external / bodyless callees fold into `acc` up front; a callee
         // with no returned value contributes undefined — precise-empty,
         // not unknown.
+        let is_new = matches!(
+            edge.kind,
+            abcd_ir::CallKind::New | abcd_ir::CallKind::NewSpread
+        );
+        if is_new && targets.len() > 1 {
+            acc.has_phi = true;
+        }
         let mut pending: VecDeque<(FuncId, ValueId)> = VecDeque::new();
         for callee in targets {
             let Some(fd) = self.module.func(*callee) else {
@@ -661,6 +680,9 @@ impl<'m> Rung1AliasOracle<'m> {
                 continue;
             }
             let returns = self.returns_of.get(callee).cloned().unwrap_or_default();
+            if is_new && (returns.is_empty() || self.has_void_return.contains(callee)) {
+                acc.sites.union_with(&AllocSiteSet::one(call));
+            }
             for v in returns {
                 pending.push_back((*callee, v));
             }
@@ -671,6 +693,7 @@ impl<'m> Rung1AliasOracle<'m> {
                 stack.push(QueryTask::Call {
                     key,
                     call,
+                    is_new,
                     pending,
                     acc,
                 });
@@ -681,6 +704,9 @@ impl<'m> Rung1AliasOracle<'m> {
             }
             None => {
                 ctx.pop();
+                if is_new && acc.sites.len() > 1 {
+                    acc.has_phi = true;
+                }
                 self.finish_query(key, acc, results);
             }
         }
@@ -822,15 +848,17 @@ impl<'m> Rung1AliasOracle<'m> {
                 };
             }
             if slots.this_index() == Some(pos) {
+                if matches!(kind, abcd_ir::CallKind::New | abcd_ir::CallKind::NewSpread) {
+                    return Bind::Leaf(QueryAnswer {
+                        sites: AllocSiteSet::one(call),
+                        ..QueryAnswer::default()
+                    });
+                }
                 return match this {
                     Some(t) => Bind::Resolve {
                         value: *t,
                         func: caller,
                     },
-                    // No explicit receiver: `this` is undefined at the
-                    // source level, but for the `obj.m()` shape the IR
-                    // carries no `this` while the runtime receiver is the
-                    // load's object — opaque rather than wrong.
                     None => Bind::Leaf(QueryAnswer::unknown()),
                 };
             }
@@ -861,15 +889,7 @@ impl<'m> Rung1AliasOracle<'m> {
     }
 }
 
-impl<F> AliasOracle<F> for Rung1AliasOracle<'_> {
-    fn inject_calling_context(&mut self, call: InstId, callee: FuncId, _fact: &F) {
-        // Rung-1 queries carry their context per-query (the stack), so
-        // answers do not depend on global learning; the edge is recorded
-        // for the §5.4 co-evolution discipline (rung 2 will rebuild the
-        // graph as contexts accumulate).
-        self.seen_contexts.borrow_mut().insert((call, callee));
-    }
-}
+impl<F> AliasOracle<F> for Rung1AliasOracle<'_> {}
 
 #[cfg(test)]
 mod tests;

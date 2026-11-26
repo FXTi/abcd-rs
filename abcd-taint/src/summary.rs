@@ -2,13 +2,13 @@
 //!
 //! One flat record per builtin, keyed by `(Sym, Arity)`. The registry
 //! owns its interner, so keys are module-independent and one registry
-//! can serve many modules; lookups resolve the call site's candidate
-//! names (see [`crate::names`]) to strings and intern them here.
+//! can serve many modules; lookups match registered names by `&str`
+//! without interning misses.
 //!
 //! ## What a summary can express
 //!
-//! - `flows`: `(from, to)` pairs over `{Param(i), Base, Return,
-//!   Field(path), ReturnField(path)}`. Leftover source fields below a
+//! - `flows`: `(from, to)` pairs over `{Param(i), AnyParamFrom(start), Base,
+//!   Return, Field(path), ReturnField(path)}`. Leftover source fields below a
 //!   matched prefix append to the sink path.
 //! - `clears`: endpoints whose taint is killed (a cleared taint does not
 //!   survive the call-to-return edge).
@@ -41,20 +41,22 @@
 //!
 //! ## The fallback ladder (`design/analysis.md`)
 //!
-//! 1. summary hit → apply on the call-to-return edge (exclusive also
-//!    kills the call edge into the callee);
-//! 2. no summary, callee has a body → step into the body (normal IFDS);
-//!    incoming operand taints are killed on the bypass edge because the
-//!    callee body carries them across call/return edges;
-//! 3. no summary, no body, receiver types to a prototype family
+//! 1. user-registered direct-name summary → apply on the call-to-return
+//!    edge (exclusive also kills the call edge into the callee and
+//!    field-bearing operand bypass taints);
+//! 2. callee has a body → step into the body (normal IFDS; user code
+//!    wins over preloaded builtin summaries);
+//! 3. preloaded builtin direct-name summary → apply on the
+//!    call-to-return edge;
+//! 4. no summary, no body, receiver types to a prototype family
 //!    (`crate::prototype`) → apply the `Family.prototype.m` summary
 //!    ADDITIVELY (prototype-path applications are never exclusive — a
 //!    may-typed receiver must not kill);
-//! 4. no summary, callee is native/external/unknown-but-named →
+//! 5. no summary, callee is native/external/unknown-but-named →
 //!    conservative keep: the incoming taint passes through untouched
 //!    (never sanitizes), plus the optional identity heuristic (`tainted
 //!    base or param ⇒ tainted return`);
-//! 5. no name resolvable at all → same conservative keep, counted
+//! 6. no name resolvable at all → same conservative keep, counted
 //!    separately.
 //!
 //! Miss counters are first-class ([`RegistryStats`]): the named-miss log
@@ -71,6 +73,9 @@ use abcd_ir::{Sym, SymbolTable};
 pub enum Endpoint {
     /// Call argument `i` (0-based over `Op::Call::args`).
     Param(u16),
+    /// Any call argument at index `>= start` (0-based over `Op::Call::args`),
+    /// modeling variadic builtins without a fixed arity cap.
+    AnyParamFrom(u16),
     /// The receiver: the call's explicit `this`, or the object of the
     /// property load that produced the callee value.
     Base,
@@ -224,27 +229,22 @@ impl Summary {
     }
 
     /// Add a gap-enter rule: taint matching `from` at the summary call
-    /// site enters the callback body on formal `formal`. Panics without
-    /// a preceding [`Summary::callback`] — the callback argument index
-    /// must be set first.
+    /// site enters the callback body on formal `formal`. No-op unless
+    /// [`Summary::callback`] or [`Summary::spawn_callback`] was set first.
     pub fn gap_enter(mut self, from: Endpoint, formal: u16) -> Self {
-        let gap = self
-            .callback
-            .as_mut()
-            .expect("callback(param) before gap_enter");
-        gap.enter.push(GapEnter { from, formal });
+        if let Some(cb) = self.callback.as_mut() {
+            cb.enter.push(GapEnter { from, formal });
+        }
         self
     }
 
     /// Set the gap return channel: the callback's return flows onto the
-    /// call result with `chain` prepended (map: `[AnyIndex]`). Panics
-    /// without a preceding [`Summary::callback`].
+    /// call result with `chain` prepended (map: `[AnyIndex]`). No-op unless
+    /// [`Summary::callback`] or [`Summary::spawn_callback`] was set first.
     pub fn gap_return(mut self, chain: FieldChain) -> Self {
-        let gap = self
-            .callback
-            .as_mut()
-            .expect("callback(param) before gap_return");
-        gap.return_to_result = Some(chain);
+        if let Some(cb) = self.callback.as_mut() {
+            cb.return_to_result = Some(chain);
+        }
         self
     }
 }
@@ -279,25 +279,33 @@ pub struct RegistryStats {
 /// counters. Arity key: `Some(n)` = exact argument count, `None` =
 /// variadic (matches any arity when no exact key exists).
 pub struct SummaryRegistry {
+    by_name: HashMap<String, Sym>,
     by_key: HashMap<(Sym, Option<usize>), Summary>,
+    builtin_keys: HashSet<(Sym, Option<usize>)>,
     callback_leaves: HashSet<String>,
     syms: RefCell<SymbolTable>,
-    /// Names already known to miss at a given arity (memoized).
-    neg: RefCell<HashSet<(Sym, Option<usize>)>>,
+    /// Unregistered candidate names already known to miss (zero-interning cache).
+    neg_names: RefCell<HashSet<Box<str>>>,
+    /// Registered `(sym, argc)` pairs known to miss both `Some(argc)` and `None`.
+    neg_arity: RefCell<HashSet<(Sym, usize)>>,
     stats: RefCell<RegistryStats>,
 }
 
-// `new` without `Default`: callers construct either `new()` or `with_builtins()`
-// explicitly.
-#[allow(clippy::new_without_default)]
+#[expect(
+    clippy::new_without_default,
+    reason = "callers construct new() or with_builtins() explicitly"
+)]
 impl SummaryRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         SummaryRegistry {
+            by_name: HashMap::new(),
             by_key: HashMap::new(),
+            builtin_keys: HashSet::new(),
             callback_leaves: HashSet::new(),
             syms: RefCell::new(SymbolTable::new()),
-            neg: RefCell::new(HashSet::new()),
+            neg_names: RefCell::new(HashSet::new()),
+            neg_arity: RefCell::new(HashSet::new()),
             stats: RefCell::new(RegistryStats::default()),
         }
     }
@@ -306,12 +314,22 @@ impl SummaryRegistry {
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         for (name, arity, summary) in builtin_summaries() {
-            r.register(name, arity, summary);
+            r.register_builtin(name, arity, summary);
         }
         r
     }
 
+    fn register_builtin(&mut self, name: &str, arity: Option<usize>, summary: Summary) {
+        self.register(name, arity, summary);
+        if let Some(&sym) = self.by_name.get(name) {
+            self.builtin_keys.insert((sym, arity));
+        }
+    }
+
     /// Register a summary under `(name, arity)` (`None` = variadic).
+    ///
+    /// User registrations override preloaded builtins at `(name, arity)` and
+    /// therefore take precedence over resolved function bodies when `exclusive`.
     pub fn register(&mut self, name: &str, arity: Option<usize>, summary: Summary) {
         if summary.callback.is_some() {
             self.callback_leaves.insert(name.to_owned());
@@ -319,7 +337,33 @@ impl SummaryRegistry {
                 .insert(name.rsplit('.').next().unwrap_or(name).to_owned());
         }
         let sym = self.syms.borrow_mut().intern(name);
+        self.by_name.insert(name.to_owned(), sym);
+        self.neg_names.get_mut().remove(name);
+        match arity {
+            Some(argc) => {
+                self.neg_arity.get_mut().remove(&(sym, argc));
+            }
+            None => {
+                self.neg_arity.get_mut().retain(|&(s, _)| s != sym);
+            }
+        }
+        self.builtin_keys.remove(&(sym, arity));
         self.by_key.insert((sym, arity), summary);
+    }
+
+    /// Whether the summary matching `(name, argc)` comes from [`Self::with_builtins`]
+    /// rather than a user [`Self::register`] override (counter-free).
+    pub(crate) fn is_builtin_hit(&self, name: &str, argc: usize) -> bool {
+        let Some(&sym) = self.by_name.get(name) else {
+            return false;
+        };
+        if self.by_key.contains_key(&(sym, Some(argc))) {
+            self.builtin_keys.contains(&(sym, Some(argc)))
+        } else if self.by_key.contains_key(&(sym, None)) {
+            self.builtin_keys.contains(&(sym, None))
+        } else {
+            false
+        }
     }
 
     /// Whether any registered callback-bearing summary matches `leaf`
@@ -329,40 +373,41 @@ impl SummaryRegistry {
     }
 
     /// Look up `name` at argument count `argc`: exact arity first, then
-    /// the variadic entry. Negative results are cached (the cache makes
-    /// repeat lookups of the same name O(1)); MISS COUNTING is the
-    /// caller's job ([`SummaryRegistry::record_miss`]) — only the
-    /// problem knows whether some LATER candidate (direct or
-    /// prototype-qualified) rescued the site, and a rescued name is
-    /// not backlog.
+    /// the variadic entry. Negative results are cached without interning
+    /// unknown names (repeat lookups of the same name are `O(1)` and
+    /// zero-allocation); MISS COUNTING is the caller's job
+    /// ([`SummaryRegistry::record_miss`]) — only the problem knows
+    /// whether some LATER candidate (direct or prototype-qualified)
+    /// rescued the site, and a rescued name is not backlog.
     pub fn lookup(&self, name: &str, argc: usize) -> Option<&Summary> {
-        let sym = self.syms.borrow_mut().intern(name);
         let mut stats = self.stats.borrow_mut();
         stats.lookups += 1;
-        let exact = (sym, Some(argc));
-        let variadic = (sym, None);
-        if self.neg.borrow().contains(&exact) && self.neg.borrow().contains(&variadic) {
-            stats.negative_cache_hits += 1;
+        if let Some(&sym) = self.by_name.get(name) {
+            if let Some(s) = self
+                .by_key
+                .get(&(sym, Some(argc)))
+                .or_else(|| self.by_key.get(&(sym, None)))
+            {
+                return Some(s);
+            }
+            if !self.neg_arity.borrow_mut().insert((sym, argc)) {
+                stats.negative_cache_hits += 1;
+            }
             return None;
         }
-        if let Some(s) = self
-            .by_key
-            .get(&exact)
-            .or_else(|| self.by_key.get(&variadic))
-        {
-            return Some(s);
+        if self.neg_names.borrow().contains(name) {
+            stats.negative_cache_hits += 1;
+        } else {
+            self.neg_names.borrow_mut().insert(name.into());
         }
-        self.neg.borrow_mut().insert(exact);
-        self.neg.borrow_mut().insert(variadic);
         None
     }
 
-    /// A counter-free lookup (no stats, no negative-cache mutation) —
-    /// the eager gap scan ([`crate::gap`]) must not perturb the
-    /// fallback-ladder counters, which classify only solver-processed
-    /// sites.
+    /// A counter-free lookup (no stats, no symbol interning, no negative-cache
+    /// mutation) — the eager gap scan ([`crate::gap`]) must not perturb the
+    /// fallback-ladder counters, which classify only solver-processed sites.
     pub fn peek(&self, name: &str, argc: usize) -> Option<&Summary> {
-        let sym = self.syms.borrow_mut().intern(name);
+        let sym = *self.by_name.get(name)?;
         self.by_key
             .get(&(sym, Some(argc)))
             .or_else(|| self.by_key.get(&(sym, None)))
@@ -487,14 +532,14 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             Summary::new("corpus-freq 18; ctor; target taint → proxy").flow(Param(0), Return),
         ),
         // String.raw (18): template cook; any tainted substitution or
-        // template taints the cooked string (variadic, params 0–3).
-        ("String.raw", None, {
-            let mut s = Summary::new("corpus-freq 18; template cook; any tainted part → string");
-            for i in 0..4u16 {
-                s = s.flow(Param(i), Return);
-            }
-            s.exclusive()
-        }),
+        // template taints the cooked string (variadic across all arguments).
+        (
+            "String.raw",
+            None,
+            Summary::new("corpus-freq 18; template cook; any tainted part → string")
+                .flow(AnyParamFrom(0), Return)
+                .exclusive(),
+        ),
         // Symbol (18): the description is carried by the symbol value
         // (readable via `.description`); conservative param→return.
         (
@@ -559,18 +604,14 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // `let o = Object.assign({}, src)` shape is covered (probe
         // e23; field-precise heap taint matches via `match_flow_endpoint`,
         // probe e5).
-        ("Object.assign", None, {
-            let mut s =
-                Summary::new("canonical; srcs → dst (mutates param 0); the result IS param 0");
-            for i in 1..4u16 {
-                s = s.alias_flow(Param(i), Param(0));
-            }
-            s = s.flow(Param(0), Return);
-            for i in 1..4u16 {
-                s = s.flow(Param(i), Return);
-            }
-            s
-        }),
+        (
+            "Object.assign",
+            None,
+            Summary::new("canonical; srcs → dst (mutates param 0); the result IS param 0")
+                .alias_flow(AnyParamFrom(1), Param(0))
+                .flow(Param(0), Return)
+                .flow(AnyParamFrom(1), Return),
+        ),
         // Object.create: the new object's prototype-chain reads reach
         // the proto's fields.
         (
@@ -637,19 +678,16 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         ),
         // Array.prototype.push: the mutator — each pushed value becomes
         // an element of the base (alias: the reference is stored, not
-        // copied). Variadic; params 0–3 modeled (the String.raw
-        // convention).
-        ("Array.prototype.push", None, {
-            let mut s =
-                Summary::new("corpus-evidenced pair of pop; args → base elements (mutates)");
-            for i in 0..4u16 {
-                s = s.alias_flow(
-                    Param(i),
+        // copied). Variadic across all arguments from index 0.
+        (
+            "Array.prototype.push",
+            None,
+            Summary::new("corpus-evidenced pair of pop; args → base elements (mutates)")
+                .alias_flow(
+                    AnyParamFrom(0),
                     Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
-                );
-            }
-            s
-        }),
+                ),
+        ),
         // String.prototype.charCodeAt (corpus `s.charCodeAt` ×36): the
         // result is a code-unit number DERIVED from the string's
         // content — content-derived, so base taint carries
@@ -826,14 +864,12 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // String.prototype.split (corpus-freq 0 — canonical preemptive,
         // probe e20): the result array's pieces derive from the base's
         // content (Base→Return covers the element reads — the load
-        // rule's empty-chain cut). The separator and limit SELECT —
+        // rule's empty-chain cut). Variadic (`split()` / `split(sep)` /
+        // `split(sep, limit)`): the separator and limit SELECT —
         // control, not content.
         (
             "String.prototype.split",
-            Some(
-                2,
-            )
-            .and(None),
+            None,
             Summary::new(
                 "canonical; content-derived pieces → result array; separator/limit are control",
             )
@@ -910,4 +946,61 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                 .callback(0),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_and_peek_do_not_intern_misses() {
+        let mut r = SummaryRegistry::new();
+        r.register("Object.is", Some(2), Summary::new("exact-2").exclusive());
+        assert_eq!(r.syms.borrow().len(), 1);
+
+        // `peek` touches neither `syms` nor `stats` nor negative caches.
+        assert!(r.peek("Unknown.fn", 1).is_none());
+        assert!(r.peek("Object.is", 1).is_none());
+        assert!(r.peek("Object.is", 2).is_some());
+        assert_eq!(r.syms.borrow().len(), 1);
+        assert_eq!(r.stats().lookups, 0);
+        assert_eq!(r.stats().negative_cache_hits, 0);
+
+        // Unregistered name misses populate `neg_names` without interning into `syms`.
+        assert!(r.lookup("Unknown.fn", 1).is_none());
+        assert_eq!(r.syms.borrow().len(), 1);
+        assert_eq!(r.stats().lookups, 1);
+        assert_eq!(r.stats().negative_cache_hits, 0);
+
+        // Repeat lookup on the unregistered name hits `neg_names` at any arity.
+        assert!(r.lookup("Unknown.fn", 3).is_none());
+        assert_eq!(r.syms.borrow().len(), 1);
+        assert_eq!(r.stats().lookups, 2);
+        assert_eq!(r.stats().negative_cache_hits, 1);
+
+        // Registered name at wrong arity populates `neg_arity` and hits on repeat.
+        assert!(r.lookup("Object.is", 1).is_none());
+        assert_eq!(r.stats().lookups, 3);
+        assert_eq!(r.stats().negative_cache_hits, 1);
+
+        assert!(r.lookup("Object.is", 1).is_none());
+        assert_eq!(r.stats().lookups, 4);
+        assert_eq!(r.stats().negative_cache_hits, 2);
+
+        // Exact arity still resolves.
+        assert!(r.lookup("Object.is", 2).is_some());
+        assert_eq!(r.syms.borrow().len(), 1);
+    }
+
+    #[test]
+    fn gap_builder_without_callback_is_panic_free_noop() {
+        let s = Summary::new("missing-callback")
+            .gap_enter(Endpoint::Base, 0)
+            .gap_return(FieldChain::new());
+        assert!(s.callback.is_none());
+        assert_eq!(
+            crate::UNCAUGHT_EXCEPTION_VALUE,
+            abcd_ir::ValueId::new(u32::MAX)
+        );
+    }
 }

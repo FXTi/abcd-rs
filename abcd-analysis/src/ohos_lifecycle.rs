@@ -33,6 +33,7 @@ use abcd_ir::module::{FunctionKind, Modifiers, Module};
 use abcd_ir::op::{CallKind, Op};
 use abcd_ir::ty::Ty;
 
+use crate::dataflow::heap::peel_movs;
 use crate::module_link::ModuleLinkTable;
 
 /// Synthetic global marker loaded to represent framework-supplied `Want`
@@ -301,7 +302,11 @@ pub fn synthesize_ohos_harness(
     if m.classes.is_empty() {
         return None;
     }
-    let host_cid = ClassId::new(0);
+    let host_cid = m
+        .classes
+        .iter()
+        .position(|c| sym_str(&m, c.descriptor) == "L_GLOBAL;")
+        .map_or(ClassId::new(0), |idx| ClassId::new(idx as u32));
     let harness_sym = m.sym.intern(OHOS_HARNESS_FUNC);
     let harness_fid = FuncId::new(m.functions.len() as u32);
     let mut hfd = FunctionData::new(host_cid, harness_sym, FunctionKind::Function);
@@ -688,21 +693,13 @@ fn func_calls_observe(module: &Module, fid: FuncId) -> bool {
     false
 }
 
-fn peel_mov(module: &Module, mut v: ValueId) -> ValueId {
-    for _ in 0..16 {
-        let Some(ValueDef::Inst(iid)) = module.value(v).map(|val| val.def) else {
-            break;
-        };
-        let Some(Op::Mov { src }) = module.inst(iid).map(|i| &i.op) else {
-            break;
-        };
-        v = *src;
-    }
-    v
+fn peel_mov(module: &Module, v: ValueId) -> ValueId {
+    peel_movs(module, v)
 }
 
 fn peel_closure_func(module: &Module, mut v: ValueId) -> Option<FuncId> {
-    for _ in 0..16 {
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(v) {
         let ValueDef::Inst(iid) = module.value(v)?.def else {
             return None;
         };
@@ -1120,5 +1117,79 @@ mod tests {
             })
             .expect("spawn");
         handle.join().expect("small stack must not overflow");
+    }
+
+    #[test]
+    fn standalone_global_at_class1_with_stub_class0_preserves_esm_after_harness() {
+        use abcd_ir::module::{ImportDecl, ModuleRequest};
+        use abcd_ir::op::ModuleVarKind;
+
+        let mut m = Module::new();
+        // ClassId(0): empty stub class `"LA;"`
+        let d_stub = m.sym.intern("LA;");
+        let n_stub = m.sym.intern("A");
+        m.classes.push(ClassData::new(d_stub, n_stub));
+
+        // ClassId(1): standalone `"L_GLOBAL;"` with module-level SDK import
+        let d_glob = m.sym.intern("L_GLOBAL;");
+        let n_glob = m.sym.intern("_GLOBAL");
+        let cid_glob = ClassId::new(1);
+        m.classes.push(ClassData::new(d_glob, n_glob));
+
+        let s_uiab = m.sym.intern("UIAbility");
+        let s_kit = m.sym.intern("@kit.AbilityKit");
+        m.imports.push(ImportDecl::Regular {
+            local_name: s_uiab,
+            import_name: s_uiab,
+            module_request: s_kit,
+        });
+        m.module_requests.push(ModuleRequest {
+            specifier: s_kit,
+            lazy: false,
+        });
+
+        let (ctor, b_ctor, _) = add_fn(&mut m, cid_glob, "MyAbility", FunctionKind::Constructor, 3);
+        emit_inst_void(&mut m, b_ctor, Op::Return { value: None });
+        let (on_create, b_oc, _) = add_fn(&mut m, cid_glob, "onCreate", FunctionKind::Function, 5);
+        emit_inst_void(&mut m, b_oc, Op::Return { value: None });
+
+        let (_, b_main, _) = add_fn(&mut m, cid_glob, "func_main_0", FunctionKind::Function, 3);
+        let h_uiab = emit_inst_val(
+            &mut m,
+            b_main,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        let s_oc = m.sym.intern("onCreate");
+        let c_s_oc = m.consts.intern(Const::String(s_oc));
+        let c_oc = m.consts.intern(Const::method_ref(on_create));
+        let mem = m.consts.push_array(vec![c_s_oc, c_oc]);
+        let _ = emit_inst_val(
+            &mut m,
+            b_main,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor,
+                heritage: Some(h_uiab),
+                members: mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        emit_inst_void(&mut m, b_main, Op::Return { value: None });
+
+        let links_before = ModuleLinkTable::build(&m);
+        assert!(links_before.external_load(cid_glob, 0).is_some());
+
+        let (aug, harness_fid) = synthesize_ohos_harness(&m, None).expect("harness synthesized");
+        assert_eq!(aug.func(harness_fid).unwrap().class_id, cid_glob);
+        assert!(aug.classes[0].methods.is_empty());
+
+        let links_after = ModuleLinkTable::build(&aug);
+        let ext = links_after
+            .external_load(cid_glob, 0)
+            .expect("standalone ESM preserved on L_GLOBAL; after harness synthesis");
+        assert_eq!(ext.external_imports, vec![(s_kit, s_uiab)]);
     }
 }

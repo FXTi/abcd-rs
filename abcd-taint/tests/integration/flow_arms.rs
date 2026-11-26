@@ -45,9 +45,10 @@ fn print_call(m: &mut abcd_ir::Module, b: abcd_ir::BlockId, args: Vec<abcd_ir::V
     );
 }
 
-/// The store rule's kill arms: a state-base fact at a strong store is
-/// never killed (`_ => false`); a strong store through a wildcard key
-/// kills the matching field fact.
+/// The store rule's kill arms (`R4-H1`): a state-base fact at a strong store
+/// is never killed (`_ => false`); an indexed store (`AnyIndex`) is a weak
+/// update on named properties (`Heap(o).[k]` stays alive), while a strong
+/// store to the exact named property (`StoreProp(k, clean)`) kills it.
 #[test]
 fn store_rule_state_base_survives_and_wildcard_kills() {
     let mut m = mk_module();
@@ -69,10 +70,10 @@ fn store_rule_state_base_survives_and_wildcard_kills() {
             value: p,
         },
     );
-    // Read the field back BEFORE the kill (the hit witnesses the flow).
+    // Read the field back BEFORE any store overwrite.
     let early = emit(&mut m, entry, Op::LoadProp { object: o, name: k });
     print_call(&mut m, entry, vec![early]);
-    // The strong store through a wildcard key kills `Heap(o).[k]`.
+    // An indexed store (`AnyIndex`) must NOT strong-kill named `Heap(o).[k]`.
     let i = load_number(&mut m, entry, 0.0);
     let clean = load_string(&mut m, entry, "clean");
     emit_void(
@@ -81,6 +82,18 @@ fn store_rule_state_base_survives_and_wildcard_kills() {
         Op::StorePropIdx {
             object: o,
             index: i,
+            value: clean,
+        },
+    );
+    let after_idx = emit(&mut m, entry, Op::LoadProp { object: o, name: k });
+    print_call(&mut m, entry, vec![after_idx]);
+    // A strong store to the exact named property `k` kills `Heap(o).[k]`.
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: o,
+            name: k,
             value: clean,
         },
     );
@@ -103,11 +116,19 @@ fn store_rule_state_base_survives_and_wildcard_kills() {
         report.hits
     );
     assert!(
+        report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(after_idx)),
+        "StorePropIdx (AnyIndex) keeps named Heap(o).[k] alive: {:?}",
+        report.hits
+    );
+    assert!(
         !report
             .hits
             .iter()
             .any(|h| h.fact.local_base() == Some(late)),
-        "the wildcard strong kill eliminated the field fact: {:?}",
+        "StoreProp(k, clean) strong-kills Heap(o).[k]: {:?}",
         report.hits
     );
     assert!(
@@ -756,24 +777,30 @@ fn call_binding_arms() {
         report.hits
     );
 
-    // (d) SuperForwardAllArgs: the caller's own formals are forwarded —
-    // the call's operands bind NOTHING (the documented gap).
+    // (d) SuperForwardAllArgs (`R4-H5`): a non-param local in `args` (`v_this`)
+    // does not taint `f0`, while the caller's own formal parameter forwards
+    // directly onto `f0`.
     let mut m = mk_module();
     let g = add_func_named(&mut m, "g");
     m.func_mut(g).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+    let f0_clean_check;
     {
         let b = entry_of(&m, g);
         add_param(&mut m, g, 0);
         add_param(&mut m, g, 1);
         add_param(&mut m, g, 2);
-        let f0 = add_param(&mut m, g, 3);
-        print_call(&mut m, b, vec![f0]);
+        f0_clean_check = add_param(&mut m, g, 3);
+        print_call(&mut m, b, vec![f0_clean_check]);
         emit_void(&mut m, b, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
+    m.func_mut(f).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
     let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
-    let p = add_param(&mut m, f, 1);
+    add_param(&mut m, f, 1);
+    add_param(&mut m, f, 2);
+    add_param(&mut m, f, 3);
+    let non_param_secret = try_get_global(&mut m, entry, "SECRET");
     let gv = load_method_ref(&mut m, entry, g);
     push_inst(
         &mut m,
@@ -781,17 +808,66 @@ fn call_binding_arms() {
         Op::Call {
             callee: gv,
             this: None,
-            args: vec![p],
+            args: vec![non_param_secret],
             kind: CallKind::SuperForwardAllArgs,
         },
     );
     emit_void(&mut m, entry, Op::Return { value: None });
-    let report = run_taint(&m, &std_config());
+    let cfg_non_param = TaintConfig {
+        sources: vec![SourceSpec::GlobalLoad {
+            name: "SECRET".to_owned(),
+        }],
+        ..std_config()
+    };
+    let report = run_taint(&m, &cfg_non_param);
     assert!(
         report.hits.is_empty(),
-        "nothing binds across SuperForwardAllArgs (documented gap): {:?}",
+        "non-param local in SuperForwardAllArgs args (`v_this`) must not taint f0: {:?}",
         report.hits
     );
+
+    let mut m = mk_module();
+    let g = add_func_named(&mut m, "g");
+    m.func_mut(g).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+    let f0_forwarded;
+    {
+        let b = entry_of(&m, g);
+        add_param(&mut m, g, 0);
+        add_param(&mut m, g, 1);
+        add_param(&mut m, g, 2);
+        f0_forwarded = add_param(&mut m, g, 3);
+        print_call(&mut m, b, vec![f0_forwarded]);
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+    let f = add_func_named(&mut m, "func_main_0");
+    m.func_mut(f).unwrap().modifiers = abcd_ir::Modifiers::STATIC;
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    add_param(&mut m, f, 1);
+    let this_v = add_param(&mut m, f, 2);
+    add_param(&mut m, f, 3); // caller formal 0 (tainted by FunctionParams)
+    let gv = load_method_ref(&mut m, entry, g);
+    push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: gv,
+            this: None,
+            args: vec![this_v],
+            kind: CallKind::SuperForwardAllArgs,
+        },
+    );
+    emit_void(&mut m, entry, Op::Return { value: None });
+    let cfg_formal = TaintConfig {
+        sources: vec![SourceSpec::FunctionParams {
+            name: "func_main_0".to_owned(),
+            params: Some(vec![3]),
+        }],
+        ..std_config()
+    };
+    let report = run_taint(&m, &cfg_formal);
+    assert_eq!(report.hits.len(), 1);
+    assert_eq!(report.hits[0].fact.local_base(), Some(f0_forwarded));
 }
 
 /// The `fresh_result_site` arms: a param (non-Inst def) and a
@@ -1380,4 +1456,165 @@ fn seed_all_functions_skips_bodyless_records() {
 
     let report = run_taint(&m, &std_config());
     assert_eq!(report.hits.len(), 1);
+}
+
+/// Variadic builtin summaries (`Endpoint::AnyParamFrom`) propagate taint from
+/// arguments past index 3 (`Object.assign`, `Array.prototype.push`, `String.raw`).
+#[test]
+fn variadic_any_param_from_high_arity() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let p_raw = add_param(&mut m, f, 1);
+    let p_assign = add_param(&mut m, f, 2);
+    let p_push = add_param(&mut m, f, 3);
+
+    let c0 = load_string(&mut m, entry, "c0");
+    let c1 = load_string(&mut m, entry, "c1");
+    let c2 = load_string(&mut m, entry, "c2");
+    let c3 = load_string(&mut m, entry, "c3");
+
+    // 1. String.raw(c0, c1, c2, c3, p_raw) — 5th arg (index 4).
+    let str_global = try_get_global(&mut m, entry, "String");
+    let raw_sym = intern(&mut m, "raw");
+    let str_raw = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: str_global,
+            name: raw_sym,
+        },
+    );
+    let cooked = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: str_raw,
+            this: Some(str_global),
+            args: vec![c0, c1, c2, c3, p_raw],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![cooked]);
+
+    // 2. Object.assign(dst, o1, o2, o3, o4, tainted_src) — 6th arg (index 5) with field taint.
+    let dst = alloc_object(&mut m, entry);
+    let o1 = alloc_object(&mut m, entry);
+    let o2 = alloc_object(&mut m, entry);
+    let o3 = alloc_object(&mut m, entry);
+    let o4 = alloc_object(&mut m, entry);
+    let src = alloc_object(&mut m, entry);
+    let k_sym = intern(&mut m, "k");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: src,
+            name: k_sym,
+            value: p_assign,
+        },
+    );
+    let obj_global = try_get_global(&mut m, entry, "Object");
+    let assign_sym = intern(&mut m, "assign");
+    let obj_assign = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: obj_global,
+            name: assign_sym,
+        },
+    );
+    let assigned = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: obj_assign,
+            this: Some(obj_global),
+            args: vec![dst, o1, o2, o3, o4, src],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let from_dst = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: dst,
+            name: k_sym,
+        },
+    );
+    let from_ret = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: assigned,
+            name: k_sym,
+        },
+    );
+    print_call(&mut m, entry, vec![from_dst]);
+    print_call(&mut m, entry, vec![from_ret]);
+
+    // 3. arr.push(c0, c1, c2, c3, p_push); arr.pop() — 5th arg (index 4).
+    let arr = alloc_array(&mut m, entry);
+    let push_sym = intern(&mut m, "push");
+    let arr_push = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: arr,
+            name: push_sym,
+        },
+    );
+    push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: arr_push,
+            this: Some(arr),
+            args: vec![c0, c1, c2, c3, p_push],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let pop_sym = intern(&mut m, "pop");
+    let arr_pop = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: arr,
+            name: pop_sym,
+        },
+    );
+    let popped = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: arr_pop,
+            this: Some(arr),
+            args: vec![],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![popped]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let config = TaintConfig {
+        builtin_summaries: true,
+        ..std_config()
+    };
+    let report = run_taint(&m, &config);
+    let bases: Vec<_> = report
+        .hits
+        .iter()
+        .filter_map(|h| h.fact.local_base())
+        .collect();
+    assert!(bases.contains(&cooked), "String.raw arg 4 tainted result");
+    assert!(
+        bases.contains(&from_dst),
+        "Object.assign arg 5 tainted dst.k"
+    );
+    assert!(
+        bases.contains(&from_ret),
+        "Object.assign arg 5 tainted return.k"
+    );
+    assert!(bases.contains(&popped), "Array.push arg 4 tainted element");
 }

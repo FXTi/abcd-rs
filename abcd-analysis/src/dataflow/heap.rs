@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use abcd_ir::{FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::{InstId, Module, Op, Sym, ValueDef, ValueId};
 
 /// Default k-limit for field chains (access-path cutoff): a chain that grows
 /// past `k` is truncated back to its prefix, merging deeper accesses into one
@@ -297,18 +297,30 @@ pub fn key_may_alias(a: &HeapRef, b: &HeapRef) -> Tribool {
     Tribool::Unknown
 }
 
-/// Policy seam for heap aliasing across the precision ladder
+/// Peel `Op::Mov` copies backward to the underlying non-`Mov` SSA definition,
+/// cycle-guarded via a `HashSet<ValueId>` with no hop cap (`#82`).
+#[must_use]
+pub fn peel_movs(module: &Module, mut val: ValueId) -> ValueId {
+    let mut visited = HashSet::new();
+    while visited.insert(val) {
+        let Some(ValueDef::Inst(iid)) = module.value(val).map(|v| v.def) else {
+            break;
+        };
+        let Some(Op::Mov { src }) = module.inst(iid).map(|i| &i.op) else {
+            break;
+        };
+        val = *src;
+    }
+    val
+}
+
+/// Policy marker seam for heap aliasing across the precision ladder
 /// (`design/analysis.md`), generalized over the client's fact type `F` so
 /// `abcd-analysis` never depends on `abcd-taint`.
 ///
-/// Only the calling-context channel lives on the trait: downstream clients
-/// key facts directly by [`AllocSiteSet`] and invoke the inherent oracle
-/// queries (`resolve`, `site_info_at`, `lex_env_at`).
-pub trait AliasOracle<F> {
-    /// Record an observed interprocedural call edge `(call -> callee)` so
-    /// context-aware alias engines can track reachable calling contexts.
-    fn inject_calling_context(&mut self, call: InstId, callee: FuncId, fact: &F);
-}
+/// Downstream clients key facts directly by [`AllocSiteSet`] and invoke the
+/// inherent oracle queries (`resolve`, `site_info_at`, `lex_env_at`).
+pub trait AliasOracle<F> {}
 
 /// The rung-0 oracle: local SSA def-chain answers only (`design/analysis.md`).
 /// Cheap, total, and conservative; every undecidable case degrades to
@@ -343,12 +355,7 @@ impl<'m> Rung0AliasOracle<'m> {
     }
 }
 
-impl<F> AliasOracle<F> for Rung0AliasOracle<'_> {
-    fn inject_calling_context(&mut self, _call: InstId, _callee: FuncId, _fact: &F) {
-        // Rung 0 is context-insensitive by construction (def chains carry
-        // no calling context); nothing to record.
-    }
-}
+impl<F> AliasOracle<F> for Rung0AliasOracle<'_> {}
 
 #[cfg(test)]
 mod tests {

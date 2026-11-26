@@ -29,7 +29,7 @@
 //! approximate across call/return anchor switches), the applied-summary
 //! log, and the registry miss counters.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::Rung1AliasOracle;
@@ -48,8 +48,7 @@ use crate::names::{
 };
 use crate::oracle::Oracle;
 use crate::problem::{
-    TaintProblem, op_uses_value, peel_ns_index, resolve_global_sources,
-    resolve_module_import_sources,
+    TaintProblem, peel_ns_index, resolve_global_sources, resolve_module_import_sources,
 };
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 
@@ -223,6 +222,10 @@ pub struct TaintReport {
     /// The alias rung the analysis actually ran at (rung 2 degrades to
     /// rung 1 when the PTA's step budget cuts — loud, never silent).
     pub alias_rung_used: u8,
+    /// Whether the rung-2 PTA ran in demand-driven root-sliced mode (`false`
+    /// unless rung 2 ran without budget degradation and `pta_stats.root_sliced`
+    /// was set).
+    pub pta_root_sliced: bool,
 }
 
 /// Run the taint analysis over `module`.
@@ -232,22 +235,15 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
 
 const PTA_SLICE_FUNC_THRESHOLD: usize = 512;
 
-fn is_const_operand(module: &Module, mut val: abcd_ir::ValueId) -> bool {
-    for _ in 0..8 {
-        let Some(v) = module.value(val) else {
-            return false;
-        };
-        match v.def {
-            abcd_ir::ValueDef::Const(_) => return true,
-            abcd_ir::ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => val = *src,
-                Some(Op::LoadConst(_)) => return true,
-                _ => return false,
-            },
-            abcd_ir::ValueDef::Param(_) | abcd_ir::ValueDef::ExceptionParam(_) => return false,
+fn is_const_operand(module: &Module, val: abcd_ir::ValueId) -> bool {
+    let peeled = abcd_analysis::dataflow::heap::peel_movs(module, val);
+    match module.value(peeled).map(|v| v.def) {
+        Some(abcd_ir::ValueDef::Const(_)) => true,
+        Some(abcd_ir::ValueDef::Inst(iid)) => {
+            matches!(module.inst(iid).map(|i| &i.op), Some(Op::LoadConst(_)))
         }
+        _ => false,
     }
-    false
 }
 
 /// Compute demand-driven PTA entry roots on large bundles (`> 512` functions),
@@ -581,7 +577,7 @@ fn compute_pta_roots(
 
     let mut viewpu_cls = gen_cls.clone();
     if !exported_slots.is_empty() {
-        let mut slot_to_readers: HashMap<ModuleSlotRef, Vec<FuncId>> = HashMap::new();
+        let mut slot_to_readers: BTreeMap<ModuleSlotRef, Vec<FuncId>> = BTreeMap::new();
         let mut push_reader = |sr: ModuleSlotRef, fid: FuncId| {
             let list = slot_to_readers.entry(sr).or_default();
             if list.last() != Some(&fid) {
@@ -724,7 +720,7 @@ fn compute_pta_roots(
         }
     }
     if !stored_globals.is_empty() {
-        let mut glob_to_readers: HashMap<abcd_ir::Sym, Vec<FuncId>> = HashMap::new();
+        let mut glob_to_readers: BTreeMap<abcd_ir::Sym, Vec<FuncId>> = BTreeMap::new();
         for (fi, f) in module.functions.iter().enumerate() {
             let fid = FuncId::new(fi as u32);
             if f.blocks.is_empty() || Some(fid) == harness_fid {
@@ -828,8 +824,13 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         let refined = CallGraph::refine_with_points_to(work_mod, &base_graph, &engine);
         (refined, Oracle::Rung1(engine), 1u8)
     };
-    let (refined, oracle, rung_used) = match config.alias_rung {
-        0 => (None, Oracle::Rung0(Rung0AliasOracle::new(work_mod)), 0u8),
+    let (refined, oracle, rung_used, pta_root_sliced) = match config.alias_rung {
+        0 => (
+            None,
+            Oracle::Rung0(Rung0AliasOracle::new(work_mod)),
+            0u8,
+            false,
+        ),
         2 => {
             let pta_config = PtaConfig {
                 step_budget: config
@@ -854,19 +855,21 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
             );
             if outcome.stats().capped {
                 let (g, o, u) = rung1_pipeline();
-                (Some(g), o, u)
+                (Some(g), o, u, false)
             } else {
                 let (graph, tables, stats) = outcome.into_parts();
+                let root_sliced = stats.root_sliced;
                 (
                     Some(graph),
                     Oracle::Rung2(Rung2AliasOracle::new(work_mod, tables, stats)),
                     2u8,
+                    root_sliced,
                 )
             }
         }
         _ => {
             let (g, o, u) = rung1_pipeline();
-            (Some(g), o, u)
+            (Some(g), o, u, false)
         }
     };
     let callgraph: &CallGraph = refined.as_ref().unwrap_or(&base_graph);
@@ -902,14 +905,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     );
     let result = solver.solve();
 
-    let hits = collect_hits(
-        work_mod,
-        problem.links(),
-        problem.prop_stores(),
-        config,
-        callgraph,
-        &result,
-    );
+    let hits = collect_hits(work_mod, &problem, config, callgraph, &result);
     let applied = problem
         .applied_summaries()
         .into_iter()
@@ -932,6 +928,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         gap_sites_resolved,
         gap_sites_unresolved,
         alias_rung_used: rung_used,
+        pta_root_sliced,
     };
     report.hits.retain(|h| h.call.index() < orig_inst_len);
     if !report.hits.is_empty() {
@@ -972,8 +969,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
 /// Scan call sites for sink matches with tainted operands.
 fn collect_hits(
     module: &Module,
-    links: &ModuleLinkTable,
-    prop_stores: &ClassPropStores,
+    problem: &TaintProblem<'_>,
     config: &TaintConfig,
     callgraph: &CallGraph,
     result: &IfdsResult<Fact>,
@@ -997,8 +993,13 @@ fn collect_hits(
         else {
             continue;
         };
-        let mut names =
-            callee_name_candidates_indexed(module, links, Some(prop_stores), edge.caller, *callee);
+        let mut names = callee_name_candidates_indexed(
+            module,
+            problem.links(),
+            Some(problem.prop_stores()),
+            edge.caller,
+            *callee,
+        );
         for f in callgraph.callees_of_call_at(iid) {
             if let Some(fd) = module.func(*f)
                 && let Some(n) = module.sym.resolve(fd.name)
@@ -1015,14 +1016,16 @@ fn collect_hits(
             let base = call_base_value(module, inst);
             for fact in &facts {
                 let Fact::Taint(tf) = &fact else { continue };
-                let Some(v) = tf.local_base() else { continue };
-                let position = if let Some(pos) = args.iter().position(|&a| a == v) {
+                let position = if let Some(pos) = args
+                    .iter()
+                    .position(|&a| problem.operand_matches_fact(a, tf, iid))
+                {
                     format!("arg {pos}")
-                } else if this == &Some(v) {
+                } else if this.is_some_and(|t| problem.operand_matches_fact(t, tf, iid)) {
                     "this".to_owned()
-                } else if base == Some(v) {
+                } else if base.is_some_and(|b| problem.operand_matches_fact(b, tf, iid)) {
                     "base".to_owned()
-                } else if v == *callee {
+                } else if problem.operand_matches_fact(*callee, tf, iid) {
                     "callee".to_owned()
                 } else {
                     continue; // unrelated fact at the call node
@@ -1043,9 +1046,9 @@ fn collect_hits(
 }
 
 /// Instruction predecessors for path reconstruction: the previous
-/// instruction in the block, or the last instruction of each predecessor
-/// block (Normal and Exceptional edges alike).
-fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
+/// instruction in the block, the last instruction of each normal predecessor
+/// block, or the throwing instructions of each exceptional predecessor block.
+fn inst_preds(module: &Module, index: &PathIndex, inst: InstId) -> Vec<InstId> {
     let Some(i) = module.inst(inst) else {
         return Vec::new();
     };
@@ -1053,17 +1056,47 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Some(pos) = block.insts.iter().position(|&x| x == inst)
+    let pos = index
+        .inst_pos_in_block
+        .get(inst.index())
+        .copied()
+        .filter(|&p| {
+            p != u32::MAX && (p as usize) < block.insts.len() && block.insts[p as usize] == inst
+        })
+        .map(|p| p as usize)
+        .or_else(|| block.insts.iter().position(|&x| x == inst));
+    if let Some(pos) = pos
         && pos > 0
     {
         out.push(block.insts[pos - 1]);
         return out;
     }
     for pred in &block.preds {
-        if let Some(pb) = module.block(pred.from)
-            && let Some(&last) = pb.insts.last()
-        {
-            out.push(last);
+        let Some(pb) = module.block(pred.from) else {
+            continue;
+        };
+        match pred.kind {
+            abcd_ir::EdgeKind::Normal => {
+                if let Some(&last) = pb.insts.last() {
+                    out.push(last);
+                }
+            }
+            abcd_ir::EdgeKind::Exceptional => {
+                let before = out.len();
+                for &iid in &pb.insts {
+                    if module
+                        .inst(iid)
+                        .is_some_and(|pi| pi.op.effects_in(module).may_throw)
+                    {
+                        out.push(iid);
+                    }
+                }
+                if out.len() == before
+                    && let Some(&last) = pb.insts.last()
+                {
+                    out.push(last);
+                }
+            }
         }
     }
     out
@@ -1075,12 +1108,16 @@ const NO_EDGE: u32 = u32::MAX;
 struct PathIndex {
     /// Dense `BlockId::index() -> Option<FuncId>` owning-function index.
     block_to_func: Vec<Option<FuncId>>,
+    /// Dense `InstId::index() -> u32` instruction position in its block (`u32::MAX` if unplaced).
+    inst_pos_in_block: Vec<u32>,
     /// `InstId::index() -> first edge index` (`NO_EDGE` when empty).
     head_by_node: Vec<u32>,
     /// `edge_idx -> next edge index` sharing the same `target_node` (`NO_EDGE` at tail).
     next_edge: Vec<u32>,
     /// start point → function.
     func_of_sp: HashMap<InstId, FuncId>,
+    /// handler entry block's first instruction → catch `ExceptionParam` value.
+    handler_entry_exc: HashMap<InstId, abcd_ir::ValueId>,
     /// function → exit instructions (Return/Throw).
     exits_of: HashMap<FuncId, Vec<InstId>>,
     /// return site → call instructions it is a return site of.
@@ -1089,6 +1126,15 @@ struct PathIndex {
 
 impl PathIndex {
     fn build(module: &Module, result: &IfdsResult<Fact>) -> Self {
+        let mut inst_pos_in_block = vec![u32::MAX; module.insts.len()];
+        for bb in &module.blocks {
+            for (pos, &iid) in bb.insts.iter().enumerate() {
+                if let Some(slot) = inst_pos_in_block.get_mut(iid.index()) {
+                    *slot = pos as u32;
+                }
+            }
+        }
+
         let mut block_to_func = vec![None; module.blocks.len()];
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
@@ -1120,6 +1166,7 @@ impl PathIndex {
         // Pre-index exceptional handler entry instructions per protected block
         // for reached functions only.
         let mut block_exc_handlers: Vec<Vec<InstId>> = vec![Vec::new(); module.blocks.len()];
+        let mut handler_entry_exc: HashMap<InstId, abcd_ir::ValueId> = HashMap::new();
         for (fi, f) in module.functions.iter().enumerate() {
             if !reached_funcs[fi] {
                 continue;
@@ -1130,9 +1177,11 @@ impl PathIndex {
                 for catch in &region.catches {
                     if let Some(&first) =
                         module.block(catch.handler).and_then(|bb| bb.insts.first())
-                        && !catch_entries.contains(&first)
                     {
-                        catch_entries.push(first);
+                        handler_entry_exc.entry(first).or_insert(catch.exception);
+                        if !catch_entries.contains(&first) {
+                            catch_entries.push(first);
+                        }
                     }
                 }
                 if catch_entries.is_empty() {
@@ -1193,8 +1242,10 @@ impl PathIndex {
                                 }
                             }
                         } else if let Some(actual_bb) = module.block(inst.block)
-                            && let Some(actual_pos) = actual_bb.insts.iter().position(|&x| x == iid)
+                            && let Some(&raw_pos) = inst_pos_in_block.get(iid.index())
+                            && raw_pos != u32::MAX
                         {
+                            let actual_pos = raw_pos as usize;
                             if actual_pos + 1 < actual_bb.insts.len() {
                                 rs_buf.push(actual_bb.insts[actual_pos + 1]);
                             } else {
@@ -1207,7 +1258,7 @@ impl PathIndex {
                                 }
                             }
                         }
-                        if inst.op.effects().may_throw
+                        if inst.op.effects_in(module).may_throw
                             && let Some(exc_list) = block_exc_handlers.get(inst.block.index())
                         {
                             for &first in exc_list {
@@ -1226,9 +1277,11 @@ impl PathIndex {
         }
         PathIndex {
             block_to_func,
+            inst_pos_in_block,
             head_by_node,
             next_edge,
             func_of_sp,
+            handler_entry_exc,
             exits_of,
             calls_at_return_site,
         }
@@ -1331,7 +1384,7 @@ fn reconstruct_path(
     visited.insert(start_edge);
     let mut seed_edge = None;
 
-    while let Some(ei) = queue.pop_front() {
+    'bfs: while let Some(ei) = queue.pop_front() {
         let (src_id, n, dst_id) = edges[ei];
         // Terminal: a seed edge (Zero, sp, non-zero fact).
         if Some(src_id) == zero_id
@@ -1349,45 +1402,67 @@ fn reconstruct_path(
         let mut preds: Vec<usize> = Vec::new();
         if src_id == dst_id && Some(src_id) != zero_id && index.func_of_sp.contains_key(&n) {
             // Callee-anchor self-loop: call edges into this function,
-            // restricted to caller facts on the call's operands (the
-            // only facts call_flow can map).
+            // restricted to caller facts on the call's operands or matching
+            // non-local state facts passed across the call edge.
             let func = index.func_of_sp[&n];
             for call in callgraph.callers_of(func) {
                 let Some(call_inst) = module.inst(*call) else {
                     continue;
                 };
                 preds.extend(index.edges_at(*call).filter(|&pi| {
-                    fact_local_base(edges[pi].2).is_some_and(|v| op_uses_value(&call_inst.op, v))
+                    edges[pi].2 == src_id
+                        || fact_local_base(edges[pi].2).is_some_and(|v| call_inst.op.has_operand(v))
                 }));
             }
         } else {
             // Return-site disambiguation: if this edge's fact is on the
-            // call's RESULT value, the taint arrived through the callee
-            // (return flow), so the path detours via the callee exit —
+            // call's RESULT value (or catch handler ExceptionParam, or a heap
+            // fact produced by the callee), the taint arrived through the
+            // callee (return flow), so the path detours via the callee exit —
             // not the intraprocedural bypass.
             let mut via_exit: Option<Vec<usize>> = None;
             if let Some(calls) = index.calls_at_return_site.get(&n) {
                 let dst_local = fact_local_base(dst_id);
+                let handler_exc = index.handler_entry_exc.get(&n).copied();
                 'calls: for c in calls {
                     let result_val = module.inst(*c).and_then(|i| i.result);
-                    let on_result = dst_local.is_some_and(|v| Some(v) == result_val);
-                    if !on_result {
+                    let is_handler_exc = dst_local.is_some() && dst_local == handler_exc;
+                    let on_result =
+                        (dst_local == result_val && result_val.is_some()) || is_handler_exc;
+                    let is_heap_return = dst_local.is_none()
+                        && Some(dst_id) != zero_id
+                        && !index
+                            .edges_at(*c)
+                            .any(|pi| edges[pi].0 == src_id && edges[pi].2 == dst_id);
+                    if !on_result && !is_heap_return {
                         continue;
                     }
                     let mut exit_preds: Vec<usize> = Vec::new();
                     for callee in callgraph.callees_of_call_at(*c) {
                         if let Some(exits) = index.exits_of.get(callee) {
                             for exit in exits {
-                                let exit_val = module.inst(*exit).and_then(|i| match &i.op {
-                                    Op::Return { value } => *value,
-                                    Op::Throw { value } => Some(*value),
-                                    _ => None,
-                                });
-                                exit_preds.extend(
-                                    index
-                                        .edges_at(*exit)
-                                        .filter(|&pi| fact_local_base(edges[pi].2) == exit_val),
-                                );
+                                let Some(exit_inst) = module.inst(*exit) else {
+                                    continue;
+                                };
+                                if is_heap_return {
+                                    if is_handler_exc && !matches!(exit_inst.op, Op::Throw { .. }) {
+                                        continue;
+                                    }
+                                    exit_preds.extend(
+                                        index.edges_at(*exit).filter(|&pi| edges[pi].2 == dst_id),
+                                    );
+                                } else {
+                                    let exit_val = match (&exit_inst.op, is_handler_exc) {
+                                        (Op::Throw { value }, true) => Some(*value),
+                                        (Op::Return { value }, false) => *value,
+                                        _ => None,
+                                    };
+                                    if exit_val.is_some() {
+                                        exit_preds.extend(index.edges_at(*exit).filter(|&pi| {
+                                            fact_local_base(edges[pi].2) == exit_val
+                                        }));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1400,9 +1475,11 @@ fn reconstruct_path(
             if let Some(exit_preds) = via_exit {
                 preds.extend(exit_preds);
             } else {
-                for p in inst_preds(module, n) {
+                let mut zero_preds: Vec<usize> = Vec::new();
+                for p in inst_preds(module, index, n) {
                     // Prefer the exact-fact (pass-through) predecessor;
-                    // widen only at transforming instructions.
+                    // widen only at transforming instructions, preferring
+                    // non-zero incoming taint before the Zero-minting fallback.
                     let mut any_exact = false;
                     for pi in index.edges_at(p) {
                         if edges[pi].0 == src_id && edges[pi].2 == dst_id {
@@ -1413,7 +1490,11 @@ fn reconstruct_path(
                     if !any_exact {
                         for pi in index.edges_at(p) {
                             if edges[pi].0 == src_id {
-                                preds.push(pi);
+                                if Some(edges[pi].2) != zero_id {
+                                    preds.push(pi);
+                                } else {
+                                    zero_preds.push(pi);
+                                }
                             }
                         }
                     }
@@ -1423,16 +1504,32 @@ fn reconstruct_path(
                         // The call edge with the same anchor (bypass).
                         for pi in index.edges_at(*c) {
                             if edges[pi].0 == src_id {
-                                preds.push(pi);
+                                if Some(edges[pi].2) != zero_id {
+                                    preds.push(pi);
+                                } else {
+                                    zero_preds.push(pi);
+                                }
                             }
                         }
                     }
+                }
+                if preds.is_empty() {
+                    preds.extend(zero_preds);
                 }
             }
         }
         for pi in preds {
             if pi != ei && visited.insert(pi) {
                 parent.insert(pi, ei);
+                if Some(dst_id) != zero_id && Some(edges[pi].2) == zero_id {
+                    seed_edge = Some((
+                        pi,
+                        index
+                            .func_of_inst(module, edges[pi].1)
+                            .unwrap_or(FuncId::new(0)),
+                    ));
+                    break 'bfs;
+                }
                 queue.push_back(pi);
             }
         }

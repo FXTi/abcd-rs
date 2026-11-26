@@ -106,20 +106,28 @@ impl ExceptionHandlerMap {
     }
 }
 
-/// Internal indexed CHK dominator solver + Euler intervals over `0..num_nodes`
-/// rooted at node `0`.
+/// Generic dense-indexed Cooper–Harvey–Kennedy (`2001`) dominator tree and
+/// `O(1)` Euler-interval solver over nodes `0..num_nodes` rooted at node `0`
+/// (`#83` `R4-D5`).
+///
+/// Out-of-bounds successor indices (`>= num_nodes`) and short `succs` slices
+/// are ignored without panicking.
+#[must_use]
 #[derive(Clone, Debug)]
-pub(crate) struct IndexedDom {
-    pub(crate) rpo: Vec<u32>,
-    pub(crate) idom: Vec<u32>,
-    pub(crate) tin: Vec<u32>,
-    pub(crate) tout: Vec<u32>,
+pub struct IndexedDom {
+    rpo: Vec<u32>,
+    idom: Vec<u32>,
+    tin: Vec<u32>,
+    tout: Vec<u32>,
 }
 
 const UNREACHABLE: u32 = u32::MAX;
 
 impl IndexedDom {
-    pub(crate) fn compute(num_nodes: usize, succs: &[Vec<u32>]) -> Self {
+    /// Compute the dominator tree and Euler intervals over `0..num_nodes`
+    /// rooted at `0` (empty when `num_nodes == 0`). Out-of-bounds successor
+    /// indices in `succs` are ignored safely.
+    pub fn compute(num_nodes: usize, succs: &[Vec<u32>]) -> Self {
         if num_nodes == 0 {
             return Self {
                 rpo: Vec::new(),
@@ -129,6 +137,8 @@ impl IndexedDom {
             };
         }
 
+        let adj = |u_idx: usize| -> &[u32] { succs.get(u_idx).map_or(&[], Vec::as_slice) };
+
         // 1. Iterative post-order DFS from root 0 -> reverse for RPO.
         let mut visited = vec![false; num_nodes];
         let mut post_order: Vec<u32> = Vec::with_capacity(num_nodes);
@@ -136,12 +146,12 @@ impl IndexedDom {
         visited[0] = true;
         dfs_stack.push((0, 0));
         while let Some((u, edge_idx)) = dfs_stack.last_mut() {
-            let u_idx = *u as usize;
-            if *edge_idx < succs[u_idx].len() {
-                let v = succs[u_idx][*edge_idx];
+            let edges = adj(*u as usize);
+            if *edge_idx < edges.len() {
+                let v = edges[*edge_idx];
                 *edge_idx += 1;
                 let v_idx = v as usize;
-                if !visited[v_idx] {
+                if v != UNREACHABLE && v_idx < num_nodes && !visited[v_idx] {
                     visited[v_idx] = true;
                     dfs_stack.push((v, 0));
                 }
@@ -159,12 +169,13 @@ impl IndexedDom {
             rpo_num[node as usize] = pos as u32;
         }
 
-        // Reachable predecessors per reachable node (filtering unreachable preds, N64).
+        // Reachable predecessors per reachable node (filtering unreachable & out-of-bounds, N64).
         let mut rpreds: Vec<Vec<u32>> = vec![Vec::new(); num_nodes];
         for &u in &rpo {
-            for &v in &succs[u as usize] {
-                if rpo_num[v as usize] != UNREACHABLE {
-                    rpreds[v as usize].push(u);
+            for &v in adj(u as usize) {
+                let v_idx = v as usize;
+                if v_idx < num_nodes && rpo_num[v_idx] != UNREACHABLE {
+                    rpreds[v_idx].push(u);
                 }
             }
         }
@@ -249,13 +260,36 @@ impl IndexedDom {
         }
     }
 
+    /// Reachable node indices in Reverse Post-Order starting at root `0`.
+    #[must_use]
     #[inline]
-    pub(crate) fn is_reachable(&self, node: usize) -> bool {
+    pub fn rpo(&self) -> &[u32] {
+        &self.rpo
+    }
+
+    /// Whether `node` is reachable from root `0`.
+    #[must_use]
+    #[inline]
+    pub fn is_reachable(&self, node: usize) -> bool {
         self.tin.get(node).copied().unwrap_or(UNREACHABLE) != UNREACHABLE
     }
 
+    /// Immediate dominator of `node`; returns `None` for root `0`, unreachable
+    /// nodes, or `node >= num_nodes`.
+    #[must_use]
     #[inline]
-    pub(crate) fn dominates(&self, a: usize, b: usize) -> bool {
+    pub fn idom(&self, node: usize) -> Option<u32> {
+        if node == 0 || !self.is_reachable(node) {
+            return None;
+        }
+        let parent = *self.idom.get(node)?;
+        (parent != UNREACHABLE).then_some(parent)
+    }
+
+    /// Whether `a` dominates `b` (`true` when `a == b` and `a` is reachable).
+    #[must_use]
+    #[inline]
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
         let ta = self.tin.get(a).copied().unwrap_or(UNREACHABLE);
         let tb = self.tin.get(b).copied().unwrap_or(UNREACHABLE);
         if ta == UNREACHABLE || tb == UNREACHABLE {
@@ -332,7 +366,7 @@ impl DomTree {
 
         let inner = IndexedDom::compute(n, &succs);
         let rpo_blocks = inner
-            .rpo
+            .rpo()
             .iter()
             .map(|&idx| func.blocks[idx as usize])
             .collect();
@@ -369,11 +403,7 @@ impl DomTree {
     #[must_use]
     pub fn idom(&self, bb: BlockId) -> Option<BlockId> {
         let i = *self.block_to_idx.get(&bb)?;
-        if i == 0 || !self.inner.is_reachable(i) {
-            return None;
-        }
-        let parent = self.inner.idom[i];
-        (parent != UNREACHABLE).then(|| self.blocks[parent as usize])
+        self.inner.idom(i).map(|p| self.blocks[p as usize])
     }
 
     /// Whether `a` dominates `b` (`true` when `a == b` and `a` is reachable).
@@ -495,5 +525,64 @@ impl SplitValueDom {
     #[inline]
     pub(crate) fn dominates_pt(&self, def_pt: usize, use_pt: usize) -> bool {
         self.dom.dominates(def_pt, use_pt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_dom_empty_and_out_of_bounds_are_panic_free() {
+        let empty = IndexedDom::compute(0, &[]);
+        assert!(empty.rpo().is_empty());
+        assert!(!empty.is_reachable(0));
+        assert_eq!(empty.idom(0), None);
+        assert!(!empty.dominates(0, 0));
+
+        // Short `succs` slice + out-of-bounds target indices (`99`, `u32::MAX`) ignored safely.
+        let dom = IndexedDom::compute(3, &[vec![1, 99, u32::MAX]]);
+        assert_eq!(dom.rpo(), &[0, 1]);
+        assert!(dom.is_reachable(0));
+        assert!(dom.is_reachable(1));
+        assert!(!dom.is_reachable(2));
+        assert!(!dom.is_reachable(99));
+        assert_eq!(dom.idom(0), None);
+        assert_eq!(dom.idom(1), Some(0));
+        assert_eq!(dom.idom(2), None);
+        assert_eq!(dom.idom(99), None);
+        assert!(dom.dominates(0, 1));
+        assert!(!dom.dominates(1, 0));
+        assert!(!dom.dominates(0, 2));
+    }
+
+    #[test]
+    fn indexed_dom_diamond_loop_and_unreachable_island() {
+        // 0 -> {1, 2}, 1 -> 3, 2 -> 3, 3 -> {1, 4} (loop 1->3->1), 5 -> 3 (unreachable pred).
+        let succs = vec![
+            vec![1, 2], // 0
+            vec![3],    // 1
+            vec![3],    // 2
+            vec![1, 4], // 3
+            vec![],     // 4
+            vec![3],    // 5 (unreachable)
+        ];
+        let dom = IndexedDom::compute(6, &succs);
+        assert_eq!(dom.rpo().len(), 5);
+        assert_eq!(dom.rpo()[0], 0);
+        assert!(!dom.is_reachable(5));
+
+        assert_eq!(dom.idom(0), None);
+        assert_eq!(dom.idom(1), Some(0));
+        assert_eq!(dom.idom(2), Some(0));
+        assert_eq!(dom.idom(3), Some(0));
+        assert_eq!(dom.idom(4), Some(3));
+        assert_eq!(dom.idom(5), None);
+
+        assert!(dom.dominates(0, 4));
+        assert!(dom.dominates(3, 4));
+        assert!(!dom.dominates(1, 3));
+        assert!(!dom.dominates(2, 3));
+        assert!(!dom.dominates(5, 3));
     }
 }

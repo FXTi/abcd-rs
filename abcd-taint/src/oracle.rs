@@ -31,13 +31,15 @@ use abcd_analysis::dataflow::heap::{
     self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, Rung0AliasOracle, SiteInfo,
 };
 use abcd_analysis::dataflow::pta::{EnvAnswer, Rung2AliasOracle};
-use abcd_ir::{FuncId, InstId, ValueId};
+use abcd_ir::{InstId, ValueId};
 
 use crate::fact::{TaintBase, TaintFact};
 
 /// The oracle the [`crate::problem::TaintProblem`] runs against.
-// Instantiated once per `TaintProblem` (never stored in collections).
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Oracle is instantiated once per TaintProblem and never stored in collections"
+)]
 pub enum Oracle<'m> {
     /// Rung 0: local def chains only.
     Rung0(Rung0AliasOracle<'m>),
@@ -166,18 +168,6 @@ impl<'m> Oracle<'m> {
     }
 }
 
-/// Delegate the `AliasOracle` seam (`design/analysis.md`) so the problem's
-/// call sites stay oracle-agnostic (the refined engines' docs apply; rung 0
-/// is the baseline behavior). Only the calling-context channel survives: the
-/// may/must-alias tri-state, the store-alias trigger, the requery probe,
-/// and the points-to delegates had no consumer and were deleted as dead
-/// surface.
-impl<F> AliasOracle<F> for Oracle<'_> {
-    fn inject_calling_context(&mut self, call: InstId, callee: FuncId, fact: &F) {
-        match self {
-            Oracle::Rung0(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
-            Oracle::Rung1(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
-            Oracle::Rung2(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
-        }
-    }
-}
+/// Implement the [`AliasOracle`] policy marker seam (`design/analysis.md`) across
+/// all precision-ladder arms (`Rung0`, `Rung1`, `Rung2`).
+impl<F> AliasOracle<F> for Oracle<'_> {}

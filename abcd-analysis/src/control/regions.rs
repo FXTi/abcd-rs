@@ -521,14 +521,22 @@ impl RegionTree {
         &self.nodes
     }
 
-    /// One node by id.
+    /// Look up one node by id, returning `None` when `id` is out of bounds.
+    #[must_use]
+    pub fn get(&self, id: RegionId) -> Option<&RegionNode> {
+        self.nodes.get(id.index())
+    }
+
+    /// One node by id (panic-free: returns a shared empty [`RegionNode::Seq`]
+    /// if `id` is out of bounds).
     pub fn node(&self, id: RegionId) -> &RegionNode {
-        &self.nodes[id.index()]
+        static EMPTY_SEQ: RegionNode = RegionNode::Seq(Vec::new());
+        self.nodes.get(id.index()).unwrap_or(&EMPTY_SEQ)
     }
 
     /// The root node, when the function has blocks.
     pub fn root_node(&self) -> Option<&RegionNode> {
-        self.root.map(|r| self.node(r))
+        self.root.and_then(|r| self.get(r))
     }
 }
 
@@ -990,28 +998,18 @@ impl Builder {
         false
     }
 
-    /// Deepest common post-dominator across a non-empty target set.
+    /// Deepest common post-dominator (LCA in `self.postdom`) across a
+    /// non-empty target set (`#82` `R4-P4`).
     fn intersect_postdom(&self, targets: &BitSet) -> Option<BlockId> {
         let mut iter = targets.iter();
-        let first = self.u_blocks[iter.next()? as usize];
-        let mut chain = self.postdom.post_dominator_chain(first);
+        let mut cur = self.u_blocks[iter.next()? as usize];
         for ti in iter {
             let t = self.u_blocks[ti as usize];
-            let other = self.postdom.post_dominator_chain(t);
-            // The chains are ordered from the block upward; the first
-            // common element is the deepest common post-dominator.
-            let mut found = None;
-            'outer: for &a in &chain {
-                for &b in &other {
-                    if a == b {
-                        found = Some(a);
-                        break 'outer;
-                    }
-                }
+            while !self.postdom.post_dominates(cur, t) {
+                cur = self.postdom.ipostdom(cur)?;
             }
-            chain = vec![found?];
         }
-        chain.first().copied()
+        Some(cur)
     }
 
     /// The merge of the loop with (natural) body `body`: the nearest
@@ -1971,7 +1969,10 @@ impl Builder {
 
 /// Classify one Normal edge against the loop forest using `O(1)` bitset
 /// membership queries.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "loop-forest bitsets and RPO index slices are passed separately to avoid per-edge wrapper allocation"
+)]
 fn classify_edge(
     u: BlockId,
     ui: u32,
@@ -2114,6 +2115,16 @@ fn project_try_regions(
     let mut plans = Vec::new();
     let mut errors = Vec::new();
     let mut earlier: Vec<BTreeSet<BlockId>> = Vec::new();
+    let region_index = match (nodes, root) {
+        (Some(nodes), Some(root_id)) if !try_regions.is_empty() => {
+            Some(RegionIndex::build(nodes, root_id, u_idx))
+        }
+        _ => None,
+    };
+    let mut in_p_count = vec![0usize; nodes.map_or(0, <[RegionNode]>::len)];
+    let mut touched: Vec<RegionId> = Vec::new();
+    let _ = word_len;
+
     for (i, tr) in try_regions.iter().enumerate() {
         let protected: BTreeSet<BlockId> = tr.protected.iter().copied().collect();
         let handlers: Vec<BlockId> = tr.catches.iter().map(|c| c.handler).collect();
@@ -2175,17 +2186,52 @@ fn project_try_regions(
             }
         }
 
-        // Tree projection walk over the reachable protected blocks.
-        let mut p_eff = BitSet::empty(word_len);
-        for &b in &protected {
-            if let Some(&bi) = u_idx.get(&b) {
-                p_eff.insert(bi);
-            }
-        }
+        // Indexed `O(|protected| * tree_depth)` projection onto the region tree.
         let mut span = None;
         let mut cuts = false;
-        if let (Some(nodes), Some(root_id), false) = (nodes, root, p_eff.is_empty()) {
-            walk_region(nodes, root_id, u_idx, &p_eff, &mut span, &mut cuts);
+        if let (Some(idx), Some(nodes)) = (&region_index, nodes) {
+            let mut p_len = 0usize;
+            for &b in &protected {
+                if let Some(&bi) = u_idx.get(&b)
+                    && let Some(mut cur) = idx.block_owner.get(bi as usize).copied().flatten()
+                {
+                    p_len += 1;
+                    loop {
+                        let ci = cur.index();
+                        if in_p_count[ci] == 0 {
+                            touched.push(cur);
+                        }
+                        in_p_count[ci] += 1;
+                        let Some(par) = idx.parent[ci] else {
+                            break;
+                        };
+                        cur = par;
+                    }
+                }
+            }
+            if p_len > 0 {
+                let mut best_depth = 0u32;
+                for &rid in &touched {
+                    let ri = rid.index();
+                    let in_p = in_p_count[ri];
+                    let total = idx.total_blocks[ri];
+                    if matches!(
+                        nodes[ri],
+                        RegionNode::Loop { .. } | RegionNode::Irreducible { .. }
+                    ) && in_p < total
+                    {
+                        cuts = true;
+                    }
+                    if in_p == p_len && (span.is_none() || idx.depth[ri] > best_depth) {
+                        span = Some(rid);
+                        best_depth = idx.depth[ri];
+                    }
+                }
+                for &rid in &touched {
+                    in_p_count[rid.index()] = 0;
+                }
+                touched.clear();
+            }
         }
 
         plans.push(TryPlan {
@@ -2200,108 +2246,109 @@ fn project_try_regions(
     (plans, errors)
 }
 
-/// Iterative containment walk (post-order over an explicit stack — the
-/// tree depth is input-driven, so this must not recurse): returns
-/// `(protected blocks inside, total blocks inside)` for the subtree,
-/// records the smallest node containing the whole protected set in `span`,
-/// and sets `cuts` when a Loop or Irreducible node is partially protected
-/// (see [`TryPlan::cuts_structured_region`]).
-fn walk_region(
-    nodes: &[RegionNode],
-    root: RegionId,
-    u_idx: &HashMap<BlockId, u32>,
-    p: &BitSet,
-    span: &mut Option<RegionId>,
-    cuts: &mut bool,
-) -> (usize, usize) {
-    /// Post-order scheduling: `Enter` pushes the node's `Exit` marker
-    /// followed by its children (in reverse, so they run in order);
-    /// `Exit` folds the children's results from `results` and applies the
-    /// node-local bookkeeping, exactly the recursive post-order.
-    enum W {
-        Enter(RegionId),
-        Exit(RegionId),
-    }
-    let in_prot = |b: BlockId| -> bool { u_idx.get(&b).is_some_and(|&bi| p.contains(bi)) };
-    let mut stack = vec![W::Enter(root)];
-    let mut results: Vec<(usize, usize)> = Vec::new();
-    while let Some(w) = stack.pop() {
-        match w {
-            W::Enter(id) => {
-                stack.push(W::Exit(id));
-                match &nodes[id.index()] {
-                    RegionNode::Block(_) | RegionNode::Irreducible { .. } => {}
-                    RegionNode::Seq(children) | RegionNode::Alternates(children) => {
-                        for &c in children.iter().rev() {
-                            stack.push(W::Enter(c));
+/// Precomputed parent, depth, subtree block count, and per-block owner index
+/// over [`RegionTree`] (`O(|RegionTree| + |U|)` once per tree, `#83` `R4-A1`).
+struct RegionIndex {
+    parent: Vec<Option<RegionId>>,
+    depth: Vec<u32>,
+    total_blocks: Vec<usize>,
+    block_owner: Vec<Option<RegionId>>,
+}
+
+impl RegionIndex {
+    fn build(nodes: &[RegionNode], root: RegionId, u_idx: &HashMap<BlockId, u32>) -> Self {
+        enum Step {
+            Enter(RegionId),
+            Exit(RegionId),
+        }
+        let n_len = nodes.len();
+        let mut parent = vec![None; n_len];
+        let mut depth = vec![0u32; n_len];
+        let mut total_blocks = vec![0usize; n_len];
+        let mut block_owner = vec![None; u_idx.len()];
+
+        let mut stack = vec![Step::Enter(root)];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Enter(id) => {
+                    stack.push(Step::Exit(id));
+                    let next_depth = depth[id.index()] + 1;
+                    match &nodes[id.index()] {
+                        RegionNode::Block(b) => {
+                            if let Some(&bi) = u_idx.get(b) {
+                                block_owner[bi as usize] = Some(id);
+                            }
                         }
-                    }
-                    RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
-                        stack.push(W::Enter(*body));
-                    }
-                    RegionNode::If {
-                        then, otherwise, ..
-                    } => {
-                        // Child order: then, then otherwise.
-                        if let Some(o) = otherwise {
-                            stack.push(W::Enter(*o));
+                        RegionNode::Irreducible { blocks, .. } => {
+                            for b in blocks {
+                                if let Some(&bi) = u_idx.get(b) {
+                                    block_owner[bi as usize] = Some(id);
+                                }
+                            }
                         }
-                        if let Some(t) = then {
-                            stack.push(W::Enter(*t));
+                        RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                            for &c in children.iter().rev() {
+                                parent[c.index()] = Some(id);
+                                depth[c.index()] = next_depth;
+                                stack.push(Step::Enter(c));
+                            }
+                        }
+                        RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                            parent[body.index()] = Some(id);
+                            depth[body.index()] = next_depth;
+                            stack.push(Step::Enter(*body));
+                        }
+                        RegionNode::If {
+                            head,
+                            then,
+                            otherwise,
+                            ..
+                        } => {
+                            if let Some(&bi) = u_idx.get(head) {
+                                block_owner[bi as usize] = Some(id);
+                            }
+                            if let Some(o) = otherwise {
+                                parent[o.index()] = Some(id);
+                                depth[o.index()] = next_depth;
+                                stack.push(Step::Enter(*o));
+                            }
+                            if let Some(t) = then {
+                                parent[t.index()] = Some(id);
+                                depth[t.index()] = next_depth;
+                                stack.push(Step::Enter(*t));
+                            }
                         }
                     }
                 }
-            }
-            W::Exit(id) => {
-                let node = &nodes[id.index()];
-                let (in_p, total) = match node {
-                    RegionNode::Block(b) => (usize::from(in_prot(*b)), 1),
-                    RegionNode::Irreducible { blocks, .. } => {
-                        (blocks.iter().filter(|&&b| in_prot(b)).count(), blocks.len())
-                    }
-                    RegionNode::Seq(children) | RegionNode::Alternates(children) => {
-                        let mut total = (0, 0);
-                        for r in results.drain(results.len() - children.len()..) {
-                            total.0 += r.0;
-                            total.1 += r.1;
+                Step::Exit(id) => {
+                    let ri = id.index();
+                    total_blocks[ri] = match &nodes[ri] {
+                        RegionNode::Block(_) => 1,
+                        RegionNode::Irreducible { blocks, .. } => blocks.len(),
+                        RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                            children.iter().map(|c| total_blocks[c.index()]).sum()
                         }
-                        total
-                    }
-                    RegionNode::Labeled { .. } | RegionNode::Loop { .. } => {
-                        results.pop().expect("child result")
-                    }
-                    RegionNode::If {
-                        head,
-                        then,
-                        otherwise,
-                        ..
-                    } => {
-                        let n = usize::from(then.is_some()) + usize::from(otherwise.is_some());
-                        let mut total = (usize::from(in_prot(*head)), 1);
-                        for r in results.drain(results.len() - n..) {
-                            total.0 += r.0;
-                            total.1 += r.1;
+                        RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                            total_blocks[body.index()]
                         }
-                        total
-                    }
-                };
-                if matches!(
-                    node,
-                    RegionNode::Loop { .. } | RegionNode::Irreducible { .. }
-                ) && in_p > 0
-                    && in_p < total
-                {
-                    *cuts = true;
+                        RegionNode::If {
+                            then, otherwise, ..
+                        } => {
+                            1 + then.map_or(0, |t| total_blocks[t.index()])
+                                + otherwise.map_or(0, |o| total_blocks[o.index()])
+                        }
+                    };
                 }
-                // Deepest node containing the whole protected set wins.
-                if in_p == p.len && span.is_none() {
-                    *span = Some(id);
-                }
-                results.push((in_p, total));
             }
         }
+
+        Self {
+            parent,
+            depth,
+            total_blocks,
+            block_owner,
+        }
     }
-    results.pop().expect("root result")
 }
 
 #[cfg(test)]

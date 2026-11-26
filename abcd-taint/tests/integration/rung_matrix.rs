@@ -912,3 +912,141 @@ fn function_params_explicit_indices() {
     assert_eq!(report.hits.len(), 1, "only params[1] was seeded");
     assert_eq!(report.hits[0].fact.local_base(), Some(p1));
 }
+
+/// R4-H2: passing an object carrying a tainted field (`o = {}; o.data = p; print(o)`)
+/// fires the sink on Rungs 0, 1, and 2 while `print(clean_obj)` stays clean.
+#[test]
+fn heap_tainted_object_operand_hits_sink_across_rungs() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let o = alloc_object(&mut m, entry);
+    let clean_obj = alloc_object(&mut m, entry);
+    let data = intern(&mut m, "data");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: o,
+            name: data,
+            value: p,
+        },
+    );
+    let zero = load_number(&mut m, entry, 0.0);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: clean_obj,
+            name: data,
+            value: zero,
+        },
+    );
+    let print_t = try_get_global(&mut m, entry, "print");
+    let tainted_call = push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: print_t,
+            this: None,
+            args: vec![o],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let print_c = try_get_global(&mut m, entry, "print");
+    let clean_call = push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: print_c,
+            this: None,
+            args: vec![clean_obj],
+            kind: CallKind::Dynamic,
+        },
+    );
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    for rung in [0u8, 1, 2] {
+        let report = run_taint(
+            &m,
+            &TaintConfig {
+                alias_rung: rung,
+                ..std_config()
+            },
+        );
+        assert_eq!(report.alias_rung_used, rung);
+        assert!(!report.pta_root_sliced);
+        assert_eq!(
+            report.hits.len(),
+            1,
+            "rung {rung}: tainted object hits sink while clean_obj does not: {:?}",
+            report.hits
+        );
+        assert_eq!(report.hits[0].call, tainted_call);
+        assert_eq!(report.hits[0].position, "arg 0");
+        assert!(report.hits.iter().all(|h| h.call != clean_call));
+    }
+}
+
+/// R4-M4: a `Zero`-minted `CallReturn` source (`x = source(); print(x)`)
+/// reconstructs a multi-step path starting at `source()` and ending at `print(x)`.
+#[test]
+fn call_return_source_reconstructs_full_path() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let src_callee = try_get_global(&mut m, entry, "source");
+    let x = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: src_callee,
+            this: None,
+            args: vec![],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let abcd_ir::ValueDef::Inst(source_call) = m.value(x).expect("x value").def else {
+        panic!("expected Call result instruction");
+    };
+    let print_callee = try_get_global(&mut m, entry, "print");
+    let sink_call = push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: print_callee,
+            this: None,
+            args: vec![x],
+            kind: CallKind::Dynamic,
+        },
+    );
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let config = TaintConfig {
+        sources: vec![SourceSpec::CallReturn {
+            name: "source".to_owned(),
+        }],
+        ..std_config()
+    };
+    for rung in [0u8, 1, 2] {
+        let report = run_taint(
+            &m,
+            &TaintConfig {
+                alias_rung: rung,
+                ..config.clone()
+            },
+        );
+        assert_eq!(report.hits.len(), 1, "rung {rung}: {:?}", report.hits);
+        let hit = &report.hits[0];
+        assert!(
+            hit.path.len() >= 2,
+            "rung {rung}: expected path.len() >= 2, got {:?}",
+            hit.path
+        );
+        assert_eq!(hit.path.first().map(|s| s.inst), Some(source_call));
+        assert_eq!(hit.path.last().map(|s| s.inst), Some(sink_call));
+    }
+}

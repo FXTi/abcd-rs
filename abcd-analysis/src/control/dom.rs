@@ -1,328 +1,192 @@
-//! Dominators and post-dominators — Cooper–Harvey–Kennedy over an
-//! iterative-DFS reverse post-order ("A Simple, Fast Dominance Algorithm",
-//! Cooper/Harvey/Kennedy 2001).
+//! Dominators and post-dominators delegated to [`abcd_ir::cfg::DomTree`] and
+//! [`abcd_ir::cfg::IndexedDom`] (`#82` `R4-P4`, `#83` `R4-D5`).
 //!
-//! Two structural facts the implementation leans on:
-//!
-//! - In any DFS-derived RPO, a dominator of `x` always precedes `x` (every
-//!   discovery path to `x` passes through its dominators, so they are DFS
-//!   ancestors), which makes the two-finger `intersect` walk strictly
-//!   decreasing and the iterated repair loop converge.
-//! - Blocks unreachable from the entry (or, for post-dominance, blocks that
-//!   cannot reach any exit) are simply absent from the tree: they are
-//!   dominated only by themselves. See the module-level dominance contract
-//!   in [`crate::control`] for how this lines up with `abcd-ir::verify`'s
-//!   private set-based computation.
-//!
-//! Both directions are generic over the successor relation, so the Normal
-//! ([`crate::control::block_succs`]) and exception-augmented
-//! ([`crate::control::augmented_succs`]) graphs — or any client relation —
-//! share one engine. Iteration order is deterministic everywhere (RPO is
-//! pinned by the successor order the relation returns).
+//! Blocks unreachable from the entry (or, for post-dominance, blocks that
+//! cannot reach any exit) are absent from the RPO slice and dominated only by
+//! themselves (`dominates(dead, dead) == true`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use abcd_ir::{BlockId, FuncId, Module};
+use abcd_ir::cfg::{DomTree, ExceptionHandlerMap, IndexedDom};
+use abcd_ir::{BlockId, FuncId, Module, Op};
 
-/// Iterative-DFS post-order over `BlockId`s from `roots`, then reversed.
-///
-/// Discovering reachable blocks directly over `BlockId` (rather than
-/// sizing dense `0..module.blocks.len()` tables) keeps per-function memory
-/// and time `O(|reachable|)` even on multi-MB `.abc` bundles with hundreds
-/// of thousands of module-wide blocks (#29).
-fn dfs_rpo_blocks(roots: &[BlockId], succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Vec<BlockId> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
-    let mut visited: HashSet<BlockId> = HashSet::with_capacity(roots.len() * 4);
-    let mut post_order: Vec<BlockId> = Vec::new();
-    if roots.len() == 1 {
-        let start = roots[0];
-        visited.insert(start);
-        let mut stack = vec![(start, succ(start), 0usize)];
-        while let Some((node, succs, next)) = stack.last_mut() {
-            if *next < succs.len() {
-                let s = succs[*next];
-                *next += 1;
-                if visited.insert(s) {
-                    stack.push((s, succ(s), 0));
-                }
-            } else {
-                post_order.push(*node);
-                stack.pop();
-            }
-        }
-    } else {
-        // Multi-root virtual super-root: visit roots in slice order.
-        let mut stack: Vec<(Option<BlockId>, Vec<BlockId>, usize)> =
-            vec![(None, roots.to_vec(), 0)];
-        while let Some((node, succs, next)) = stack.last_mut() {
-            if *next < succs.len() {
-                let s = succs[*next];
-                *next += 1;
-                if visited.insert(s) {
-                    stack.push((Some(s), succ(s), 0));
-                }
-            } else {
-                if let Some(real) = *node {
-                    post_order.push(real);
-                }
-                stack.pop();
-            }
-        }
-    }
-    post_order.reverse();
-    post_order
-}
+use super::succs::{augmented_succs, augmented_succs_with_map, block_succs};
 
-/// One wrapped tree (dense RPO-indexed Cooper–Harvey–Kennedy view).
+/// Dense wrapper over [`IndexedDom`] supporting single-entry forward graphs
+/// and virtual-super-root multi-exit reversed graphs.
 #[derive(Clone, Debug)]
-struct BlockTree {
-    /// Reachable blocks in RPO (roots first).
+struct IndexedBlockTree {
+    /// Dense node index (`0..nodes.len()`) → `BlockId` (`nodes[0]` is a dummy
+    /// placeholder when `virtual_root` is `true`).
+    nodes: Vec<BlockId>,
+    node_idx: HashMap<BlockId, usize>,
     rpo: Vec<BlockId>,
-    /// Reachable block → RPO position (absent = unreachable).
-    rpo_index: HashMap<BlockId, usize>,
-    /// RPO position → RPO position of immediate dominator (`None` for roots).
-    idom: Vec<Option<usize>>,
-    /// Euler-tour entry timestamp in the immediate-dominator forest (indexed by RPO position).
-    tin: Vec<u32>,
-    /// Euler-tour exit timestamp in the immediate-dominator forest (indexed by RPO position).
-    tout: Vec<u32>,
+    dom: IndexedDom,
+    virtual_root: bool,
 }
 
-/// Iterative Euler-tour timestamps over the immediate-dominator forest so
-/// ancestry (`dominates`) answers in `O(1)` time without walking `idom` chains.
-fn compute_euler_tour(idom: &[Option<usize>]) -> (Vec<u32>, Vec<u32>) {
-    let n = idom.len();
-    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut roots: Vec<u32> = Vec::new();
-    for (pos, &parent) in idom.iter().enumerate() {
-        match parent {
-            Some(p) if p != pos => children[p].push(pos as u32),
-            _ => roots.push(pos as u32),
+impl IndexedBlockTree {
+    fn empty() -> Self {
+        Self {
+            nodes: Vec::new(),
+            node_idx: HashMap::new(),
+            rpo: Vec::new(),
+            dom: IndexedDom::compute(0, &[]),
+            virtual_root: false,
         }
     }
-    let mut tin = vec![0u32; n];
-    let mut tout = vec![0u32; n];
-    let mut timer = 0u32;
-    let mut stack: Vec<(u32, bool)> = Vec::with_capacity(n * 2);
-    for &r in roots.iter().rev() {
-        stack.push((r, false));
-    }
-    while let Some((u, exiting)) = stack.pop() {
-        let ui = u as usize;
-        if exiting {
-            tout[ui] = timer;
-        } else {
-            timer += 1;
-            tin[ui] = timer;
-            stack.push((u, true));
-            for &c in children[ui].iter().rev() {
-                stack.push((c, false));
+
+    fn build_single(entry: Option<BlockId>, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
+        let Some(root) = entry else {
+            return Self::empty();
+        };
+        let mut nodes = vec![root];
+        let mut node_idx = HashMap::from([(root, 0usize)]);
+        let mut raw_succs: Vec<Vec<BlockId>> = Vec::new();
+        let mut queue = VecDeque::from([0usize]);
+        while let Some(ui) = queue.pop_front() {
+            let u = nodes[ui];
+            let s_list = succ(u);
+            for &s in &s_list {
+                if let std::collections::hash_map::Entry::Vacant(e) = node_idx.entry(s) {
+                    let next_idx = nodes.len();
+                    e.insert(next_idx);
+                    nodes.push(s);
+                    queue.push_back(next_idx);
+                }
+            }
+            if ui >= raw_succs.len() {
+                raw_succs.resize_with(ui + 1, Vec::new);
+            }
+            raw_succs[ui] = s_list;
+        }
+        let n = nodes.len();
+        let mut succs: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (ui, list) in raw_succs.into_iter().enumerate() {
+            for s in list {
+                if let Some(&si) = node_idx.get(&s) {
+                    succs[ui].push(si as u32);
+                }
             }
         }
-    }
-    (tin, tout)
-}
-
-impl BlockTree {
-    fn empty() -> Self {
-        BlockTree {
-            rpo: Vec::new(),
-            rpo_index: HashMap::new(),
-            idom: Vec::new(),
-            tin: Vec::new(),
-            tout: Vec::new(),
+        let dom = IndexedDom::compute(n, &succs);
+        let rpo = dom.rpo().iter().map(|&idx| nodes[idx as usize]).collect();
+        Self {
+            nodes,
+            node_idx,
+            rpo,
+            dom,
+            virtual_root: false,
         }
     }
 
-    fn build(roots: &[BlockId], succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
-        let rpo = dfs_rpo_blocks(roots, succ);
-        if rpo.is_empty() {
+    fn build_postdom(
+        blocks: &[BlockId],
+        succ: &dyn Fn(BlockId) -> Vec<BlockId>,
+        extra_exit: &dyn Fn(BlockId) -> bool,
+    ) -> Self {
+        if blocks.is_empty() {
             return Self::empty();
         }
-        let n = rpo.len();
-        let mut rpo_index: HashMap<BlockId, usize> = HashMap::with_capacity(n);
-        for (pos, &b) in rpo.iter().enumerate() {
-            rpo_index.insert(b, pos);
-        }
-
-        // Two-finger intersect on RPO positions: dominators always precede
-        // their dominatees in RPO, so the larger-position finger walks up its
-        // idom chain and the walk strictly decreases.
-        fn intersect(mut a: usize, mut b: usize, idom: &[Option<usize>]) -> usize {
-            while a != b {
-                while a > b {
-                    a = idom[a].expect("processed");
-                }
-                while b > a {
-                    b = idom[b].expect("processed");
-                }
-            }
-            a
-        }
-
-        if roots.len() == 1 {
-            // Predecessor lists (as RPO positions), in RPO-first-seen order.
-            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-            for (u_pos, &u) in rpo.iter().enumerate() {
-                for s in succ(u) {
-                    if let Some(&s_pos) = rpo_index.get(&s) {
-                        preds[s_pos].push(u_pos);
-                    }
-                }
-            }
-            let mut idom: Vec<Option<usize>> = vec![None; n];
-            idom[0] = Some(0);
-            loop {
-                let mut changed = false;
-                for pos in 1..n {
-                    let mut new_idom: Option<usize> = None;
-                    for &p_pos in &preds[pos] {
-                        if idom[p_pos].is_none() {
-                            continue;
-                        }
-                        new_idom = Some(match new_idom {
-                            None => p_pos,
-                            Some(cur) => intersect(p_pos, cur, &idom),
-                        });
-                    }
-                    if idom[pos] != new_idom {
-                        idom[pos] = new_idom;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            let (tin, tout) = compute_euler_tour(&idom);
-            BlockTree {
-                rpo,
-                rpo_index,
-                idom,
-                tin,
-                tout,
-            }
-        } else {
-            // Virtual super-root sits at extended RPO position 0; real nodes
-            // sit at `pos + 1` (`1..=n`).
-            let total = n + 1;
-            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); total];
-            let mut seen_root = HashSet::with_capacity(roots.len());
-            for &r in roots {
-                if seen_root.insert(r)
-                    && let Some(&r_pos) = rpo_index.get(&r)
-                {
-                    preds[r_pos + 1].push(0);
-                }
-            }
-            // Note: duplicates in `roots` must match the legacy `out.extend_from_slice(roots)`
-            // behavior (though duplicate `0` predecessors intersect idempotently: `intersect(0, 0) == 0`).
-            for (u_pos, &u) in rpo.iter().enumerate() {
-                for s in succ(u) {
-                    if let Some(&s_pos) = rpo_index.get(&s) {
-                        preds[s_pos + 1].push(u_pos + 1);
-                    }
-                }
-            }
-            let mut ext_idom: Vec<Option<usize>> = vec![None; total];
-            ext_idom[0] = Some(0);
-            loop {
-                let mut changed = false;
-                for pos in 1..total {
-                    let mut new_idom: Option<usize> = None;
-                    for &p_pos in &preds[pos] {
-                        if ext_idom[p_pos].is_none() {
-                            continue;
-                        }
-                        new_idom = Some(match new_idom {
-                            None => p_pos,
-                            Some(cur) => intersect(p_pos, cur, &ext_idom),
-                        });
-                    }
-                    if ext_idom[pos] != new_idom {
-                        ext_idom[pos] = new_idom;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            // Strip virtual root `0`: real roots (`ext_idom == Some(0)`)
-            // become `None`, other real nodes shift down by 1.
-            let idom: Vec<Option<usize>> = (1..total)
-                .map(|ext_pos| ext_idom[ext_pos].and_then(|d| (d != 0).then(|| d - 1)))
-                .collect();
-            let (tin, tout) = compute_euler_tour(&idom);
-            BlockTree {
-                rpo,
-                rpo_index,
-                idom,
-                tin,
-                tout,
+        let mut nodes = Vec::with_capacity(blocks.len() + 1);
+        nodes.push(BlockId::new(0)); // virtual exit super-root at index 0
+        let mut node_idx = HashMap::with_capacity(blocks.len());
+        for &b in blocks {
+            if let std::collections::hash_map::Entry::Vacant(e) = node_idx.entry(b) {
+                let idx = nodes.len();
+                e.insert(idx);
+                nodes.push(b);
             }
         }
-    }
-
-    fn position(&self, b: BlockId) -> Option<usize> {
-        self.rpo_index.get(&b).copied()
+        let total = nodes.len();
+        let mut rev_succs: Vec<Vec<u32>> = vec![Vec::new(); total];
+        for &b in blocks {
+            let Some(&bi) = node_idx.get(&b) else {
+                continue;
+            };
+            let s_list = succ(b);
+            if (s_list.is_empty() || extra_exit(b)) && !rev_succs[0].contains(&(bi as u32)) {
+                rev_succs[0].push(bi as u32);
+            }
+            for s in s_list {
+                if let Some(&si) = node_idx.get(&s) {
+                    rev_succs[si].push(bi as u32);
+                }
+            }
+        }
+        if rev_succs[0].is_empty() {
+            return Self::empty();
+        }
+        let dom = IndexedDom::compute(total, &rev_succs);
+        let rpo = dom
+            .rpo()
+            .iter()
+            .skip(1)
+            .map(|&idx| nodes[idx as usize])
+            .collect();
+        Self {
+            nodes,
+            node_idx,
+            rpo,
+            dom,
+            virtual_root: true,
+        }
     }
 
     fn is_reachable(&self, b: BlockId) -> bool {
-        self.position(b).is_some()
+        self.node_idx
+            .get(&b)
+            .is_some_and(|&i| self.dom.is_reachable(i))
     }
 
     fn idom(&self, b: BlockId) -> Option<BlockId> {
-        let pos = self.position(b)?;
-        let dpos = self.idom.get(pos).copied().flatten()?;
-        (dpos != pos).then(|| self.rpo[dpos])
+        let i = *self.node_idx.get(&b)?;
+        let parent = self.dom.idom(i)?;
+        if self.virtual_root && parent == 0 {
+            None
+        } else {
+            Some(self.nodes[parent as usize])
+        }
     }
 
-    /// Whether `a` dominates `b` in this tree. Every block dominates
-    /// itself; unreachable blocks are dominated by nothing else.
     fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         if a == b {
             return true;
         }
-        let (Some(pa), Some(pb)) = (self.position(a), self.position(b)) else {
+        let (Some(&ai), Some(&bi)) = (self.node_idx.get(&a), self.node_idx.get(&b)) else {
             return false;
         };
-        self.tin[pa] <= self.tin[pb] && self.tout[pb] <= self.tout[pa]
+        self.dom.dominates(ai, bi)
     }
 
-    /// The full dominator set of `b` (`b` itself included), in chain order
-    /// from `b` up to the root. Unreachable blocks yield just `{b}`.
-    fn dominator_chain(&self, b: BlockId) -> Vec<BlockId> {
-        let mut chain = vec![b];
-        let Some(mut cur) = self.position(b) else {
-            return chain;
-        };
-        while let Some(next) = self.idom.get(cur).copied().flatten() {
-            if next == cur {
-                break;
-            }
-            chain.push(self.rpo[next]);
+    fn chain(&self, b: BlockId) -> Vec<BlockId> {
+        let mut out = vec![b];
+        let mut cur = b;
+        while let Some(next) = self.idom(cur) {
+            out.push(next);
             cur = next;
         }
-        chain
+        out
     }
+}
+
+#[derive(Clone, Debug)]
+enum DomBacking {
+    Ir(Option<DomTree>),
+    Custom(IndexedBlockTree),
 }
 
 /// Immediate-dominator tree of one function.
 ///
 /// Construction is generic over the successor relation; use
-/// [`Dominators::normal`] (terminator successors only — the relation
-/// `abcd-ir::verify`'s N45 check uses, via the stored
-/// [`abcd_ir::EdgeKind::Normal`] predecessors) or
+/// [`Dominators::normal`] (terminator successors only) or
 /// [`Dominators::augmented`] (try→handler dispatch included) for the two
 /// standard relations, or [`Dominators::over`] for a custom one.
 #[derive(Clone, Debug)]
 pub struct Dominators {
     /// The analyzed function.
     pub func: FuncId,
-    tree: BlockTree,
+    backing: DomBacking,
 }
 
 impl Dominators {
@@ -333,10 +197,9 @@ impl Dominators {
         entry: Option<BlockId>,
         succ: &dyn Fn(BlockId) -> Vec<BlockId>,
     ) -> Self {
-        let roots: Vec<BlockId> = entry.into_iter().collect();
-        Dominators {
+        Self {
             func,
-            tree: BlockTree::build(&roots, succ),
+            backing: DomBacking::Custom(IndexedBlockTree::build_single(entry, succ)),
         }
     }
 
@@ -348,57 +211,90 @@ impl Dominators {
 
     /// Dominators over terminator (Normal-edge) successors.
     pub fn normal(module: &Module, func: FuncId) -> Self {
-        Self::over(module, func, &|b| super::succs::block_succs(module, b))
+        Self {
+            func,
+            backing: DomBacking::Ir(DomTree::compute_normal(module, func)),
+        }
     }
 
     /// Dominators over exception-augmented successors.
     pub fn augmented(module: &Module, func: FuncId) -> Self {
-        Self::over(module, func, &|b| {
-            super::succs::augmented_succs(module, func, b)
-        })
+        Self {
+            func,
+            backing: DomBacking::Ir(DomTree::compute_augmented(module, func)),
+        }
     }
 
     /// Reachable blocks in reverse post-order (the entry first).
     pub fn rpo(&self) -> &[BlockId] {
-        &self.tree.rpo
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.rpo(),
+            DomBacking::Ir(None) => &[],
+            DomBacking::Custom(tree) => &tree.rpo,
+        }
     }
 
     /// Whether `b` is reachable from the entry in the tree's relation.
     pub fn is_reachable(&self, b: BlockId) -> bool {
-        self.tree.is_reachable(b)
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.is_reachable(b),
+            DomBacking::Ir(None) => false,
+            DomBacking::Custom(tree) => tree.is_reachable(b),
+        }
     }
 
     /// The immediate dominator of `b`; `None` for the entry and for
     /// unreachable blocks.
     pub fn idom(&self, b: BlockId) -> Option<BlockId> {
-        self.tree.idom(b)
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.idom(b),
+            DomBacking::Ir(None) => None,
+            DomBacking::Custom(tree) => tree.idom(b),
+        }
     }
 
     /// Whether `a` dominates `b`. Every block dominates itself;
     /// unreachable blocks are dominated by nothing else.
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
-        self.tree.dominates(a, b)
+        if a == b {
+            return true;
+        }
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.dominates(a, b),
+            DomBacking::Ir(None) => false,
+            DomBacking::Custom(tree) => tree.dominates(a, b),
+        }
     }
 
     /// The full dominator chain of `b`, from `b` up to the entry
     /// (unreachable blocks yield `{b}` alone).
     pub fn dominator_chain(&self, b: BlockId) -> Vec<BlockId> {
-        self.tree.dominator_chain(b)
+        match &self.backing {
+            DomBacking::Ir(_) => {
+                let mut out = vec![b];
+                let mut cur = b;
+                while let Some(next) = self.idom(cur) {
+                    out.push(next);
+                    cur = next;
+                }
+                out
+            }
+            DomBacking::Custom(tree) => tree.chain(b),
+        }
     }
 }
 
 /// Immediate-POST-dominator tree of one function: `a` post-dominates `b`
 /// when every path from `b` to a function exit passes through `a`.
 ///
-/// Computed as dominators of the reversed graph with a virtual super-root
-/// over all exit blocks (blocks with no successors in the relation).
-/// Blocks that cannot reach any exit (infinite loops, dead code) are
-/// post-dominated only by themselves.
+/// Computed via [`IndexedDom`] over the reversed graph with a virtual
+/// super-root over all exit blocks. Blocks that cannot reach any exit
+/// (infinite loops, dead code) are post-dominated only by themselves.
 #[derive(Clone, Debug)]
 pub struct PostDominators {
     /// The analyzed function.
     pub func: FuncId,
-    tree: BlockTree,
+    tree: IndexedBlockTree,
 }
 
 impl PostDominators {
@@ -409,49 +305,71 @@ impl PostDominators {
         blocks: &[BlockId],
         succ: &dyn Fn(BlockId) -> Vec<BlockId>,
     ) -> Self {
-        let block_set: HashSet<BlockId> = blocks.iter().copied().collect();
-        let mut exits: Vec<BlockId> = Vec::new();
-        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::with_capacity(blocks.len());
-        for &b in blocks {
-            let s_list = succ(b);
-            if s_list.is_empty() {
-                exits.push(b);
-            }
-            for s in s_list {
-                if block_set.contains(&s) {
-                    preds.entry(s).or_default().push(b);
-                }
-            }
+        Self {
+            func,
+            tree: IndexedBlockTree::build_postdom(blocks, succ, &|_| false),
         }
-        let tree = if exits.is_empty() {
-            BlockTree::empty()
-        } else {
-            BlockTree::build(&exits, &|b| preds.get(&b).cloned().unwrap_or_default())
-        };
-        PostDominators { func, tree }
     }
 
     /// Post-dominators over an arbitrary successor relation.
     pub fn over(module: &Module, func: FuncId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
-        let empty: &[BlockId] = &[];
-        let blocks = module
-            .func(func)
-            .map(|f| f.blocks.as_slice())
-            .unwrap_or(empty);
+        let blocks = module.func(func).map_or(&[][..], |f| f.blocks.as_slice());
         Self::over_blocks(func, blocks, succ)
     }
 
-    /// Post-dominators over exception-augmented successors (exceptions are
-    /// real exits — the right default for value-flow reasoning).
+    /// Post-dominators over exception-augmented successors (`#82` `R4-P4`).
+    ///
+    /// Any block owned by `func` whose terminator is [`Op::Return`] — or
+    /// [`Op::Throw`] not covered by a catch-all (`catch.type_class.is_none()`)
+    /// handler in `func` — is also connected to the virtual exit super-root
+    /// even when protected by a [`abcd_ir::TryRegion`].
     pub fn augmented(module: &Module, func: FuncId) -> Self {
-        Self::over(module, func, &|b| {
-            super::succs::augmented_succs(module, func, b)
-        })
+        let Some(f) = module.func(func) else {
+            return Self {
+                func,
+                tree: IndexedBlockTree::empty(),
+            };
+        };
+        let Some(exc_map) = ExceptionHandlerMap::build(module, func) else {
+            return Self::over(module, func, &|b| augmented_succs(module, func, b));
+        };
+        let mut catch_all_blocks: HashSet<BlockId> = HashSet::new();
+        for region in &f.try_regions {
+            let has_catch_all = region
+                .catches
+                .iter()
+                .any(|c| c.type_class.is_none() && exc_map.block_index(c.handler).is_some());
+            if has_catch_all {
+                for &p in &region.protected {
+                    if exc_map.block_index(p).is_some() {
+                        catch_all_blocks.insert(p);
+                    }
+                }
+            }
+        }
+        let is_direct_exit = |b: BlockId| -> bool {
+            let Some(last_iid) = module.block(b).and_then(|bb| bb.insts.last().copied()) else {
+                return false;
+            };
+            match module.inst(last_iid).map(|i| &i.op) {
+                Some(Op::Return { .. }) => true,
+                Some(Op::Throw { .. }) => !catch_all_blocks.contains(&b),
+                _ => false,
+            }
+        };
+        Self {
+            func,
+            tree: IndexedBlockTree::build_postdom(
+                &f.blocks,
+                &|b| augmented_succs_with_map(module, &exc_map, b),
+                &is_direct_exit,
+            ),
+        }
     }
 
     /// Post-dominators over terminator (Normal-edge) successors.
     pub fn normal(module: &Module, func: FuncId) -> Self {
-        Self::over(module, func, &|b| super::succs::block_succs(module, b))
+        Self::over(module, func, &|b| block_succs(module, b))
     }
 
     /// Blocks the tree covers, in (reversed-graph) RPO.
@@ -477,7 +395,7 @@ impl PostDominators {
 
     /// The full post-dominator chain of `b`, from `b` down to the exits.
     pub fn post_dominator_chain(&self, b: BlockId) -> Vec<BlockId> {
-        self.tree.dominator_chain(b)
+        self.tree.chain(b)
     }
 }
 
@@ -485,7 +403,8 @@ impl PostDominators {
 mod tests {
     use super::*;
     use crate::testutil::*;
-    use abcd_ir::{EdgeKind, Op};
+    use abcd_ir::function::{Catch, Edge, TryRegion};
+    use abcd_ir::{ClassId, EdgeKind, Op};
 
     /// Diamond: entry → {a, b} → join → exit.
     #[test]
@@ -615,15 +534,101 @@ mod tests {
         assert!(aug.is_reachable(handler));
         assert_eq!(aug.idom(handler), Some(entry));
 
-        // Post-dominance over the augmented graph: the entry is
-        // post-dominated by nothing reachable (two disjoint exits), and
-        // both exit blocks post-dominate themselves only.
         let post = PostDominators::augmented(&m, f);
         assert!(post.reaches_exit(entry));
         assert_eq!(post.ipostdom(exit), None);
         assert_eq!(post.ipostdom(handler), None);
         assert_eq!(post.ipostdom(entry), None);
         assert!(post.post_dominates(exit, exit));
+    }
+
+    /// Protected `Return` inside `try` is a direct function exit even when
+    /// `augmented_succs` connects the block to a catch handler (`#82` `R4-P4`).
+    #[test]
+    fn augmented_postdom_treats_protected_return_and_uncaught_throw_as_exits() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let ret_in_try = add_block(&mut m, f);
+        let throw_in_catchall = add_block(&mut m, f);
+        let throw_in_typed = add_block(&mut m, f);
+        let catchall_handler = add_block(&mut m, f);
+        let typed_handler = add_block(&mut m, f);
+
+        let cond = load_number(&mut m, entry, 1.0);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond,
+                true_dest: ret_in_try,
+                false_dest: throw_in_catchall,
+            },
+        );
+        emit_void(&mut m, ret_in_try, Op::Return { value: Some(cond) });
+        emit_void(&mut m, throw_in_catchall, Op::Throw { value: cond });
+        emit_void(&mut m, throw_in_typed, Op::Throw { value: cond });
+
+        let exc_all = add_exception_param(&mut m, catchall_handler);
+        emit_void(
+            &mut m,
+            catchall_handler,
+            Op::CondBranch {
+                cond,
+                true_dest: catchall_handler, // handler may loop or branch to typed throw
+                false_dest: throw_in_typed,
+            },
+        );
+        let exc_typed = add_exception_param(&mut m, typed_handler);
+        emit_void(
+            &mut m,
+            typed_handler,
+            Op::Return {
+                value: Some(exc_typed),
+            },
+        );
+
+        link(&mut m, entry, ret_in_try);
+        link(&mut m, entry, throw_in_catchall);
+        link(&mut m, catchall_handler, catchall_handler);
+        link(&mut m, catchall_handler, throw_in_typed);
+        add_try(
+            &mut m,
+            f,
+            vec![ret_in_try, throw_in_catchall],
+            catchall_handler,
+            exc_all,
+        );
+        m.block_mut(typed_handler).unwrap().preds.push(Edge {
+            from: throw_in_typed,
+            kind: EdgeKind::Exceptional,
+        });
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![throw_in_typed],
+            catches: vec![Catch {
+                handler: typed_handler,
+                exception: exc_typed,
+                type_class: Some(ClassId::new(0)),
+            }],
+        });
+
+        let post = PostDominators::augmented(&m, f);
+        assert!(post.reaches_exit(ret_in_try));
+        assert!(
+            !post.post_dominates(catchall_handler, ret_in_try),
+            "protected Return exits directly; catch handler must not post-dominate it"
+        );
+        assert_eq!(post.ipostdom(ret_in_try), None);
+
+        // `throw_in_catchall` IS covered by `catchall_handler` (`type_class: None`),
+        // so every execution of `throw_in_catchall` enters `catchall_handler`.
+        assert!(post.post_dominates(catchall_handler, throw_in_catchall));
+        assert_eq!(post.ipostdom(throw_in_catchall), Some(catchall_handler));
+
+        // `throw_in_typed` is covered only by a typed catch (`type_class: Some`),
+        // so non-matching throws escape the function directly.
+        assert!(!post.post_dominates(typed_handler, throw_in_typed));
+        assert_eq!(post.ipostdom(throw_in_typed), None);
     }
 
     /// Dead blocks (no path from entry) are dominated by themselves only.

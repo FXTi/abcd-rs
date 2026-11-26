@@ -1,13 +1,9 @@
-//! Use-def chains as a commodity, cached per function with explicit
-//! invalidation.
+//! Per-function use-def chains in deterministic program order.
 //!
 //! Definitions are already free in the IR ([`abcd_ir::Value::def`]); what
 //! an analysis repeatedly pays for is the reverse map. [`UseDefChains`]
 //! builds the use lists of one function in deterministic order (block
 //! order, then instruction order, then operand order).
-//! [`AnalysisStore`] caches chains per function; pass pipelines must call
-//! [`AnalysisStore::invalidate`] after mutating a function — the cache
-//! never guesses.
 
 use std::collections::HashMap;
 
@@ -49,15 +45,15 @@ impl UseDefChains {
                     for (edge, v) in entries {
                         chains.phi_uses.entry(*v).or_default().push((iid, *edge));
                     }
-                    // Phi entries also appear in `operands()`; skip the
+                    // Phi entries also appear in `for_each_operand`; skip the
                     // plain use list for phis so each use is reported once
                     // (with its edge, which is the semantically meaningful
                     // form).
                     continue;
                 }
-                for v in inst.op.operands() {
+                inst.op.for_each_operand(|v| {
                     chains.uses.entry(v).or_default().push(iid);
-                }
+                });
             }
         }
         chains
@@ -91,44 +87,15 @@ impl UseDefChains {
 
     /// All values used by `inst` (the op's operand list).
     pub fn used_by(module: &Module, inst: InstId) -> Vec<ValueId> {
-        module
-            .inst(inst)
-            .map(|i| i.op.operands())
-            .unwrap_or_default()
-    }
-}
-
-/// A per-module cache of analyses keyed by function, invalidated
-/// EXPLICITLY. The contract for pass pipelines: mutate a function, then
-/// [`invalidate`](AnalysisStore::invalidate) it before the next query;
-/// the store never watches for changes itself.
-#[derive(Default)]
-pub struct AnalysisStore {
-    use_def: HashMap<FuncId, UseDefChains>,
-}
-
-impl AnalysisStore {
-    /// An empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The use-def chains of `func`, building and caching them on first
-    /// query.
-    pub fn use_def(&mut self, module: &Module, func: FuncId) -> &UseDefChains {
-        self.use_def
-            .entry(func)
-            .or_insert_with(|| UseDefChains::build(module, func))
-    }
-
-    /// Drop every cached analysis of `func` (call after mutating it).
-    pub fn invalidate(&mut self, func: FuncId) {
-        self.use_def.remove(&func);
-    }
-
-    /// Drop everything (call after module-wide rewrites).
-    pub fn invalidate_all(&mut self) {
-        self.use_def.clear();
+        let Some(i) = module.inst(inst) else {
+            return Vec::new();
+        };
+        let mut out = match i.op.arity() {
+            abcd_ir::Arity::Exact(n) => Vec::with_capacity(n),
+            abcd_ir::Arity::Variadic => Vec::new(),
+        };
+        i.op.for_each_operand(|v| out.push(v));
+        out
     }
 }
 
@@ -215,29 +182,5 @@ mod tests {
         assert_eq!(phi_uses.len(), 1);
         assert_eq!(phi_uses[0].1.from, t);
         assert_eq!(chains.all_users(x).len(), 1);
-    }
-
-    #[test]
-    fn store_invalidates_explicitly() {
-        let mut m = mk_module();
-        let f = add_func(&mut m);
-        let entry = entry_of(&m, f);
-        let v = load_number(&mut m, entry, 1.0);
-        emit_void(&mut m, entry, Op::Return { value: Some(v) });
-
-        let mut store = AnalysisStore::new();
-        assert_eq!(store.use_def(&m, f).users_of(v).len(), 1);
-
-        // Mutate: drop the return value. Without invalidation the cache is
-        // stale — that is the caller's contract.
-        let ret = m.block(entry).unwrap().insts[1];
-        m.inst_mut(ret).unwrap().op = Op::Return { value: None };
-        assert_eq!(
-            store.use_def(&m, f).users_of(v).len(),
-            1,
-            "stale until invalidated"
-        );
-        store.invalidate(f);
-        assert_eq!(store.use_def(&m, f).users_of(v).len(), 0);
     }
 }
