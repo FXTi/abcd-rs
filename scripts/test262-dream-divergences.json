@@ -3,12 +3,9 @@
  "decompile-bug-misc-assertion-divergence": [],
  "expected-fallback-generator-machinery": [
   "24.0.0.0/test262/built-ins/GeneratorPrototype/return/try-finally-nested-try-catch-within-catch/baseline/input.abc",
-  "24.0.0.0/test262/built-ins/GeneratorPrototype/throw/try-catch-following-catch/baseline/input.abc",
-  "24.0.0.0/test262/built-ins/GeneratorPrototype/throw/try-catch-within-try/baseline/input.abc",
   "24.0.0.0/test262/built-ins/GeneratorPrototype/throw/try-finally-following-finally/baseline/input.abc",
   "24.0.0.0/test262/built-ins/GeneratorPrototype/throw/try-finally-within-finally/baseline/input.abc",
   "24.0.0.0/test262/language/expressions/yield/star-rhs-iter-rtrn-res-value-final/baseline/input.abc",
-  "24.0.0.0/test262/language/expressions/yield/within-for/baseline/input.abc",
   "24.0.0.0/test262/language/statements/for-of/yield-star-from-try/baseline/input.abc"
  ]
 }

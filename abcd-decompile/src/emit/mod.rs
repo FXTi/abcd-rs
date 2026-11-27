@@ -1689,9 +1689,15 @@ impl<'m> Emitter<'m> {
                         if let Some(b) = &extra.binding
                             && *b != primary_binding
                         {
-                            out.push_str(&format!(
-                                "{pad}  const {b} = {primary_binding}; /* merged typed-catch binding */\n"
-                            ));
+                            if self.hoisted.contains(b) {
+                                out.push_str(&format!(
+                                    "{pad}  {b} = {primary_binding}; /* merged typed-catch binding */\n"
+                                ));
+                            } else {
+                                out.push_str(&format!(
+                                    "{pad}  const {b} = {primary_binding}; /* merged typed-catch binding */\n"
+                                ));
+                            }
                         }
                         tasks.push(PrintTask::Nodes {
                             slice: &extra.body,
@@ -2004,10 +2010,15 @@ impl<'m> Emitter<'m> {
                 match catches.split_first() {
                     Some((first, rest)) => {
                         let binding = first.binding.clone().unwrap_or_else(|| "e".to_string());
+                        let catch_param = if self.hoisted.contains(&binding) {
+                            format!("{binding}$catch")
+                        } else {
+                            binding.clone()
+                        };
                         if !rest.is_empty() {
                             tasks.push(PrintTask::ExtraCatches {
                                 catches: rest,
-                                primary_binding: binding.clone(),
+                                primary_binding: catch_param.clone(),
                                 indent,
                             });
                         }
@@ -2015,9 +2026,15 @@ impl<'m> Emitter<'m> {
                             slice: &first.body,
                             indent: indent + 1,
                         });
-                        tasks.push(PrintTask::RawOwned(format!(
-                            "{pad}}} catch ({binding}) {{\n"
-                        )));
+                        if self.hoisted.contains(&binding) {
+                            tasks.push(PrintTask::RawOwned(format!(
+                                "{pad}}} catch ({catch_param}) {{\n{pad}  {binding} = {catch_param};\n"
+                            )));
+                        } else {
+                            tasks.push(PrintTask::RawOwned(format!(
+                                "{pad}}} catch ({binding}) {{\n"
+                            )));
+                        }
                     }
                     None => {
                         if finally.is_none() {
@@ -2633,11 +2650,13 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
         PushPath(usize),
         PopPath,
     }
-    fn collect_uses(root: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos)>) {
+    fn collect_uses(root: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos, bool)>) {
         let mut stack: Vec<&Expr> = vec![root];
         while let Some(e) = stack.pop() {
-            if let Expr::Temp { name, .. } = e {
-                uses.push((name.clone(), pos.clone()));
+            match e {
+                Expr::Temp { name, .. } => uses.push((name.clone(), pos.clone(), true)),
+                Expr::Ident(name) => uses.push((name.clone(), pos.clone(), false)),
+                _ => {}
             }
             for c in crate::folds::expr_children(e).into_iter().rev() {
                 stack.push(c);
@@ -2648,7 +2667,8 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
         root_nodes: &[SNode],
         path: &mut Vec<usize>,
         decls: &mut BTreeMap<String, Vec<Pos>>,
-        uses: &mut Vec<(String, Pos)>,
+        catch_scopes: &mut BTreeMap<String, Vec<Vec<usize>>>,
+        uses: &mut Vec<(String, Pos, bool)>,
     ) {
         let mut frames: Vec<EscapeFrame<'_>> = vec![EscapeFrame::EnterNodes {
             nodes: root_nodes,
@@ -2766,6 +2786,24 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                             finally,
                             ..
                         } => {
+                            for (k, c) in catches.iter().enumerate() {
+                                if let Some(b) = &c.binding {
+                                    let mut cpath = path.clone();
+                                    cpath.push(i);
+                                    cpath.push(1 + k);
+                                    catch_scopes.entry(b.clone()).or_default().push(cpath);
+                                }
+                            }
+                            if catches.len() > 1
+                                && let Some(b0) = &catches[0].binding
+                            {
+                                for k in 1..catches.len() {
+                                    let mut cpath = path.clone();
+                                    cpath.push(i);
+                                    cpath.push(1 + k);
+                                    catch_scopes.entry(b0.clone()).or_default().push(cpath);
+                                }
+                            }
                             frames.push(EscapeFrame::PopPath);
                             if let Some(fin) = finally {
                                 frames.push(EscapeFrame::PopPath);
@@ -2811,23 +2849,36 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
         }
     }
     let mut decls: BTreeMap<String, Vec<Pos>> = BTreeMap::new();
-    let mut uses: Vec<(String, Pos)> = Vec::new();
-    walk(nodes, &mut Vec::new(), &mut decls, &mut uses);
+    let mut catch_scopes: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
+    let mut uses: Vec<(String, Pos, bool)> = Vec::new();
+    walk(
+        nodes,
+        &mut Vec::new(),
+        &mut decls,
+        &mut catch_scopes,
+        &mut uses,
+    );
     let mut out = BTreeSet::new();
-    for (name, u) in uses {
-        if let Some(dpaths) = decls.get(&name) {
-            // Visible: same block list at a later position, or nested
-            // under a LATER sibling of the declaration's list.
-            let visible = |(ds, dn, dl): &Pos| {
-                let (us, un, ul) = &u;
-                if us == ds {
-                    return (un, ul) > (dn, dl);
-                }
-                us.len() > ds.len() && us[..ds.len()] == ds[..] && us[ds.len()] > *dn
-            };
-            if !dpaths.iter().any(visible) {
-                out.insert(name);
+    for (name, u, is_temp) in uses {
+        // Visible: same block list at a later position, or nested
+        // under a LATER sibling of the declaration's list.
+        let visible = |(ds, dn, dl): &Pos| {
+            let (us, un, ul) = &u;
+            if us == ds {
+                return (un, ul) > (dn, dl);
             }
+            us.len() > ds.len() && us[..ds.len()] == ds[..] && us[ds.len()] > *dn
+        };
+        if is_temp
+            && let Some(dpaths) = decls.get(&name)
+            && !dpaths.iter().any(visible)
+        {
+            out.insert(name);
+        } else if !decls.contains_key(&name)
+            && let Some(cpaths) = catch_scopes.get(&name)
+            && !cpaths.iter().any(|cp| u.0.starts_with(cp))
+        {
+            out.insert(name);
         }
     }
     out

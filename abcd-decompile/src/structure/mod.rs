@@ -4089,7 +4089,7 @@ impl<'m> Ctx<'m> {
                             follow
                         };
                         if (i > 0 || j + 1 < children.len())
-                            && let Some(plan) = self.plan_cut_try_slice(&children[i..=j], p)
+                            && let Some(plan) = self.plan_cut_try_slice(&children[i..=j], p, active)
                         {
                             let slice = children[i..=j].to_vec();
                             ts.tasks.push(StructTask::SeqStep {
@@ -4110,7 +4110,7 @@ impl<'m> Ctx<'m> {
                         }
                         if let RegionNode::If { head, .. } = *self.f().node(children[j])
                             && self.f_mut().plan_of(head) == Some(p)
-                            && !self.can_cut_try(children[j], p)
+                            && !self.can_cut_try(children[j], p, active)
                         {
                             j += 1;
                         }

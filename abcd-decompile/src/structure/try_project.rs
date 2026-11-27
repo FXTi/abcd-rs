@@ -1337,12 +1337,18 @@ impl<'m> Ctx<'m> {
     }
 
     /// Phase 1: classify a Mixed node into protected skeleton +
-    /// deferred tail for plan `p` (iterative spine walk, zero recursion).
-    pub(in crate::structure) fn cut_classify(
+    /// deferred tail for plan `p`, where the deferred tail exits `p`
+    /// back to the enclosing `defer_plan` (`None` at top level, `Some(aq)`
+    /// when `p` sits inside an already-open outer `try` `aq`).
+    pub(in crate::structure) fn cut_classify_with_defer(
         &mut self,
         root_id: RegionId,
         p: usize,
+        defer_plan: Option<usize>,
     ) -> Option<CutSplit> {
+        if defer_plan == Some(p) {
+            return None;
+        }
         enum CutSpine {
             Seq { split_at: usize },
             IfThen { otherwise: Option<ArmCut> },
@@ -1357,8 +1363,8 @@ impl<'m> Ctx<'m> {
         let mut acc = loop {
             match self.f_mut().cov(cur) {
                 Cov::Uniform(Some(q)) if q == p => break CutSplit::Prot,
-                Cov::Uniform(None) => break CutSplit::Defer,
-                Cov::Uniform(Some(_)) => return None,
+                Cov::Uniform(d) if d == defer_plan => break CutSplit::Defer,
+                Cov::Uniform(_) => return None,
                 Cov::Mixed => {
                     let node = self.f().node(cur).clone();
                     match node {
@@ -1377,7 +1383,7 @@ impl<'m> Ctx<'m> {
                                 }
                             }
                             for &c in &children[i..] {
-                                if self.f_mut().cov(c) != Cov::Uniform(None) {
+                                if self.f_mut().cov(c) != Cov::Uniform(defer_plan) {
                                     return None;
                                 }
                             }
@@ -1615,10 +1621,48 @@ impl<'m> Ctx<'m> {
         true
     }
 
+    /// Verify that no un-emitted outer plan strictly between `p` and `active`
+    /// still needs to wrap `p`'s handlers, returning `active` as the target
+    /// deferred-tail plan (`None` at top level, `Some(aq)` inside an open
+    /// enclosing `try` `aq`).
+    pub(in crate::structure) fn cut_defer_plan(
+        &mut self,
+        p: usize,
+        active: Option<usize>,
+    ) -> Option<Option<usize>> {
+        let handlers = self.f().plans[p].handlers.clone();
+        let mut visited: HashSet<BTreeSet<BlockId>> =
+            [self.f().plans[p].protected.clone()].into_iter().collect();
+        if let Some(aq) = active {
+            let aq_prot = self.f().plans[aq].protected.clone();
+            for pl in &self.f().plans {
+                if aq_prot.is_subset(&pl.protected) {
+                    visited.insert(pl.protected.clone());
+                }
+            }
+            for pl in &self.frames[0].plans {
+                if aq_prot.is_subset(&pl.protected) {
+                    visited.insert(pl.protected.clone());
+                }
+            }
+        }
+        self.outer_wrap_plan(&visited, &handlers)
+            .is_none()
+            .then_some(active)
+    }
+
     /// Pure pre-check for [`Ctx::emit_cut_try`]: whether `id` satisfies
     /// every join-hoist analysis guard for plan `p`.
-    pub(in crate::structure) fn can_cut_try(&mut self, id: RegionId, p: usize) -> bool {
-        let Some(split) = self.cut_classify(id, p) else {
+    pub(in crate::structure) fn can_cut_try(
+        &mut self,
+        id: RegionId,
+        p: usize,
+        active: Option<usize>,
+    ) -> bool {
+        let Some(defer_plan) = self.cut_defer_plan(p, active) else {
+            return false;
+        };
+        let Some(split) = self.cut_classify_with_defer(id, p, defer_plan) else {
             return false;
         };
         if matches!(split, CutSplit::Prot | CutSplit::Defer) {
@@ -1635,15 +1679,7 @@ impl<'m> Ctx<'m> {
         let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
             return false;
         };
-        if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
-            return false;
-        }
-        let handlers = self.f().plans[p].handlers.clone();
-        self.outer_wrap_plan(
-            &[self.f().plans[p].protected.clone()].into_iter().collect(),
-            &handlers,
-        )
-        .is_none()
+        rejoin == 0 || self.defer_prefix_phi_only(&defers[..rejoin])
     }
 
     /// Whether every Normal exit edge out of `slice` targets the entry of
@@ -1687,6 +1723,7 @@ impl<'m> Ctx<'m> {
         &mut self,
         slice: &[RegionId],
         p: usize,
+        active: Option<usize>,
     ) -> Option<CutTryPlan> {
         if slice.len() < 2 {
             return None;
@@ -1696,7 +1733,8 @@ impl<'m> Ctx<'m> {
         if !self.slice_falls_cleanly(prefix_slice, last) {
             return None;
         }
-        let split = self.cut_classify(last, p)?;
+        let defer_plan = self.cut_defer_plan(p, active)?;
+        let split = self.cut_classify_with_defer(last, p, defer_plan)?;
         if matches!(split, CutSplit::Prot | CutSplit::Defer) {
             return None;
         }
@@ -1712,15 +1750,6 @@ impl<'m> Ctx<'m> {
         }
         let hoisted = defers[rejoin..].to_vec();
         let handlers = self.f().plans[p].handlers.clone();
-        if self
-            .outer_wrap_plan(
-                &[self.f().plans[p].protected.clone()].into_iter().collect(),
-                &handlers,
-            )
-            .is_some()
-        {
-            return None;
-        }
         Some(CutTryPlan {
             rejoin,
             hoisted,
@@ -1733,8 +1762,10 @@ impl<'m> Ctx<'m> {
         &mut self,
         id: RegionId,
         p: usize,
+        active: Option<usize>,
     ) -> Option<CutTryPlan> {
-        let split = self.cut_classify(id, p)?;
+        let defer_plan = self.cut_defer_plan(p, active)?;
+        let split = self.cut_classify_with_defer(id, p, defer_plan)?;
         if matches!(split, CutSplit::Prot) {
             return None;
         }
@@ -1750,15 +1781,6 @@ impl<'m> Ctx<'m> {
         }
         let hoisted = defers[rejoin..].to_vec();
         let handlers = self.f().plans[p].handlers.clone();
-        if self
-            .outer_wrap_plan(
-                &[self.f().plans[p].protected.clone()].into_iter().collect(),
-                &handlers,
-            )
-            .is_some()
-        {
-            return None;
-        }
         Some(CutTryPlan {
             rejoin,
             hoisted,
@@ -2514,7 +2536,7 @@ impl<'m> Ctx<'m> {
                         && self.f_mut().cov(children[ne]) == Cov::Mixed
                         && let RegionNode::If { head, .. } = *self.f().node(children[ne])
                         && self.f_mut().plan_of(head) == Some(np)
-                        && !self.can_cut_try(children[ne], np)
+                        && !self.can_cut_try(children[ne], np, None)
                     {
                         ne += 1;
                     }
@@ -2525,7 +2547,7 @@ impl<'m> Ctx<'m> {
                         Some(np)
                             if np != cur_p
                                 && !self.is_suppressed(np)
-                                && !self.can_cut_try(next_child, np) =>
+                                && !self.can_cut_try(next_child, np, None) =>
                         {
                             Some((np, cur_end + 1))
                         }
@@ -2582,10 +2604,10 @@ impl<'m> Ctx<'m> {
                 if let Some(p) = p
                     && Some(p) != active
                     && matches!(
-                        self.cut_classify(id, p),
+                        self.cut_classify_with_defer(id, p, active),
                         Some(CutSplit::Seq { inner: Some(_), .. })
                     )
-                    && let Some(plan) = self.plan_cut_try(id, p)
+                    && let Some(plan) = self.plan_cut_try(id, p, active)
                 {
                     self.start_cut_try(plan, CutTryInput::Node(id), p, active, follow, ts);
                     return;
@@ -2603,7 +2625,7 @@ impl<'m> Ctx<'m> {
                     && active != Some(p)
                     && !self.is_suppressed(p)
                 {
-                    if let Some(plan) = self.plan_cut_try(id, p) {
+                    if let Some(plan) = self.plan_cut_try(id, p, active) {
                         self.start_cut_try(plan, CutTryInput::Node(id), p, active, follow, ts);
                     } else {
                         ts.tasks.push(StructTask::WrapTryRun {
