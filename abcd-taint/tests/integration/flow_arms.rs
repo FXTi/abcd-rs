@@ -150,12 +150,14 @@ fn store_rekey_appends_the_value_chain() {
     let p = add_param(&mut m, f, 1);
     let f1 = intern(&mut m, "f1");
     let f2 = intern(&mut m, "f2");
-    let a1 = emit(
+    let a1 = try_get_global(&mut m, entry, "a1");
+    emit_void(
         &mut m,
         entry,
-        Op::LoadProp {
-            object: p,
+        Op::StoreProp {
+            object: a1,
             name: f1,
+            value: p,
         },
     );
     // The store base is a global load — imprecise at every rung, so the
@@ -228,11 +230,20 @@ fn summary_endpoint_match_arms() {
         },
     );
     print_call(&mut m, entry, vec![r1]);
-    // A receiver carrying a one-element chain: w2.y = (p.z); recv = w2.y
+    // A receiver carrying a one-element chain: a1.z = p; w2.y = a1; recv = w2.y
     // gives Local(recv, [z]).
     let z = intern(&mut m, "z");
     let y = intern(&mut m, "y");
-    let a1 = emit(&mut m, entry, Op::LoadProp { object: p, name: z });
+    let a1 = try_get_global(&mut m, entry, "a1");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: a1,
+            name: z,
+            value: p,
+        },
+    );
     let w2 = try_get_global(&mut m, entry, "w2");
     emit_void(
         &mut m,
@@ -367,13 +378,15 @@ fn summary_heap_endpoint_and_substitute_arms() {
     let p = add_param(&mut m, f, 1);
     let zz = intern(&mut m, "z");
     let ww = intern(&mut m, "w");
-    // Heap(site_o).[z, w]: store o.z = a1 where a1 = p.w.
-    let a1 = emit(
+    // Heap(site_o).[z, w]: store o.z = a1 where a1.w = p (`Local(a1, [w])`).
+    let a1 = try_get_global(&mut m, entry, "a1");
+    emit_void(
         &mut m,
         entry,
-        Op::LoadProp {
-            object: p,
+        Op::StoreProp {
+            object: a1,
             name: ww,
+            value: p,
         },
     );
     let o = alloc_object(&mut m, entry);

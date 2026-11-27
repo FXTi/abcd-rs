@@ -276,11 +276,114 @@ impl<'m> Supergraph<'m> {
     }
 }
 
-/// The client problem: fact type + the four flow functions + seeds.
+/// Interned solver fact identifier (`0` is always [`IfdsProblem::zero`]; `D6`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FactId(pub u32);
+
+/// One transfer-function emission: either an allocation-free identity
+/// passthrough of the input fact (`PassThrough`) or a newly constructed fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlowOut<F> {
+    /// Reuse the incoming [`FactId`] directly without cloning or hashing `F`.
+    PassThrough,
+    /// Intern and emit `F`.
+    Fact(F),
+}
+
+/// Zero-allocation transfer-function output buffer (`D6`, `#94`).
 ///
-/// `Fact` should be a newtype over interned ids (`design/analysis.md`); it
-/// must be cheap to clone and have semantic `Eq`/`Hash`. The
-/// [`IfdsProblem::zero`] fact (`Λ`) must not equal any domain fact.
+/// Calling [`Self::pass_through`] records an `O(1)` boolean flag so
+/// [`IfdsSolver`] propagates the incoming [`FactId`] directly with **zero**
+/// `Fact` clones, **zero** `Vec` allocations, and **zero** `HashMap` lookups.
+#[derive(Debug)]
+pub struct FlowSink<F> {
+    pass_through: bool,
+    extra_ids: Vec<FactId>,
+    facts: Vec<F>,
+}
+
+impl<F> Default for FlowSink<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F> FlowSink<F> {
+    /// Construct an empty sink.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pass_through: false,
+            extra_ids: Vec::new(),
+            facts: Vec::new(),
+        }
+    }
+
+    /// Clear all recorded emissions while retaining allocated buffer capacity.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.pass_through = false;
+        self.extra_ids.clear();
+        self.facts.clear();
+    }
+
+    /// Propagate the incoming fact unchanged (`d2 -> d2`) without cloning or
+    /// hashing `F`.
+    #[inline]
+    pub fn pass_through(&mut self) {
+        self.pass_through = true;
+    }
+
+    /// Whether [`Self::pass_through`] was requested on this step.
+    #[must_use]
+    #[inline]
+    pub const fn has_pass_through(&self) -> bool {
+        self.pass_through
+    }
+
+    /// Emit a newly constructed or transformed fact.
+    #[inline]
+    pub fn emit(&mut self, fact: F) {
+        self.facts.push(fact);
+    }
+
+    /// Emit a known [`FactId`] directly without cloning or hashing `F`.
+    #[inline]
+    pub fn emit_id(&mut self, id: FactId) {
+        self.extra_ids.push(id);
+    }
+
+    /// Emit a [`FlowOut`] item.
+    #[inline]
+    pub fn emit_flow(&mut self, out: FlowOut<F>) {
+        match out {
+            FlowOut::PassThrough => self.pass_through(),
+            FlowOut::Fact(fact) => self.emit(fact),
+        }
+    }
+
+    /// Emit every fact from `iter`.
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = F>>(&mut self, iter: I) {
+        self.facts.extend(iter);
+    }
+
+    /// Mutable access to the materialized-fact buffer (used by default
+    /// backward-compatible `*_out` adapters).
+    #[inline]
+    pub fn facts_mut(&mut self) -> &mut Vec<F> {
+        &mut self.facts
+    }
+}
+
+/// The client problem: fact type + the flow functions + seeds.
+///
+/// Clients may implement either the classic `Vec`-emitting methods
+/// (`normal_flow`, `call_flow`, `return_flow`, `call_to_return_flow`,
+/// `call_uncaught_exit_flow`) OR the zero-copy [`FlowSink`] methods
+/// (`normal_flow_out`, `call_flow_out`, `return_flow_out`,
+/// `call_to_return_flow_out`, `call_uncaught_exit_flow_out`), which default to
+/// delegating to their `Vec`-based counterparts (`D6`).
 pub trait IfdsProblem {
     /// The data-flow fact.
     type Fact: Clone + Eq + Hash + std::fmt::Debug;
@@ -299,23 +402,51 @@ pub trait IfdsProblem {
     /// branch-sensitive analyses can split on the outgoing edge.
     fn normal_flow(
         &self,
+        _module: &Module,
+        _curr: InstId,
+        _succ: InstId,
+        _source: &Self::Fact,
+        _out: &mut Vec<Self::Fact>,
+    ) {
+    }
+
+    /// Zero-copy intraprocedural transfer (`D6`): defaults to [`Self::normal_flow`].
+    fn normal_flow_out(
+        &self,
         module: &Module,
         curr: InstId,
         succ: InstId,
+        _source_id: FactId,
         source: &Self::Fact,
-        out: &mut Vec<Self::Fact>,
-    );
+        out: &mut FlowSink<Self::Fact>,
+    ) {
+        self.normal_flow(module, curr, succ, source, out.facts_mut());
+    }
 
     /// Call edge into one concrete callee (call-graph resolution is the
     /// oracle's job, not the flow function's).
     fn call_flow(
         &self,
+        _module: &Module,
+        _call: InstId,
+        _callee: FuncId,
+        _source: &Self::Fact,
+        _out: &mut Vec<Self::Fact>,
+    ) {
+    }
+
+    /// Zero-copy call transfer (`D6`): defaults to [`Self::call_flow`].
+    fn call_flow_out(
+        &self,
         module: &Module,
         call: InstId,
         callee: FuncId,
+        _source_id: FactId,
         source: &Self::Fact,
-        out: &mut Vec<Self::Fact>,
-    );
+        out: &mut FlowSink<Self::Fact>,
+    ) {
+        self.call_flow(module, call, callee, source, out.facts_mut());
+    }
 
     /// Return edge out of `callee`'s `exit` instruction back to the call
     /// site. `call_site`/`return_site` are `None` under unbalanced
@@ -328,25 +459,67 @@ pub trait IfdsProblem {
     )]
     fn return_flow(
         &self,
+        _module: &Module,
+        _call_site: Option<InstId>,
+        _callee: FuncId,
+        _exit: InstId,
+        _return_site: Option<InstId>,
+        _source: &Self::Fact,
+        _out: &mut Vec<Self::Fact>,
+    ) {
+    }
+
+    /// Zero-copy return transfer (`D6`): defaults to [`Self::return_flow`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct IFDS return-flow inputs"
+    )]
+    fn return_flow_out(
+        &self,
         module: &Module,
         call_site: Option<InstId>,
         callee: FuncId,
         exit: InstId,
         return_site: Option<InstId>,
+        _source_id: FactId,
         source: &Self::Fact,
-        out: &mut Vec<Self::Fact>,
-    );
+        out: &mut FlowSink<Self::Fact>,
+    ) {
+        self.return_flow(
+            module,
+            call_site,
+            callee,
+            exit,
+            return_site,
+            source,
+            out.facts_mut(),
+        );
+    }
 
     /// The call-to-return bypass edge: facts the callee cannot affect
     /// (locals not passed in, zero propagation) skip the call along it.
     fn call_to_return_flow(
         &self,
+        _module: &Module,
+        _call: InstId,
+        _return_site: InstId,
+        _source: &Self::Fact,
+        _out: &mut Vec<Self::Fact>,
+    ) {
+    }
+
+    /// Zero-copy call-to-return transfer (`D6`): defaults to [`Self::call_to_return_flow`].
+    fn call_to_return_flow_out(
+        &self,
         module: &Module,
         call: InstId,
         return_site: InstId,
+        _source_id: FactId,
         source: &Self::Fact,
-        out: &mut Vec<Self::Fact>,
-    );
+        out: &mut FlowSink<Self::Fact>,
+    ) {
+        self.call_to_return_flow(module, call, return_site, source, out.facts_mut());
+    }
 
     /// Uncaught-exception propagation out of `callee`'s `callee_exit` when
     /// `call_site` is not covered by a catch-all handler in its caller
@@ -362,14 +535,34 @@ pub trait IfdsProblem {
     ) {
     }
 
+    /// Zero-copy uncaught-exception exit transfer (`D6`): defaults to
+    /// [`Self::call_uncaught_exit_flow`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct IFDS uncaught-exit flow inputs"
+    )]
+    fn call_uncaught_exit_flow_out(
+        &self,
+        module: &Module,
+        call_site: InstId,
+        callee: FuncId,
+        callee_exit: InstId,
+        _source_id: FactId,
+        source: &Self::Fact,
+        out: &mut FlowSink<Self::Fact>,
+    ) {
+        self.call_uncaught_exit_flow(
+            module,
+            call_site,
+            callee,
+            callee_exit,
+            source,
+            out.facts_mut(),
+        );
+    }
+
     /// Whether the tautological zero fact (`Λ`) should propagate as `Λ -> Λ`
     /// across `call` into `callee`. Defaults to `true`.
-    ///
-    /// Clients whose `initial_seeds` already plant `Λ` on every function that can
-    /// generate a non-zero fact from `Λ` (and its transitive callers) may return
-    /// `false` for callees outside that backward cone, avoiding `O(|Module|)`
-    /// `(Λ, inst, Λ)` tabulation across source-free subgraphs while still running
-    /// `call_flow(call, callee, &Λ)` for any direct `Λ -> d` seed edges.
     fn propagate_zero_to_callee(&self, _call: InstId, _callee: FuncId) -> bool {
         true
     }
@@ -587,8 +780,13 @@ pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
     /// Interned ID of `problem.zero()` (always `0`).
     zero_id: u32,
     /// The jump-function table for the binary lattice: the set of
-    /// propagated path edges `(source_id, target_node, target_id)`.
+    /// propagated normal arrival path edges `(source_id, target_node, target_id)`.
     edge_set: HashSet<(u32, InstId, u32)>,
+    /// Separate deduplication set for uncaught-exception exits at call sites
+    /// (`D6`, `#94`) so uncaught-throw propagation never suppresses normal
+    /// arrival / return-flow propagation at the same `(source, call_site, fact)`
+    /// triple (and vice versa).
+    uncaught_edge_set: HashSet<(u32, InstId, u32)>,
     /// Reverse index: `(target node, target fact id)` → source fact ids
     /// (`process_exit` iterates it for caller-side path continuation).
     by_target: HashMap<(InstId, u32), CompactU32Set>,
@@ -603,8 +801,8 @@ pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
     /// Iterative queue of uncaught-throw call-site exits awaiting `process_exit`
     /// (`256 KiB`-stack safe across arbitrarily deep call chains).
     exit_worklist: VecDeque<(u32, InstId, u32)>,
-    /// Reusable transfer-output scratch buffer avoiding per-edge heap allocations.
-    scratch_facts: Vec<P::Fact>,
+    /// Reusable zero-copy transfer sink avoiding per-edge heap allocations.
+    scratch_sink: FlowSink<P::Fact>,
     /// Propagation order record (the result).
     ordered_edges: Vec<(u32, InstId, u32)>,
     /// Target instruction index → reached target fact ids.
@@ -629,12 +827,13 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             fact_ids,
             zero_id: 0,
             edge_set: HashSet::new(),
+            uncaught_edge_set: HashSet::new(),
             by_target: HashMap::new(),
             incoming: HashMap::new(),
             end_summary: HashMap::new(),
             worklist: VecDeque::new(),
             exit_worklist: VecDeque::new(),
-            scratch_facts: Vec::new(),
+            scratch_sink: FlowSink::new(),
             ordered_edges: Vec::new(),
             reached: vec![CompactU32Set::default(); module.insts.len()],
         }
@@ -651,8 +850,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
     }
 
     /// The single chokepoint for the join and the worklist: an edge is
-    /// processed iff it is new. Over the binary lattice the join is set
-    /// union, so "strictly improved" reduces to "absent before".
+    /// processed iff it is new in `edge_set`. Over the binary lattice the join
+    /// is set union, so "strictly improved" reduces to "absent before".
     fn propagate(&mut self, source: u32, target_node: InstId, target_fact: u32) {
         let key = (source, target_node, target_fact);
         if !self.edge_set.insert(key) {
@@ -671,13 +870,17 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                 .resize_with(target_node.index() + 1, CompactU32Set::default);
         }
         self.reached[target_node.index()].insert(target_fact);
-        self.ordered_edges.push(key);
+        if !self.uncaught_edge_set.contains(&key) {
+            self.ordered_edges.push(key);
+        }
         self.worklist.push_back(key);
     }
 
     /// Record an uncaught-exception exit `(caller_entry, call_site, uncaught_fact)`
-    /// without inserting into `by_target` or running `process_call` bypass edges,
-    /// and schedule it for immediate `process_exit` replay.
+    /// in `uncaught_edge_set` (separate from normal `edge_set` so normal arrival
+    /// and uncaught exit at `call_site` never mask each other, `D6`) without
+    /// inserting into `by_target` or running `process_call` bypass edges, and
+    /// schedule it once for `process_exit` replay.
     fn propagate_uncaught_exit(
         &mut self,
         caller_entry: u32,
@@ -685,50 +888,80 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         uncaught_fact: u32,
     ) {
         let key = (caller_entry, call_site, uncaught_fact);
-        if self.edge_set.insert(key) {
-            if call_site.index() >= self.reached.len() {
-                self.reached
-                    .resize_with(call_site.index() + 1, CompactU32Set::default);
-            }
-            self.reached[call_site.index()].insert(uncaught_fact);
+        if !self.uncaught_edge_set.insert(key) {
+            return;
+        }
+        if call_site.index() >= self.reached.len() {
+            self.reached
+                .resize_with(call_site.index() + 1, CompactU32Set::default);
+        }
+        self.reached[call_site.index()].insert(uncaught_fact);
+        if !self.edge_set.contains(&key) {
             self.ordered_edges.push(key);
         }
         self.exit_worklist.push_back(key);
     }
 
-    /// Compute a flow function's interned target fact IDs, enforcing
-    /// unconditional zero (`Λ`) preservation: whenever `source == zero_id`,
-    /// `zero_id` is guaranteed to remain among the output facts.
-    fn compute_targets(
+    /// Drain `sink` into interned target fact IDs, resolving `pass_through` and
+    /// `extra_ids` directly to `u32` without cloning or hashing `P::Fact`.
+    fn drain_sink_to_ids(
         &mut self,
         source: u32,
-        f: impl FnOnce(&P, &Module, &P::Fact, &mut Vec<P::Fact>),
+        keep_zero: bool,
+        mut sink: FlowSink<P::Fact>,
     ) -> Vec<u32> {
-        let mut out = std::mem::take(&mut self.scratch_facts);
-        out.clear();
-        f(
-            self.problem,
-            self.module,
-            &self.facts[source as usize],
-            &mut out,
-        );
-        let mut ids = Vec::with_capacity(out.len() + usize::from(source == self.zero_id));
+        let extra_cap = usize::from(sink.pass_through) + usize::from(keep_zero);
+        let mut ids = Vec::with_capacity(sink.extra_ids.len() + sink.facts.len() + extra_cap);
         let mut saw_zero = false;
-        for fact in out.drain(..) {
+        if sink.pass_through {
+            if source == self.zero_id {
+                saw_zero = true;
+            }
+            ids.push(source);
+        }
+        for raw_id in sink.extra_ids.drain(..) {
+            if (raw_id.0 as usize) < self.facts.len() {
+                if raw_id.0 == self.zero_id {
+                    saw_zero = true;
+                }
+                ids.push(raw_id.0);
+            }
+        }
+        for fact in sink.facts.drain(..) {
             let id = self.intern_fact(fact);
             if id == self.zero_id {
                 saw_zero = true;
             }
             ids.push(id);
         }
-        self.scratch_facts = out;
-        if source == self.zero_id && !saw_zero {
+        self.scratch_sink = sink;
+        if keep_zero && !saw_zero {
             ids.push(self.zero_id);
         }
         ids
     }
 
-    /// Compute `call_uncaught_exit_flow` target fact IDs without injecting `Λ`.
+    /// Compute a flow function's interned target fact IDs via [`FlowSink`],
+    /// enforcing unconditional zero (`Λ`) preservation whenever `source == zero_id`.
+    fn compute_targets(
+        &mut self,
+        source: u32,
+        f: impl FnOnce(&P, &Module, FactId, &P::Fact, &mut FlowSink<P::Fact>),
+    ) -> Vec<u32> {
+        let mut sink = std::mem::take(&mut self.scratch_sink);
+        sink.clear();
+        f(
+            self.problem,
+            self.module,
+            FactId(source),
+            &self.facts[source as usize],
+            &mut sink,
+        );
+        let keep_zero = source == self.zero_id;
+        self.drain_sink_to_ids(source, keep_zero, sink)
+    }
+
+    /// Compute `call_uncaught_exit_flow_out` target fact IDs without injecting `Λ`.
     fn compute_uncaught_targets(
         &mut self,
         call_site: InstId,
@@ -736,54 +969,38 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         callee_exit: InstId,
         source: u32,
     ) -> Vec<u32> {
-        let mut out = std::mem::take(&mut self.scratch_facts);
-        out.clear();
-        self.problem.call_uncaught_exit_flow(
+        let mut sink = std::mem::take(&mut self.scratch_sink);
+        sink.clear();
+        self.problem.call_uncaught_exit_flow_out(
             self.module,
             call_site,
             callee,
             callee_exit,
+            FactId(source),
             &self.facts[source as usize],
-            &mut out,
+            &mut sink,
         );
-        let mut ids = Vec::with_capacity(out.len());
-        for fact in out.drain(..) {
-            ids.push(self.intern_fact(fact));
-        }
-        self.scratch_facts = out;
-        ids
+        self.drain_sink_to_ids(source, false, sink)
     }
 
-    /// Compute `call_flow` target fact IDs across `(call, callee)`, gating
+    /// Compute `call_flow_out` target fact IDs across `(call, callee)`, gating
     /// automatic `Λ -> Λ` propagation via
     /// [`IfdsProblem::propagate_zero_to_callee`] while still invoking
-    /// `call_flow` on `Λ` for any direct `Λ -> d` seed edges.
+    /// `call_flow_out` on `Λ` for any direct `Λ -> d` seed edges.
     fn compute_call_targets(&mut self, call: InstId, callee: FuncId, source: u32) -> Vec<u32> {
-        let mut out = std::mem::take(&mut self.scratch_facts);
-        out.clear();
-        self.problem.call_flow(
+        let mut sink = std::mem::take(&mut self.scratch_sink);
+        sink.clear();
+        self.problem.call_flow_out(
             self.module,
             call,
             callee,
+            FactId(source),
             &self.facts[source as usize],
-            &mut out,
+            &mut sink,
         );
         let keep_zero =
             source == self.zero_id && self.problem.propagate_zero_to_callee(call, callee);
-        let mut ids = Vec::with_capacity(out.len() + usize::from(keep_zero));
-        let mut saw_zero = false;
-        for fact in out.drain(..) {
-            let id = self.intern_fact(fact);
-            if id == self.zero_id {
-                saw_zero = true;
-            }
-            ids.push(id);
-        }
-        self.scratch_facts = out;
-        if keep_zero && !saw_zero {
-            ids.push(self.zero_id);
-        }
-        ids
+        self.drain_sink_to_ids(source, keep_zero, sink)
     }
 
     fn drain_exit_worklist(&mut self) {
@@ -844,8 +1061,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         let succ_len = self.graph.normal_succs(n).len();
         for i in 0..succ_len {
             let succ = self.graph.normal_succs(n)[i];
-            let targets = self.compute_targets(d2, |p, m, src, out| {
-                p.normal_flow(m, n, succ, src, out);
+            let targets = self.compute_targets(d2, |p, m, src_id, src, out| {
+                p.normal_flow_out(m, n, succ, src_id, src, out);
             });
             for t in targets {
                 self.propagate(d1, succ, t);
@@ -887,8 +1104,17 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                     let ret_len = self.graph.return_sites_of_call(n).len();
                     for ri in 0..ret_len {
                         let ret_site = self.graph.return_sites_of_call(n)[ri];
-                        let d5s = self.compute_targets(d4, |p, m, src, out| {
-                            p.return_flow(m, Some(n), callee, ep, Some(ret_site), src, out);
+                        let d5s = self.compute_targets(d4, |p, m, src_id, src, out| {
+                            p.return_flow_out(
+                                m,
+                                Some(n),
+                                callee,
+                                ep,
+                                Some(ret_site),
+                                src_id,
+                                src,
+                                out,
+                            );
                         });
                         for d5 in d5s {
                             self.propagate(d1, ret_site, d5);
@@ -911,8 +1137,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         let ret_len = self.graph.return_sites_of_call(n).len();
         for ri in 0..ret_len {
             let ret_site = self.graph.return_sites_of_call(n)[ri];
-            let d6s = self.compute_targets(d2, |p, m, src, out| {
-                p.call_to_return_flow(m, n, ret_site, src, out);
+            let d6s = self.compute_targets(d2, |p, m, src_id, src, out| {
+                p.call_to_return_flow_out(m, n, ret_site, src_id, src, out);
             });
             for d6 in d6s {
                 self.propagate(d1, ret_site, d6);
@@ -951,8 +1177,17 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             let ret_len = self.graph.return_sites_of_call(call_site).len();
             for ri in 0..ret_len {
                 let ret_site = self.graph.return_sites_of_call(call_site)[ri];
-                let d5s = self.compute_targets(d2, |p, m, src, out| {
-                    p.return_flow(m, Some(call_site), func, n, Some(ret_site), src, out);
+                let d5s = self.compute_targets(d2, |p, m, src_id, src, out| {
+                    p.return_flow_out(
+                        m,
+                        Some(call_site),
+                        func,
+                        n,
+                        Some(ret_site),
+                        src_id,
+                        src,
+                        out,
+                    );
                 });
                 for d5 in d5s {
                     let callers_len = self
@@ -999,16 +1234,25 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             let callgraph = self.callgraph;
             let callers = callgraph.callers_of(func);
             if callers.is_empty() {
-                let _ignored = self.compute_targets(d2, |p, m, src, out| {
-                    p.return_flow(m, None, func, n, None, src, out);
+                let _ignored = self.compute_targets(d2, |p, m, src_id, src, out| {
+                    p.return_flow_out(m, None, func, n, None, src_id, src, out);
                 });
             } else {
                 for &call_site in callers {
                     let ret_len = self.graph.return_sites_of_call(call_site).len();
                     for ri in 0..ret_len {
                         let ret_site = self.graph.return_sites_of_call(call_site)[ri];
-                        let d5s = self.compute_targets(d2, |p, m, src, out| {
-                            p.return_flow(m, Some(call_site), func, n, Some(ret_site), src, out);
+                        let d5s = self.compute_targets(d2, |p, m, src_id, src, out| {
+                            p.return_flow_out(
+                                m,
+                                Some(call_site),
+                                func,
+                                n,
+                                Some(ret_site),
+                                src_id,
+                                src,
+                                out,
+                            );
                         });
                         for d5 in d5s {
                             self.propagate(self.zero_id, ret_site, d5);

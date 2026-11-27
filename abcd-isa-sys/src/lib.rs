@@ -1,45 +1,20 @@
-//! Low-level FFI bindings for the ArkCompiler bytecode ISA (`24.0.0.0`).
+//! Low-level raw C99 FFI bindings for the vendored C++ ArkCompiler ISA oracle (`24.0.0.0`).
 //!
-//! Built from the Route A pre-generated ISA bindings (`src/generated/`, derived
-//! offline from `vendor/arkcompiler_runtime_core/isa/isa.yaml` and
-//! `bridge/isa_bridge.h` via `scripts/vendor-gen.py`) and compiled with pure
-//! `cc::Build` C++17 behind a C99 `extern "C"` bridge. It exposes:
-//!
-//! - Raw C99 FFI functions (`isa_*`)
-//! - A safe [`Bytecode`] enum with per-mnemonic variants and operand views
-//! - Per-mnemonic constructor types in the [`insn`] module
-//! - Operand newtypes and views: [`Reg`], [`Imm`], [`EntityId`], [`EntityKind`], [`Label`], [`Operand`]
-//! - Classification flags: [`BytecodeFlags`], [`ExceptionType`]
-//!
-//! Most users should depend on the safe `abcd-isa` crate instead, which wraps
-//! this crate in a safe `decode`, `decode_legacy`, `encode`, relocation, and
-//! version API.
+//! Pure-Rust production ISA decoding, encoding, entity relocation, and version
+//! queries live in `abcd-isa` (`#![forbid(unsafe_code)]`), which links this
+//! crate solely under `[dev-dependencies]` as an exhaustive differential test
+//! oracle.
 //!
 //! # Quick start
 //!
 //! ```
-//! use abcd_isa_sys::{
-//!     Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Operand, Reg, insn,
-//! };
-//!
-//! let load_str: Bytecode = insn::LdaStr::new(EntityId(7));
-//! assert_eq!(load_str.mnemonic(), "lda.str");
-//! assert!(load_str.has_flag(BytecodeFlags::STRING_ID) && load_str.can_throw());
-//! assert_eq!(
-//!     load_str.entity_operands(),
-//!     vec![(EntityKind::StringId, EntityId(7))]
-//! );
-//!
-//! let call: Bytecode = insn::Callthisrange::new(Imm(0), Imm(2), Reg(4));
-//! assert!(call.is_range());
-//! assert_eq!(
-//!     call.operands(),
-//!     vec![Operand::Imm(0), Operand::Imm(2), Operand::Reg(4)]
-//! );
-//!
-//! let jump: Bytecode = insn::Jmp::new(Label(0));
-//! assert!(jump.is_jump() && jump.is_terminator());
+//! let mut cur = [0u8; 4];
+//! // SAFETY: `cur` is a valid 4-byte stack buffer.
+//! unsafe { abcd_isa_sys::isa_get_version(cur.as_mut_ptr()) };
+//! assert_eq!(cur, [24, 0, 0, 0]);
 //! ```
+
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 #[allow(
     non_upper_case_globals,
@@ -50,14 +25,10 @@
     clippy::all,
     clippy::undocumented_unsafe_blocks,
     clippy::allow_attributes_without_reason,
-    reason = "pre-generated C FFI and ISA bindings emitted by scripts/vendor-gen.py"
+    reason = "pre-generated C FFI bindings emitted by scripts/vendor-gen.py"
 )]
 mod generated {
-    // Raw FFI bindings (pre-generated from bridge/isa_bridge.h).
     include!("generated/bindings.rs");
-
-    // Bytecode enum, operand newtypes, insn constructors (pre-generated from isa.yaml).
-    include!("generated/bytecode.rs");
 }
 
 pub use generated::*;
@@ -68,37 +39,33 @@ pub use generated::*;
     reason = "raw FFI smoke tests exercise generated unsafe extern C exports directly"
 )]
 mod tests {
-    //! Raw-FFI smoke tests for the isa bridge exports that the safe layer
-    //! pre-validates away (the emitter's UNBOUND_LABELS error switch arm) or
-    //! that no in-selection package drives (the pure-lookup classification
-    //! and version families — those are exercised end-to-end by abcd-isa in
-    //! the full workspace metric).
     use super::*;
 
-    /// `isa_emitter_build` must report `ISA_BUILD_UNBOUND_LABELS` when a
-    /// label was created and referenced but never bound. The safe
-    /// `abcd_isa::encode` pre-validates every jump target
-    /// (`EncodeError::LabelOutOfBounds`) and binds every created label, so
-    /// this arm is only reachable through the raw FFI.
     #[test]
-    fn emitter_build_reports_unbound_labels() {
+    fn emitter_build_reports_unbound_labels_and_null_guards() {
         unsafe {
+            assert_eq!(isa_get_opcode(std::ptr::null()), u16::MAX);
+            assert_eq!(isa_get_size_from_bytes(std::ptr::null()), 0);
+            isa_get_version(std::ptr::null_mut());
+            isa_get_min_version(std::ptr::null_mut());
+            assert_eq!(isa_get_version_by_api(12, std::ptr::null_mut()), 1);
+            assert_eq!(isa_is_version_compatible(std::ptr::null()), 0);
+            assert_eq!(isa_is_version_incompatible(std::ptr::null()), 0);
+            assert_eq!(isa_emitter_create_label(std::ptr::null_mut()), u32::MAX);
+            assert_eq!(isa_emitter_bind(std::ptr::null_mut(), 0), -1);
+
             let e = isa_emitter_create();
             assert!(!e.is_null());
             let label = isa_emitter_create_label(e);
             assert_ne!(label, u32::MAX);
 
-            // Emit `jmp <label>` and deliberately never bind it.
-            let bc = insn::Jmp::new(Label(0));
-            let (opcode, mut args, num_args) = bc.emit_args();
-            let label_idx = bc
-                .jump_label_arg_index()
-                .expect("jmp carries a label operand");
-            args[label_idx] = i64::from(label);
-            let rc = isa_emitter_emit(e, opcode, args.as_ptr(), num_args);
+            // Emit `jmp <label>` (opcode 0x4d = 77) and deliberately never bind it.
+            let jmp_op = isa_get_opcode([0x4du8, 0x00].as_ptr());
+            assert_eq!(isa_is_jump_opcode(jmp_op), 1);
+            let args = [i64::from(label)];
+            let rc = isa_emitter_emit(e, jmp_op, args.as_ptr(), args.len());
             assert_eq!(rc, ISA_EMIT_OK as i32, "emit must succeed");
 
-            // Poison the out-params: build must overwrite them on failure.
             let mut buf = std::ptr::dangling_mut::<u8>();
             let mut len = 77usize;
             let rc = isa_emitter_build(e, &mut buf, &mut len);
@@ -112,17 +79,15 @@ mod tests {
         }
     }
 
-    /// Positive control for the emitter path: a bound program builds and the
-    /// buffer is released through `isa_emitter_free_buf`.
     #[test]
     fn emitter_build_bound_program_roundtrip() {
         unsafe {
             let e = isa_emitter_create();
             assert!(!e.is_null());
-            let bc = insn::Returnundefined::new();
-            let (opcode, args, num_args) = bc.emit_args();
+            let ret_undef_op = isa_get_opcode([0x65u8].as_ptr());
+            assert_eq!(isa_is_terminator_opcode(ret_undef_op), 1);
             assert_eq!(
-                isa_emitter_emit(e, opcode, args.as_ptr(), num_args),
+                isa_emitter_emit(e, ret_undef_op, std::ptr::null(), 0),
                 ISA_EMIT_OK as i32
             );
             let mut buf = std::ptr::null_mut::<u8>();
@@ -132,106 +97,45 @@ mod tests {
                 ISA_BUILD_OK as i32
             );
             assert!(!buf.is_null());
-            assert!(len > 0);
+            assert_eq!(len, 1);
             isa_emitter_free_buf(buf);
             isa_emitter_destroy(e);
         }
     }
 
-    /// The pure-lookup classification family: exact flag answers for
-    /// opcodes whose semantics are pinned by abcd-isa's bytecode tests.
-    #[test]
-    fn classification_exports_answer_for_known_opcodes() {
-        unsafe {
-            let jmp = insn::Jmp::new(Label(0)).emit_args().0;
-            let ldundef = insn::Ldundefined::new().emit_args().0;
-            let ret = insn::Return::new().emit_args().0;
-            let retund = insn::Returnundefined::new().emit_args().0;
-            let throw = insn::Throw::new().emit_args().0;
-            let range = insn::Callthisrange::new(Imm(0), Imm(0), Reg(0))
-                .emit_args()
-                .0;
-            let call0 = insn::Callarg0::new(Imm(0)).emit_args().0;
-            let suspend = insn::Suspendgenerator::new(Reg(0)).emit_args().0;
-
-            assert_eq!(isa_is_jump_opcode(jmp), 1);
-            assert_eq!(isa_is_jump_opcode(ldundef), 0);
-            assert_eq!(isa_can_throw_opcode(throw), 1);
-            assert_eq!(isa_can_throw_opcode(ldundef), 0);
-            assert_eq!(isa_is_terminator_opcode(retund), 1);
-            assert_eq!(isa_is_terminator_opcode(ldundef), 0);
-            assert_eq!(isa_is_range_opcode(range), 1);
-            assert_eq!(isa_is_range_opcode(call0), 0);
-            assert_eq!(isa_is_return_or_throw_opcode(ret), 1);
-            assert_eq!(isa_is_return_or_throw_opcode(ldundef), 0);
-            // The SUSPEND flag is never assigned by the ISA (pinned quirk):
-            // even suspendgenerator reports 0.
-            assert_eq!(isa_is_suspend_opcode(suspend), 0);
-            assert_eq!(isa_is_suspend_opcode(ret), 0);
-            assert_eq!(
-                isa_is_throw_ex_opcode(throw, ExceptionType::X_THROW.bits()),
-                1
-            );
-            assert_eq!(
-                isa_is_throw_ex_opcode(throw, ExceptionType::X_NULL.bits()),
-                0
-            );
-            // An out-of-range opcode is rejected by the validity guard.
-            assert_eq!(isa_is_jump_opcode(u16::MAX), 0);
-        }
-    }
-
-    /// The version-query family: current/min version, the API-level lookup
-    /// (hit and miss), the compatibility predicate both ways, and the
-    /// incompatible-version blocklist with its bounds guard.
     #[test]
     fn version_exports_answer_queries() {
         unsafe {
             let mut cur = [0u8; 4];
             isa_get_version(cur.as_mut_ptr());
-            assert_ne!(cur, [0, 0, 0, 0], "current version must be set");
+            assert_ne!(cur, [0, 0, 0, 0]);
             let mut min = [0u8; 4];
             isa_get_min_version(min.as_mut_ptr());
-            assert!(min <= cur, "min version must not exceed current");
+            assert!(min <= cur);
 
             assert_eq!(isa_is_version_compatible(cur.as_ptr()), 1);
             assert_eq!(
                 isa_is_version_compatible([0xFF, 0xFF, 0xFF, 0xFF].as_ptr()),
-                0,
-                "a version past current must be incompatible"
+                0
             );
 
             let mut out = [0u8; 4];
             assert_eq!(isa_get_version_by_api(12, out.as_mut_ptr()), 0);
             assert_ne!(out, [0, 0, 0, 0]);
-            assert_eq!(
-                isa_get_version_by_api(250, out.as_mut_ptr()),
-                1,
-                "an unknown API level must report failure"
-            );
-
+            assert_eq!(isa_get_version_by_api(250, out.as_mut_ptr()), 1);
             assert_eq!(
                 isa_get_version_by_api_sub(12, c"beta1".as_ptr(), out.as_mut_ptr()),
                 0
             );
-            // NB: no failing case here — GetVersionByApi falls back for
-            // unknown API levels when a sub-API is given (version.rs docs),
-            // so api_sub's error arm has no deterministic trigger.
 
             let count = isa_incompatible_version_count();
-            // Out-of-range index: the guard returns without touching `out`.
             let mut probe = [0xAAu8; 4];
             isa_incompatible_version_at(count, probe.as_mut_ptr());
             assert_eq!(probe, [0xAA; 4]);
-            // Every blocklist entry must round-trip through the predicate.
             for i in 0..count {
                 let mut v = [0u8; 4];
                 isa_incompatible_version_at(i, v.as_mut_ptr());
-                assert_eq!(
-                    isa_is_version_incompatible(v.as_ptr()),
-                    1,
-                    "blocklist entry {v:?} must report incompatible"
-                );
+                assert_eq!(isa_is_version_incompatible(v.as_ptr()), 1);
             }
         }
     }

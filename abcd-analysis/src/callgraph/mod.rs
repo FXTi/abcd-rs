@@ -145,25 +145,19 @@ impl CallGraph {
                     let Op::Call { callee, kind, .. } = &inst.op else {
                         continue;
                     };
-                    let resolution = resolve_callee(module, links, caller, *callee, *kind);
+                    let mut resolution = resolve_callee(module, links, caller, *callee, *kind);
+                    if !resolution.complete {
+                        for h_target in hierarchy.resolve_call(caller, *callee, *kind) {
+                            resolution.funcs.insert(h_target);
+                        }
+                    }
                     let edge = if resolution.funcs.is_empty() {
-                        let targets = hierarchy.resolve_call(caller, *callee, *kind);
-                        if targets.is_empty() {
-                            CallEdge {
-                                caller,
-                                kind: *kind,
-                                edge_kind: CallEdgeKind::UnknownCallees,
-                                targets: CallTargets::UnknownCallees,
-                                resolution_complete: resolution.complete,
-                            }
-                        } else {
-                            CallEdge {
-                                caller,
-                                kind: *kind,
-                                edge_kind: CallEdgeKind::ResolvedValueFlow,
-                                targets: CallTargets::Resolved(targets),
-                                resolution_complete: false,
-                            }
+                        CallEdge {
+                            caller,
+                            kind: *kind,
+                            edge_kind: CallEdgeKind::UnknownCallees,
+                            targets: CallTargets::UnknownCallees,
+                            resolution_complete: false,
                         }
                     } else {
                         let edge_kind = match kind {
@@ -288,6 +282,7 @@ impl CallGraph {
         base: &CallGraph,
         oracle: &Rung1AliasOracle,
     ) -> CallGraph {
+        let open_funcs = compute_open_caller_funcs(module, base);
         let mut graph = base.clone();
         let mut bridged: Vec<(FuncId, InstId)> = Vec::new();
         for (iid, edge) in base.sites() {
@@ -315,6 +310,8 @@ impl CallGraph {
             for t in &targets {
                 bridged.push((*t, iid));
             }
+            let caller_closed =
+                !answer.unbalanced || !open_funcs.get(edge.caller.index()).copied().unwrap_or(true);
             graph.sites.insert(
                 iid,
                 CallEdge {
@@ -322,7 +319,7 @@ impl CallGraph {
                     kind: *kind,
                     edge_kind: CallEdgeKind::ResolvedValueFlow,
                     targets: CallTargets::Resolved(targets),
-                    resolution_complete: answer.complete_for_resolution(),
+                    resolution_complete: answer.complete_for_resolution() && caller_closed,
                 },
             );
         }
@@ -335,6 +332,159 @@ impl CallGraph {
         }
         graph
     }
+}
+
+/// Identify functions whose callers in `base` may be incomplete (escaped as
+/// non-callee values, methods/constructors, or targeted by an incomplete call
+/// edge), so unbalanced parameter fan-out inside them does not claim
+/// `resolution_complete == true`.
+fn compute_open_caller_funcs(module: &Module, base: &CallGraph) -> Vec<bool> {
+    let n = module.functions.len();
+    let mut open = vec![false; n];
+    let mut val_funcs: Vec<BTreeSet<FuncId>> = vec![BTreeSet::new(); module.values.len()];
+    let mut copy_edges: Vec<Vec<ValueId>> = vec![Vec::new(); module.values.len()];
+    let mut q = std::collections::VecDeque::new();
+
+    for (vi, v) in module.values.iter().enumerate() {
+        if let ValueDef::Const(cid) = v.def
+            && let Some(Const::MethodRef { func, .. }) = module.consts.get(cid)
+        {
+            val_funcs[vi].insert(*func);
+            q.push_back(ValueId::new(vi as u32));
+        }
+    }
+    for (fi, fd) in module.functions.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                        if let Some(slot) = open.get_mut(cls.ctor.index()) {
+                            *slot = true;
+                        }
+                    }
+                    Op::DefineFunc { body, .. } => {
+                        if let Some(r) = inst.result
+                            && let Some(s) = val_funcs.get_mut(r.index())
+                            && s.insert(*body)
+                        {
+                            q.push_back(r);
+                        }
+                    }
+                    Op::LoadConst(cid) => {
+                        if let Some(Const::MethodRef { func, .. }) = module.consts.get(*cid)
+                            && let Some(r) = inst.result
+                            && let Some(s) = val_funcs.get_mut(r.index())
+                            && s.insert(*func)
+                        {
+                            q.push_back(r);
+                        }
+                    }
+                    Op::LoadFunction => {
+                        if let Some(r) = inst.result
+                            && let Some(s) = val_funcs.get_mut(r.index())
+                            && s.insert(fid)
+                        {
+                            q.push_back(r);
+                        }
+                    }
+                    Op::Mov { src } | Op::AllocClosure { func: src } => {
+                        if let Some(r) = inst.result
+                            && let Some(outs) = copy_edges.get_mut(src.index())
+                        {
+                            outs.push(r);
+                        }
+                    }
+                    Op::Phi { entries } => {
+                        if let Some(r) = inst.result {
+                            for (_, inc) in entries {
+                                if let Some(outs) = copy_edges.get_mut(inc.index()) {
+                                    outs.push(r);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    while let Some(v) = q.pop_front() {
+        let cur = val_funcs.get(v.index()).cloned().unwrap_or_default();
+        for dst in copy_edges.get(v.index()).cloned().unwrap_or_default() {
+            if let Some(ds) = val_funcs.get_mut(dst.index()) {
+                let before = ds.len();
+                ds.extend(cur.iter().copied());
+                if ds.len() > before {
+                    q.push_back(dst);
+                }
+            }
+        }
+    }
+    for fd in &module.functions {
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::Mov { .. } | Op::AllocClosure { .. } | Op::Phi { .. } => {}
+                    Op::Call {
+                        callee, this, args, ..
+                    } => {
+                        let complete = base.edge_at(iid).is_some_and(|e| e.resolution_complete);
+                        if !complete {
+                            for &f in val_funcs.get(callee.index()).into_iter().flatten() {
+                                if let Some(slot) = open.get_mut(f.index()) {
+                                    *slot = true;
+                                }
+                            }
+                        }
+                        if let Some(t) = this {
+                            for &f in val_funcs.get(t.index()).into_iter().flatten() {
+                                if let Some(slot) = open.get_mut(f.index()) {
+                                    *slot = true;
+                                }
+                            }
+                        }
+                        for &a in args {
+                            for &f in val_funcs.get(a.index()).into_iter().flatten() {
+                                if let Some(slot) = open.get_mut(f.index()) {
+                                    *slot = true;
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        other.for_each_operand(|op_v| {
+                            for &f in val_funcs.get(op_v.index()).into_iter().flatten() {
+                                if let Some(slot) = open.get_mut(f.index()) {
+                                    *slot = true;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for (_, edge) in base.sites() {
+        if !edge.resolution_complete
+            && let CallTargets::Resolved(ts) = &edge.targets
+        {
+            for &t in ts {
+                if let Some(slot) = open.get_mut(t.index()) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    open
 }
 
 /// Map one allocation site found by the engine back to function bodies:
@@ -443,6 +593,10 @@ fn resolve_callee(
 /// not recurse. The result is the AND of every visited leaf's
 /// completeness and `funcs` is a set, so the visit order is
 /// unobservable — the worklist reproduces the recursive walk exactly.
+/// Maximum backward SSA/module-export trace steps per call site before
+/// cutting with `resolution_complete = false`.
+const MAX_TRACE_STEPS: usize = 4096;
+
 fn trace(
     module: &Module,
     links: &ModuleLinkTable,
@@ -453,6 +607,7 @@ fn trace(
     visiting: &mut HashSet<(FuncId, ValueId)>,
 ) -> bool {
     let mut complete = true;
+    let mut steps = 0usize;
     let mut stack = vec![(initial_func, value)];
     while let Some((current, value)) = stack.pop() {
         if !visiting.insert((current, value)) {
@@ -461,6 +616,11 @@ fn trace(
             // Complete.
             continue;
         }
+        if steps >= MAX_TRACE_STEPS {
+            complete = false;
+            break;
+        }
+        steps += 1;
         let Some(v) = module.value(value) else {
             complete = false;
             continue;
@@ -563,6 +723,12 @@ fn trace(
                         _ => None,
                     }) {
                         Some(Op::GetModuleNamespace { index }) => {
+                            if links
+                                .namespace_target(cid, *index)
+                                .is_some_and(|tc| links.has_unresolved_star(tc))
+                            {
+                                complete = false;
+                            }
                             if let Some(slots) = links.resolve_namespace_member(cid, *index, *name)
                                 && !slots.is_empty()
                             {
@@ -589,6 +755,9 @@ fn trace(
                                 }
                                 let mut matched_any = false;
                                 for &ns_cid in &target.namespace_classes {
+                                    if links.has_unresolved_star(ns_cid) {
+                                        complete = false;
+                                    }
                                     if let Some(slots) =
                                         links.namespace_exports(ns_cid).and_then(|m| m.get(name))
                                         && !slots.is_empty()
@@ -3138,6 +3307,188 @@ mod tests {
         assert_eq!(
             cg.edge_at(call_iface).unwrap().targets,
             CallTargets::Resolved(vec![ssub_greet])
+        );
+    }
+
+    #[test]
+    fn dynamic_define_class_extends_resolves_subtype_overrides_and_marks_incomplete() {
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+        let s_run = intern(&mut m, "run");
+
+        let add_cls_fn = |m: &mut Module, name: &str, kind: FunctionKind| {
+            let sym = m.sym.intern(name);
+            let fid = FuncId::new(m.functions.len() as u32);
+            let mut fd = FunctionData::new(cid, sym, kind);
+            fd.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+            m.functions.push(fd);
+            m.classes[cid.index()].methods.push(fid);
+            let b = add_block(m, fid);
+            let p0 = add_param(m, fid, 0);
+            let _ = add_param(m, fid, 1);
+            let p_this = add_param(m, fid, 2);
+            (fid, b, p0, p_this)
+        };
+
+        // `class Base { run() { ... }; dispatch() { return this.run(); } }`
+        let (base_ctor, b_bc, _, _) = add_cls_fn(&mut m, "Base", FunctionKind::Constructor);
+        emit_void(&mut m, b_bc, Op::Return { value: None });
+
+        let (base_run, b_br, _, _) = add_cls_fn(&mut m, "Base_run", FunctionKind::Function);
+        emit_void(&mut m, b_br, Op::Return { value: None });
+
+        let (base_dispatch, b_bd, _, disp_this) =
+            add_cls_fn(&mut m, "Base_dispatch", FunctionKind::Function);
+        let callee_run = emit(
+            &mut m,
+            b_bd,
+            Op::LoadProp {
+                object: disp_this,
+                name: s_run,
+            },
+        );
+        let call_virtual = push_inst(
+            &mut m,
+            b_bd,
+            Op::Call {
+                callee: callee_run,
+                this: Some(disp_this),
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_bd, Op::Return { value: None });
+
+        // `class Sub extends Base { run() { ... } }`
+        let (sub_ctor, b_sc, _, _) = add_cls_fn(&mut m, "Sub", FunctionKind::Constructor);
+        emit_void(&mut m, b_sc, Op::Return { value: None });
+
+        let (sub_run, b_sr, _, _) = add_cls_fn(&mut m, "Sub_run", FunctionKind::Function);
+        emit_void(&mut m, b_sr, Op::Return { value: None });
+
+        // `class UnresolvedSub extends dynamicBase() { constructor() { super(); } }`
+        let (unres_ctor, b_uc, uc_p0, _) =
+            add_cls_fn(&mut m, "UnresolvedSub", FunctionKind::Constructor);
+        let call_unres_super = push_inst(
+            &mut m,
+            b_uc,
+            Op::Call {
+                callee: uc_p0,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Super,
+            },
+        );
+        emit_void(&mut m, b_uc, Op::Return { value: None });
+
+        let (_, b_main, _, _) = add_cls_fn(&mut m, "func_main_0", FunctionKind::Function);
+        let s_disp = intern(&mut m, "dispatch");
+        let c_s_run = m.consts.intern(Const::String(s_run));
+        let c_s_disp = m.consts.intern(Const::String(s_disp));
+        let c_br = m.consts.intern(Const::method_ref(base_run));
+        let c_bd = m.consts.intern(Const::method_ref(base_dispatch));
+        let c_sr = m.consts.intern(Const::method_ref(sub_run));
+        let base_mem = m.consts.push_array(vec![c_s_run, c_br, c_s_disp, c_bd]);
+        let sub_mem = m.consts.push_array(vec![c_s_run, c_sr]);
+        let empty_mem = m.consts.push_array(Vec::new());
+
+        let base_cls = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: base_ctor,
+                heritage: None,
+                members: base_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: sub_ctor,
+                heritage: Some(base_cls),
+                members: sub_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+
+        let s_dyn = intern(&mut m, "getDynamicBase");
+        let dyn_base = emit(
+            &mut m,
+            b_main,
+            Op::TryGetGlobal {
+                name: s_dyn,
+                default: None,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: unres_ctor,
+                heritage: Some(dyn_base),
+                members: empty_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        let virt_edge = cg.edge_at(call_virtual).expect("virtual edge");
+        let mut want = vec![base_run, sub_run];
+        want.sort();
+        assert_eq!(
+            virt_edge.targets,
+            CallTargets::Resolved(want),
+            "dynamic DefineClass `extends` must include Sub.run override via sub_classes CHA"
+        );
+        assert!(
+            !virt_edge.resolution_complete,
+            "CHA virtual dispatch must mark resolution_complete == false"
+        );
+
+        let super_edge = cg.edge_at(call_unres_super).expect("unresolved super edge");
+        assert_eq!(super_edge.targets, CallTargets::UnknownCallees);
+        assert!(
+            !super_edge.resolution_complete,
+            "unresolved dynamic base expression must leave resolution_complete == false"
+        );
+    }
+
+    #[test]
+    fn capped_trace_chain_marks_resolution_incomplete() {
+        let mut m = mk_module();
+        let t1 = add_func_named(&mut m, "t1");
+        let b_t1 = entry_of(&m, t1);
+        emit_void(&mut m, b_t1, Op::Return { value: None });
+
+        let f = add_func_named(&mut m, "deep_caller");
+        let b = entry_of(&m, f);
+        let mut cur = load_method_ref(&mut m, b, t1);
+        for _ in 0..(MAX_TRACE_STEPS + 16) {
+            cur = emit(&mut m, b, Op::Mov { src: cur });
+        }
+        let call_iid = push_inst(
+            &mut m,
+            b,
+            Op::Call {
+                callee: cur,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        let edge = cg.edge_at(call_iid).expect("edge");
+        assert!(
+            !edge.resolution_complete,
+            "budget-cut trace must never report resolution_complete == true"
         );
     }
 }

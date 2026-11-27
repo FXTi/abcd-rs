@@ -6,8 +6,8 @@ Format-aware SSA lowering converter from [`abcd_ir::Module`](../abcd-ir/README.m
 
 `abcd-lower` is the sole outbound bridge from the container-independent SSA IR back into ArkCompiler `.abc` bytecode and container records:
 
-- **Allowed workspace dependencies**: `abcd-ir` (semantic SSA IR), `abcd-analysis` (shared format-independent CFG successor and RPO traversal helpers), `abcd-file` (`.abc` container model), and `abcd-isa` (bytecode instruction definitions).
-- **Strict non-dependencies**: `abcd-lower` **never** depends on `abcd-lift` or `abcd-opt` in `[dependencies]` (`abcd-lift` and `abcd-opt` appear only in `[dev-dependencies]` for round-trip integration tests).
+- **Allowed workspace dependencies**: `abcd-ir` (semantic SSA IR and shared CFG / `DomTree` / `ExceptionHandlerMap` infrastructure), `abcd-file` (`.abc` container model), and `abcd-isa` (bytecode instruction definitions).
+- **Strict non-dependencies**: `abcd-lower` **never** depends on `abcd-analysis`, `abcd-lift`, or `abcd-opt` in `[dependencies]` (`abcd-lift` and `abcd-opt` appear only in `[dev-dependencies]` for round-trip integration tests).
 - **Three lowering entrypoints**:
   - `rewrite_file`: container-preserving binary rewrite on top of a decoded `abcd_file::File`, materializing newly synthesized strings, literal arrays, classes, and helper functions while keeping untouched container metadata intact.
   - `lower_module` / `lower_module_with_options`: standalone whole-module `.abc` synthesis directly from `&Module` + `Version` with zero source `File` dependency.
@@ -18,7 +18,7 @@ Format-aware SSA lowering converter from [`abcd_ir::Module`](../abcd-ir/README.m
 | Stage / API | Module | Responsibility |
 | :--- | :--- | :--- |
 | `fusion::analyze` | [`fusion`](src/fusion.rs) | Pre-allocation `O(B + I)` suppression of single-use expansion chains (`DefineFunc`→`AllocClosure`→`DefineMethod`, `0..=u32::MAX` by-index `LoadConst`, `undefined` `TryGetGlobal` defaults, `JumpEqz`/`JumpNez` + `CondBranch`) |
-| `regalloc::allocate` | [`regalloc`](src/regalloc.rs) | Exception-augmented `[u64]` bitset backward liveness, forward MCS chordal greedy coloring, reserved `v0..v255` low scratch slots & contiguous `*range` call windows, and interference-guarded handler-phi pinned stores |
+| `regalloc::allocate` | [`regalloc`](src/regalloc.rs) | Exception-augmented `[u64]` bitset backward liveness (with `ExceptionParam` handler-entry kills), Boissinot CSSA isolation & biased coalescing, Hack–Grund–Goos iterative `DomTree` preorder SSA coloring (`O(1)` call stack, `O(V + E)` memory, zero `O(V^2)` interference graph), reserved `v0..v255` low scratch slots & `*range` call windows, and mixed `Normal + Exceptional` handler-phi lowering |
 | `resolve_slot_copies` | [`copy_resolve`](src/copy_resolve.rs) | Linear `O(N)` Boissinot out-of-SSA slot-level parallel-copy topological scheduling with cycle-breaking `copy_temp` |
 | `isel::select` | [`isel`](src/isel.rs) | Physical `AccContent` (`acc`-as-cache) emission, unfused conditional branches (`istrue` coercion on non-boolean conditions), narrow/wide opcode selection, and `0xFF`-safe `ReArrangeIc` IC-slot assignment |
 | `layout::layout` | [`layout`](src/layout.rs) | Reachable-first RPO block placement, conditional-edge phi trampolines, fallthrough `jmp` elision / boolean `jnez`→`jeqz` inversion, label resolution, `inst_pcs` tracking, and `LoweredTryBlock` span reconstruction |

@@ -27,6 +27,7 @@ fn main() {
         .std("c++17")
         .warnings(false)
         .define("NDEBUG", None)
+        .define("SUPPORT_KNOWN_EXCEPTION", None)
         .include(format!("{manifest}/bridge/generated"))
         .include(&vendor_gen)
         .include(format!("{manifest}/bridge/shim"))

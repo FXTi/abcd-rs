@@ -182,10 +182,9 @@ pub struct Method {
 
 /// Per-parameter annotations, indexed by parameter position.
 ///
-/// Decode fills both buckets; encode folds them (see the contract at the
-/// encode site): when the compile-time bucket carries any annotation, the
-/// runtime bucket is folded into it and only a compile-time item is written
-/// (same precedent as the annotation-category collapse, review finding #9).
+/// Both `compile_time` (`MethodTag::PARAM_ANNOTATION`) and `runtime`
+/// (`MethodTag::RUNTIME_PARAM_ANNOTATION`) buckets are decoded and sealed
+/// independently on [`crate::encode`] without cross-bucket folding.
 #[derive(Clone, Debug, Default)]
 pub struct ParamAnnotations {
     pub compile_time: Vec<Vec<Annotation>>,
@@ -214,6 +213,9 @@ pub enum FieldValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// String item reference (`FieldTag::VALUE` + `u32` `StringItem` offset),
+    /// used for static/constant string fields (`Type::Reference` or `Type::U32`).
+    String(StringId),
     /// Module-record field (standalone `_ESModuleRecord`, or `moduleRecordIdx`
     /// on the module's own record class in `--merge-abc` output): the u32 wire
     /// value is the source-file offset of an untagged ModuleDataAccessor-format
@@ -296,7 +298,6 @@ pub struct Annotations {
 }
 
 /// A single decoded annotation.
-#[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
     pub class_descriptor: StringId,
     pub elements: Vec<AnnotationElem>,

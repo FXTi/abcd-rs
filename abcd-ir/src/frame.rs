@@ -3,13 +3,12 @@
 //!
 //! A callee's [`FunctionData::params`] are the SSA entry parameter slots in
 //! code-header argument order. `abcd-ir` supports two explicit execution and
-//! calling-convention dialects ([`crate::Dialect`], determined by the owning
-//! [`crate::ClassData::source_lang`]):
+//! calling-convention dialects ([`crate::Dialect`], carried on
+//! [`crate::Module::dialect`]):
 //!
-//! ## 1. Dynamic ECMAScript / TypeScript ([`crate::Dialect::DynamicEcma`])
+//! ## 1. Dynamic ECMAScript / TypeScript / ArkTS 1.1 ([`crate::Dialect::DynamicEcma`])
 //!
-//! In dynamic `.abc` modules (`es2abc`, [`crate::SourceLang::EcmaScript`] /
-//! [`crate::SourceLang::TypeScript`]), the LEADING slots of
+//! In dynamic `.abc` modules (`es2abc`), the LEADING slots of
 //! [`FunctionData::params`] are the vendored implicit frame slots
 //! `[func][new.target][this]`, each present per the callee's
 //! `L_ESCallTypeAnnotation;` `callType` bits (vendor `method_literal.h:59-62`:
@@ -18,9 +17,10 @@
 //! default (`CALL_TYPE_MASK`, `method_literal.h:28`) applies
 //! ([`FrameSlots::DEFAULT`], `H = 3` — all three leading slots present).
 //! Declared source formals follow at `params[H..]`, left-aligned and
-//! `undefined`-padded (`interpreter-inl.cpp:486-494`). Bit 2 (`HaveExtraBit`)
-//! appends actual argc as a TRAILING slot at call entry
-//! (`interpreter-inl.cpp:490-494`) and never shifts leading indices.
+//! `undefined`-padded (`interpreter-inl.cpp:486-494`). Bit 2 (`HaveExtraBit`,
+//! queried via [`FrameSlots::has_extra`]) appends actual argc as a TRAILING
+//! slot at call entry (`interpreter-inl.cpp:490-494`) and never shifts leading
+//! indices.
 //!
 //! The dynamic runtime binds `thisObj` from the `this`-role slot and `ldthis`
 //! reads it back (`EcmaInterpreter::GetThis`, `interpreter-inl.cpp:7907-7912`;
@@ -30,11 +30,11 @@
 //!
 //! ## 2. Static ArkTS ([`crate::Dialect::StaticArkTS`])
 //!
-//! In static ArkTS modules (`static_core` / `ets2panda`,
-//! [`crate::SourceLang::ArkTS`], `#36`), functions carry **zero** hidden
-//! ECMAScript closure (`func`) or `new.target` slots (`vendor`
-//! `MethodDataAccessor::EnumerateTypes`, `method_data_accessor-inl.h:318-330`;
-//! `DebugInfoExtractor`, `debug_info_extractor.cpp:206-208`):
+//! In static ArkTS modules (`static_core` / `ets2panda`, `0.1.0.x`, `#36`),
+//! functions carry **zero** hidden ECMAScript closure (`func`) or `new.target`
+//! slots (`vendor` `MethodDataAccessor::EnumerateTypes`,
+//! `method_data_accessor-inl.h:318-330`; `DebugInfoExtractor`,
+//! `debug_info_extractor.cpp:206-208`):
 //!
 //! - **`static` methods / top-level functions**
 //!   (`func.modifiers.contains(Modifiers::STATIC)`): `H = 0` implicit leading
@@ -46,13 +46,14 @@
 //!   class ([`this_param_index`] = `Some(0)`) and declared formals follow at
 //!   `params[1..]`.
 
+use crate::consts::Const;
 use crate::function::FunctionData;
 use crate::module::{AnnValue, Dialect, Modifiers, Module};
 
 /// The callee's leading implicit parameter slots before declared source formals.
 ///
 /// Resolved via [`FrameSlots::of`] from an explicit `L_ESCallTypeAnnotation;`
-/// when present, or from the callee's [`Dialect`] default (`D6`).
+/// when present, or from [`Module::dialect`] (`D6`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSlots {
     /// Leading closure-object slot (`func`, dynamic `callType` bit 3).
@@ -91,9 +92,9 @@ impl FrameSlots {
         this: true,
     };
 
-    /// Default leading frame layout for [`Dialect::StaticArkTS`]
-    /// (`SourceLang::ArkTS`): [`Self::NONE`] (`H = 0`) when `is_static_method`
-    /// is `true`, [`Self::STATIC_INSTANCE`] (`params[0]` = `this`) otherwise.
+    /// Default leading frame layout for [`Dialect::StaticArkTS`]:
+    /// [`Self::NONE`] (`H = 0`) when `is_static_method` is `true`,
+    /// [`Self::STATIC_INSTANCE`] (`params[0]` = `this`) otherwise.
     #[must_use]
     pub const fn for_static_arkts(is_static_method: bool) -> Self {
         if is_static_method {
@@ -127,10 +128,17 @@ impl FrameSlots {
         }
     }
 
-    /// Decode an explicit `L_ESCallTypeAnnotation;` `callType` element on
-    /// `func`, returning `None` when the annotation is absent or unreadable.
+    /// Decode the raw `u32` `callType` bitmask from an explicit
+    /// `L_ESCallTypeAnnotation;` on `func`, returning `None` when the
+    /// annotation is absent or carries a non-numeric payload.
+    ///
+    /// Supports integer constants ([`Const::Int8`], [`Const::Int32`],
+    /// [`Const::Int64`], [`Const::UInt64`]) as well as finite float constants
+    /// ([`Const::Float32`], [`Const::Number`]), converting floats via
+    /// `(f as i64) as u32` so negative encodings such as `-1.0` preserve
+    /// `0xFFFF_FFFF` rather than saturating to `0`.
     #[must_use]
-    pub fn from_call_type_annotation(module: &Module, func: &FunctionData) -> Option<Self> {
+    pub fn call_type_bits(module: &Module, func: &FunctionData) -> Option<u32> {
         for ann in &func.annotations {
             let is_call_type = module
                 .class(ann.class)
@@ -146,29 +154,67 @@ impl FrameSlots {
                 let AnnValue::Const(cid) = value else {
                     continue;
                 };
-                let Some(bits) = module.consts.get(*cid).and_then(|c| c.as_f64()) else {
+                let Some(konst) = module.consts.get(*cid) else {
                     continue;
                 };
-                let bits = bits as u32;
-                return Some(Self {
-                    func: bits & 0b1000 != 0,
-                    new_target: bits & 0b0010 != 0,
-                    this: bits & 0b0001 != 0,
-                });
+                let bits = match konst {
+                    Const::Int8(v) => u32::from(*v),
+                    Const::Int32(v) => *v,
+                    Const::Int64(v) => *v as u32,
+                    Const::UInt64(v) => *v as u32,
+                    Const::Float32(raw) => {
+                        let f = f32::from_bits(*raw);
+                        if !f.is_finite() {
+                            continue;
+                        }
+                        (f as i64) as u32
+                    }
+                    Const::Number(raw) => {
+                        let f = f64::from_bits(*raw);
+                        if !f.is_finite() {
+                            continue;
+                        }
+                        (f as i64) as u32
+                    }
+                    _ => continue,
+                };
+                return Some(bits);
             }
         }
         None
     }
 
+    /// Decode an explicit `L_ESCallTypeAnnotation;` `callType` element on
+    /// `func`, returning `None` when the annotation is absent or unreadable.
+    #[must_use]
+    pub fn from_call_type_annotation(module: &Module, func: &FunctionData) -> Option<Self> {
+        let bits = Self::call_type_bits(module, func)?;
+        Some(Self {
+            func: bits & 0b1000 != 0,
+            new_target: bits & 0b0010 != 0,
+            this: bits & 0b0001 != 0,
+        })
+    }
+
+    /// Whether `func` carries `HaveExtraBit` (`bits & 0b0100 != 0`) for the
+    /// trailing actual-argc slot (`true` under the `0xF` [`Dialect::DynamicEcma`]
+    /// default when unannotated; `false` under [`Dialect::StaticArkTS`]).
+    #[must_use]
+    pub fn has_extra(module: &Module, func: &FunctionData) -> bool {
+        if let Some(bits) = Self::call_type_bits(module, func) {
+            return bits & 0b0100 != 0;
+        }
+        matches!(module.func_dialect(func), Dialect::DynamicEcma)
+    }
+
     /// Resolve `func`'s leading implicit frame slots (`D6`):
     ///
     /// 1. Explicit `L_ESCallTypeAnnotation;` `callType` bits win when present.
-    /// 2. Under [`Dialect::StaticArkTS`] (`SourceLang::ArkTS`), `static`
-    ///    methods return [`FrameSlots::NONE`] (`H = 0`) and non-static methods
-    ///    return [`FrameSlots::STATIC_INSTANCE`] (`params[0]` = `this`).
-    /// 3. Under [`Dialect::DynamicEcma`] (or bare synthetic modules without a
-    ///    class entry), returns [`FrameSlots::DEFAULT`] (`0xF`, `H = 3` —
-    ///    vendor `method_literal.cpp:51`).
+    /// 2. Under [`Dialect::StaticArkTS`], `static` methods return
+    ///    [`FrameSlots::NONE`] (`H = 0`) and non-static methods return
+    ///    [`FrameSlots::STATIC_INSTANCE`] (`params[0]` = `this`).
+    /// 3. Under [`Dialect::DynamicEcma`], returns [`FrameSlots::DEFAULT`]
+    ///    (`0xF`, `H = 3` — vendor `method_literal.cpp:51`).
     #[must_use]
     pub fn of(module: &Module, func: &FunctionData) -> Self {
         if let Some(annotated) = Self::from_call_type_annotation(module, func) {
@@ -243,16 +289,20 @@ mod tests {
         id
     }
 
-    fn add_call_type(m: &mut Module, f: FuncId, bits: u32) {
+    fn add_call_type_const(m: &mut Module, f: FuncId, konst: Const) {
         let descriptor = m.sym.intern("L_ESCallTypeAnnotation;");
         m.classes.push(ClassData::new(descriptor, descriptor));
         let class = ClassId::new((m.classes.len() - 1) as u32);
         let elem = m.sym.intern("callType");
-        let cid = m.consts.push(Const::number(f64::from(bits)));
+        let cid = m.consts.push(konst);
         m.functions[f.index()].annotations.push(Annotation {
             class,
             elements: vec![(elem, AnnValue::Const(cid))],
         });
+    }
+
+    fn add_call_type(m: &mut Module, f: FuncId, bits: u32) {
+        add_call_type_const(m, f, Const::number(f64::from(bits)));
     }
 
     #[test]
@@ -261,6 +311,8 @@ mod tests {
         let f = bare_func(&mut m, 3);
         let fd = &m.functions[f.index()];
         assert_eq!(FrameSlots::from_call_type_annotation(&m, fd), None);
+        assert_eq!(FrameSlots::call_type_bits(&m, fd), None);
+        assert!(FrameSlots::has_extra(&m, fd));
         assert_eq!(FrameSlots::of(&m, fd), FrameSlots::DEFAULT);
         assert_eq!(FrameSlots::DEFAULT.formal_offset(), 3);
         assert_eq!(
@@ -274,10 +326,48 @@ mod tests {
     fn annotation_without_newtarget_shifts_this() {
         let mut m = bare_module();
         let f = bare_func(&mut m, 2);
-        add_call_type(&mut m, f, 0b1001); // func + this, no new.target
+        add_call_type(&mut m, f, 0b1001); // func + this, no new.target, no extra
         let fd = &m.functions[f.index()];
+        assert_eq!(FrameSlots::call_type_bits(&m, fd), Some(0b1001));
+        assert!(!FrameSlots::has_extra(&m, fd));
         assert!(FrameSlots::from_call_type_annotation(&m, fd).is_some());
         assert_eq!(this_param_index(&m, fd), Some(1));
+    }
+
+    #[test]
+    fn annotation_decodes_int32_neg1_and_negative_f64_without_zero_saturation() {
+        let mut m = bare_module();
+        let f_i32 = bare_func(&mut m, 3);
+        add_call_type_const(&mut m, f_i32, Const::Int32((-1i32) as u32));
+        let f_f64 = bare_func(&mut m, 3);
+        add_call_type_const(&mut m, f_f64, Const::number(-1.0));
+        let f_i64 = bare_func(&mut m, 3);
+        add_call_type_const(&mut m, f_i64, Const::Int64(-1));
+        let f_i8 = bare_func(&mut m, 3);
+        add_call_type_const(&mut m, f_i8, Const::Int8(0b0101));
+        let f_u64 = bare_func(&mut m, 3);
+        add_call_type_const(&mut m, f_u64, Const::UInt64(0b1111));
+
+        for fid in [f_i32, f_f64, f_i64, f_u64] {
+            let fd = &m.functions[fid.index()];
+            assert_eq!(
+                FrameSlots::from_call_type_annotation(&m, fd),
+                Some(FrameSlots::DEFAULT),
+                "all-ones (-1) callType must decode to DEFAULT (0xF), not NONE"
+            );
+            assert!(FrameSlots::has_extra(&m, fd));
+        }
+
+        let fd_i8 = &m.functions[f_i8.index()];
+        assert_eq!(
+            FrameSlots::from_call_type_annotation(&m, fd_i8),
+            Some(FrameSlots {
+                func: false,
+                new_target: false,
+                this: true,
+            })
+        );
+        assert!(FrameSlots::has_extra(&m, fd_i8));
     }
 
     #[test]
@@ -297,12 +387,13 @@ mod tests {
 
     #[test]
     fn static_arkts_static_method_has_zero_hidden_slots() {
-        let mut m = bare_module();
+        let mut m = Module::with_dialect(Dialect::StaticArkTS);
         let ark_cls = add_class_with_lang(&mut m, "LArkPkg/ETSGLOBAL;", SourceLang::ArkTS);
         let f = bare_func_in_class(&mut m, ark_cls, Modifiers::STATIC, 2);
         let fd = &m.functions[f.index()];
 
         assert_eq!(m.func_dialect(fd), Dialect::StaticArkTS);
+        assert!(!FrameSlots::has_extra(&m, fd));
         let slots = FrameSlots::of(&m, fd);
         assert_eq!(slots, FrameSlots::NONE);
         assert_eq!(slots.implicit_count(), 0);
@@ -313,7 +404,7 @@ mod tests {
 
     #[test]
     fn static_arkts_instance_method_binds_this_at_params_0() {
-        let mut m = bare_module();
+        let mut m = Module::with_dialect(Dialect::StaticArkTS);
         let ark_cls = add_class_with_lang(&mut m, "LArkPkg/Widget;", SourceLang::ArkTS);
         let inst_fn = bare_func_in_class(&mut m, ark_cls, Modifiers::PUBLIC, 2);
         let fd = &m.functions[inst_fn.index()];
@@ -333,14 +424,16 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_ecmascript_and_typescript_keep_3_hidden_slots_even_when_static() {
+    fn dynamic_container_keeps_3_hidden_slots_even_when_source_lang_is_arkts() {
         let mut m = bare_module();
         let es_cls = add_class_with_lang(&mut m, "L_GLOBAL;", SourceLang::EcmaScript);
         let ts_cls = add_class_with_lang(&mut m, "LTsMod;", SourceLang::TypeScript);
+        let dyn_ark_cls = add_class_with_lang(&mut m, "LDynArk;", SourceLang::ArkTS);
         let es_fn = bare_func_in_class(&mut m, es_cls, Modifiers::STATIC, 4);
         let ts_fn = bare_func_in_class(&mut m, ts_cls, Modifiers::STATIC, 3);
+        let ark_fn = bare_func_in_class(&mut m, dyn_ark_cls, Modifiers::STATIC, 3);
 
-        for fid in [es_fn, ts_fn] {
+        for fid in [es_fn, ts_fn, ark_fn] {
             let fd = &m.functions[fid.index()];
             assert_eq!(m.func_dialect(fd), Dialect::DynamicEcma);
             assert_eq!(FrameSlots::of(&m, fd), FrameSlots::DEFAULT);

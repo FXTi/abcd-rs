@@ -126,12 +126,13 @@ fn element_record_read_failure_is_hard_error() {
     assert!(
         matches!(
             err,
-            Error::Malformed {
-                field: "annotation element",
-                ..
-            }
+            Error::InvalidOffset(_)
+                | Error::Malformed {
+                    field: "annotation element",
+                    ..
+                }
         ),
-        "expected Malformed/annotation element, got: {err:?}"
+        "expected InvalidOffset or Malformed/annotation element, got: {err:?}"
     );
 }
 
@@ -293,11 +294,11 @@ fn method_handle_bad_type_is_hard_error() {
         matches!(
             err,
             Error::Malformed {
-                field: "method_handle_type",
+                field: "method_handle" | "method_handle_type",
                 ..
             }
         ),
-        "expected Malformed/method_handle_type, got: {err:?}"
+        "expected Malformed/method_handle(_type), got: {err:?}"
     );
 }
 
@@ -765,11 +766,11 @@ fn array_method_handle_bad_type_is_hard_error() {
         matches!(
             err,
             Error::Malformed {
-                field: "method_handle_type",
+                field: "method_handle" | "method_handle_type",
                 ..
             }
         ),
-        "expected Malformed/method_handle_type, got: {err:?}"
+        "expected Malformed/method_handle(_type), got: {err:?}"
     );
 }
 

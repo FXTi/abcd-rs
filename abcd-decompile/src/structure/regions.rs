@@ -100,10 +100,9 @@ use std::rc::Rc;
 
 use abcd_ir::{BlockId, EdgeKind, FuncId, Module, TryRegion};
 
-use super::dom::{Dominators, PostDominators};
-use super::loops::back_edges_in_blocks;
-use super::reach::reachable_from;
-use super::succs::block_succs;
+use abcd_analysis::control::{
+    Dominators, PostDominators, back_edges_in_blocks, block_succs, reachable_from,
+};
 
 /// Fixed-width dense bitset over `0..u_len` universe block indices.
 ///
@@ -458,7 +457,6 @@ pub struct LoopInfo {
 /// Projection of one `TryRegion` onto the region tree (design §4.2.5:
 /// the try is one region with multiple exits; the protected blocks are
 /// structured as a sub-CFG).
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TryPlan {
     /// Index into `func.try_regions`.
     pub region: usize,
@@ -479,6 +477,148 @@ pub struct TryPlan {
     /// emission must place the `try {`/`catch` markers inside the cut
     /// region.
     pub cuts_structured_region: bool,
+    /// Nested laminar child `TryPlan`s when organized into a nesting forest
+    /// (see [`RegionTree::try_plan_forest`]).
+    pub children: Vec<TryPlan>,
+}
+
+impl Drop for TryPlan {
+    fn drop(&mut self) {
+        if self.children.is_empty() {
+            return;
+        }
+        let mut stack: Vec<TryPlan> = std::mem::take(&mut self.children);
+        while let Some(mut cur) = stack.pop() {
+            if !cur.children.is_empty() {
+                stack.extend(std::mem::take(&mut cur.children));
+            }
+        }
+    }
+}
+
+impl Clone for TryPlan {
+    fn clone(&self) -> Self {
+        if self.children.is_empty() {
+            return Self {
+                region: self.region,
+                entry: self.entry,
+                protected: self.protected.clone(),
+                handlers: self.handlers.clone(),
+                span: self.span,
+                cuts_structured_region: self.cuts_structured_region,
+                children: Vec::new(),
+            };
+        }
+        enum Step<'a> {
+            Visit(&'a TryPlan),
+            Build(&'a TryPlan, usize),
+        }
+        let mut steps = vec![Step::Visit(self)];
+        let mut vals: Vec<TryPlan> = Vec::new();
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Visit(p) => {
+                    if p.children.is_empty() {
+                        vals.push(TryPlan {
+                            region: p.region,
+                            entry: p.entry,
+                            protected: p.protected.clone(),
+                            handlers: p.handlers.clone(),
+                            span: p.span,
+                            cuts_structured_region: p.cuts_structured_region,
+                            children: Vec::new(),
+                        });
+                    } else {
+                        steps.push(Step::Build(p, p.children.len()));
+                        for ch in p.children.iter().rev() {
+                            steps.push(Step::Visit(ch));
+                        }
+                    }
+                }
+                Step::Build(p, count) => {
+                    let start = vals.len().saturating_sub(count);
+                    let children = vals.split_off(start);
+                    vals.push(TryPlan {
+                        region: p.region,
+                        entry: p.entry,
+                        protected: p.protected.clone(),
+                        handlers: p.handlers.clone(),
+                        span: p.span,
+                        cuts_structured_region: p.cuts_structured_region,
+                        children,
+                    });
+                }
+            }
+        }
+        vals.pop().unwrap_or(Self {
+            region: self.region,
+            entry: self.entry,
+            protected: Vec::new(),
+            handlers: Vec::new(),
+            span: None,
+            cuts_structured_region: false,
+            children: Vec::new(),
+        })
+    }
+}
+
+impl PartialEq for TryPlan {
+    fn eq(&self, other: &Self) -> bool {
+        let mut stack = vec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            if a.region != b.region
+                || a.entry != b.entry
+                || a.protected != b.protected
+                || a.handlers != b.handlers
+                || a.span != b.span
+                || a.cuts_structured_region != b.cuts_structured_region
+                || a.children.len() != b.children.len()
+            {
+                return false;
+            }
+            for (ca, cb) in a.children.iter().zip(b.children.iter()).rev() {
+                stack.push((ca, cb));
+            }
+        }
+        true
+    }
+}
+
+impl Eq for TryPlan {}
+
+impl std::fmt::Debug for TryPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        enum Task<'a> {
+            Plan(&'a TryPlan),
+            Raw(&'static str),
+        }
+        let mut tasks = vec![Task::Plan(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Raw(s) => f.write_str(s)?,
+                Task::Plan(p) => {
+                    write!(
+                        f,
+                        "TryPlan {{ region: {:?}, entry: {:?}, protected: {:?}, handlers: {:?}, span: {:?}, cuts_structured_region: {:?}, children: [",
+                        p.region,
+                        p.entry,
+                        p.protected,
+                        p.handlers,
+                        p.span,
+                        p.cuts_structured_region
+                    )?;
+                    tasks.push(Task::Raw("] }"));
+                    for (idx, ch) in p.children.iter().enumerate().rev() {
+                        tasks.push(Task::Plan(ch));
+                        if idx > 0 {
+                            tasks.push(Task::Raw(", "));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The structured region tree of one function, plus all side reports.
@@ -537,6 +677,60 @@ impl RegionTree {
     /// The root node, when the function has blocks.
     pub fn root_node(&self) -> Option<&RegionNode> {
         self.root.and_then(|r| self.get(r))
+    }
+
+    /// Organize [`Self::try_plans`] into a laminar nesting forest via
+    /// [`TryPlan::children`] (outermost plans as roots, nested sub-plans
+    /// attached in declaration order).
+    #[must_use]
+    pub fn try_plan_forest(&self) -> Vec<TryPlan> {
+        if self.try_plans.is_empty() {
+            return Vec::new();
+        }
+        let n = self.try_plans.len();
+        let sets: Vec<BTreeSet<BlockId>> = self
+            .try_plans
+            .iter()
+            .map(|p| p.protected.iter().copied().collect())
+            .collect();
+        // Order indices by `(protected.len(), region)` ascending so children
+        // are finalized before their enclosing parents without recursion.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (sets[i].len(), self.try_plans[i].region));
+
+        let mut parent_of = vec![None; n];
+        for (pos, &i) in order.iter().enumerate() {
+            if sets[i].is_empty() {
+                continue;
+            }
+            for &j in &order[pos + 1..] {
+                let strict_or_earlier_tie =
+                    sets[j].len() > sets[i].len() || (sets[j].len() == sets[i].len() && j < i);
+                if strict_or_earlier_tie && sets[i].is_subset(&sets[j]) {
+                    parent_of[i] = Some(j);
+                    break;
+                }
+            }
+        }
+
+        let mut nodes: Vec<Option<TryPlan>> = self.try_plans.iter().cloned().map(Some).collect();
+        let mut children_buckets: Vec<Vec<TryPlan>> = (0..n).map(|_| Vec::new()).collect();
+        for &i in &order {
+            let Some(mut plan) = nodes[i].take() else {
+                continue;
+            };
+            let mut ch = std::mem::take(&mut children_buckets[i]);
+            ch.sort_by_key(|p| p.region);
+            plan.children = ch;
+            if let Some(p) = parent_of[i] {
+                children_buckets[p].push(plan);
+            } else {
+                nodes[i] = Some(plan);
+            }
+        }
+        let mut roots: Vec<TryPlan> = nodes.into_iter().flatten().collect();
+        roots.sort_by_key(|p| p.region);
+        roots
     }
 }
 
@@ -757,49 +951,46 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
         loop_bits.push(bits);
     }
 
-    // Parent links: the smallest strict superset loop (`O(|U|/64)` word subset test).
-    for i in 0..loops.len() {
-        let i_len = loops[i].blocks.len();
-        if loop_bits[i].is_empty() {
+    // Parent links: two reducible natural loops with distinct headers are
+    // laminar (`L_i ⊂ L_j` iff `header(L_i) ∈ L_j`), so indexing headers in
+    // `header_to_loop` discovers every loop's smallest strictly-containing
+    // parent in `O(|U| + ∑|L_j|)` without an `O(L^2)` pair scan.
+    let mut header_to_loop: Vec<Option<usize>> = vec![None; u_len];
+    for (i, lp) in loops.iter().enumerate() {
+        if !loop_bits[i].is_empty()
+            && let Some(&hi) = u_idx.get(&lp.header)
+        {
+            header_to_loop[hi as usize] = Some(i);
+        }
+    }
+    for j in 0..loops.len() {
+        if loop_bits[j].is_empty() {
             continue;
         }
-        let mut parent: Option<usize> = None;
-        for j in 0..loops.len() {
-            let j_len = loops[j].blocks.len();
-            if i == j || j_len <= i_len || loop_bits[j].is_empty() {
-                continue;
-            }
-            if let Some(p) = parent
-                && loops[p].blocks.len() <= j_len
+        let j_len = loops[j].blocks.len();
+        for bi in loop_bits[j].iter() {
+            if let Some(i) = header_to_loop[bi as usize]
+                && i != j
+                && j_len > loops[i].blocks.len()
+                && loops[i]
+                    .parent
+                    .is_none_or(|p| j_len < loops[p].blocks.len())
+                && loop_bits[i].is_subset(&loop_bits[j])
             {
-                continue;
-            }
-            if loop_bits[i].is_subset(&loop_bits[j]) {
-                parent = Some(j);
+                loops[i].parent = Some(j);
             }
         }
-        loops[i].parent = parent;
     }
 
-    // Irreducible cores: cycles in the graph minus dominance back edges.
-    let mut removed: HashSet<(u32, u32)> = HashSet::with_capacity(be.len() * 2);
+    // Irreducible cores: single-pass iterative Tarjan SCC over `G \ back_edges`
+    // (`O(|U| + |E|)` worst-case time, zero DFS restarts).
+    let mut back_edges_u: HashSet<(u32, u32)> = HashSet::with_capacity(be.len() * 2);
     for &(u, v) in &be {
         if let (Some(&ui), Some(&vi)) = (u_idx.get(&u), u_idx.get(&v)) {
-            removed.insert((ui, vi));
+            back_edges_u.insert((ui, vi));
         }
     }
-    let mut irreducible = Vec::new();
-    while let Some((blocks, cycle_edges_idx)) = find_cycle(u_len, &u_blocks, &succs, &removed) {
-        let mut cycle_edges = Vec::with_capacity(cycle_edges_idx.len());
-        for (ui, vi) in cycle_edges_idx {
-            removed.insert((ui, vi));
-            cycle_edges.push((u_blocks[ui as usize], u_blocks[vi as usize]));
-        }
-        irreducible.push(IrreducibleCore {
-            blocks,
-            cycle_edges,
-        });
-    }
+    let irreducible = irreducible_cores_tarjan(u_len, &u_blocks, &succs, &back_edges_u);
 
     // Innermost natural loop per block (the tail-arm decomposition's
     // fold-compatibility bail — see `Builder::shared_tail_plan`).
@@ -2014,71 +2205,111 @@ fn classify_edge(
     EdgeClass::Internal
 }
 
-/// A cycle witness: the cycle's blocks (sorted) and dense edges (cycle order).
-type CycleWitness = (Vec<BlockId>, Vec<(u32, u32)>);
-
-/// Find one cycle in the graph minus `removed` edges, deterministically
-/// (start nodes in sorted order, successors in terminator order). Returns
-/// the cycle's blocks (sorted) and dense edges (cycle order).
-fn find_cycle(
+/// Discover all irreducible cores via a single-pass iterative Tarjan strongly
+/// connected components walk over `G \ back_edges` (`O(|U| + |E|)`).
+///
+/// Every non-trivial SCC (`comp.len() >= 2` or self-edge `u -> u` not in
+/// `back_edges`) yields one deterministic [`IrreducibleCore`] with sorted
+/// member [`BlockId`]s and sorted intra-SCC [`IrreducibleCore::cycle_edges`].
+fn irreducible_cores_tarjan(
     u_len: usize,
     u_blocks: &[BlockId],
     succs: &[Vec<u32>],
-    removed: &HashSet<(u32, u32)>,
-) -> Option<CycleWitness> {
-    let mut state: Vec<u8> = vec![0u8; u_len]; // 0 = Unvisited, 1 = Gray, 2 = Black
-    let mut path: Vec<u32> = Vec::new();
-    let mut stack: Vec<(u32, usize)> = Vec::new();
+    back_edges: &HashSet<(u32, u32)>,
+) -> Vec<IrreducibleCore> {
+    let mut index_of = vec![u32::MAX; u_len];
+    let mut lowlink = vec![0u32; u_len];
+    let mut on_stack = vec![false; u_len];
+    let mut in_comp = vec![false; u_len];
+    let mut scc_stack: Vec<u32> = Vec::new();
+    let mut dfs_stack: Vec<(u32, usize)> = Vec::new();
+    let mut next_index = 0u32;
+    let mut cores = Vec::new();
+
     for start in 0..u_len as u32 {
-        if state[start as usize] != 0 {
+        if index_of[start as usize] != u32::MAX {
             continue;
         }
-        path.clear();
-        stack.clear();
-        stack.push((start, 0));
-        state[start as usize] = 1;
-        path.push(start);
-        while let Some((node, next)) = stack.last_mut() {
-            let node = *node;
-            let node_succs = &succs[node as usize];
-            let mut advanced = false;
-            while *next < node_succs.len() {
-                let s = node_succs[*next];
-                *next += 1;
-                if removed.contains(&(node, s)) {
+        index_of[start as usize] = next_index;
+        lowlink[start as usize] = next_index;
+        next_index += 1;
+        on_stack[start as usize] = true;
+        scc_stack.push(start);
+        dfs_stack.push((start, 0));
+
+        while let Some((v_ref, edge_idx)) = dfs_stack.last_mut() {
+            let v = *v_ref;
+            let v_usize = v as usize;
+            if *edge_idx < succs[v_usize].len() {
+                let w = succs[v_usize][*edge_idx];
+                *edge_idx += 1;
+                if back_edges.contains(&(v, w)) {
                     continue;
                 }
-                match state[s as usize] {
-                    0 => {
-                        state[s as usize] = 1;
-                        stack.push((s, 0));
-                        path.push(s);
-                        advanced = true;
-                        break;
-                    }
-                    1 => {
-                        // Cycle: the path segment from s to node, closed by (node → s).
-                        let pos = path.iter().position(|&b| b == s).expect("gray on path");
-                        let seg = &path[pos..];
-                        let mut blocks: Vec<BlockId> =
-                            seg.iter().map(|&bi| u_blocks[bi as usize]).collect();
-                        let mut edges: Vec<(u32, u32)> =
-                            seg.windows(2).map(|w| (w[0], w[1])).collect();
-                        edges.push((node, s));
-                        blocks.sort();
-                        return Some((blocks, edges));
-                    }
-                    _ => {}
+                let w_usize = w as usize;
+                if index_of[w_usize] == u32::MAX {
+                    index_of[w_usize] = next_index;
+                    lowlink[w_usize] = next_index;
+                    next_index += 1;
+                    on_stack[w_usize] = true;
+                    scc_stack.push(w);
+                    dfs_stack.push((w, 0));
+                } else if on_stack[w_usize] && index_of[w_usize] < lowlink[v_usize] {
+                    lowlink[v_usize] = index_of[w_usize];
                 }
-            }
-            if !advanced {
-                state[node as usize] = 2;
-                stack.pop();
-                path.pop();
+            } else {
+                dfs_stack.pop();
+                if let Some(&(parent, _)) = dfs_stack.last()
+                    && lowlink[v_usize] < lowlink[parent as usize]
+                {
+                    lowlink[parent as usize] = lowlink[v_usize];
+                }
+                if lowlink[v_usize] == index_of[v_usize] {
+                    let mut comp = Vec::new();
+                    while let Some(w) = scc_stack.pop() {
+                        on_stack[w as usize] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    let has_self_edge = comp.len() == 1
+                        && succs[v_usize]
+                            .iter()
+                            .any(|&w| w == v && !back_edges.contains(&(v, w)));
+                    if comp.len() >= 2 || has_self_edge {
+                        for &ui in &comp {
+                            in_comp[ui as usize] = true;
+                        }
+                        let mut blocks: Vec<BlockId> =
+                            comp.iter().map(|&ui| u_blocks[ui as usize]).collect();
+                        blocks.sort();
+                        let mut cycle_edges = Vec::new();
+                        for &ui in &comp {
+                            let from = u_blocks[ui as usize];
+                            for &wi in &succs[ui as usize] {
+                                if in_comp[wi as usize] && !back_edges.contains(&(ui, wi)) {
+                                    cycle_edges.push((from, u_blocks[wi as usize]));
+                                }
+                            }
+                        }
+                        for &ui in &comp {
+                            in_comp[ui as usize] = false;
+                        }
+                        cycle_edges.sort();
+                        cycle_edges.dedup();
+                        cores.push(IrreducibleCore {
+                            blocks,
+                            cycle_edges,
+                        });
+                    }
+                }
             }
         }
     }
-    None
+
+    cores.sort_by(|a, b| a.blocks.cmp(&b.blocks));
+    cores
 }
 
 /// Project `TryRegion`s onto the finished tree and run the containment
@@ -2114,7 +2345,12 @@ fn project_try_regions(
     };
     let mut plans = Vec::new();
     let mut errors = Vec::new();
-    let mut earlier: Vec<BTreeSet<BlockId>> = Vec::new();
+    // Per-block membership list for touch-counted `InterleavedTryRegions`
+    // verification (`O(∑|P_i|)` on disjoint tries instead of `O(T^2)`).
+    let mut block_to_earlier: HashMap<BlockId, Vec<usize>> = HashMap::new();
+    let mut earlier_lens: Vec<usize> = Vec::with_capacity(try_regions.len());
+    let mut shared_counts: Vec<usize> = vec![0usize; try_regions.len()];
+    let mut touched_earlier: Vec<usize> = Vec::new();
     let region_index = match (nodes, root) {
         (Some(nodes), Some(root_id)) if !try_regions.is_empty() => {
             Some(RegionIndex::build(nodes, root_id, u_idx))
@@ -2136,13 +2372,30 @@ fn project_try_regions(
                 });
             }
         }
-        for (j, prev) in earlier.iter().enumerate() {
-            let has_inter = protected.intersection(prev).next().is_some();
-            if has_inter && !protected.is_subset(prev) && !prev.is_subset(&protected) {
+        for &b in &protected {
+            if let Some(owners) = block_to_earlier.get(&b) {
+                for &j in owners {
+                    if shared_counts[j] == 0 {
+                        touched_earlier.push(j);
+                    }
+                    shared_counts[j] += 1;
+                }
+            }
+        }
+        touched_earlier.sort_unstable();
+        let cur_len = protected.len();
+        for &j in &touched_earlier {
+            let shared = shared_counts[j];
+            shared_counts[j] = 0;
+            if shared < cur_len && shared < earlier_lens[j] {
                 errors.push(RegionError::InterleavedTryRegions { a: j, b: i });
             }
         }
-        earlier.push(protected.clone());
+        touched_earlier.clear();
+        earlier_lens.push(cur_len);
+        for &b in &protected {
+            block_to_earlier.entry(b).or_default().push(i);
+        }
 
         // Single-entry assertion, per Normal-connected component of the
         // protected sub-CFG.
@@ -2241,6 +2494,7 @@ fn project_try_regions(
             handlers,
             span,
             cuts_structured_region: cuts,
+            children: Vec::new(),
         });
     }
     (plans, errors)
@@ -2354,8 +2608,103 @@ impl RegionIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::*;
-    use abcd_ir::Op;
+    use abcd_ir::consts::Const;
+    use abcd_ir::function::{Block, Catch, FunctionData, Inst, Value};
+    use abcd_ir::module::{ClassData, FunctionKind};
+    use abcd_ir::ty::Ty;
+    use abcd_ir::{ClassId, Edge, InstId, Op, ValueDef, ValueId};
+
+    fn mk_module() -> Module {
+        let mut m = Module::new();
+        let name = m.sym.intern("Ltest;");
+        m.classes.push(ClassData::new(name, name));
+        m
+    }
+
+    fn add_block(m: &mut Module, f: FuncId) -> BlockId {
+        let id = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(f).unwrap().blocks.push(id);
+        id
+    }
+
+    fn add_func(m: &mut Module) -> FuncId {
+        let name = m.sym.intern("f");
+        let id = FuncId::new(m.functions.len() as u32);
+        m.functions.push(FunctionData::new(
+            ClassId::new(0),
+            name,
+            FunctionKind::Function,
+        ));
+        m.classes[0].methods.push(id);
+        add_block(m, id);
+        id
+    }
+
+    fn entry_of(m: &Module, f: FuncId) -> BlockId {
+        m.func(f).unwrap().blocks[0]
+    }
+
+    fn push_inst(m: &mut Module, b: BlockId, op: Op) -> InstId {
+        let id = InstId::new(m.insts.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: None,
+            block: b,
+            loc: None,
+        });
+        m.block_mut(b).unwrap().insts.push(id);
+        id
+    }
+
+    fn emit_void(m: &mut Module, b: BlockId, op: Op) -> InstId {
+        push_inst(m, b, op)
+    }
+
+    fn load_number(m: &mut Module, b: BlockId, x: f64) -> ValueId {
+        let cid = m.consts.push(Const::number(x));
+        let inst = push_inst(m, b, Op::LoadConst(cid));
+        let val = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Inst(inst),
+            ty: Ty::Any,
+        });
+        m.inst_mut(inst).unwrap().result = Some(val);
+        val
+    }
+
+    fn link(m: &mut Module, from: BlockId, to: BlockId) {
+        m.block_mut(to).unwrap().preds.push(Edge {
+            from,
+            kind: EdgeKind::Normal,
+        });
+    }
+
+    fn add_exception_param(m: &mut Module, handler: BlockId) -> ValueId {
+        let val = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::ExceptionParam(handler),
+            ty: Ty::Any,
+        });
+        val
+    }
+
+    fn add_try(m: &mut Module, f: FuncId, protected: Vec<BlockId>, handler: BlockId, exc: ValueId) {
+        for &p in &protected {
+            m.block_mut(handler).unwrap().preds.push(Edge {
+                from: p,
+                kind: EdgeKind::Exceptional,
+            });
+        }
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected,
+            catches: vec![Catch {
+                handler,
+                exception: exc,
+                type_class: None,
+            }],
+        });
+    }
 
     /// `cond`-terminated block helper.
     fn cond_branch(m: &mut abcd_ir::Module, b: BlockId, t: BlockId, f: BlockId) {

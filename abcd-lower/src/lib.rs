@@ -2,18 +2,17 @@
 //!
 //! Format-aware lowering layer (`design/ir.md` §5, `design/decisions.md`)
 //! that compiles the SSA IR ([`abcd_ir::Module`]) back to `.abc` bytecode and
-//! container structures: chordal maximum-cardinality-search register
-//! allocation, slot-level parallel-copy cycle breaking, accumulator-as-cache
-//! instruction selection, basic-block layout with edge trampolines, try-range
-//! reconstruction, entity relocation and per-method `u16` compaction, in-place
-//! file rewriting ([`rewrite_file`]), and standalone whole-module lowering
-//! ([`lower_module`]).
+//! container structures: Hack–Grund–Goos dominance-tree SSA register
+//! allocation with Boissinot CSSA isolation and biased coalescing, slot-level
+//! parallel-copy cycle breaking, accumulator-as-cache instruction selection,
+//! basic-block layout with edge trampolines, try-range reconstruction, entity
+//! relocation and per-method `u16` compaction, in-place file rewriting
+//! ([`rewrite_file`]), and standalone whole-module lowering ([`lower_module`]).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-pub mod analysis;
 pub mod copy_resolve;
 pub mod fusion;
 pub mod isel;
@@ -229,6 +228,20 @@ pub enum LowerError {
         expected: usize,
         /// Operand count visited by `for_each_entity_operand_mut`.
         visited: usize,
+    },
+    /// An instruction immediate exceeds its narrow bytecode operand width.
+    #[error("function {func:?}: {op} immediate {field} = {value} exceeds {max}")]
+    ImmediateOutOfRange {
+        /// The owning function.
+        func: FuncId,
+        /// Instruction or opcode name.
+        op: &'static str,
+        /// Immediate field name.
+        field: &'static str,
+        /// Out-of-range immediate value.
+        value: u64,
+        /// Maximum encodable value.
+        max: u64,
     },
 }
 

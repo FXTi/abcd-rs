@@ -140,11 +140,11 @@ fn elimination_refused_when_converging_edges_carry_distinct_values() {
 
 /// Negative pin (b): when both converging edges carry the SAME value,
 /// elimination is value-preserving and must STILL fire — the jump-only
-/// block is removed, T's phi collapses to the single surviving edge,
-/// and the module verifies.
+/// block `B` is removed, `CondBranch(c, T, T)` folds to `Branch(T)`, `T`'s
+/// trivial phi collapses and merges into `P`, and the module verifies.
 #[test]
 fn elimination_still_fires_when_converging_edges_agree() {
-    let (mut module, func, _p, b, t, _phi) = build_converging_module(false);
+    let (mut module, func, p, b, t, _phi) = build_converging_module(false);
     let pre = verify_module(&module);
     assert!(pre.is_ok(), "fixture must verify pre-opt: {:?}", pre.errors);
 
@@ -156,7 +156,11 @@ fn elimination_still_fires_when_converging_edges_agree() {
         "same-value converging edges must not block empty-jump elimination: {:?}",
         func_data.blocks
     );
-    assert!(func_data.blocks.contains(&t));
+    assert_eq!(
+        func_data.blocks,
+        vec![p],
+        "after folding CondBranch(c, T, T) -> Branch(T), T merges straight into P (eliminating {t:?})"
+    );
     let report = verify_module(&module);
     assert!(report.is_ok(), "post-opt verify: {:?}", report.errors);
 }

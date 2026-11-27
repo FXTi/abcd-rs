@@ -142,18 +142,24 @@ impl<'m> Emitter<'m> {
         if self.opts.arkui
             && !sendable
             && !self.hoisted.contains(name)
-            && crate::arkui::try_emit_arkui_component(
-                self,
-                pad,
-                indent,
-                name,
-                ctor,
-                heritage,
-                members,
-                member_attrs,
-                out,
-            )
+            && let Some((rendered, delta_stats, had_fb)) = self
+                .arkui_components
+                .get(&(ctor, name.to_string()))
+                .cloned()
         {
+            super::accumulate_decompile_stats(&mut self.stats, &delta_stats);
+            if had_fb {
+                self.current_fn_has_fallback = true;
+            }
+            for line in rendered.lines() {
+                if line.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(pad);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
             return;
         }
         self.stats.classes += 1;
@@ -223,7 +229,10 @@ impl<'m> Emitter<'m> {
             if folded_names.contains(pname.as_str()) {
                 continue;
             }
-            priv_text.push_str(&format!("{pad}  #{};\n", sanitize(pname)));
+            priv_text.push_str(&format!(
+                "{pad}  #{};\n",
+                super::expr::format_private_ident(pname)
+            ));
         }
         if let Some(fold) = &fold {
             for (fname, cid) in &fold.fields {
@@ -232,7 +241,7 @@ impl<'m> Emitter<'m> {
                     .unwrap_or_else(|| "undefined /* non-literal field value */".to_string());
                 priv_text.push_str(&format!(
                     "{pad}  #{} = {}; /* es2abc instance-initializer fold */\n",
-                    sanitize(fname),
+                    super::expr::format_private_ident(fname),
                     value
                 ));
             }
@@ -414,39 +423,56 @@ pub(in crate::emit) fn collect_private_names_with_index(
     func: FuncId,
     out: &mut BTreeSet<String>,
 ) {
-    let Some(f) = module.func(func) else {
-        return;
-    };
-    let scopes = crate::names::NameScopes::build_with_index(module, func, index);
-    for &b in &f.blocks {
-        let Some(block) = module.block(b) else {
+    let mut visited: HashSet<FuncId> = HashSet::new();
+    let mut stack: Vec<FuncId> = vec![func];
+    let mut shape_refs = BTreeSet::new();
+
+    while let Some(fid) = stack.pop() {
+        if !visited.insert(fid) {
+            continue;
+        }
+        let Some(f) = module.func(fid) else {
             continue;
         };
-        for &iid in &block.insts {
-            let Some(inst) = module.inst(iid) else {
+        let scopes = crate::names::NameScopes::build_with_index(module, fid, index);
+        for &b in &f.blocks {
+            let Some(block) = module.block(b) else {
                 continue;
             };
-            match &inst.op {
-                Op::LoadPrivate { level, slot, .. }
-                | Op::StorePrivate { level, slot, .. }
-                | Op::DefinePrivate { level, slot, .. }
-                | Op::TestPrivate { level, slot, .. } => {
-                    let name = scopes
-                        .name_of(iid)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("p{level}_{slot}"));
-                    out.insert(name);
-                }
-                Op::CreatePrivateNames { names, .. } => {
-                    if let Some(items) = lit_of(module, *names).and_then(Lit::into_array) {
-                        for item in items {
-                            if let Some(n) = item.into_string() {
-                                out.insert(n);
+            for &iid in &block.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::LoadPrivate { level, slot, .. }
+                    | Op::StorePrivate { level, slot, .. }
+                    | Op::DefinePrivate { level, slot, .. }
+                    | Op::TestPrivate { level, slot, .. } => {
+                        let name = scopes
+                            .name_of(iid)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("p{level}_{slot}"));
+                        out.insert(name);
+                    }
+                    Op::CreatePrivateNames { names, .. } => {
+                        if let Some(items) = lit_of(module, *names).and_then(Lit::into_array) {
+                            for item in items {
+                                if let Some(n) = item.into_string() {
+                                    out.insert(n);
+                                }
                             }
                         }
                     }
+                    Op::DefineFunc { body, .. } => {
+                        stack.push(*body);
+                    }
+                    Op::AllocObject { shape } => {
+                        shape_refs.clear();
+                        collect_method_refs(module, *shape, &mut shape_refs);
+                        stack.extend(shape_refs.iter().copied());
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -490,6 +516,7 @@ pub(in crate::emit) fn ty_ts(module: &Module, ty: &Ty) -> String {
         Some(match ty {
             Ty::Any => "any".to_string(),
             Ty::Unknown => "unknown".to_string(),
+            Ty::Never => "never".to_string(),
             Ty::DynPrim(p) => match p {
                 DynPrim::Undefined => "undefined".to_string(),
                 DynPrim::Null => "null".to_string(),

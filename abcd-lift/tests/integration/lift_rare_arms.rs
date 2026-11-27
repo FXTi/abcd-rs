@@ -513,9 +513,9 @@ fn throw_deletesuperproperty_lifts_to_the_dedicated_op() {
 fn throw_undefinedifhole_two_register_roles() {
     let file = build(
         &[
-            Bytecode::Ldai(Imm(10)), // name value
+            Bytecode::Ldai(Imm(10)), // v0 (`v1`): hole-checked value (`D8`)
             Bytecode::Sta(Reg(0)),
-            Bytecode::Ldai(Imm(20)), // checked value
+            Bytecode::Ldai(Imm(20)), // v1 (`v2`): variable name
             Bytecode::Sta(Reg(1)),
             Bytecode::ThrowUndefinedifhole(Reg(0), Reg(1)),
             Bytecode::Returnundefined,
@@ -529,8 +529,8 @@ fn throw_undefinedifhole_two_register_roles() {
     else {
         unreachable!()
     };
-    assert_eq!(const_of(&m, *name), Const::number(10.0), "name = v1");
-    assert_eq!(const_of(&m, *value), Const::number(20.0), "value = v2");
+    assert_eq!(const_of(&m, *value), Const::number(10.0), "value = v1");
+    assert_eq!(const_of(&m, *name), Const::number(20.0), "name = v2");
 }
 
 // ── throw.ifsupernotcorrectcall with imm ∉ {0,1} → hard error ────────

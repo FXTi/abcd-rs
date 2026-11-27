@@ -11,7 +11,7 @@
 //!    (design §4.2.4), which ran unconditionally inline and clobbered
 //!    the result (`SwitchTest(1)` returned NaN). The analysis now
 //!    decomposes them into a tail-arm-first `Alternates`
-//!    (`abcd_analysis::control::regions::Builder::structure_shared_tail`),
+//!    (`abcd_decompile::structure::regions` shared-tail structuring),
 //!    and the sequence-run fold accepts an arm that DIVERGES via a
 //!    terminator action (the arm's `break L$…` into the tail label) —
 //!    previously it bailed and the leaf emitter silently dropped the
@@ -115,7 +115,7 @@ fn try_nested_finally_phi_temps_declared() {
     let text =
         decompile("24.0.0.0/test262/language/statements/try/S12.14_A7_T1/baseline/input.abc");
     assert!(
-        text.contains("var v357; /* phi */"),
+        text.contains("var v479; /* phi */"),
         "the outer handler's phi declaration must be emitted (its body must exist):\n{}",
         &text[text.len() / 3..2 * text.len() / 3]
     );
@@ -150,25 +150,33 @@ fn try_nested_finally_exception_replacement() {
 #[ignore]
 fn try_switch_inside_finally_reconstruction() {
     let text = decompile("24.0.0.0/test262/language/statements/try/S12.14_A15/baseline/input.abc");
-    // SwitchTest3's finally-`break` dispatch folds to a switch whose
-    // `case undefined` (no-exception path) RETURNS the accumulated
-    // result — at HEAD the dispatch was an if/else whose arms fell out
-    // of the catch clause to nowhere (`return v529` survived only in
-    // the never-taken outer `else` arm).
+    // SwitchTest3's finally-`break` dispatch checks `v472 == undefined`
+    // (kept as an `if` rather than `switch` under R5-6b because loose `==`
+    // must not coerce into strict `switch` `===`), and its no-exception arm
+    // RETURNS the accumulated result — at HEAD the dispatch's arms fell out
+    // of the catch clause to nowhere (`return v529` survived only in the
+    // never-taken outer `else` arm).
     let st3 = &text[text.find("___SwitchTest3").expect("SwitchTest3")..];
     assert!(
-        st3.contains("switch (v477) {\n      case undefined: {\n"),
-        "SwitchTest3's dispatch must fold to a switch over the completion marker:\n{}",
+        st3.contains("if (v472 == undefined) {\n        v492 = v488;\n        var v492; /* phi */\n        return v492;"),
+        "SwitchTest3's completion-marker dispatch must return the accumulated result:\n{}",
         &st3[..st3.len().min(2500)]
     );
-    // SwitchTest1's inner dispatch switch must CLOSE before the
-    // finally epilogue's phi declarations (at HEAD the epilogue was
-    // buried inside the inner `default` arm, so the case-4 `break`
+    // SwitchTest1's inner dispatch (`case 1.0` + `default`'s `switch (p3)` `case 4.0`)
+    // must assign the finally-epilogue phis (`v415`, `v420`) on EVERY non-throwing arm
+    // before `break`, reaching `if (v368 == undefined) { return v415; }` (at HEAD the
+    // epilogue assignment was buried only inside `default`, so `case 4.0`'s `break`
     // skipped it and SwitchTest1(4) returned `undefined`).
     let st1 = &text[text.find("___SwitchTest1").expect("SwitchTest1")..];
     assert!(
-        st1.contains("            }\n            var v408; /* phi */\n            var v416; /* phi */\n            v407 = v408;"),
-        "the epilogue must follow the inner dispatch switch, not hide in an arm:\n{}",
+        st1.contains(
+            "            }\n            v415 = v418;\n            v420 = undefined/*hole*/;\n          }\n          break;"
+        ) && st1.contains(
+            "              } else {\n                v415 = v418;\n                v420 = undefined/*hole*/;\n              }\n              break;"
+        ) && st1.contains(
+            "  var v415; /* phi */\n  var v420; /* phi */\n  if (v368 == undefined) {\n    return v415;\n  }"
+        ),
+        "every non-throwing dispatch arm must feed the finally epilogue:\n{}",
         &st1[..st1.len().min(3500)]
     );
 }

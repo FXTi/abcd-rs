@@ -388,7 +388,7 @@ fn dominator_sections(ir: &Module) -> Vec<DominatorTree> {
                 .map(|b| DomNode {
                     block: b.index() as u32,
                     idom: dom.idom(*b).map(|i| i.index() as u32),
-                    depth: dom.dominator_chain(*b).len().saturating_sub(1),
+                    depth: dom.depth(*b).unwrap_or(0) as usize,
                 })
                 .collect();
             DominatorTree {

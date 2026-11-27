@@ -253,7 +253,7 @@ fn lift_failure_is_a_tool_error() {
     assert_eq!(err.exit_code(), 2, "lift failure is a tool error");
     let msg = err.to_string();
     assert!(msg.contains("failed to lift"), "{msg}");
-    assert!(msg.contains("ldthisbyname"), "{msg}");
+    assert!(msg.contains("jeqnull"), "{msg}");
 }
 
 // ---- call-kind tags ----

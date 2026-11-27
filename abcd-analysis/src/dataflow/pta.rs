@@ -100,7 +100,7 @@
 //! cut sets [`PtaStats::capped`] and the driver degrades to rung 1
 //! (sound, loud).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use abcd_ir::{
@@ -108,7 +108,10 @@ use abcd_ir::{
 };
 
 use super::alias::QueryAnswer;
-use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
+use super::heap::{
+    AliasOracle, AllocSiteSet, SingletonSiteClassifier, SiteInfo, is_keyed_alloc,
+    resolve_alloc_sites,
+};
 use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallEdge, CallEdgeKind, CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
@@ -138,6 +141,20 @@ const MAX_SLICED_EXTRA_FUNCS: usize = 768;
 /// activation, `Some(call)` the activation entered through `call`.
 pub type Ctx = Option<InstId>;
 
+/// Abstract field-bearing object identity (`Site` instance/constructor vs
+/// synthetic class/super prototype views).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ObjLoc {
+    /// Concrete/constructor/literal site `(site, ctx)`.
+    Site(InstId, Ctx),
+    /// `Cls.prototype` object of a `DefineClass` / `DefineSendableClass` `(site, ctx)`.
+    ClassProto(InstId, Ctx),
+    /// Superclass prototype view for `super.prop` inside instance methods of `(site, ctx)`.
+    SuperProto(InstId, Ctx),
+    /// Superclass constructor view for `super.prop` inside static methods of `(site, ctx)`.
+    SuperStatic(InstId, Ctx),
+}
+
 /// An abstract heap object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Obj {
@@ -165,6 +182,19 @@ enum Obj {
         /// `CreateObjectWithExcludedKeys` allocations).
         keyed: bool,
     },
+    /// Synthetic non-keyed prototype / super-lookup object backed by an [`ObjLoc`].
+    Proto(ObjLoc),
+}
+
+impl Obj {
+    #[inline]
+    fn loc(self) -> Option<ObjLoc> {
+        match self {
+            Obj::Site { site, ctx, .. } => Some(ObjLoc::Site(site, ctx)),
+            Obj::Proto(loc) => Some(loc),
+            Obj::Unknown | Obj::GlobalThis => None,
+        }
+    }
 }
 
 /// Ordered lexical-environment flavor for `Ptr` keys (`abcd_ir::LexEnvKind`
@@ -187,7 +217,7 @@ impl From<abcd_ir::LexEnvKind> for LexKindKey {
 }
 
 /// A field bucket of an abstract object (the
-/// [`super::heap::FieldKey`] vocabulary, per object).
+/// [`super::heap::FieldKey`] vocabulary, per object, plus private fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Slot {
     /// A statically named property.
@@ -196,6 +226,8 @@ enum Slot {
     Index,
     /// A computed-key property.
     Dynamic,
+    /// An ECMAScript private field `(optional NewLexEnv site, slot)` (`StorePrivate` / `LoadPrivate`).
+    Private((Option<InstId>, u16)),
 }
 
 /// A pointer (a node of the pointer-flow graph).
@@ -203,19 +235,29 @@ enum Slot {
 enum Ptr {
     /// An SSA value in an activation.
     Local(ValueId, Ctx),
-    /// A field bucket of one abstract object `(site, ctx)`.
-    Field(InstId, Ctx, Slot),
+    /// A field bucket of one abstract object location.
+    Field(ObjLoc, Slot),
+    /// Dynamic superclass constructor pointer for `DefineClass` `(class_site, class_ctx)`.
+    SuperCtor(InstId, Ctx),
+    /// Dynamic `super` property receiver pointer for `(method_or_ctor_fn)`.
+    SuperPropBase(FuncId),
     /// A named global binding (the module-global object's field — d4).
     Global(Sym),
     /// Computed/indexed stores on `globalThis`.
     GlobalDynamic,
     /// A per-record module-variable slot `(ClassId, local_slot)`.
     ModuleVar(ClassId, u32),
-    /// A lexical-environment slot `(NewLexEnv InstId, slot, is_recorded_ctx)`.
-    LexVar(InstId, u16, bool),
+    /// Per-writer lexical-environment slot `(NewLexEnv InstId, writer FuncId, slot, is_recorded_ctx)`.
+    LexVar(InstId, FuncId, u16, bool),
+    /// Aggregated lexical-environment slot `(NewLexEnv InstId, slot)` for on-the-fly
+    /// propagation during `pump`.
+    LexVarAll(InstId, u16),
+    /// Activation-local lexical-environment slot `(NewLexEnv InstId, ctx, slot)`
+    /// for non-captured same-function reads.
+    LexVarLocal(InstId, Ctx, u16),
     /// Conservative fallback slot for `PutLexVar`/`GetLexVar` on an `Unknown`
-    /// or `truncated_outer` lexical frame, partitioned by `(kind, slot)`.
-    UnknownLexVar(LexKindKey, u16),
+    /// or `truncated_outer` lexical frame, partitioned by `(record ClassId, kind, slot)`.
+    UnknownLexVar(ClassId, LexKindKey, u16),
     /// Element-spread bridge pointer `(inst, ctx)` for `ArraySpread` and
     /// `CallKind::{Apply, NewSpread, SuperSpread}`.
     SpreadElem(InstId, Ctx),
@@ -228,8 +270,10 @@ enum Read {
     Named(Sym),
     /// `Index` ∪ `Dynamic`.
     Index,
-    /// Every bucket (re-armed when a new bucket appears).
+    /// Every public bucket (re-armed when a new bucket appears).
     All,
+    /// Private slot `(optional NewLexEnv site, slot)` only.
+    Private((Option<InstId>, u16)),
 }
 
 /// A statement-level handler, fired once per `(handler, object)`:
@@ -247,12 +291,24 @@ enum Handler {
     /// (`CopyDataProps` / `CreateObjectWithExcludedKeys`), skipping excluded
     /// constant property names stored in `Pta::copy_excluded[excl_idx]`.
     CopyProps { dst_base: Ptr, excl_idx: u32 },
-    /// Copy all buckets written on `dst_obj` from `src_obj` (`site, ctx`).
+    /// Copy all public buckets written on `src_loc` onto `dst_obj` (skipping
+    /// `copy_excluded[excl_idx]` and, when `respect_own_methods` is `true`, any
+    /// method explicitly declared on `dst_obj` so subclass overrides shadow base
+    /// methods cleanly).
     CopyFromSrc {
-        src_site: InstId,
-        src_ctx: Ctx,
+        src_loc: ObjLoc,
         excl_idx: u32,
+        respect_own_methods: bool,
     },
+    /// Wire `DefineClass` / `DefineSendableClass` `(sub_site, sub_ctx)`
+    /// prototype, static, and super-constructor inheritance from `heritage` (`base` of handler).
+    InheritClass { sub_site: InstId, sub_ctx: Ctx },
+    /// Link `child_loc`'s prototype delegation to any object arriving on `base`
+    /// (`LegacyFn.prototype` or `SetObjectWithProto`'s `proto` operand).
+    LinkProtoFromBase { child_loc: ObjLoc },
+    /// `SetObjectWithProto { proto, obj }`: fired on `obj` (`base`), registers
+    /// `LinkProtoFromBase` on `proto_ptr`.
+    SetObjProto { proto_ptr: Ptr },
     /// Seed `Obj::Unknown` into wildcard element/property slots (`Index`,
     /// `Dynamic`) of an object escaping into an incomplete/external call.
     TaintEscape,
@@ -269,6 +325,10 @@ pub struct PtaConfig {
     pub step_budget: usize,
     /// Lexical-environment stack depth cap.
     pub max_env_depth: usize,
+    /// Explicit synthesized lifecycle harness [`FuncId`] from
+    /// [`crate::ohos_lifecycle::EntryModel::harness_func`], when present
+    /// (`None` falls back to matching [`crate::ohos_lifecycle::OHOS_HARNESS_FUNC`]).
+    pub harness_func: Option<FuncId>,
 }
 
 impl Default for PtaConfig {
@@ -276,6 +336,7 @@ impl Default for PtaConfig {
         PtaConfig {
             step_budget: DEFAULT_STEP_BUDGET,
             max_env_depth: DEFAULT_MAX_ENV_DEPTH,
+            harness_func: None,
         }
     }
 }
@@ -422,6 +483,16 @@ pub struct Rung2Tables {
     env_stack_at: Vec<Arc<EnvState>>,
     /// Instruction index → whether it is a `NewLexEnv`/`NewLexEnvWithName`.
     env_sites: Vec<bool>,
+    /// Precomputed `O(1)` concrete-singleton classifier over the co-evolved graph (`D5`).
+    singletons: SingletonSiteClassifier,
+}
+
+impl Rung2Tables {
+    /// Borrow the precomputed [`SingletonSiteClassifier`] (`D5`).
+    #[must_use]
+    pub fn singletons(&self) -> &SingletonSiteClassifier {
+        &self.singletons
+    }
 }
 
 /// The outcome of [`analyze`]: the co-evolved call graph plus the
@@ -723,11 +794,27 @@ fn collect_active_harness_receivers_in(
     active
 }
 
+fn is_harness_func(
+    module: &Module,
+    fid: FuncId,
+    fd: &abcd_ir::FunctionData,
+    explicit_harness: Option<FuncId>,
+) -> bool {
+    match explicit_harness {
+        Some(hf) => hf == fid,
+        None => module.sym.resolve(fd.name) == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC),
+    }
+}
+
 /// Precompute the deterministic bounded forward slice (`slice_allow`, `func_hop`)
 /// for root-sliced PTA (`roots = Some(root_funcs)`), starting at hop `0` from
 /// non-harness `root_funcs` and hop `1` from active `OHOS_HARNESS_FUNC` callees,
 /// expanding up to `max_base_hop` hops (capped at [`MAX_SLICED_EXTRA_FUNCS`]
 /// newly discovered functions) without recursion.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "precomputed module/link/callgraph/env tables passed directly into sliced BFS"
+)]
 fn compute_sliced_bfs(
     module: &Module,
     links: &ModuleLinkTable,
@@ -736,6 +823,7 @@ fn compute_sliced_bfs(
     root_funcs: &[FuncId],
     root_keep: &BTreeSet<FuncId>,
     max_base_hop: u8,
+    explicit_harness: Option<FuncId>,
 ) -> (Vec<bool>, Vec<u8>) {
     let mut func_hop = vec![u8::MAX; module.functions.len()];
     let mut queue: VecDeque<FuncId> = VecDeque::new();
@@ -766,7 +854,7 @@ fn compute_sliced_bfs(
         if fd.is_external || fd.blocks.is_empty() {
             continue;
         }
-        if module.sym.resolve(fd.name) == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC) {
+        if is_harness_func(module, func, fd, explicit_harness) {
             if let Some(slot) = func_hop.get_mut(func.index()) {
                 *slot = 0;
             }
@@ -989,6 +1077,12 @@ struct SliceInit {
     max_dyn_hop: u8,
 }
 
+/// Deferred step on the iterative handler-firing stack.
+enum FireStep {
+    Fire(u32, Obj),
+    AddEdge(Ptr, Ptr),
+}
+
 /// The engine state.
 struct Pta<'m> {
     module: &'m Module,
@@ -1023,14 +1117,34 @@ struct Pta<'m> {
     handlers_by_base: HashMap<Ptr, Vec<u32>>,
     /// `(handler, object)` pairs already fired.
     fired: BTreeSet<(u32, Obj)>,
-    /// Dynamic-read / copy-src `(handler id, object)` pairs indexed by `(site, ctx)`
+    /// Explicit LIFO workstack for iterative handler firing and re-arm cascades.
+    fire_stack: Vec<FireStep>,
+    /// Dynamic-read / copy-src `(handler id, object)` pairs indexed by `ObjLoc`
     /// (lookup-only map; `BTreeSet` values preserve deterministic `(id, o)` order).
-    dyn_loads_by_obj: HashMap<(InstId, Ctx), BTreeSet<(u32, Obj)>>,
-    /// Buckets known per object `(site, ctx)` — a NEW bucket re-arms
-    /// the dynamic reads / property copies that already fired on the object.
-    buckets: BTreeMap<(InstId, Ctx), BTreeSet<Slot>>,
+    dyn_loads_by_obj: HashMap<ObjLoc, BTreeSet<(u32, Obj)>>,
+    /// Buckets known per `ObjLoc` — a NEW bucket re-arms the dynamic reads /
+    /// property copies / prototype delegations that already fired on the object.
+    buckets: BTreeMap<ObjLoc, BTreeSet<Slot>>,
     /// Excluded constant string keys per `CopyProps` / `CopyFromSrc` handler.
     copy_excluded: Vec<BTreeSet<Sym>>,
+    /// Own named methods declared directly on `(ObjLoc, Slot)` so inherited
+    /// superclass prototype/static methods do not overwrite subclass overrides.
+    own_class_members: HashSet<(ObjLoc, Slot)>,
+    /// `DefineClass` / `DefineSendableClass` instruction sites.
+    class_sites: HashSet<InstId>,
+    /// Active `(class_site, class_ctx)` pairs per constructor `FuncId`.
+    ctor_class_activations: HashMap<FuncId, BTreeSet<(InstId, Ctx)>>,
+    /// Interned `Sym`s equal to `"prototype"` in `module.sym`.
+    proto_syms: Vec<Sym>,
+    /// Interned `Sym`s equal to `"value"` in `module.sym` (for `CreateIterResultObj`).
+    value_syms: Vec<Sym>,
+    /// Variadic argument sinks `(var_iid, skip_formals)` (`GetUnmappedArgs` /
+    /// `CopyRestArgs`) per function `FuncId`.
+    variadic_sinks: HashMap<FuncId, Vec<(InstId, usize)>>,
+    /// Writer functions per `(NewLexEnv InstId, slot)` pair, plus non-owner writers.
+    lex_writers: BTreeMap<(InstId, u16), BTreeSet<FuncId>>,
+    /// `(NewLexEnv InstId, slot)` pairs written by at least one child closure (`func != owner_fn`).
+    lex_captured_mutated: HashSet<(InstId, u16)>,
     /// Instance methods `(method_sym, mfid)` per constructor `FuncId`.
     ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>>,
     /// Wired internal call edges `(call, caller ctx, callee)`.
@@ -1039,6 +1153,8 @@ struct Pta<'m> {
     call_targets: BTreeMap<(InstId, Ctx), BTreeSet<FuncId>>,
     /// Call-site activations whose callee set contained `Unknown`.
     call_unknown: BTreeSet<(InstId, Ctx)>,
+    /// Call sites where root-slicing / dynamic-hop caps skipped wiring a target.
+    hop_cut_calls: BTreeSet<InstId>,
     /// Scanned call activations `(call, caller ctx)` for completeness checking.
     scanned_calls: Vec<(InstId, Ctx)>,
     /// Scanned call activations already tainted for incomplete/external escape.
@@ -1068,17 +1184,69 @@ impl<'m> Pta<'m> {
             ),
             None => (None, None, Vec::new(), MAX_SLICED_DYN_HOP),
         };
+        let mut proto_syms = Vec::new();
+        let mut value_syms = Vec::new();
+        for si in 0..module.sym.len() {
+            let sym = Sym::new(si as u32);
+            match module.sym.resolve(sym) {
+                Some("prototype") => proto_syms.push(sym),
+                Some("value") => value_syms.push(sym),
+                _ => {}
+            }
+        }
         let mut ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>> = HashMap::new();
-        for inst in &module.insts {
-            if let Op::DefineClass(cls) | Op::DefineSendableClass(cls) = &inst.op {
-                let entry = ctor_inst_methods.entry(cls.ctor).or_default();
-                for (sym, mfid, is_static) in class_named_methods(module, cls) {
-                    if !is_static && !entry.contains(&(sym, mfid)) {
-                        entry.push((sym, mfid));
+        let mut class_sites: HashSet<InstId> = HashSet::new();
+        let mut variadic_sinks: HashMap<FuncId, Vec<(InstId, usize)>> = HashMap::new();
+        let mut lex_captured_mutated: HashSet<(InstId, u16)> = HashSet::new();
+
+        for (fi, fd) in module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            for &b in &fd.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                for &iid in &bb.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                            class_sites.insert(iid);
+                            let entry = ctor_inst_methods.entry(cls.ctor).or_default();
+                            for (sym, mfid, is_static) in class_named_methods(module, cls) {
+                                if !is_static && !entry.contains(&(sym, mfid)) {
+                                    entry.push((sym, mfid));
+                                }
+                            }
+                        }
+                        Op::GetUnmappedArgs => {
+                            variadic_sinks.entry(fid).or_default().push((iid, 0));
+                        }
+                        Op::CopyRestArgs { start_index } => {
+                            variadic_sinks
+                                .entry(fid)
+                                .or_default()
+                                .push((iid, *start_index as usize));
+                        }
+                        Op::PutLexVar {
+                            level, slot, kind, ..
+                        } => {
+                            if let Some(entry) = env_stack_at
+                                .get(iid.index())
+                                .and_then(|es| es.chain(*kind))
+                                .and_then(|ch| ch.at_level(*level))
+                            {
+                                for &env_site in &entry.sites {
+                                    if links.inst_func(module, env_site) != Some(fid) {
+                                        lex_captured_mutated.insert((env_site, *slot));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+
         Pta {
             module,
             links,
@@ -1098,13 +1266,23 @@ impl<'m> Pta<'m> {
             handlers: Vec::new(),
             handlers_by_base: HashMap::new(),
             fired: BTreeSet::new(),
+            fire_stack: Vec::new(),
             dyn_loads_by_obj: HashMap::new(),
             buckets: BTreeMap::new(),
             copy_excluded: vec![BTreeSet::new()],
+            own_class_members: HashSet::new(),
+            class_sites,
+            ctor_class_activations: HashMap::new(),
+            proto_syms,
+            value_syms,
+            variadic_sinks,
+            lex_writers: BTreeMap::new(),
+            lex_captured_mutated,
             ctor_inst_methods,
             wired: BTreeSet::new(),
             call_targets: BTreeMap::new(),
             call_unknown: BTreeSet::new(),
+            hop_cut_calls: BTreeSet::new(),
             scanned_calls: Vec::new(),
             tainted_calls: BTreeSet::new(),
             load_results: Vec::new(),
@@ -1186,33 +1364,44 @@ impl<'m> Pta<'m> {
         }
     }
 
+    /// Push one `(handler_id, obj)` firing onto the deferred workstack.
+    fn enqueue_fire(&mut self, id: u32, o: Obj) {
+        self.fire_stack.push(FireStep::Fire(id, o));
+    }
+
+    /// Register a handler and enqueue immediate catch-up firings onto
+    /// `self.fire_stack` without re-entering `drain_fires`.
+    fn register_deferred(&mut self, base: Ptr, handler: Handler) {
+        let id = self.handlers.len() as u32;
+        self.handlers.push((base, handler));
+        self.handlers_by_base.entry(base).or_default().push(id);
+        if let Some(objs) = self.pts.get(&base).cloned() {
+            for o in objs.into_iter().rev() {
+                self.enqueue_fire(id, o);
+            }
+        }
+    }
+
     /// Register a statement handler on a base pointer. Handlers
     /// register during activation scans, but an aliased base pointer
     /// may already carry facts — fire on those immediately (the
     /// statement-level delta discipline).
     fn register(&mut self, base: Ptr, handler: Handler) {
-        let id = self.handlers.len() as u32;
-        self.handlers.push((base, handler));
-        self.handlers_by_base.entry(base).or_default().push(id);
-        // Defensive catch-up if `base` already carries facts (under the
-        // activation-priority pump discipline, pending activations scan
-        // before worklist facts populate `pts`).
-        if let Some(objs) = self.pts.get(&base).cloned() {
-            for o in objs {
-                self.fire(id, o);
-            }
-        }
+        self.register_deferred(base, handler);
+        self.drain_fires();
     }
 
     /// Fire one handler on one object (once per pair), driving any bucket
-    /// re-arm cascade over an explicit stack rather than mutual recursion.
+    /// re-arm or call-wiring cascade over `self.fire_stack`.
     fn fire(&mut self, first_id: u32, first_o: Obj) {
-        enum FireStep {
-            Fire(u32, Obj),
-            AddEdge(Ptr, Ptr),
-        }
-        let mut stack = vec![FireStep::Fire(first_id, first_o)];
-        while let Some(step) = stack.pop() {
+        self.enqueue_fire(first_id, first_o);
+        self.drain_fires();
+    }
+
+    /// Iteratively drain all pending `FireStep`s on `self.fire_stack` without
+    /// direct or mutual call-stack recursion.
+    fn drain_fires(&mut self) {
+        while let Some(step) = self.fire_stack.pop() {
             match step {
                 FireStep::AddEdge(s, t) => self.add_edge(s, t),
                 FireStep::Fire(id, o) => {
@@ -1221,68 +1410,85 @@ impl<'m> Pta<'m> {
                     }
                     let (_, handler) = self.handlers[id as usize];
                     match handler {
-                        Handler::Store { value, slot } => match o {
-                            Obj::Site { site, ctx, .. } => {
-                                stack.push(FireStep::AddEdge(value, Ptr::Field(site, ctx, slot)));
-                                let rearm = self.note_bucket_rearms(site, ctx, slot);
+                        Handler::Store { value, slot } => match o.loc() {
+                            Some(loc) => {
+                                self.fire_stack
+                                    .push(FireStep::AddEdge(value, Ptr::Field(loc, slot)));
+                                let rearm = self.note_bucket_rearms(loc, slot);
                                 for (rid, ro) in rearm.into_iter().rev() {
-                                    stack.push(FireStep::Fire(rid, ro));
+                                    self.fire_stack.push(FireStep::Fire(rid, ro));
                                 }
                             }
-                            Obj::GlobalThis => match slot {
-                                Slot::Named(name) => {
-                                    stack.push(FireStep::AddEdge(value, Ptr::Global(name)));
-                                }
-                                Slot::Index | Slot::Dynamic => {
-                                    stack.push(FireStep::AddEdge(value, Ptr::GlobalDynamic));
-                                }
+                            None => match o {
+                                Obj::GlobalThis => match slot {
+                                    Slot::Named(name) => {
+                                        self.fire_stack
+                                            .push(FireStep::AddEdge(value, Ptr::Global(name)));
+                                    }
+                                    Slot::Index | Slot::Dynamic => {
+                                        self.fire_stack
+                                            .push(FireStep::AddEdge(value, Ptr::GlobalDynamic));
+                                    }
+                                    Slot::Private(_) => {}
+                                },
+                                Obj::Unknown | Obj::Site { .. } | Obj::Proto(_) => {}
                             },
-                            Obj::Unknown => {}
                         },
-                        Handler::Load { result, read } => match o {
-                            Obj::Site { site, ctx, .. } => {
+                        Handler::Load { result, read } => match o.loc() {
+                            Some(loc) => {
                                 let slots: Vec<Slot> = match read {
                                     Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
                                     Read::Index => vec![Slot::Index, Slot::Dynamic],
+                                    Read::Private(pslot) => vec![Slot::Private(pslot)],
                                     Read::All => {
                                         self.dyn_loads_by_obj
-                                            .entry((site, ctx))
+                                            .entry(loc)
                                             .or_default()
                                             .insert((id, o));
                                         self.buckets
-                                            .get(&(site, ctx))
-                                            .map(|b| b.iter().copied().collect())
+                                            .get(&loc)
+                                            .map(|b| {
+                                                b.iter()
+                                                    .copied()
+                                                    .filter(|s| !matches!(s, Slot::Private(_)))
+                                                    .collect()
+                                            })
                                             .unwrap_or_default()
                                     }
                                 };
                                 for slot in slots {
-                                    self.add_edge(Ptr::Field(site, ctx, slot), result);
+                                    self.add_edge(Ptr::Field(loc, slot), result);
                                 }
                             }
-                            Obj::GlobalThis => match read {
-                                Read::Named(name) => {
-                                    self.add_edge(Ptr::Global(name), result);
-                                    self.add_edge(Ptr::GlobalDynamic, result);
-                                }
-                                Read::Index | Read::All => {
-                                    self.add_edge(Ptr::GlobalDynamic, result);
+                            None => match o {
+                                Obj::GlobalThis => match read {
+                                    Read::Named(name) => {
+                                        self.add_edge(Ptr::Global(name), result);
+                                        self.add_edge(Ptr::GlobalDynamic, result);
+                                    }
+                                    Read::Index | Read::All => {
+                                        self.add_edge(Ptr::GlobalDynamic, result);
+                                        self.add_fact(result, Obj::Unknown);
+                                    }
+                                    Read::Private(_) => {
+                                        self.add_fact(result, Obj::Unknown);
+                                    }
+                                },
+                                Obj::Unknown | Obj::Site { .. } | Obj::Proto(_) => {
                                     self.add_fact(result, Obj::Unknown);
                                 }
                             },
-                            Obj::Unknown => {
-                                self.add_fact(result, Obj::Unknown);
-                            }
                         },
                         Handler::Call { call, caller_ctx } => {
                             self.resolve_call(call, caller_ctx, o);
                         }
-                        Handler::CopyProps { dst_base, excl_idx } => match o {
-                            Obj::Site { site, ctx, .. } => {
+                        Handler::CopyProps { dst_base, excl_idx } => match o.loc() {
+                            Some(src_loc) => {
                                 let sub_id = self.handlers.len() as u32;
                                 let sub_h = Handler::CopyFromSrc {
-                                    src_site: site,
-                                    src_ctx: ctx,
+                                    src_loc,
                                     excl_idx,
+                                    respect_own_methods: false,
                                 };
                                 self.handlers.push((dst_base, sub_h));
                                 self.handlers_by_base
@@ -1291,11 +1497,11 @@ impl<'m> Pta<'m> {
                                     .push(sub_id);
                                 if let Some(dst_objs) = self.pts.get(&dst_base).cloned() {
                                     for dst_o in dst_objs.into_iter().rev() {
-                                        stack.push(FireStep::Fire(sub_id, dst_o));
+                                        self.fire_stack.push(FireStep::Fire(sub_id, dst_o));
                                     }
                                 }
                             }
-                            Obj::Unknown | Obj::GlobalThis => {
+                            None => {
                                 let sub_id = self.handlers.len() as u32;
                                 self.handlers.push((dst_base, Handler::TaintEscape));
                                 self.handlers_by_base
@@ -1304,32 +1510,35 @@ impl<'m> Pta<'m> {
                                     .push(sub_id);
                                 if let Some(dst_objs) = self.pts.get(&dst_base).cloned() {
                                     for dst_o in dst_objs.into_iter().rev() {
-                                        stack.push(FireStep::Fire(sub_id, dst_o));
+                                        self.fire_stack.push(FireStep::Fire(sub_id, dst_o));
                                     }
                                 }
                             }
                         },
                         Handler::CopyFromSrc {
-                            src_site,
-                            src_ctx,
+                            src_loc,
                             excl_idx,
+                            respect_own_methods,
                         } => {
-                            let Obj::Site {
-                                site: dst_site,
-                                ctx: dst_ctx,
-                                ..
-                            } = o
-                            else {
+                            let Some(dst_loc) = o.loc() else {
                                 continue;
                             };
+                            if src_loc == dst_loc {
+                                continue;
+                            }
                             self.dyn_loads_by_obj
-                                .entry((src_site, src_ctx))
+                                .entry(src_loc)
                                 .or_default()
                                 .insert((id, o));
                             let src_slots: Vec<Slot> = self
                                 .buckets
-                                .get(&(src_site, src_ctx))
-                                .map(|b| b.iter().copied().collect())
+                                .get(&src_loc)
+                                .map(|b| {
+                                    b.iter()
+                                        .copied()
+                                        .filter(|s| !matches!(s, Slot::Private(_)))
+                                        .collect()
+                                })
                                 .unwrap_or_default();
                             for slot in src_slots {
                                 if let Slot::Named(sym) = slot
@@ -1340,18 +1549,200 @@ impl<'m> Pta<'m> {
                                 {
                                     continue;
                                 }
-                                stack.push(FireStep::AddEdge(
-                                    Ptr::Field(src_site, src_ctx, slot),
-                                    Ptr::Field(dst_site, dst_ctx, slot),
+                                if respect_own_methods
+                                    && self.own_class_members.contains(&(dst_loc, slot))
+                                {
+                                    continue;
+                                }
+                                self.fire_stack.push(FireStep::AddEdge(
+                                    Ptr::Field(src_loc, slot),
+                                    Ptr::Field(dst_loc, slot),
                                 ));
-                                let rearm = self.note_bucket_rearms(dst_site, dst_ctx, slot);
+                                let rearm = self.note_bucket_rearms(dst_loc, slot);
                                 for (rid, ro) in rearm.into_iter().rev() {
-                                    stack.push(FireStep::Fire(rid, ro));
+                                    self.fire_stack.push(FireStep::Fire(rid, ro));
+                                }
+                            }
+                        }
+                        Handler::InheritClass { sub_site, sub_ctx } => {
+                            let sub_cls_loc = ObjLoc::Site(sub_site, sub_ctx);
+                            let sub_proto_loc = ObjLoc::ClassProto(sub_site, sub_ctx);
+                            let sub_super_proto = ObjLoc::SuperProto(sub_site, sub_ctx);
+                            let sub_super_static = ObjLoc::SuperStatic(sub_site, sub_ctx);
+                            match o {
+                                Obj::Site {
+                                    site: base_site,
+                                    ctx: base_ctx,
+                                    callable,
+                                    ..
+                                } => {
+                                    let base_cls_loc = ObjLoc::Site(base_site, base_ctx);
+                                    // 1. Dynamic super constructor target (`super(...)`).
+                                    if callable.is_some() {
+                                        self.add_fact(Ptr::SuperCtor(sub_site, sub_ctx), o);
+                                    }
+                                    // 2. Static constructor chain (`Sub.__proto__ = Base`) and
+                                    //    static `super.prop` view.
+                                    let st_id = self.handlers.len() as u32;
+                                    self.handlers.push((
+                                        Ptr::SuperCtor(sub_site, sub_ctx),
+                                        Handler::CopyFromSrc {
+                                            src_loc: base_cls_loc,
+                                            excl_idx: 0,
+                                            respect_own_methods: true,
+                                        },
+                                    ));
+                                    self.fire_stack
+                                        .push(FireStep::Fire(st_id, Obj::Proto(sub_cls_loc)));
+
+                                    let sst_id = self.handlers.len() as u32;
+                                    self.handlers.push((
+                                        Ptr::SuperCtor(sub_site, sub_ctx),
+                                        Handler::CopyFromSrc {
+                                            src_loc: base_cls_loc,
+                                            excl_idx: 0,
+                                            respect_own_methods: false,
+                                        },
+                                    ));
+                                    self.fire_stack
+                                        .push(FireStep::Fire(sst_id, Obj::Proto(sub_super_static)));
+
+                                    // 3. Instance prototype chain (`Sub.prototype.__proto__ = Base.prototype`)
+                                    //    and instance `super.prop` view.
+                                    if self.class_sites.contains(&base_site) {
+                                        let base_proto_loc =
+                                            ObjLoc::ClassProto(base_site, base_ctx);
+                                        let pr_id = self.handlers.len() as u32;
+                                        self.handlers.push((
+                                            Ptr::SuperCtor(sub_site, sub_ctx),
+                                            Handler::CopyFromSrc {
+                                                src_loc: base_proto_loc,
+                                                excl_idx: 0,
+                                                respect_own_methods: true,
+                                            },
+                                        ));
+                                        self.fire_stack
+                                            .push(FireStep::Fire(pr_id, Obj::Proto(sub_proto_loc)));
+
+                                        let spr_id = self.handlers.len() as u32;
+                                        self.handlers.push((
+                                            Ptr::SuperCtor(sub_site, sub_ctx),
+                                            Handler::CopyFromSrc {
+                                                src_loc: base_proto_loc,
+                                                excl_idx: 0,
+                                                respect_own_methods: false,
+                                            },
+                                        ));
+                                        self.fire_stack.push(FireStep::Fire(
+                                            spr_id,
+                                            Obj::Proto(sub_super_proto),
+                                        ));
+                                    } else {
+                                        let ps_list = self.proto_syms.clone();
+                                        for psym in ps_list {
+                                            let base_proto_ptr =
+                                                Ptr::Field(base_cls_loc, Slot::Named(psym));
+                                            for target_loc in [sub_proto_loc, sub_super_proto] {
+                                                let lp_id = self.handlers.len() as u32;
+                                                self.handlers.push((
+                                                    base_proto_ptr,
+                                                    Handler::LinkProtoFromBase {
+                                                        child_loc: target_loc,
+                                                    },
+                                                ));
+                                                self.handlers_by_base
+                                                    .entry(base_proto_ptr)
+                                                    .or_default()
+                                                    .push(lp_id);
+                                                if let Some(pobjs) =
+                                                    self.pts.get(&base_proto_ptr).cloned()
+                                                {
+                                                    for po in pobjs.into_iter().rev() {
+                                                        self.fire_stack
+                                                            .push(FireStep::Fire(lp_id, po));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Obj::Proto(parent_loc) => {
+                                    let pr_id = self.handlers.len() as u32;
+                                    self.handlers.push((
+                                        Ptr::SuperCtor(sub_site, sub_ctx),
+                                        Handler::CopyFromSrc {
+                                            src_loc: parent_loc,
+                                            excl_idx: 0,
+                                            respect_own_methods: true,
+                                        },
+                                    ));
+                                    self.fire_stack
+                                        .push(FireStep::Fire(pr_id, Obj::Proto(sub_proto_loc)));
+                                }
+                                Obj::Unknown | Obj::GlobalThis => {
+                                    self.add_fact(Ptr::SuperCtor(sub_site, sub_ctx), Obj::Unknown);
+                                    for loc in [
+                                        sub_cls_loc,
+                                        sub_proto_loc,
+                                        sub_super_proto,
+                                        sub_super_static,
+                                    ] {
+                                        self.add_fact(Ptr::Field(loc, Slot::Dynamic), Obj::Unknown);
+                                        let rearm = self.note_bucket_rearms(loc, Slot::Dynamic);
+                                        for (rid, ro) in rearm.into_iter().rev() {
+                                            self.fire_stack.push(FireStep::Fire(rid, ro));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Handler::LinkProtoFromBase { child_loc } => match o.loc() {
+                            Some(parent_loc) => {
+                                if parent_loc != child_loc {
+                                    let cp_id = self.handlers.len() as u32;
+                                    self.handlers.push((
+                                        Ptr::Field(child_loc, Slot::Dynamic),
+                                        Handler::CopyFromSrc {
+                                            src_loc: parent_loc,
+                                            excl_idx: 0,
+                                            respect_own_methods: true,
+                                        },
+                                    ));
+                                    self.fire_stack
+                                        .push(FireStep::Fire(cp_id, Obj::Proto(child_loc)));
+                                }
+                            }
+                            None => {
+                                if matches!(o, Obj::Unknown | Obj::GlobalThis) {
+                                    self.add_fact(
+                                        Ptr::Field(child_loc, Slot::Dynamic),
+                                        Obj::Unknown,
+                                    );
+                                    let rearm = self.note_bucket_rearms(child_loc, Slot::Dynamic);
+                                    for (rid, ro) in rearm.into_iter().rev() {
+                                        self.fire_stack.push(FireStep::Fire(rid, ro));
+                                    }
+                                }
+                            }
+                        },
+                        Handler::SetObjProto { proto_ptr } => {
+                            if let Some(child_loc) = o.loc() {
+                                let lp_id = self.handlers.len() as u32;
+                                self.handlers
+                                    .push((proto_ptr, Handler::LinkProtoFromBase { child_loc }));
+                                self.handlers_by_base
+                                    .entry(proto_ptr)
+                                    .or_default()
+                                    .push(lp_id);
+                                if let Some(pobjs) = self.pts.get(&proto_ptr).cloned() {
+                                    for po in pobjs.into_iter().rev() {
+                                        self.fire_stack.push(FireStep::Fire(lp_id, po));
+                                    }
                                 }
                             }
                         }
                         Handler::TaintEscape | Handler::TaintEscapeIndex => {
-                            let Obj::Site { site, ctx, .. } = o else {
+                            let Some(loc) = o.loc() else {
                                 continue;
                             };
                             let slots: &[Slot] = if matches!(handler, Handler::TaintEscapeIndex) {
@@ -1360,10 +1751,10 @@ impl<'m> Pta<'m> {
                                 &[Slot::Index, Slot::Dynamic]
                             };
                             for &slot in slots {
-                                self.add_fact(Ptr::Field(site, ctx, slot), Obj::Unknown);
-                                let rearm = self.note_bucket_rearms(site, ctx, slot);
+                                self.add_fact(Ptr::Field(loc, slot), Obj::Unknown);
+                                let rearm = self.note_bucket_rearms(loc, slot);
                                 for (rid, ro) in rearm.into_iter().rev() {
-                                    stack.push(FireStep::Fire(rid, ro));
+                                    self.fire_stack.push(FireStep::Fire(rid, ro));
                                 }
                             }
                         }
@@ -1373,13 +1764,13 @@ impl<'m> Pta<'m> {
         }
     }
 
-    /// Record a bucket on an object and return any `(handler_id, obj)` dynamic
-    /// reads that need to re-fire (already cleared from `self.fired`).
-    fn note_bucket_rearms(&mut self, site: InstId, ctx: Ctx, slot: Slot) -> Vec<(u32, Obj)> {
-        if !self.buckets.entry((site, ctx)).or_default().insert(slot) {
+    /// Record a bucket on `loc` and return any `(handler_id, obj)` dynamic
+    /// reads / copies that need to re-fire (already cleared from `self.fired`).
+    fn note_bucket_rearms(&mut self, loc: ObjLoc, slot: Slot) -> Vec<(u32, Obj)> {
+        if !self.buckets.entry(loc).or_default().insert(slot) {
             return Vec::new();
         }
-        let Some(loads) = self.dyn_loads_by_obj.get(&(site, ctx)) else {
+        let Some(loads) = self.dyn_loads_by_obj.get(&loc) else {
             return Vec::new();
         };
         let rearm: Vec<(u32, Obj)> = loads.iter().copied().collect();
@@ -1389,14 +1780,45 @@ impl<'m> Pta<'m> {
         rearm
     }
 
-    /// Note a bucket on an object; a NEW bucket re-arms the dynamic
-    /// reads that already fired on it (a computed read sees every
-    /// bucket, including ones created after the read first fired).
-    fn note_bucket(&mut self, site: InstId, ctx: Ctx, slot: Slot) {
-        let rearm = self.note_bucket_rearms(site, ctx, slot);
-        for (id, o) in rearm {
-            self.fire(id, o);
+    /// Note a bucket on `loc` and enqueue re-arms onto `self.fire_stack`
+    /// without re-entering `drain_fires`.
+    fn note_bucket_deferred(&mut self, loc: ObjLoc, slot: Slot) {
+        let rearm = self.note_bucket_rearms(loc, slot);
+        for (id, o) in rearm.into_iter().rev() {
+            self.enqueue_fire(id, o);
         }
+    }
+
+    /// Note a bucket on `loc`; a NEW bucket re-arms the dynamic reads / copies
+    /// that already fired on it.
+    fn note_bucket(&mut self, loc: ObjLoc, slot: Slot) {
+        self.note_bucket_deferred(loc, slot);
+        self.drain_fires();
+    }
+
+    /// Link `child_loc` to `parent_loc` and enqueue the initial firing onto
+    /// `self.fire_stack` without re-entering `drain_fires`.
+    fn link_proto_locs_deferred(&mut self, child_loc: ObjLoc, parent_loc: ObjLoc) {
+        if child_loc == parent_loc {
+            return;
+        }
+        let id = self.handlers.len() as u32;
+        self.handlers.push((
+            Ptr::Field(child_loc, Slot::Dynamic),
+            Handler::CopyFromSrc {
+                src_loc: parent_loc,
+                excl_idx: 0,
+                respect_own_methods: true,
+            },
+        ));
+        self.enqueue_fire(id, Obj::Proto(child_loc));
+    }
+
+    /// Link `child_loc` so it inherits public buckets from `parent_loc`
+    /// (respecting `own_class_members` on `child_loc`).
+    fn link_proto_locs(&mut self, child_loc: ObjLoc, parent_loc: ObjLoc) {
+        self.link_proto_locs_deferred(child_loc, parent_loc);
+        self.drain_fires();
     }
 
     /// An object reached a callee pointer: `Unknown` marks the site
@@ -1442,11 +1864,44 @@ impl<'m> Pta<'m> {
                         .filter(|&t| t != body && Some(t) != caller_fn)
                         .collect();
                     if super_targets.is_empty() {
-                        if self.call_unknown.insert((call, caller_ctx)) {
-                            self.stats.call_sites_partial += 1;
-                        }
-                        if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
-                            self.add_fact(Ptr::Local(result, caller_ctx), Obj::Unknown);
+                        // Also consult dynamic `Ptr::SuperCtor(cls_site, cls_ctx)`
+                        // when the derived class has a dynamic `heritage` expression!
+                        if let Some(cls_acts) = self
+                            .ctor_class_activations
+                            .get(&body)
+                            .cloned()
+                            .filter(|s| !s.is_empty())
+                        {
+                            for (cls_site, cls_ctx) in cls_acts {
+                                let sup_ptr = Ptr::SuperCtor(cls_site, cls_ctx);
+                                let sub_id = self.handlers.len() as u32;
+                                self.handlers
+                                    .push((sup_ptr, Handler::Call { call, caller_ctx }));
+                                self.handlers_by_base
+                                    .entry(sup_ptr)
+                                    .or_default()
+                                    .push(sub_id);
+                                if let Some(sobjs) = self.pts.get(&sup_ptr).cloned() {
+                                    for so in sobjs {
+                                        if !matches!(
+                                            so,
+                                            Obj::Site {
+                                                callable: Some(f),
+                                                ..
+                                            } if f == body || Some(f) == caller_fn
+                                        ) {
+                                            self.resolve_call_direct(call, caller_ctx, so);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            if self.call_unknown.insert((call, caller_ctx)) {
+                                self.stats.call_sites_partial += 1;
+                            }
+                            if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
+                                self.add_fact(Ptr::Local(result, caller_ctx), Obj::Unknown);
+                            }
                         }
                     } else {
                         let next_hop = caller_fn
@@ -1464,6 +1919,8 @@ impl<'m> Pta<'m> {
                             }
                             if self.try_record_dyn_hop(super_ctor, next_hop) {
                                 self.wire_call(call, caller_ctx, super_ctor);
+                            } else {
+                                self.hop_cut_calls.insert(call);
                             }
                         }
                     }
@@ -1483,9 +1940,52 @@ impl<'m> Pta<'m> {
                     .saturating_add(1);
                 if self.try_record_dyn_hop(body, next_hop) {
                     self.wire_call(call, caller_ctx, body);
+                } else {
+                    self.hop_cut_calls.insert(call);
                 }
             }
-            Obj::Site { callable: None, .. } | Obj::GlobalThis => {}
+            Obj::Site { callable: None, .. } | Obj::Proto(_) | Obj::GlobalThis => {}
+        }
+    }
+
+    fn resolve_call_direct(&mut self, call: InstId, caller_ctx: Ctx, o: Obj) {
+        match o {
+            Obj::Unknown => {
+                if self.call_unknown.insert((call, caller_ctx)) {
+                    self.stats.call_sites_partial += 1;
+                }
+                if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
+                    self.add_fact(Ptr::Local(result, caller_ctx), Obj::Unknown);
+                }
+            }
+            Obj::Site {
+                callable: Some(body),
+                ..
+            } => {
+                if self
+                    .call_targets
+                    .entry((call, caller_ctx))
+                    .or_default()
+                    .insert(body)
+                {
+                    self.stats.call_edges_resolved += 1;
+                }
+                let caller_fn = self
+                    .base
+                    .edge_at(call)
+                    .map(|e| e.caller)
+                    .or_else(|| self.links.inst_func(self.module, call));
+                let next_hop = caller_fn
+                    .and_then(|f| self.func_hop.get(f.index()).copied())
+                    .unwrap_or(u8::MAX)
+                    .saturating_add(1);
+                if self.try_record_dyn_hop(body, next_hop) {
+                    self.wire_call(call, caller_ctx, body);
+                } else {
+                    self.hop_cut_calls.insert(call);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1521,19 +2021,53 @@ impl<'m> Pta<'m> {
                 callable: None,
                 keyed: true,
             });
-        if constructed_instance.is_some()
-            && let Some(methods) = self.ctor_inst_methods.get(&callee).cloned()
-        {
-            for (msym, mfid) in methods {
-                self.add_fact(
-                    Ptr::Field(call, caller_ctx, Slot::Named(msym)),
-                    Obj::Site {
-                        site: call,
-                        ctx: None,
-                        callable: Some(mfid),
-                        keyed: false,
-                    },
-                );
+        if constructed_instance.is_some() {
+            let inst_loc = ObjLoc::Site(call, caller_ctx);
+            if let Some(methods) = self.ctor_inst_methods.get(&callee).cloned() {
+                for (msym, mfid) in methods {
+                    let slot = Slot::Named(msym);
+                    self.own_class_members.insert((inst_loc, slot));
+                    self.add_fact(
+                        Ptr::Field(inst_loc, slot),
+                        Obj::Site {
+                            site: call,
+                            ctx: None,
+                            callable: Some(mfid),
+                            keyed: false,
+                        },
+                    );
+                    self.note_bucket_deferred(inst_loc, slot);
+                }
+            }
+            // Link constructed instance to `Cls.prototype` (`DefineClass` prototype
+            // chain AND legacy constructor function `Fn.prototype` stores!).
+            if let Some(cls_acts) = self.ctor_class_activations.get(&callee).cloned() {
+                for (cls_site, cls_ctx) in cls_acts {
+                    self.link_proto_locs_deferred(inst_loc, ObjLoc::ClassProto(cls_site, cls_ctx));
+                }
+            }
+            let ps_list = self.proto_syms.clone();
+            if !ps_list.is_empty()
+                && let Some(callee_objs) = self.pts.get(&local(callee_val)).cloned()
+            {
+                for co in callee_objs {
+                    if let Obj::Site {
+                        site: fn_site,
+                        ctx: fn_ctx,
+                        ..
+                    } = co
+                        && !self.class_sites.contains(&fn_site)
+                    {
+                        for &psym in &ps_list {
+                            self.register_deferred(
+                                Ptr::Field(ObjLoc::Site(fn_site, fn_ctx), Slot::Named(psym)),
+                                Handler::LinkProtoFromBase {
+                                    child_loc: inst_loc,
+                                },
+                            );
+                        }
+                    }
+                }
             }
         }
         let caller_fn = self
@@ -1561,6 +2095,11 @@ impl<'m> Pta<'m> {
             self.module.func(caller)?.params.get(c_this_idx).copied()
         })
         .flatten();
+        let callee_variadics = self
+            .variadic_sinks
+            .get(&callee)
+            .cloned()
+            .unwrap_or_default();
         let callee_params = fd.params.clone();
         match frame_slots_of(self.module, callee) {
             Some(slots) if callee_params.len() >= slots.implicit_count() => {
@@ -1582,6 +2121,11 @@ impl<'m> Pta<'m> {
                             for &p in callee_params.iter().skip(formal_base) {
                                 self.add_edge(spread_ptr, Ptr::Local(p, callee_ctx));
                             }
+                            for &(var_iid, _) in &callee_variadics {
+                                let var_loc = ObjLoc::Site(var_iid, callee_ctx);
+                                self.note_bucket_deferred(var_loc, Slot::Index);
+                                self.add_edge(spread_ptr, Ptr::Field(var_loc, Slot::Index));
+                            }
                         }
                     }
                     CallKind::SuperForwardAllArgs => {
@@ -1600,11 +2144,44 @@ impl<'m> Pta<'m> {
                                 self.add_fact(Ptr::Local(callee_p, callee_ctx), Obj::Unknown);
                             }
                         }
+                        for &(var_iid, skip) in &callee_variadics {
+                            let var_loc = ObjLoc::Site(var_iid, callee_ctx);
+                            let elem_ptr = Ptr::Field(var_loc, Slot::Index);
+                            self.note_bucket_deferred(var_loc, Slot::Index);
+                            for &caller_p in caller_formals.iter().skip(skip) {
+                                self.add_edge(local(caller_p), elem_ptr);
+                            }
+                            if caller_ctx.is_none() {
+                                self.add_fact(elem_ptr, Obj::Unknown);
+                            } else if let Some(cf) = caller_fn
+                                && let Some(c_vars) = self.variadic_sinks.get(&cf).cloned()
+                            {
+                                for (c_var_iid, _) in c_vars {
+                                    self.add_edge(
+                                        Ptr::Field(
+                                            ObjLoc::Site(c_var_iid, caller_ctx),
+                                            Slot::Index,
+                                        ),
+                                        elem_ptr,
+                                    );
+                                }
+                            }
+                        }
                     }
                     _ => {
                         for (i, a) in args.iter().enumerate() {
                             if let Some(&p) = callee_params.get(formal_base + i) {
                                 self.add_edge(local(*a), Ptr::Local(p, callee_ctx));
+                            }
+                            // Propagate ALL actual arguments (including excess args
+                            // beyond `callee_params.len()`) into `GetUnmappedArgs`
+                            // and `CopyRestArgs` (`#94`)!
+                            for &(var_iid, skip) in &callee_variadics {
+                                if i >= skip {
+                                    let var_loc = ObjLoc::Site(var_iid, callee_ctx);
+                                    self.note_bucket_deferred(var_loc, Slot::Index);
+                                    self.add_edge(local(*a), Ptr::Field(var_loc, Slot::Index));
+                                }
                             }
                         }
                     }
@@ -1620,6 +2197,11 @@ impl<'m> Pta<'m> {
                     for &p in &callee_params {
                         self.add_edge(spread_ptr, Ptr::Local(p, callee_ctx));
                     }
+                    for &(var_iid, _) in &callee_variadics {
+                        let var_loc = ObjLoc::Site(var_iid, callee_ctx);
+                        self.note_bucket_deferred(var_loc, Slot::Index);
+                        self.add_edge(spread_ptr, Ptr::Field(var_loc, Slot::Index));
+                    }
                 }
                 let mut operands = args.clone();
                 if let Some(t) = this.or(inherited_this) {
@@ -1628,6 +2210,11 @@ impl<'m> Pta<'m> {
                 for a in operands {
                     for &p in &callee_params {
                         self.add_edge(local(a), Ptr::Local(p, callee_ctx));
+                    }
+                    for &(var_iid, _) in &callee_variadics {
+                        let var_loc = ObjLoc::Site(var_iid, callee_ctx);
+                        self.note_bucket_deferred(var_loc, Slot::Index);
+                        self.add_edge(local(a), Ptr::Field(var_loc, Slot::Index));
                     }
                 }
             }
@@ -1670,7 +2257,7 @@ impl<'m> Pta<'m> {
         };
         let func_class_id = fd.class_id;
         let is_harness = self.root_keep.is_some()
-            && self.module.sym.resolve(fd.name) == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC);
+            && is_harness_func(self.module, func, fd, self.config.harness_func);
         // Base-activation parameters are opaque (unrecorded callers —
         // the balanced discipline's floor); context activations are
         // bound by their call edge.
@@ -1721,6 +2308,7 @@ impl<'m> Pta<'m> {
                                 },
                             );
                         }
+                        let obj_loc = ObjLoc::Site(iid, ctx);
                         match op {
                             Op::AllocObject { shape } => {
                                 if let Some(Const::ObjectLiteral { keys, values }) =
@@ -1736,7 +2324,7 @@ impl<'m> Pta<'m> {
                                         match self.module.consts.get(v_cid).cloned() {
                                             Some(Const::MethodRef { func: mfid, .. }) => {
                                                 self.add_fact(
-                                                    Ptr::Field(iid, ctx, slot),
+                                                    Ptr::Field(obj_loc, slot),
                                                     Obj::Site {
                                                         site: iid,
                                                         ctx: None,
@@ -1744,7 +2332,7 @@ impl<'m> Pta<'m> {
                                                         keyed: false,
                                                     },
                                                 );
-                                                self.note_bucket(iid, ctx, slot);
+                                                self.note_bucket(obj_loc, slot);
                                                 if sliced
                                                     && self.try_record_dyn_hop(mfid, next_dyn_hop)
                                                 {
@@ -1758,10 +2346,10 @@ impl<'m> Pta<'m> {
                                                 | Const::LiteralBufferRef(_),
                                             ) => {
                                                 self.add_fact(
-                                                    Ptr::Field(iid, ctx, slot),
+                                                    Ptr::Field(obj_loc, slot),
                                                     Obj::Unknown,
                                                 );
-                                                self.note_bucket(iid, ctx, slot);
+                                                self.note_bucket(obj_loc, slot);
                                             }
                                             _ => {}
                                         }
@@ -1771,7 +2359,7 @@ impl<'m> Pta<'m> {
                             Op::AllocArray { shape: Some(shape) } => {
                                 for mfid in collect_const_method_refs(self.module, *shape) {
                                     self.add_fact(
-                                        Ptr::Field(iid, ctx, Slot::Index),
+                                        Ptr::Field(obj_loc, Slot::Index),
                                         Obj::Site {
                                             site: iid,
                                             ctx: None,
@@ -1779,7 +2367,7 @@ impl<'m> Pta<'m> {
                                             keyed: false,
                                         },
                                     );
-                                    self.note_bucket(iid, ctx, Slot::Index);
+                                    self.note_bucket(obj_loc, Slot::Index);
                                     if sliced && self.try_record_dyn_hop(mfid, next_dyn_hop) {
                                         self.activate(mfid, None);
                                     }
@@ -1864,6 +2452,89 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                        let cls_loc = ObjLoc::Site(iid, ctx);
+                        let proto_loc = ObjLoc::ClassProto(iid, ctx);
+                        let super_proto_loc = ObjLoc::SuperProto(iid, ctx);
+                        let super_static_loc = ObjLoc::SuperStatic(iid, ctx);
+
+                        let is_new_cls_act = self
+                            .ctor_class_activations
+                            .entry(cls.ctor)
+                            .or_default()
+                            .insert((iid, ctx));
+                        if is_new_cls_act {
+                            // Retroactively link any already-wired `new Sub()` instances
+                            // constructed before `DefineClass` ran in this scan order.
+                            let existing_news: Vec<(InstId, Ctx)> = self
+                                .wired
+                                .iter()
+                                .filter_map(|&(call_iid, c_ctx, callee)| {
+                                    (callee == cls.ctor
+                                        && matches!(
+                                            self.module.inst(call_iid).map(|i| &i.op),
+                                            Some(Op::Call {
+                                                kind: CallKind::New | CallKind::NewSpread,
+                                                ..
+                                            })
+                                        ))
+                                    .then_some((call_iid, c_ctx))
+                                })
+                                .collect();
+                            for (call_iid, c_ctx) in existing_news {
+                                self.link_proto_locs(ObjLoc::Site(call_iid, c_ctx), proto_loc);
+                            }
+                        }
+
+                        // Wire `Cls.prototype = Obj::Proto(ClassProto(iid, ctx))`.
+                        let ps_list = self.proto_syms.clone();
+                        for psym in ps_list {
+                            let pslot = Slot::Named(psym);
+                            self.own_class_members.insert((cls_loc, pslot));
+                            self.add_fact(Ptr::Field(cls_loc, pslot), Obj::Proto(proto_loc));
+                            self.note_bucket(cls_loc, pslot);
+                        }
+
+                        // Seed `super.prop` receiver pointers for `ctor`, static methods,
+                        // and instance methods of `cls`.
+                        self.add_fact(Ptr::SuperPropBase(cls.ctor), Obj::Proto(super_proto_loc));
+                        for (msym, mfid, is_static) in class_named_methods(self.module, cls) {
+                            let mslot = Slot::Named(msym);
+                            let method_obj = Obj::Site {
+                                site: iid,
+                                ctx: None,
+                                callable: Some(mfid),
+                                keyed: false,
+                            };
+                            if is_static {
+                                self.own_class_members.insert((cls_loc, mslot));
+                                self.add_fact(Ptr::Field(cls_loc, mslot), method_obj);
+                                self.note_bucket(cls_loc, mslot);
+                                self.add_fact(
+                                    Ptr::SuperPropBase(mfid),
+                                    Obj::Proto(super_static_loc),
+                                );
+                            } else {
+                                self.own_class_members.insert((proto_loc, mslot));
+                                self.add_fact(Ptr::Field(proto_loc, mslot), method_obj);
+                                self.note_bucket(proto_loc, mslot);
+                                self.add_fact(
+                                    Ptr::SuperPropBase(mfid),
+                                    Obj::Proto(super_proto_loc),
+                                );
+                            }
+                        }
+
+                        // Wire `extends heritage` prototype, static, and super-ctor chains!
+                        if let Some(h_val) = cls.heritage {
+                            self.register(
+                                local(h_val),
+                                Handler::InheritClass {
+                                    sub_site: iid,
+                                    sub_ctx: ctx,
+                                },
+                            );
+                        }
+
                         if let Some(r) = inst.result {
                             self.add_fact(
                                 local(r),
@@ -1874,19 +2545,6 @@ impl<'m> Pta<'m> {
                                     keyed: false,
                                 },
                             );
-                            for (msym, mfid, is_static) in class_named_methods(self.module, cls) {
-                                if is_static {
-                                    self.add_fact(
-                                        Ptr::Field(iid, ctx, Slot::Named(msym)),
-                                        Obj::Site {
-                                            site: iid,
-                                            ctx: None,
-                                            callable: Some(mfid),
-                                            keyed: false,
-                                        },
-                                    );
-                                }
-                            }
                         }
                     }
                     Op::LoadConst(c) => {
@@ -2044,6 +2702,105 @@ impl<'m> Pta<'m> {
                             },
                         );
                     }
+                    Op::LoadSuper { key, .. } => {
+                        if let Some(r) = inst.result {
+                            let result = local(r);
+                            self.load_results.push(result);
+                            let read = match key {
+                                abcd_ir::SuperKey::Name(name) => Read::Named(*name),
+                                abcd_ir::SuperKey::Dynamic(_) => Read::All,
+                            };
+                            self.register(Ptr::SuperPropBase(func), Handler::Load { result, read });
+                        }
+                    }
+                    Op::SetObjectWithProto { proto, obj } => {
+                        self.register(
+                            local(*obj),
+                            Handler::SetObjProto {
+                                proto_ptr: local(*proto),
+                            },
+                        );
+                    }
+                    Op::StorePrivate {
+                        obj,
+                        level,
+                        slot,
+                        value,
+                    }
+                    | Op::DefinePrivate {
+                        obj,
+                        level,
+                        slot,
+                        value,
+                    } => {
+                        let p_envs = self
+                            .env_stack_at
+                            .get(iid.index())
+                            .and_then(|es| es.chain(abcd_ir::LexEnvKind::Plain))
+                            .and_then(|ch| ch.at_level(*level))
+                            .filter(|e| !e.sites.is_empty())
+                            .map(|e| e.sites.iter().copied().map(Some).collect::<Vec<_>>())
+                            .unwrap_or_else(|| vec![None]);
+                        for env_opt in p_envs {
+                            self.register(
+                                local(*obj),
+                                Handler::Store {
+                                    value: local(*value),
+                                    slot: Slot::Private((env_opt, *slot)),
+                                },
+                            );
+                        }
+                    }
+                    Op::LoadPrivate { obj, level, slot } => {
+                        if let Some(r) = inst.result {
+                            let result = local(r);
+                            self.load_results.push(result);
+                            let p_envs = self
+                                .env_stack_at
+                                .get(iid.index())
+                                .and_then(|es| es.chain(abcd_ir::LexEnvKind::Plain))
+                                .and_then(|ch| ch.at_level(*level))
+                                .filter(|e| !e.sites.is_empty())
+                                .map(|e| e.sites.iter().copied().map(Some).collect::<Vec<_>>())
+                                .unwrap_or_else(|| vec![None]);
+                            for env_opt in p_envs {
+                                self.register(
+                                    local(*obj),
+                                    Handler::Load {
+                                        result,
+                                        read: Read::Private((env_opt, *slot)),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Op::CreateIterResultObj { value, .. } => {
+                        if let Some(r) = inst.result {
+                            let iter_loc = ObjLoc::Site(iid, ctx);
+                            self.add_fact(
+                                local(r),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: None,
+                                    keyed: false,
+                                },
+                            );
+                            let val_syms = self.value_syms.clone();
+                            if val_syms.is_empty() {
+                                self.add_edge(local(*value), Ptr::Field(iter_loc, Slot::Dynamic));
+                                self.note_bucket(iter_loc, Slot::Dynamic);
+                            } else {
+                                for vsym in val_syms {
+                                    self.add_edge(
+                                        local(*value),
+                                        Ptr::Field(iter_loc, Slot::Named(vsym)),
+                                    );
+                                    self.note_bucket(iter_loc, Slot::Named(vsym));
+                                }
+                            }
+                        }
+                    }
                     Op::CopyDataProps { dst, src } => {
                         self.register(
                             local(*src),
@@ -2109,6 +2866,7 @@ impl<'m> Pta<'m> {
                                 Op::CopyRestArgs { start_index } => *start_index as usize,
                                 _ => 0,
                             };
+                            let var_loc = ObjLoc::Site(iid, ctx);
                             self.add_fact(
                                 local(r),
                                 Obj::Site {
@@ -2118,8 +2876,11 @@ impl<'m> Pta<'m> {
                                     keyed: true,
                                 },
                             );
-                            self.note_bucket(iid, ctx, Slot::Index);
-                            let elem_ptr = Ptr::Field(iid, ctx, Slot::Index);
+                            self.note_bucket(var_loc, Slot::Index);
+                            let elem_ptr = Ptr::Field(var_loc, Slot::Index);
+                            if ctx.is_none() {
+                                self.add_fact(elem_ptr, Obj::Unknown);
+                            }
                             match frame_slots_of(self.module, func) {
                                 Some(slots) => {
                                     let start = slots.implicit_count() + skip_extra;
@@ -2162,17 +2923,34 @@ impl<'m> Pta<'m> {
                         {
                             Some(entry) => {
                                 for &env_site in &entry.sites {
+                                    self.lex_writers
+                                        .entry((env_site, *slot))
+                                        .or_default()
+                                        .insert(func);
                                     self.add_edge(
                                         local(*value),
-                                        Ptr::LexVar(env_site, *slot, ctx.is_some()),
+                                        Ptr::LexVar(env_site, func, *slot, ctx.is_some()),
                                     );
+                                    self.add_edge(local(*value), Ptr::LexVarAll(env_site, *slot));
+                                    if links.inst_func(self.module, env_site) == Some(func) {
+                                        self.add_edge(
+                                            local(*value),
+                                            Ptr::LexVarLocal(env_site, ctx, *slot),
+                                        );
+                                    }
                                 }
                                 if entry.unknown || entry.sites.is_empty() {
-                                    self.add_edge(local(*value), Ptr::UnknownLexVar(lkey, *slot));
+                                    self.add_edge(
+                                        local(*value),
+                                        Ptr::UnknownLexVar(func_class_id, lkey, *slot),
+                                    );
                                 }
                             }
                             None => {
-                                self.add_edge(local(*value), Ptr::UnknownLexVar(lkey, *slot));
+                                self.add_edge(
+                                    local(*value),
+                                    Ptr::UnknownLexVar(func_class_id, lkey, *slot),
+                                );
                             }
                         }
                     }
@@ -2187,26 +2965,45 @@ impl<'m> Pta<'m> {
                             {
                                 Some(entry) => {
                                     for &env_site in &entry.sites {
+                                        let owner_fn = links.inst_func(self.module, env_site);
                                         if sliced
-                                            && let Some(owner_fn) =
-                                                links.inst_func(self.module, env_site)
-                                            && self.try_record_dyn_hop(owner_fn, next_dyn_hop)
+                                            && let Some(of) = owner_fn
+                                            && self.try_record_dyn_hop(of, next_dyn_hop)
                                         {
-                                            self.activate(owner_fn, None);
+                                            self.activate(of, None);
                                         }
-                                        self.add_edge(Ptr::LexVar(env_site, *slot, true), local(r));
-                                        self.add_edge(
-                                            Ptr::LexVar(env_site, *slot, false),
-                                            local(r),
-                                        );
+                                        if owner_fn == Some(func)
+                                            && !self
+                                                .lex_captured_mutated
+                                                .contains(&(env_site, *slot))
+                                        {
+                                            // Non-captured local variable: isolate per
+                                            // `(env_site, ctx)` activation so calls `f(a)`
+                                            // and `f(b)` never cross-contaminate!
+                                            self.add_edge(
+                                                Ptr::LexVarLocal(env_site, ctx, *slot),
+                                                local(r),
+                                            );
+                                        } else {
+                                            self.add_edge(
+                                                Ptr::LexVarAll(env_site, *slot),
+                                                local(r),
+                                            );
+                                        }
                                     }
                                     if entry.unknown || entry.sites.is_empty() {
-                                        self.add_edge(Ptr::UnknownLexVar(lkey, *slot), local(r));
+                                        self.add_edge(
+                                            Ptr::UnknownLexVar(func_class_id, lkey, *slot),
+                                            local(r),
+                                        );
                                         self.add_fact(local(r), Obj::Unknown);
                                     }
                                 }
                                 None => {
-                                    self.add_edge(Ptr::UnknownLexVar(lkey, *slot), local(r));
+                                    self.add_edge(
+                                        Ptr::UnknownLexVar(func_class_id, lkey, *slot),
+                                        local(r),
+                                    );
                                     self.add_fact(local(r), Obj::Unknown);
                                 }
                             }
@@ -2279,8 +3076,9 @@ impl<'m> Pta<'m> {
                                     },
                                 );
                                 if let Some(exports) = links.namespace_exports(target_cid) {
+                                    let ns_loc = ObjLoc::Site(iid, None);
                                     for (&export_sym, slots) in exports {
-                                        self.note_bucket(iid, None, Slot::Named(export_sym));
+                                        self.note_bucket(ns_loc, Slot::Named(export_sym));
                                         for &sr in slots {
                                             if sliced {
                                                 for &(def_fn, _) in links.stored_values(sr) {
@@ -2292,9 +3090,16 @@ impl<'m> Pta<'m> {
                                             }
                                             self.add_edge(
                                                 Ptr::ModuleVar(sr.class_id, sr.slot),
-                                                Ptr::Field(iid, None, Slot::Named(export_sym)),
+                                                Ptr::Field(ns_loc, Slot::Named(export_sym)),
                                             );
                                         }
+                                    }
+                                    if links.has_unresolved_star(target_cid) {
+                                        self.add_fact(
+                                            Ptr::Field(ns_loc, Slot::Dynamic),
+                                            Obj::Unknown,
+                                        );
+                                        self.note_bucket(ns_loc, Slot::Dynamic);
                                     }
                                 }
                             } else {
@@ -2333,6 +3138,21 @@ impl<'m> Pta<'m> {
                         kind,
                     } => {
                         let callee_val = *callee;
+                        if let Some(ValueDef::Const(mcid)) =
+                            self.module.value(callee_val).map(|v| v.def)
+                            && let Some(Const::MethodRef { func: mfid, .. }) =
+                                self.module.consts.get(mcid)
+                        {
+                            self.add_fact(
+                                local(callee_val),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: Some(*mfid),
+                                    keyed: false,
+                                },
+                            );
+                        }
                         let spread_kind = matches!(
                             kind,
                             CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread
@@ -2385,6 +3205,7 @@ impl<'m> Pta<'m> {
                                         self.wire_call(iid, ctx, target_callee);
                                     }
                                 }
+                                self.drain_fires();
                             }
                         } else {
                             self.scanned_calls.push((iid, ctx));
@@ -2410,8 +3231,11 @@ impl<'m> Pta<'m> {
                                 for &target_callee in base.callees_of_call_at(iid) {
                                     if !sliced || self.is_base_slice_allowed(target_callee) {
                                         self.wire_call(iid, ctx, target_callee);
+                                    } else {
+                                        self.hop_cut_calls.insert(iid);
                                     }
                                 }
+                                self.drain_fires();
                             }
                         }
                     }
@@ -2625,9 +3449,12 @@ impl<'m> Pta<'m> {
                         if matches!(
                             self.module.inst(*site).map(|i| &i.op),
                             Some(Op::AllocArray { .. })
-                        ) && !self.buckets.get(&(*site, *ctx)).is_some_and(|b| {
-                            b.contains(&Slot::Named(*method_sym)) || b.contains(&Slot::Dynamic)
-                        })
+                        ) && !self
+                            .buckets
+                            .get(&ObjLoc::Site(*site, *ctx))
+                            .is_some_and(|b| {
+                                b.contains(&Slot::Named(*method_sym)) || b.contains(&Slot::Dynamic)
+                            })
                 )
             }))
         .then_some((*recv, stores_args))
@@ -2709,12 +3536,15 @@ pub fn analyze_with_links_and_roots(
             answers.push(value_answer(module, vid, None, true));
         }
         let empty_env = Arc::new(EnvState::default());
+        let singletons =
+            SingletonSiteClassifier::build_with_links(module, links, base, config.harness_func);
         return PtaOutcome {
             graph: base.clone(),
             tables: Rung2Tables {
                 answers,
                 env_stack_at: vec![empty_env; module.insts.len()],
                 env_sites,
+                singletons,
             },
             stats: PtaStats {
                 env_rounds,
@@ -2745,6 +3575,7 @@ pub fn analyze_with_links_and_roots(
             root_funcs,
             &rk,
             max_base_hop,
+            config.harness_func,
         );
         SliceInit {
             root_keep: rk,
@@ -2785,13 +3616,15 @@ pub fn analyze_with_links_and_roots(
                 resolution_complete: false,
             }
         } else {
-            let resolution_complete =
-                if roots.is_none() || scanned_funcs.contains(&base_edge.caller) {
-                    !pta_partial.contains(&iid)
-                        && (pta_targets.contains_key(&iid) || base_edge.resolution_complete)
-                } else {
-                    base_edge.resolution_complete
-                };
+            let resolution_complete = if stats_engine.capped || engine.hop_cut_calls.contains(&iid)
+            {
+                false
+            } else if roots.is_none() || scanned_funcs.contains(&base_edge.caller) {
+                !pta_partial.contains(&iid)
+                    && (pta_targets.contains_key(&iid) || base_edge.resolution_complete)
+            } else {
+                base_edge.resolution_complete
+            };
             CallEdge {
                 caller: base_edge.caller,
                 kind: base_edge.kind,
@@ -2807,6 +3640,8 @@ pub fn analyze_with_links_and_roots(
         sites.insert(iid, edge);
     }
     let graph = CallGraph::from_edges(sites);
+    let singletons =
+        SingletonSiteClassifier::build_with_links(module, links, &graph, config.harness_func);
 
     // ── Externally-invocable classification & Value answers ──────────
     let recorded_funcs: BTreeSet<FuncId> = engine
@@ -2814,8 +3649,15 @@ pub fn analyze_with_links_and_roots(
         .iter()
         .filter_map(|&(f, c)| c.map(|_| f))
         .collect();
-    let (externally_invocable, value_owner) =
-        compute_externally_invocable(module, links, &engine, &graph, &recorded_funcs, roots);
+    let (externally_invocable, may_run_unrecorded, value_owner) = compute_externally_invocable(
+        module,
+        links,
+        &engine,
+        &graph,
+        &recorded_funcs,
+        roots,
+        config.harness_func,
+    );
 
     let mut acc: HashMap<ValueId, (BTreeSet<Obj>, BTreeSet<Obj>, bool)> = HashMap::new();
     for (p, objs) in &engine.pts {
@@ -2866,35 +3708,39 @@ pub fn analyze_with_links_and_roots(
                 {
                     let mut union = BTreeSet::new();
                     for &env_site in &entry.sites {
-                        let owner_fn = links.inst_func(module, env_site);
-                        let has_rec = owner_fn.is_some_and(|of| recorded_funcs.contains(&of));
-                        let owner_ext = owner_fn.is_none_or(|of| {
-                            externally_invocable
-                                .get(of.index())
-                                .copied()
-                                .unwrap_or(true)
-                        });
-                        if has_rec {
-                            if let Some(objs) = engine.pts.get(&Ptr::LexVar(env_site, *slot, true))
-                            {
-                                union.extend(objs.iter().copied());
+                        if let Some(writers) = engine.lex_writers.get(&(env_site, *slot)) {
+                            for &writer_fn in writers {
+                                let w_has_rec = recorded_funcs.contains(&writer_fn);
+                                let w_unrec = may_run_unrecorded
+                                    .get(writer_fn.index())
+                                    .copied()
+                                    .unwrap_or(true);
+                                if w_has_rec
+                                    && let Some(objs) = engine
+                                        .pts
+                                        .get(&Ptr::LexVar(env_site, writer_fn, *slot, true))
+                                {
+                                    union.extend(objs.iter().copied());
+                                }
+                                // Include `ctx == None` writes iff `writer_fn` may
+                                // genuinely execute outside recorded call sites (or
+                                // when querying inside an uncalled `writer_fn` itself).
+                                if (w_unrec || (!w_has_rec && writer_fn == func))
+                                    && let Some(objs) = engine
+                                        .pts
+                                        .get(&Ptr::LexVar(env_site, writer_fn, *slot, false))
+                                {
+                                    union.extend(objs.iter().copied());
+                                }
                             }
-                            if owner_ext
-                                && let Some(objs) =
-                                    engine.pts.get(&Ptr::LexVar(env_site, *slot, false))
-                            {
-                                union.extend(objs.iter().copied());
-                            }
-                        } else if let Some(objs) =
-                            engine.pts.get(&Ptr::LexVar(env_site, *slot, false))
-                        {
-                            union.extend(objs.iter().copied());
                         }
                     }
                     let mut ans = ValueAnswer::default();
                     for o in &union {
                         match o {
-                            Obj::Unknown | Obj::GlobalThis => ans.has_unknown = true,
+                            Obj::Unknown | Obj::GlobalThis | Obj::Proto(_) => {
+                                ans.has_unknown = true;
+                            }
                             Obj::Site { site, keyed, .. } => {
                                 if *keyed {
                                     ans.sites.union_with(&AllocSiteSet::one(*site));
@@ -2926,14 +3772,20 @@ pub fn analyze_with_links_and_roots(
             answers,
             env_stack_at,
             env_sites,
+            singletons,
         },
         stats,
     }
 }
 
-/// Classify which functions may be invoked outside resolved contextual
-/// (`ctx = Some(..)`) internal call sites, plus build a dense `ValueId -> Option<FuncId>`
-/// ownership table.
+/// Classify:
+/// 1. `ext[fi]`: whether `value_answer` for SSA values inside `fi` must retain
+///    base (`ctx = None`) points-to facts (`may_run_unrecorded[fi] || !recorded_funcs.contains(&fid)`),
+/// 2. `may_run_unrecorded[fi]`: whether `fi` can actually execute at runtime
+///    outside recorded internal `ctx = Some(call)` edges (used to check
+///    writer/reader lexical activation compatibility without phantom dead-closure
+///    pollution, `#94`), and
+/// 3. `value_owner`: dense `ValueId -> Option<FuncId>` ownership table.
 fn compute_externally_invocable(
     module: &Module,
     links: &ModuleLinkTable,
@@ -2941,21 +3793,23 @@ fn compute_externally_invocable(
     graph: &CallGraph,
     recorded_funcs: &BTreeSet<FuncId>,
     roots: Option<&[FuncId]>,
-) -> (Vec<bool>, Vec<Option<FuncId>>) {
+    explicit_harness: Option<FuncId>,
+) -> (Vec<bool>, Vec<bool>, Vec<Option<FuncId>>) {
     let n_funcs = module.functions.len();
-    let mut ext = vec![false; n_funcs];
+    let mut unrec = vec![false; n_funcs];
     let mut value_owner = vec![None; module.values.len()];
     let mut has_harness = false;
+    let mut has_named_main = false;
 
     for (fi, fd) in module.functions.iter().enumerate() {
         let fid = FuncId::new(fi as u32);
         let fname = module.sym.resolve(fd.name);
-        if fname == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC) {
+        if is_harness_func(module, fid, fd, explicit_harness) {
             has_harness = true;
-            ext[fi] = true;
+            unrec[fi] = true;
         }
-        if !recorded_funcs.contains(&fid) {
-            ext[fi] = true;
+        if matches!(fname, Some("func_main_0" | "<cctor>")) {
+            has_named_main = true;
         }
         for &p in &fd.params {
             if let Some(slot) = value_owner.get_mut(p.index()) {
@@ -2977,31 +3831,45 @@ fn compute_externally_invocable(
 
     if !has_harness {
         for &init_fid in links.init_order() {
-            if let Some(slot) = ext.get_mut(init_fid.index()) {
+            if let Some(slot) = unrec.get_mut(init_fid.index()) {
                 *slot = true;
             }
         }
         for (fi, fd) in module.functions.iter().enumerate() {
-            if module.sym.resolve(fd.name) == Some("func_main_0") {
-                ext[fi] = true;
+            if matches!(module.sym.resolve(fd.name), Some("func_main_0" | "<cctor>")) {
+                unrec[fi] = true;
             }
         }
         if let Some(root_funcs) = roots {
             for &rf in root_funcs {
-                if let Some(slot) = ext.get_mut(rf.index()) {
+                if let Some(slot) = unrec.get_mut(rf.index()) {
                     *slot = true;
                 }
             }
         }
         for comp in crate::ohos_lifecycle::discover_components(module, links, None) {
-            if let Some(slot) = ext.get_mut(comp.ctor.index()) {
+            if let Some(slot) = unrec.get_mut(comp.ctor.index()) {
                 *slot = true;
             }
             for fids in comp.methods.values() {
                 for &mfid in fids {
-                    if let Some(slot) = ext.get_mut(mfid.index()) {
+                    if let Some(slot) = unrec.get_mut(mfid.index()) {
                         *slot = true;
                     }
+                }
+            }
+        }
+        // Synthetic unit-test modules with no `func_main_0`: treat 0-caller
+        // non-captured top-level functions as external entry points.
+        if !has_named_main && roots.is_none() {
+            for (fi, fd) in module.functions.iter().enumerate() {
+                let fid = FuncId::new(fi as u32);
+                if !fd.is_external
+                    && !fd.blocks.is_empty()
+                    && graph.callers_of(fid).is_empty()
+                    && !recorded_funcs.contains(&fid)
+                {
+                    unrec[fi] = true;
                 }
             }
         }
@@ -3013,7 +3881,7 @@ fn compute_externally_invocable(
             let caller_scanned = engine.scanned.iter().any(|&(f, _)| f == edge.caller);
             if !caller_scanned || !edge.resolution_complete {
                 for &t in targets {
-                    if let Some(slot) = ext.get_mut(t.index()) {
+                    if let Some(slot) = unrec.get_mut(t.index()) {
                         *slot = true;
                     }
                 }
@@ -3022,9 +3890,9 @@ fn compute_externally_invocable(
         }
     }
 
-    // Index object fields `(site, ctx) -> Vec<Ptr::Field>` once so transitive
+    // Index object fields `ObjLoc -> Vec<Ptr::Field>` once so transitive
     // heap escape runs in linear time over `engine.pts`.
-    let mut fields_by_obj: HashMap<(InstId, Ctx), Vec<Ptr>> = HashMap::new();
+    let mut fields_by_obj: HashMap<ObjLoc, Vec<Ptr>> = HashMap::new();
     let mut escaped_objs: BTreeSet<Obj> = BTreeSet::new();
     let mut obj_queue: VecDeque<Obj> = VecDeque::new();
     let enqueue_ptr = |p: Ptr,
@@ -3042,13 +3910,13 @@ fn compute_externally_invocable(
 
     for (&p, objs) in &engine.pts {
         match p {
-            Ptr::Field(site, ctx, _) => {
-                fields_by_obj.entry((site, ctx)).or_default().push(p);
+            Ptr::Field(loc, _) => {
+                fields_by_obj.entry(loc).or_default().push(p);
             }
             Ptr::Global(_)
             | Ptr::GlobalDynamic
             | Ptr::ModuleVar(_, _)
-            | Ptr::UnknownLexVar(_, _) => {
+            | Ptr::UnknownLexVar(_, _, _) => {
                 for &o in objs {
                     if escaped_objs.insert(o) {
                         obj_queue.push_back(o);
@@ -3081,7 +3949,8 @@ fn compute_externally_invocable(
         }
     }
 
-    // Stores onto an `Obj::Unknown` receiver escape the stored value.
+    // Property/private stores onto `Obj::Unknown`, getter/setter attachments,
+    // and generator / async / throw escapes (`#94`).
     for &(func, ctx) in &engine.scanned {
         let Some(fd) = module.func(func) else {
             continue;
@@ -3104,16 +3973,20 @@ fn compute_externally_invocable(
                         value,
                         ..
                     }
+                    | Op::StorePrivate {
+                        obj: object, value, ..
+                    }
+                    | Op::DefinePrivate {
+                        obj: object, value, ..
+                    }
                     | Op::DefineMethod {
                         object,
                         func: value,
                         ..
                     } => {
-                        if engine
-                            .pts
-                            .get(&Ptr::Local(*object, ctx))
-                            .is_some_and(|s| s.contains(&Obj::Unknown))
-                        {
+                        if engine.pts.get(&Ptr::Local(*object, ctx)).is_some_and(|s| {
+                            s.contains(&Obj::Unknown) || s.contains(&Obj::GlobalThis)
+                        }) {
                             enqueue_ptr(
                                 Ptr::Local(*value, ctx),
                                 &engine.pts,
@@ -3122,30 +3995,47 @@ fn compute_externally_invocable(
                             );
                         }
                     }
-                    Op::DefineGetterSetterByValue {
-                        obj,
-                        getter,
-                        setter,
-                        ..
-                    } => {
-                        if engine
-                            .pts
-                            .get(&Ptr::Local(*obj, ctx))
-                            .is_some_and(|s| s.contains(&Obj::Unknown))
-                        {
-                            for &v in [getter, setter] {
-                                enqueue_ptr(
-                                    Ptr::Local(v, ctx),
-                                    &engine.pts,
-                                    &mut escaped_objs,
-                                    &mut obj_queue,
-                                );
+                    Op::DefineGetterSetterByValue { getter, setter, .. } => {
+                        // Any property access can implicitly invoke an attached
+                        // getter or setter without an explicit `Op::Call`.
+                        for &v in [getter, setter] {
+                            enqueue_ptr(
+                                Ptr::Local(v, ctx),
+                                &engine.pts,
+                                &mut escaped_objs,
+                                &mut obj_queue,
+                            );
+                            if let Some(body) = callable_body(module, v)
+                                && let Some(slot) = unrec.get_mut(body.index())
+                            {
+                                *slot = true;
+                            }
+                        }
+                    }
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                        // Class getters/setters may run implicitly on property access.
+                        for mfid in collect_const_method_refs(module, cls.members) {
+                            if module.func(mfid).is_some_and(|mfd| {
+                                matches!(
+                                    mfd.kind,
+                                    abcd_ir::FunctionKind::Getter | abcd_ir::FunctionKind::Setter
+                                )
+                            }) && let Some(slot) = unrec.get_mut(mfid.index())
+                            {
+                                *slot = true;
                             }
                         }
                     }
                     Op::Throw { value }
                     | Op::NotifyConcurrentResult { value }
-                    | Op::AsyncResolve { value, .. } => {
+                    | Op::SuspendGenerator { value, .. }
+                    | Op::CreateIterResultObj { value, .. }
+                    | Op::Await { value }
+                    | Op::AwaitUncaught { value, .. }
+                    | Op::AsyncResolve { value, .. }
+                    | Op::AsyncReject { value, .. }
+                    | Op::AsyncGeneratorResolve { value, .. }
+                    | Op::AsyncGeneratorReject { value, .. } => {
                         enqueue_ptr(
                             Ptr::Local(*value, ctx),
                             &engine.pts,
@@ -3159,11 +4049,19 @@ fn compute_externally_invocable(
         }
     }
 
-    // Fixed point over escaped objects and values returned by `ext[fid]` functions.
+    // Pre-collect scanned contexts per function for return/yield escape seeding.
+    let mut ctxs_by_func: Vec<Vec<Ctx>> = vec![Vec::new(); n_funcs];
+    for &(f, c) in &engine.scanned {
+        if let Some(list) = ctxs_by_func.get_mut(f.index()) {
+            list.push(c);
+        }
+    }
+
+    // Fixed point over escaped objects and values returned by `unrec[fid]` functions.
     let mut returned_seeded = vec![false; n_funcs];
     loop {
         for fi in 0..n_funcs {
-            if ext[fi] && !returned_seeded[fi] {
+            if unrec[fi] && !returned_seeded[fi] {
                 returned_seeded[fi] = true;
                 let fid = FuncId::new(fi as u32);
                 if let Some(fd) = module.func(fid) {
@@ -3173,12 +4071,14 @@ fn compute_externally_invocable(
                             if let Some(Op::Return { value: Some(rv) }) =
                                 module.inst(iid).map(|i| &i.op)
                             {
-                                enqueue_ptr(
-                                    Ptr::Local(*rv, None),
-                                    &engine.pts,
-                                    &mut escaped_objs,
-                                    &mut obj_queue,
-                                );
+                                for &c in &ctxs_by_func[fi] {
+                                    enqueue_ptr(
+                                        Ptr::Local(*rv, c),
+                                        &engine.pts,
+                                        &mut escaped_objs,
+                                        &mut obj_queue,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3186,44 +4086,65 @@ fn compute_externally_invocable(
             }
         }
         let Some(o) = obj_queue.pop_front() else {
-            if (0..n_funcs).all(|fi| !ext[fi] || returned_seeded[fi]) {
+            if (0..n_funcs).all(|fi| !unrec[fi] || returned_seeded[fi]) {
                 break;
             }
             continue;
         };
-        if let Obj::Site {
-            site,
-            ctx,
-            callable,
-            ..
-        } = o
-        {
-            if let Some(cfid) = callable
-                && let Some(slot) = ext.get_mut(cfid.index())
-            {
-                *slot = true;
-            }
-            if let Some(Op::DefineClass(cls) | Op::DefineSendableClass(cls)) =
-                module.inst(site).map(|i| &i.op)
-            {
-                if let Some(slot) = ext.get_mut(cls.ctor.index()) {
+        match o {
+            Obj::Site {
+                site,
+                ctx,
+                callable,
+                ..
+            } => {
+                if let Some(cfid) = callable
+                    && let Some(slot) = unrec.get_mut(cfid.index())
+                {
                     *slot = true;
                 }
-                for mfid in collect_const_method_refs(module, cls.members) {
-                    if let Some(slot) = ext.get_mut(mfid.index()) {
+                if let Some(Op::DefineClass(cls) | Op::DefineSendableClass(cls)) =
+                    module.inst(site).map(|i| &i.op)
+                {
+                    if let Some(slot) = unrec.get_mut(cls.ctor.index()) {
                         *slot = true;
+                    }
+                    for mfid in collect_const_method_refs(module, cls.members) {
+                        if let Some(slot) = unrec.get_mut(mfid.index()) {
+                            *slot = true;
+                        }
+                    }
+                    if let Some(fptrs) = fields_by_obj.get(&ObjLoc::ClassProto(site, ctx)) {
+                        for &fp in fptrs {
+                            enqueue_ptr(fp, &engine.pts, &mut escaped_objs, &mut obj_queue);
+                        }
+                    }
+                }
+                if let Some(fptrs) = fields_by_obj.get(&ObjLoc::Site(site, ctx)) {
+                    for &fp in fptrs {
+                        enqueue_ptr(fp, &engine.pts, &mut escaped_objs, &mut obj_queue);
                     }
                 }
             }
-            if let Some(fptrs) = fields_by_obj.get(&(site, ctx)) {
-                for &fp in fptrs {
-                    enqueue_ptr(fp, &engine.pts, &mut escaped_objs, &mut obj_queue);
+            Obj::Proto(loc) => {
+                if let Some(fptrs) = fields_by_obj.get(&loc) {
+                    for &fp in fptrs {
+                        enqueue_ptr(fp, &engine.pts, &mut escaped_objs, &mut obj_queue);
+                    }
                 }
             }
+            Obj::Unknown | Obj::GlobalThis => {}
         }
     }
 
-    (ext, value_owner)
+    let mut ext = unrec.clone();
+    for (fi, slot) in ext.iter_mut().enumerate() {
+        if !recorded_funcs.contains(&FuncId::new(fi as u32)) {
+            *slot = true;
+        }
+    }
+
+    (ext, unrec, value_owner)
 }
 /// `retain_base` is `true` (`externally_invocable[owner_fid]`) or no recorded
 /// `ctx = Some(..)` call site exists.
@@ -3255,7 +4176,7 @@ fn value_answer(
             let mut answer = ValueAnswer::default();
             for o in union {
                 match o {
-                    Obj::Unknown | Obj::GlobalThis => answer.has_unknown = true,
+                    Obj::Unknown | Obj::GlobalThis | Obj::Proto(_) => answer.has_unknown = true,
                     Obj::Site { site, keyed, .. } => {
                         if *keyed {
                             answer.sites.union_with(&AllocSiteSet::one(*site));
@@ -3784,6 +4705,19 @@ impl<'m> Rung2AliasOracle<'m> {
         self.module
     }
 
+    /// Precomputed [`SingletonSiteClassifier`] over the co-evolved call graph (`D5`).
+    #[must_use]
+    pub fn singletons(&self) -> &SingletonSiteClassifier {
+        &self.tables.singletons
+    }
+
+    /// `O(1)` query: whether `site` executes at most once in a concrete program run (`D5`).
+    #[must_use]
+    #[inline]
+    pub fn is_concrete_singleton_site(&self, site: InstId) -> bool {
+        self.tables.singletons.site_is_concrete(site)
+    }
+
     /// The rich query, in the rung-1 [`QueryAnswer`] vocabulary:
     /// `sites` are the keyed alloc sites (contexts stripped),
     /// `has_unknown` marks any incompleteness (unknown object, unkeyed
@@ -3818,10 +4752,11 @@ impl<'m> Rung2AliasOracle<'m> {
 
     /// The consumer-facing answer: the PTA result when it is complete,
     /// else the rung-0 local def-chain answer (the sound floor — the
-    /// ladder's unchanged fallback rule).
+    /// ladder's unchanged fallback rule), gated by [`SingletonSiteClassifier`]
+    /// so non-singleton sites never trigger unsound strong updates (`D5`, `#94`).
     pub fn site_info_at(&self, base: ValueId, at: InstId) -> SiteInfo {
         let ans = self.query(base, at);
-        if ans.precise_for_keying() {
+        let raw = if ans.precise_for_keying() {
             SiteInfo {
                 sites: ans.sites,
                 has_phi: ans.has_phi,
@@ -3829,7 +4764,8 @@ impl<'m> Rung2AliasOracle<'m> {
             }
         } else {
             resolve_alloc_sites(self.module, base)
-        }
+        };
+        self.tables.singletons.gate_site_info(raw)
     }
 
     /// The lexical environment a `GetLexVar`/`PutLexVar` at `at` with

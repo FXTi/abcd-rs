@@ -39,7 +39,9 @@ UPSTREAM_TOML = VENDOR_DIR / "UPSTREAM.toml"
 VENDOR_GEN_DIR = VENDOR_DIR / "generated"
 
 ISA_SYS_DIR = REPO_ROOT / "abcd-isa-sys"
+ISA_DIR = REPO_ROOT / "abcd-isa"
 FILE_SYS_DIR = REPO_ROOT / "abcd-file-sys"
+FILE_DIR = REPO_ROOT / "abcd-file"
 
 DEFAULT_REPO = "https://github.com/openharmony/arkcompiler_runtime_core.git"
 SUBTREES: Tuple[str, ...] = (
@@ -294,7 +296,17 @@ def strip_c_comments(text: str) -> str:
     return text
 
 
-def eval_int_expr(expr: str, env: Dict[str, int], context: str) -> int:
+UNDERLYING_BITS: Dict[str, int] = {
+    "uint8_t": 8,
+    "uint16_t": 16,
+    "uint32_t": 32,
+    "uint64_t": 64,
+}
+
+
+def eval_int_expr(
+    expr: str, env: Dict[str, int], context: str, width_bits: int = 32
+) -> int:
     s = expr.strip()
     m_ctz = re.fullmatch(r"Ctz\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", s)
     if m_ctz:
@@ -306,27 +318,117 @@ def eval_int_expr(expr: str, env: Dict[str, int], context: str) -> int:
             fail(f"{context}: Ctz(0) is undefined")
         return (val & -val).bit_length() - 1
 
-    # Pure integer arithmetic / bitwise expression over known identifiers
-    tokens = re.findall(r"0x[0-9a-fA-F]+|\d+|[A-Za-z_][A-Za-z0-9_]*|<<|>>|[|&^~()+-]", s)
-    joined = "".join(tokens)
-    if joined != re.sub(r"\s+", "", s):
+    # Iterative two-stack Shunting-Yard evaluator (zero recursion, zero Python eval,
+    # exact C++ unsigned bitwise complement semantics masked to `width_bits`).
+    mask = (1 << width_bits) - 1
+    tokens = re.findall(
+        r"0x[0-9a-fA-F]+[uUlL]*|\d+[uUlL]*|[A-Za-z_][A-Za-z0-9_]*|<<|>>|[|&^~()+-]",
+        s,
+    )
+    if "".join(tokens) != re.sub(r"\s+", "", s):
         fail(f"{context}: unsupported constant expression {expr!r}")
 
-    py_parts: List[str] = []
+    prec = {
+        "u+": 7,
+        "u-": 7,
+        "u~": 7,
+        "+": 5,
+        "-": 5,
+        "<<": 4,
+        ">>": 4,
+        "&": 3,
+        "^": 2,
+        "|": 1,
+    }
+    right_assoc = {"u+", "u-", "u~"}
+
+    values: List[int] = []
+    ops: List[str] = []
+
+    def apply_top() -> None:
+        if not ops:
+            fail(f"{context}: malformed operator stack in {expr!r}")
+        op = ops.pop()
+        if op in right_assoc:
+            if not values:
+                fail(f"{context}: missing unary operand in {expr!r}")
+            a = values.pop()
+            if op == "u+":
+                values.append(a & mask)
+            elif op == "u-":
+                values.append((-a) & mask)
+            else:
+                values.append((~a) & mask)
+            return
+        if len(values) < 2:
+            fail(f"{context}: missing binary operand in {expr!r}")
+        b = values.pop()
+        a = values.pop()
+        if op == "+":
+            values.append((a + b) & mask)
+        elif op == "-":
+            values.append((a - b) & mask)
+        elif op == "<<":
+            values.append((a << b) & mask)
+        elif op == ">>":
+            values.append((a & mask) >> b)
+        elif op == "&":
+            values.append((a & b) & mask)
+        elif op == "^":
+            values.append((a ^ b) & mask)
+        elif op == "|":
+            values.append((a | b) & mask)
+        else:
+            fail(f"{context}: unknown operator {op!r}")
+
+    expect_operand = True
     for tok in tokens:
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
-            if tok.endswith(("u", "U", "l", "L")) and tok[:-1].isdigit():
-                py_parts.append(tok[:-1])
+        if tok == "(":
+            ops.append("(")
+            expect_operand = True
+        elif tok == ")":
+            while ops and ops[-1] != "(":
+                apply_top()
+            if not ops or ops[-1] != "(":
+                fail(f"{context}: unbalanced parentheses in {expr!r}")
+            ops.pop()
+            expect_operand = False
+        elif tok in ("+", "-", "~") and expect_operand:
+            uop = f"u{tok}"
+            while ops and ops[-1] != "(" and prec[ops[-1]] > prec[uop]:
+                apply_top()
+            ops.append(uop)
+            expect_operand = True
+        elif tok in prec:
+            if expect_operand:
+                fail(f"{context}: unexpected binary operator {tok!r} in {expr!r}")
+            while ops and ops[-1] != "(" and prec[ops[-1]] >= prec[tok]:
+                apply_top()
+            ops.append(tok)
+            expect_operand = True
+        else:
+            if not expect_operand:
+                fail(f"{context}: missing operator before {tok!r} in {expr!r}")
+            stripped = tok.rstrip("uUlL")
+            if stripped.startswith(("0x", "0X")):
+                values.append(int(stripped, 16) & mask)
+            elif stripped.isdigit():
+                values.append(int(stripped, 10) & mask)
             elif tok in env:
-                py_parts.append(str(env[tok]))
+                values.append(env[tok] & mask)
             else:
                 fail(f"{context}: unknown identifier {tok!r} in {expr!r}")
-        else:
-            py_parts.append(tok)
-    try:
-        return int(eval(" ".join(py_parts), {"__builtins__": {}}, {}))
-    except Exception as exc:  # noqa: BLE001
-        fail(f"{context}: failed evaluating {expr!r}: {exc}")
+            expect_operand = False
+
+    if expect_operand:
+        fail(f"{context}: trailing operator in {expr!r}")
+    while ops:
+        if ops[-1] == "(":
+            fail(f"{context}: unclosed parenthesis in {expr!r}")
+        apply_top()
+    if len(values) != 1:
+        fail(f"{context}: expression {expr!r} did not reduce to a single value")
+    return values[0]
 
 
 def parse_cpp_enum_class(
@@ -359,7 +461,7 @@ def parse_cpp_enum_class(
         if "=" in entry:
             name_part, expr_part = entry.split("=", 1)
             name = name_part.strip()
-            val = eval_int_expr(expr_part, env, f"{header_path}:{enum_name}::{name}")
+            val = eval_int_expr(expr_part, env, f"{header_path}:{enum_name}::{name}", UNDERLYING_BITS.get(underlying, 32))
         else:
             name = entry
             val = next_val
@@ -588,15 +690,7 @@ def map_c_type(c_type: str, context: str, is_param: bool = False) -> str:
     return cur
 
 
-def parse_c_param(raw_param: str, idx: int, context: str) -> Tuple[str, str]:
-    p = re.sub(r"\s+", " ", raw_param.strip())
-    # Inline function pointer parameter, e.g.: `void (*cb)(uint8_t flag, void *ctx)`
-    m_fp = re.fullmatch(r"(.+?)\(\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\((.*)\)", p)
-    if m_fp:
-        ret_c, name, inner_params = m_fp.group(1).strip(), m_fp.group(2), m_fp.group(3)
-        fn_ty = format_fn_ptr_option(ret_c, inner_params, f"{context}:{name}")
-        return sanitize_rust_ident(name), fn_ty
-
+def parse_c_leaf_param(p: str, idx: int, context: str) -> Tuple[str, str]:
     # Fixed-size array parameter decay, e.g. `const uint8_t ver[4]` or `uint8_t out[4]`
     m_arr = re.fullmatch(r"(.+?)\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\d*\]", p)
     if m_arr:
@@ -610,7 +704,7 @@ def parse_c_param(raw_param: str, idx: int, context: str) -> Tuple[str, str]:
 
     m = re.fullmatch(r"(.+?[\s\*])([A-Za-z_][A-Za-z0-9_]*)", p)
     if not m:
-        fail(f"{context}: cannot parse parameter #{idx}: {raw_param!r}")
+        fail(f"{context}: cannot parse parameter #{idx}: {p!r}")
     ty_c, name = m.group(1).strip(), m.group(2)
     return sanitize_rust_ident(name), map_c_type(ty_c, f"{context}:{name}", is_param=True)
 
@@ -620,13 +714,25 @@ def format_fn_ptr_option(ret_c: str, params_c: str, context: str) -> str:
     rendered_params: List[str] = []
     if params_clean and params_clean != "void":
         for i, rp in enumerate(split_top_level_Comma(params_clean)):
-            pname, pty = parse_c_param(rp, i, context)
+            rp_norm = re.sub(r"\s+", " ", rp.strip())
+            pname, pty = parse_c_leaf_param(rp_norm, i, context)
             rendered_params.append(f"{pname}: {pty}")
     ret_rs = map_c_type(ret_c, f"{context}:ret")
     ret_part = "" if ret_rs == "()" else f" -> {ret_rs}"
     return (
         f"::std::option::Option<unsafe extern \"C\" fn({', '.join(rendered_params)}){ret_part}>"
     )
+
+
+def parse_c_param(raw_param: str, idx: int, context: str) -> Tuple[str, str]:
+    p = re.sub(r"\s+", " ", raw_param.strip())
+    # Inline function pointer parameter, e.g.: `void (*cb)(uint8_t flag, void *ctx)`
+    m_fp = re.fullmatch(r"(.+?)\(\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\((.*)\)", p)
+    if m_fp:
+        ret_c, name, inner_params = m_fp.group(1).strip(), m_fp.group(2), m_fp.group(3)
+        fn_ty = format_fn_ptr_option(ret_c, inner_params, f"{context}:{name}")
+        return sanitize_rust_ident(name), fn_ty
+    return parse_c_leaf_param(p, idx, context)
 
 
 def generate_c_bridge_bindings(
@@ -836,6 +942,509 @@ def generate_c_bridge_bindings(
 
 
 # ---------------------------------------------------------------------------
+# Step 4: Pure-Rust Version table & Legacy 0.0.0.2 opcode table generators
+# ---------------------------------------------------------------------------
+
+
+def generate_version_table(version_h: pathlib.Path) -> str:
+    clean = strip_c_comments(version_h.read_text(encoding="utf-8"))
+
+    def parse_ver_tuple(name: str) -> Tuple[int, int, int, int]:
+        m = re.search(
+            rf"\b{re.escape(name)}\s*\{{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}}",
+            clean,
+        )
+        if not m:
+            fail(f"{version_h}: missing version array `{name}`")
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+
+    cur_v = parse_ver_tuple("version")
+    min_v = parse_ver_tuple("minVersion")
+
+    m_inc = re.search(r"incompatibleVersion\s*\{(.*?)\}\s*;", clean, re.S)
+    if not m_inc:
+        fail(f"{version_h}: missing `incompatibleVersion`")
+    incompat = sorted(
+        {
+            (int(a), int(b), int(c), int(d))
+            for a, b, c, d in re.findall(
+                r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}",
+                m_inc.group(1),
+            )
+        }
+    )
+
+    m_api12 = re.search(r"constexpr\s+uint8_t\s+API_12\s*=\s*(\d+)\s*;", clean)
+    if not m_api12:
+        fail(f"{version_h}: missing `API_12`")
+    api_12 = int(m_api12.group(1))
+
+    sub_quals: List[str] = []
+    for sub_name in ("SUB_API_VERSION_1", "SUB_API_VERSION_2"):
+        ms = re.search(rf'{sub_name}\s*=\s*"([^"]*)"\s*;', clean)
+        if not ms:
+            fail(f"{version_h}: missing `{sub_name}`")
+        sub_quals.append(ms.group(1))
+
+    m_sub_v = re.search(
+        r"GetVersionByApi.*?return\s+std::array<[^>]+>\s*\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}",
+        clean,
+        re.S,
+    )
+    if not m_sub_v:
+        fail(f"{version_h}: missing API_12 sub-version return tuple")
+    api_12_sub_v = (
+        int(m_sub_v.group(1)),
+        int(m_sub_v.group(2)),
+        int(m_sub_v.group(3)),
+        int(m_sub_v.group(4)),
+    )
+
+    m_map = re.search(r"api_version_map\s*\{(.*?)\}\s*;", clean, re.S)
+    if not m_map:
+        fail(f"{version_h}: missing `api_version_map`")
+    api_map: Dict[int, Tuple[int, int, int, int]] = {}
+    for k, a, b, c, d in re.findall(
+        r"\{\s*(\d+)\s*,\s*\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\}\s*\}",
+        m_map.group(1),
+    ):
+        ki = int(k)
+        if ki not in api_map:
+            api_map[ki] = (int(a), int(b), int(c), int(d))
+
+    lines = [
+        "// Auto-generated by scripts/vendor-gen.py from file_format_version.h — do not edit.",
+        "",
+        f"pub(crate) const CURRENT_VERSION: [u8; 4] = [{cur_v[0]}, {cur_v[1]}, {cur_v[2]}, {cur_v[3]}];",
+        f"pub(crate) const MIN_VERSION: [u8; 4] = [{min_v[0]}, {min_v[1]}, {min_v[2]}, {min_v[3]}];",
+        f"pub(crate) const API_12: u8 = {api_12};",
+        "pub(crate) const API_12_SUB_QUALIFIERS: &[&str] = &["
+        + ", ".join(f'"{q}"' for q in sub_quals)
+        + "];",
+        f"pub(crate) const API_12_SUB_VERSION: [u8; 4] = [{api_12_sub_v[0]}, {api_12_sub_v[1]}, {api_12_sub_v[2]}, {api_12_sub_v[3]}];",
+        "pub(crate) const INCOMPATIBLE_VERSIONS: &[[u8; 4]] = &[",
+    ]
+    for v in incompat:
+        lines.append(f"    [{v[0]}, {v[1]}, {v[2]}, {v[3]}],")
+    lines.append("];")
+    lines.append("pub(crate) const API_VERSION_MAP: &[(u8, [u8; 4])] = &[")
+    for k in sorted(api_map):
+        v = api_map[k]
+        lines.append(f"    ({k}, [{v[0]}, {v[1]}, {v[2]}, {v[3]}]),")
+    lines.append("];")
+    lines.append("")
+    return "\n".join(lines)
+
+
+LEGACY_FORMATS: Dict[str, List[Tuple[str, bool, int, int]]] = {
+    "none": [],
+    "id32": [("id", False, 32, 8)],
+    "imm8": [("imm", True, 8, 8)],
+    "imm16": [("imm", True, 16, 8)],
+    "imm32": [("imm", True, 32, 8)],
+    "imm64": [("imm", True, 64, 8)],
+    "v8": [("v", False, 8, 8)],
+    "v8_v8": [("v", False, 8, 8), ("v", False, 8, 16)],
+    "v16_v16": [("v", False, 16, 8), ("v", False, 16, 24)],
+    "pref_none": [],
+    "pref_v8": [("v", False, 8, 16)],
+    "pref_v8_v8": [("v", False, 8, 16), ("v", False, 8, 24)],
+    "pref_v8_v8_v8": [("v", False, 8, 16), ("v", False, 8, 24), ("v", False, 8, 32)],
+    "pref_v8_v8_v8_v8": [
+        ("v", False, 8, 16),
+        ("v", False, 8, 24),
+        ("v", False, 8, 32),
+        ("v", False, 8, 40),
+    ],
+    "pref_imm16": [("imm", False, 16, 16)],
+    "pref_imm16_v8": [("imm", False, 16, 16), ("v", False, 8, 32)],
+    "pref_imm16_v8_v8": [
+        ("imm", False, 16, 16),
+        ("v", False, 8, 32),
+        ("v", False, 8, 40),
+    ],
+    "pref_imm4_imm4": [("imm", False, 4, 16), ("imm", False, 4, 20)],
+    "pref_imm8_imm8": [("imm", False, 8, 16), ("imm", False, 8, 24)],
+    "pref_imm16_imm16": [("imm", False, 16, 16), ("imm", False, 16, 32)],
+    "pref_imm4_imm4_v8": [
+        ("imm", False, 4, 16),
+        ("imm", False, 4, 20),
+        ("v", False, 8, 24),
+    ],
+    "pref_imm8_imm8_v8": [
+        ("imm", False, 8, 16),
+        ("imm", False, 8, 24),
+        ("v", False, 8, 32),
+    ],
+    "pref_imm16_imm16_v8": [
+        ("imm", False, 16, 16),
+        ("imm", False, 16, 32),
+        ("v", False, 8, 48),
+    ],
+    "pref_id16_imm16_v8": [
+        ("id", False, 16, 16),
+        ("imm", False, 16, 32),
+        ("v", False, 8, 48),
+    ],
+    "pref_id16_imm16_imm16_v8_v8": [
+        ("id", False, 16, 16),
+        ("imm", False, 16, 32),
+        ("imm", False, 16, 48),
+        ("v", False, 8, 64),
+        ("v", False, 8, 72),
+    ],
+    "pref_id32": [("id", False, 32, 16)],
+    "pref_id32_v8": [("id", False, 32, 16), ("v", False, 8, 48)],
+    "pref_id32_imm8": [("id", False, 32, 16), ("imm", False, 8, 48)],
+    "pref_v8_imm32": [("v", False, 8, 16), ("imm", False, 32, 24)],
+}
+
+LEGACY_0_0_0_2_SPECS: Tuple[Tuple[int, int, str, str, int, str, Tuple[str, ...]], ...] = (
+    (0x00, 0x00, 'nop', 'none', 1, 'Nop', ()),
+    (0x00, 0x18, 'lda.str string_id', 'id32', 5, 'LdaStr', ('id',)),
+    (0x00, 0x22, 'jmp imm:i32', 'imm8', 2, 'Jmp', ('jmp',)),
+    (0x00, 0x23, 'jmp imm:i32', 'imm16', 3, 'Jmp', ('jmp',)),
+    (0x00, 0x24, 'jmp imm:i32', 'imm32', 5, 'Jmp', ('jmp',)),
+    (0x00, 0x2D, 'jeqz imm:i32', 'imm8', 2, 'Jeqz', ('jmp',)),
+    (0x00, 0x2E, 'jeqz imm:i32', 'imm16', 3, 'Jeqz', ('jmp',)),
+    (0x00, 0x2F, 'jnez imm:i32', 'imm8', 2, 'Jnez', ('jmp',)),
+    (0x00, 0x30, 'jnez imm:i32', 'imm16', 3, 'Jnez', ('jmp',)),
+    (0x00, 0xA0, 'mov.dyn v1:out:any, v2:in:any', 'v8_v8', 3, 'Mov', ('v0', 'v1')),
+    (0x00, 0xA1, 'mov.dyn v1:out:any, v2:in:any', 'v16_v16', 5, 'Mov', ('v0', 'v1')),
+    (0x00, 0xA2, 'lda.dyn v:in:any', 'v8', 2, 'Lda', ('v0',)),
+    (0x00, 0xA3, 'sta.dyn v:out:any', 'v8', 2, 'Sta', ('v0',)),
+    (0x00, 0xA4, 'ldai.dyn imm:i32', 'imm32', 5, 'Ldai', ('imm',)),
+    (0x00, 0xA5, 'fldai.dyn imm:f64', 'imm64', 9, 'Fldai', ('imm',)),
+    (0x00, 0xA6, 'return.dyn', 'none', 1, 'Return', ()),
+    (0xFF, 0x00, 'ecma.ldnan', 'pref_none', 2, 'Ldnan', ()),
+    (0xFF, 0x01, 'ecma.ldinfinity', 'pref_none', 2, 'Ldinfinity', ()),
+    (0xFF, 0x02, 'ecma.ldglobalthis', 'pref_none', 2, 'Ldglobal', ()),
+    (0xFF, 0x03, 'ecma.ldundefined', 'pref_none', 2, 'Ldundefined', ()),
+    (0xFF, 0x04, 'ecma.ldnull', 'pref_none', 2, 'Ldnull', ()),
+    (0xFF, 0x05, 'ecma.ldsymbol', 'pref_none', 2, 'Ldsymbol', ()),
+    (0xFF, 0x06, 'ecma.ldglobal', 'pref_none', 2, 'Ldglobal', ()),
+    (0xFF, 0x07, 'ecma.ldtrue', 'pref_none', 2, 'Ldtrue', ()),
+    (0xFF, 0x08, 'ecma.ldfalse', 'pref_none', 2, 'Ldfalse', ()),
+    (0xFF, 0x09, 'ecma.throwdyn', 'pref_none', 2, 'Throw', ()),
+    (0xFF, 0x0A, 'ecma.typeofdyn', 'pref_none', 2, 'Typeof', ('0',)),
+    (0xFF, 0x0B, 'ecma.ldlexenvdyn', 'pref_none', 2, 'DeprecatedLdlexenv', ()),
+    (0xFF, 0x0C, 'ecma.poplexenvdyn', 'pref_none', 2, 'DeprecatedPoplexenv', ()),
+    (0xFF, 0x0D, 'ecma.getunmappedargs', 'pref_none', 2, 'Getunmappedargs', ()),
+    (0xFF, 0x0E, 'ecma.getpropiterator', 'pref_none', 2, 'Getpropiterator', ()),
+    (0xFF, 0x0F, 'ecma.asyncfunctionenter', 'pref_none', 2, 'Asyncfunctionenter', ()),
+    (0xFF, 0x10, 'ecma.ldhole', 'pref_none', 2, 'Ldhole', ()),
+    (0xFF, 0x11, 'ecma.returnundefined', 'pref_none', 2, 'Returnundefined', ()),
+    (0xFF, 0x12, 'ecma.createemptyobject', 'pref_none', 2, 'Createemptyobject', ()),
+    (0xFF, 0x13, 'ecma.createemptyarray', 'pref_none', 2, 'Createemptyarray', ('0',)),
+    (0xFF, 0x14, 'ecma.getiterator', 'pref_none', 2, 'Getiterator', ('0',)),
+    (0xFF, 0x15, 'ecma.throwthrownotexists', 'pref_none', 2, 'ThrowNotexists', ()),
+    (0xFF, 0x16, 'ecma.throwpatternnoncoercible', 'pref_none', 2, 'ThrowPatternnoncoercible', ()),
+    (0xFF, 0x17, 'ecma.ldhomeobject', 'pref_none', 2, 'DeprecatedLdhomeobject', ()),
+    (0xFF, 0x18, 'ecma.throwdeletesuperproperty', 'pref_none', 2, 'ThrowDeletesuperproperty', ()),
+    (0xFF, 0x19, 'ecma.debugger', 'pref_none', 2, 'Debugger', ()),
+    (0xFF, 0x1A, 'ecma.add2dyn v:in:top', 'pref_v8', 3, 'Add2', ('0', 'v0')),
+    (0xFF, 0x1B, 'ecma.sub2dyn v:in:top', 'pref_v8', 3, 'Sub2', ('0', 'v0')),
+    (0xFF, 0x1C, 'ecma.mul2dyn v:in:top', 'pref_v8', 3, 'Mul2', ('0', 'v0')),
+    (0xFF, 0x1D, 'ecma.div2dyn v:in:top', 'pref_v8', 3, 'Div2', ('0', 'v0')),
+    (0xFF, 0x1E, 'ecma.mod2dyn v:in:top', 'pref_v8', 3, 'Mod2', ('0', 'v0')),
+    (0xFF, 0x1F, 'ecma.eqdyn v:in:top', 'pref_v8', 3, 'Eq', ('0', 'v0')),
+    (0xFF, 0x20, 'ecma.noteqdyn v:in:top', 'pref_v8', 3, 'Noteq', ('0', 'v0')),
+    (0xFF, 0x21, 'ecma.lessdyn v:in:top', 'pref_v8', 3, 'Less', ('0', 'v0')),
+    (0xFF, 0x22, 'ecma.lesseqdyn v:in:top', 'pref_v8', 3, 'Lesseq', ('0', 'v0')),
+    (0xFF, 0x23, 'ecma.greaterdyn v:in:top', 'pref_v8', 3, 'Greater', ('0', 'v0')),
+    (0xFF, 0x24, 'ecma.greatereqdyn v:in:top', 'pref_v8', 3, 'Greatereq', ('0', 'v0')),
+    (0xFF, 0x25, 'ecma.shl2dyn v:in:top', 'pref_v8', 3, 'Shl2', ('0', 'v0')),
+    (0xFF, 0x26, 'ecma.shr2dyn v:in:top', 'pref_v8', 3, 'Ashr2', ('0', 'v0')),
+    (0xFF, 0x27, 'ecma.ashr2dyn v:in:top', 'pref_v8', 3, 'Shr2', ('0', 'v0')),
+    (0xFF, 0x28, 'ecma.and2dyn v:in:top', 'pref_v8', 3, 'And2', ('0', 'v0')),
+    (0xFF, 0x29, 'ecma.or2dyn v:in:top', 'pref_v8', 3, 'Or2', ('0', 'v0')),
+    (0xFF, 0x2A, 'ecma.xor2dyn v:in:top', 'pref_v8', 3, 'Xor2', ('0', 'v0')),
+    (0xFF, 0x2B, 'ecma.tonumber v:in:top', 'pref_v8', 3, 'DeprecatedTonumber', ('v0',)),
+    (0xFF, 0x2C, 'ecma.negdyn v:in:top', 'pref_v8', 3, 'DeprecatedNeg', ('v0',)),
+    (0xFF, 0x2D, 'ecma.notdyn v:in:top', 'pref_v8', 3, 'DeprecatedNot', ('v0',)),
+    (0xFF, 0x2E, 'ecma.incdyn v:in:top', 'pref_v8', 3, 'DeprecatedInc', ('v0',)),
+    (0xFF, 0x2F, 'ecma.decdyn v:in:top', 'pref_v8', 3, 'DeprecatedDec', ('v0',)),
+    (0xFF, 0x30, 'ecma.expdyn v:in:top', 'pref_v8', 3, 'Exp', ('0', 'v0')),
+    (0xFF, 0x31, 'ecma.isindyn v:in:top', 'pref_v8', 3, 'Isin', ('0', 'v0')),
+    (0xFF, 0x32, 'ecma.instanceofdyn v:in:top', 'pref_v8', 3, 'Instanceof', ('0', 'v0')),
+    (0xFF, 0x33, 'ecma.strictnoteqdyn v:in:top', 'pref_v8', 3, 'Strictnoteq', ('0', 'v0')),
+    (0xFF, 0x34, 'ecma.stricteqdyn v:in:top', 'pref_v8', 3, 'Stricteq', ('0', 'v0')),
+    (0xFF, 0x35, 'ecma.resumegenerator v:in:top', 'pref_v8', 3, 'DeprecatedResumegenerator', ('v0',)),
+    (0xFF, 0x36, 'ecma.getresumemode v:in:top', 'pref_v8', 3, 'DeprecatedGetresumemode', ('v0',)),
+    (0xFF, 0x37, 'ecma.creategeneratorobj v:in:top', 'pref_v8', 3, 'Creategeneratorobj', ('v0',)),
+    (0xFF, 0x38, 'ecma.throwconstassignment v:in:top', 'pref_v8', 3, 'ThrowConstassignment', ('v0',)),
+    (0xFF, 0x39, 'ecma.gettemplateobject v:in:top', 'pref_v8', 3, 'DeprecatedGettemplateobject', ('v0',)),
+    (0xFF, 0x3A, 'ecma.getnextpropname v:in:top', 'pref_v8', 3, 'Getnextpropname', ('v0',)),
+    (0xFF, 0x3B, 'ecma.callarg0dyn v:in:top', 'pref_v8', 3, 'DeprecatedCallarg0', ('v0',)),
+    (0xFF, 0x3C, 'ecma.throwifnotobject v:in:top', 'pref_v8', 3, 'ThrowIfnotobject', ('v0',)),
+    (0xFF, 0x3E, 'ecma.closeiterator v:in:top', 'pref_v8', 3, 'Closeiterator', ('0', 'v0')),
+    (0xFF, 0x40, 'ecma.supercallspread v:in:top', 'pref_v8', 3, 'Supercallspread', ('0', 'v0')),
+    (0xFF, 0x41, 'ecma.delobjprop v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedDelobjprop', ('v0', 'v1')),
+    (0xFF, 0x42, 'ecma.newobjspreaddyn v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Newobjapply', ('0', 'v1')),
+    (0xFF, 0x43, 'ecma.createiterresultobj v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Createiterresultobj', ('v0', 'v1')),
+    (0xFF, 0x44, 'ecma.suspendgenerator v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedSuspendgenerator', ('v0', 'v1')),
+    (0xFF, 0x45, 'ecma.asyncfunctionawaituncaught v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedAsyncfunctionawaituncaught', ('v0', 'v1')),
+    (0xFF, 0x46, 'ecma.throwundefinedifhole v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'ThrowUndefinedifhole', ('v0', 'v1')),
+    (0xFF, 0x47, 'ecma.callarg1dyn v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedCallarg1', ('v0', 'v1')),
+    (0xFF, 0x48, 'ecma.copydataproperties v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedCopydataproperties', ('v0', 'v1')),
+    (0xFF, 0x49, 'ecma.starrayspread v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Starrayspread', ('v0', 'v1')),
+    (0xFF, 0x4A, 'ecma.getiteratornext v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedGetiteratornext', ('v0', 'v1')),
+    (0xFF, 0x4B, 'ecma.setobjectwithproto v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedSetobjectwithproto', ('v0', 'v1')),
+    (0xFF, 0x4C, 'ecma.ldobjbyvalue v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedLdobjbyvalue', ('v0', 'v1')),
+    (0xFF, 0x4D, 'ecma.stobjbyvalue v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Stobjbyvalue', ('0', 'v0', 'v1')),
+    (0xFF, 0x4E, 'ecma.stownbyvalue v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Stownbyvalue', ('0', 'v0', 'v1')),
+    (0xFF, 0x4F, 'ecma.ldsuperbyvalue v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedLdsuperbyvalue', ('v0', 'v1')),
+    (0xFF, 0x50, 'ecma.stsuperbyvalue v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Stsuperbyvalue', ('0', 'v0', 'v1')),
+    (0xFF, 0x51, 'ecma.ldobjbyindex v:in:top, imm', 'pref_v8_imm32', 7, 'DeprecatedLdobjbyindex', ('v0', 'imm')),
+    (0xFF, 0x52, 'ecma.stobjbyindex v:in:top, imm', 'pref_v8_imm32', 7, 'WideStobjbyindex', ('v0', 'imm')),
+    (0xFF, 0x53, 'ecma.stownbyindex v:in:top, imm', 'pref_v8_imm32', 7, 'WideStownbyindex', ('v0', 'imm')),
+    (0xFF, 0x54, 'ecma.callspreaddyn v1:in:top, v2:in:top, v3:in:top', 'pref_v8_v8_v8', 5, 'DeprecatedCallspread', ('v0', 'v1', 'v2')),
+    (0xFF, 0x55, 'ecma.asyncfunctionresolve v1:in:top, v2:in:top, v3:in:top', 'pref_v8_v8_v8', 5, 'DeprecatedAsyncfunctionresolve', ('v0', 'v1', 'v2')),
+    (0xFF, 0x56, 'ecma.asyncfunctionreject v1:in:top, v2:in:top, v3:in:top', 'pref_v8_v8_v8', 5, 'DeprecatedAsyncfunctionreject', ('v0', 'v1', 'v2')),
+    (0xFF, 0x57, 'ecma.callargs2dyn v1:in:top, v2:in:top, v3:in:top', 'pref_v8_v8_v8', 5, 'DeprecatedCallargs2', ('v0', 'v1', 'v2')),
+    (0xFF, 0x58, 'ecma.callargs3dyn v1:in:top, v2:in:top, v3:in:top, v4:in:top', 'pref_v8_v8_v8_v8', 6, 'DeprecatedCallargs3', ('v0', 'v1', 'v2', 'v3')),
+    (0xFF, 0x59, 'ecma.definegettersetterbyvalue v1:in:top, v2:in:top, v3:in:top, v4:in:top', 'pref_v8_v8_v8_v8', 6, 'Definegettersetterbyvalue', ('v0', 'v1', 'v2', 'v3')),
+    (0xFF, 0x5A, 'ecma.newobjdynrange imm, v:in:top', 'pref_imm16_v8', 5, 'WideNewobjrange', ('imm_minus_1', 'v0_plus_1')),
+    (0xFF, 0x5B, 'ecma.callirangedyn imm, v:in:top', 'pref_imm16_v8', 5, 'DeprecatedCallrange', ('imm', 'v0')),
+    (0xFF, 0x5C, 'ecma.callithisrangedyn imm, v:in:top', 'pref_imm16_v8', 5, 'DeprecatedCallthisrange', ('imm', 'v0')),
+    (0xFF, 0x5D, 'ecma.supercall imm, v:in:top', 'pref_imm16_v8', 5, 'WideSupercallarrowrange', ('imm', 'v0')),
+    (0xFF, 0x5E, 'ecma.createobjectwithexcludedkeys imm, v1:in:top, v2:in:top', 'pref_imm16_v8_v8', 6, 'WideCreateobjectwithexcludedkeys', ('imm', 'v0', 'v1')),
+    (0xFF, 0x5F, 'ecma.definefuncdyn method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definefunc', ('0', 'id', 'imm')),
+    (0xFF, 0x60, 'ecma.definencfuncdyn method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definefunc', ('0', 'id', 'imm')),
+    (0xFF, 0x61, 'ecma.definegeneratorfunc method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definefunc', ('0', 'id', 'imm')),
+    (0xFF, 0x62, 'ecma.defineasyncfunc method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definefunc', ('0', 'id', 'imm')),
+    (0xFF, 0x63, 'ecma.definemethod method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definemethod', ('0', 'id', 'imm')),
+    (0xFF, 0x64, 'ecma.newlexenvdyn imm', 'pref_imm16', 4, 'WideNewlexenv', ('imm',)),
+    (0xFF, 0x65, 'ecma.copyrestargs imm', 'pref_imm16', 4, 'WideCopyrestargs', ('imm',)),
+    (0xFF, 0x66, 'ecma.createarraywithbuffer imm', 'pref_imm16', 4, 'DeprecatedCreatearraywithbuffer', ('imm',)),
+    (0xFF, 0x67, 'ecma.createobjecthavingmethod imm', 'pref_imm16', 4, 'DeprecatedCreateobjecthavingmethod', ('imm',)),
+    (0xFF, 0x68, 'ecma.throwifsupernotcorrectcall imm', 'pref_imm16', 4, 'ThrowIfsupernotcorrectcall', ('imm',)),
+    (0xFF, 0x69, 'ecma.createobjectwithbuffer imm', 'pref_imm16', 4, 'DeprecatedCreateobjectwithbuffer', ('imm',)),
+    (0xFF, 0x6A, 'ecma.ldlexvardyn imm1, imm2', 'pref_imm4_imm4', 3, 'Ldlexvar', ('imm', 'imm')),
+    (0xFF, 0x6B, 'ecma.ldlexvardyn imm1, imm2', 'pref_imm8_imm8', 4, 'Ldlexvar', ('imm', 'imm')),
+    (0xFF, 0x6C, 'ecma.ldlexvardyn imm1, imm2', 'pref_imm16_imm16', 6, 'WideLdlexvar', ('imm', 'imm')),
+    (0xFF, 0x6D, 'ecma.stlexvardyn imm1, imm2, v:in:top', 'pref_imm4_imm4_v8', 4, 'DeprecatedStlexvar', ('imm', 'imm', 'v0')),
+    (0xFF, 0x6E, 'ecma.stlexvardyn imm1, imm2, v:in:top', 'pref_imm8_imm8_v8', 5, 'DeprecatedStlexvar', ('imm', 'imm', 'v0')),
+    (0xFF, 0x6F, 'ecma.stlexvardyn imm1, imm2, v:in:top', 'pref_imm16_imm16_v8', 7, 'DeprecatedStlexvar', ('imm', 'imm', 'v0')),
+    (0xFF, 0x70, 'ecma.defineclasswithbuffer method_id, imm1, imm2, v1:in:top, v2:in:top', 'pref_id16_imm16_imm16_v8_v8', 10, 'DeprecatedDefineclasswithbuffer', ('id', 'imm', 'imm', 'v0', 'v1')),
+    (0xFF, 0x71, 'ecma.getmodulenamespace string_id', 'pref_id32', 6, 'DeprecatedGetmodulenamespace', ('id',)),
+    (0xFF, 0x72, 'ecma.stmodulevar string_id', 'pref_id32', 6, 'DeprecatedStmodulevar', ('id',)),
+    (0xFF, 0x73, 'ecma.tryldglobalbyname string_id', 'pref_id32', 6, 'Tryldglobalbyname', ('0', 'id')),
+    (0xFF, 0x74, 'ecma.trystglobalbyname string_id', 'pref_id32', 6, 'Trystglobalbyname', ('0', 'id')),
+    (0xFF, 0x75, 'ecma.ldglobalvar string_id', 'pref_id32', 6, 'Ldglobalvar', ('0', 'id')),
+    (0xFF, 0x76, 'ecma.stglobalvar string_id', 'pref_id32', 6, 'Stglobalvar', ('0', 'id')),
+    (0xFF, 0x77, 'ecma.ldobjbyname string_id, v:in:top', 'pref_id32_v8', 7, 'DeprecatedLdobjbyname', ('id', 'v0')),
+    (0xFF, 0x78, 'ecma.stobjbyname string_id, v:in:top', 'pref_id32_v8', 7, 'Stobjbyname', ('0', 'id', 'v0')),
+    (0xFF, 0x79, 'ecma.stownbyname string_id, v:in:top', 'pref_id32_v8', 7, 'Stownbyname', ('0', 'id', 'v0')),
+    (0xFF, 0x7A, 'ecma.ldsuperbyname string_id, v:in:top', 'pref_id32_v8', 7, 'DeprecatedLdsuperbyname', ('id', 'v0')),
+    (0xFF, 0x7B, 'ecma.stsuperbyname string_id, v:in:top', 'pref_id32_v8', 7, 'Stsuperbyname', ('0', 'id', 'v0')),
+    (0xFF, 0x7C, 'ecma.ldmodulevar string_id, imm', 'pref_id32_imm8', 7, 'DeprecatedLdmodulevar', ('id', 'imm')),
+    (0xFF, 0x7D, 'ecma.createregexpwithliteral string_id, imm', 'pref_id32_imm8', 7, 'Createregexpwithliteral', ('0', 'id', 'imm')),
+    (0xFF, 0x7E, 'ecma.istrue', 'pref_none', 2, 'Istrue', ()),
+    (0xFF, 0x7F, 'ecma.isfalse', 'pref_none', 2, 'Isfalse', ()),
+    (0xFF, 0x80, 'ecma.stconsttoglobalrecord string_id', 'pref_id32', 6, 'DeprecatedStconsttoglobalrecord', ('id',)),
+    (0xFF, 0x81, 'ecma.stlettoglobalrecord string_id', 'pref_id32', 6, 'DeprecatedStlettoglobalrecord', ('id',)),
+    (0xFF, 0x82, 'ecma.stclasstoglobalrecord string_id', 'pref_id32', 6, 'DeprecatedStclasstoglobalrecord', ('id',)),
+    (0xFF, 0x83, 'ecma.stownbyvaluewithnameset v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'Stownbyvaluewithnameset', ('0', 'v0', 'v1')),
+    (0xFF, 0x84, 'ecma.stownbynamewithnameset string_id, v:in:top', 'pref_id32_v8', 7, 'Stownbynamewithnameset', ('0', 'id', 'v0')),
+    (0xFF, 0x85, 'ecma.ldfunction', 'pref_none', 2, 'Ldfunction', ()),
+    (0xFF, 0x86, 'ecma.newlexenvwithnamedyn imm1:u16, imm2:u16', 'pref_imm16_imm16', 6, 'WideNewlexenvwithname', ('imm', 'imm_as_id')),
+    (0xFF, 0x87, 'ecma.ldbigint string_id', 'pref_id32', 6, 'Ldbigint', ('id',)),
+    (0xFF, 0x88, 'ecma.tonumeric v:in:top', 'pref_v8', 3, 'DeprecatedTonumeric', ('v0',)),
+    (0xFF, 0x89, 'ecma.createasyncgeneratorobj v:in:top', 'pref_v8', 3, 'Createasyncgeneratorobj', ('v0',)),
+    (0xFF, 0x8A, 'ecma.asyncgeneratorresolve v1:in:top, v2:in:top, v3:in:top', 'pref_v8_v8_v8', 5, 'Asyncgeneratorresolve', ('v0', 'v1', 'v2')),
+    (0xFF, 0x8B, 'ecma.defineasyncgeneratorfunc method_id, imm, v:in:top', 'pref_id16_imm16_v8', 7, 'Definefunc', ('0', 'id', 'imm')),
+    (0xFF, 0x8C, 'ecma.dynamicimport v:in:top', 'pref_v8', 3, 'DeprecatedDynamicimport', ('v0',)),
+    (0xFF, 0x8D, 'ecma.ldpatchvar imm', 'pref_imm16', 4, 'WideLdpatchvar', ('imm',)),
+    (0xFF, 0x8E, 'ecma.stpatchvar imm', 'pref_imm16', 4, 'WideStpatchvar', ('imm',)),
+    (0xFF, 0x8F, 'ecma.asyncgeneratorreject v1:in:top, v2:in:top', 'pref_v8_v8', 4, 'DeprecatedAsyncgeneratorreject', ('v0', 'v1')),
+    (0xFF, 0x90, 'ecma.notifyconcurrentresult', 'pref_none', 2, 'CallruntimeNotifyconcurrentresult', ()),
+)
+
+
+
+def parse_bytecode_variants(bytecode_rs: pathlib.Path) -> Dict[str, List[str]]:
+    variants: Dict[str, List[str]] = {}
+    enum_re = re.compile(r"^    ([A-Z][A-Za-z0-9]*)(\(([^)]*)\))?,\s*$")
+    in_enum = False
+    for line in bytecode_rs.read_text(encoding="utf-8").splitlines():
+        if line.startswith("pub enum Bytecode"):
+            in_enum = True
+            continue
+        if in_enum:
+            if line.startswith("}"):
+                break
+            m = enum_re.match(line)
+            if m:
+                fields = m.group(3).split(", ") if m.group(3) else []
+                variants[m.group(1)] = fields
+    return variants
+
+
+def legacy_extract_expr(width: int, bit_offset: int) -> str:
+    byte = bit_offset // 8
+    if width == 4:
+        return f"(b[{byte}] >> 4) & 0xf" if bit_offset % 8 else f"b[{byte}] & 0xf"
+    if width == 8:
+        return f"b[{byte}]"
+    if width == 16:
+        return f"u16::from_le_bytes([b[{byte}], b[{byte + 1}]])"
+    if width == 32:
+        return f"u32::from_le_bytes([b[{byte}], b[{byte + 1}], b[{byte + 2}], b[{byte + 3}]])"
+    if width == 64:
+        return (
+            f"u64::from_le_bytes([b[{byte}], b[{byte + 1}], b[{byte + 2}], b[{byte + 3}], "
+            f"b[{byte + 4}], b[{byte + 5}], b[{byte + 6}], b[{byte + 7}]])"
+        )
+    fail(f"unsupported legacy operand width {width}")
+
+
+def generate_legacy_table(bytecode_rs: pathlib.Path) -> str:
+    variants = parse_bytecode_variants(bytecode_rs)
+    lines: List[str] = [
+        "// Auto-generated by scripts/vendor-gen.py — do not edit.",
+        "//",
+        "// Legacy (file format 0.0.0.2, OpenHarmony 3.0/3.1-era) opcode",
+        "// translation table aligned with upstream `panda_file_translator.cpp`.",
+        "",
+        "use crate::generated::{Bytecode, EntityId, Imm, Label, Reg};",
+        "",
+        "/// One legacy opcode table entry.",
+        "#[derive(Clone, Copy)]",
+        "pub(crate) struct LegacyInsn {",
+        "    /// Total instruction size in bytes (legacy encoding).",
+        "    pub size: u8,",
+        "    /// Build the modern-IR instruction from the raw bytes starting at",
+        "    /// the instruction, plus the raw jump offset for jump instructions.",
+        "    pub make: fn(&[u8]) -> (Bytecode, Option<i64>),",
+        "}",
+        "",
+    ]
+
+    for pbyte, sub, sig, fmt, size, variant, tokens in LEGACY_0_0_0_2_SPECS:
+        fields = variants.get(variant)
+        if fields is None:
+            fail(
+                f"legacy_table (0x{pbyte:02x}, 0x{sub:02x}): variant {variant} missing from Bytecode"
+            )
+        if len(fields) != len(tokens):
+            fail(
+                f"legacy_table (0x{pbyte:02x}, 0x{sub:02x}): {variant} expects {len(fields)} operands, got {len(tokens)}"
+            )
+        fmt_ops = LEGACY_FORMATS.get(fmt)
+        if fmt_ops is None:
+            fail(f"legacy_table (0x{pbyte:02x}, 0x{sub:02x}): unknown format {fmt!r}")
+        hdr_bits = 16 if pbyte == 0xFF else 8
+        expected_bits = hdr_bits + sum(w for _, _, w, _ in fmt_ops)
+        if expected_bits != size * 8:
+            fail(
+                f"legacy_table (0x{pbyte:02x}, 0x{sub:02x}): format {fmt} bits {expected_bits} != size {size}"
+            )
+
+        vs = [o for o in fmt_ops if o[0] == "v"]
+        imms = [o for o in fmt_ops if o[0] == "imm"]
+        ids = [o for o in fmt_ops if o[0] == "id"]
+        imm_idx = 0
+        id_idx = 0
+        args: List[str] = []
+        jump_expr: Optional[str] = None
+
+        for field, tok in zip(fields, tokens):
+            if tok == "0":
+                if field != "Imm":
+                    fail(f"legacy_table {variant}: synthesized 0 into {field}")
+                args.append("Imm(0)")
+            elif tok == "v0_plus_1":
+                _, _, w, off = vs[0]
+                if field != "Reg" or w != 8:
+                    fail(f"legacy_table {variant}: v0_plus_1 expects u8 Reg")
+                ex = legacy_extract_expr(w, off)
+                args.append(f"Reg(({ex}).wrapping_add(1) as u16)")
+            elif tok.startswith("v"):
+                _, _, w, off = vs[int(tok[1:])]
+                if field != "Reg":
+                    fail(f"legacy_table {variant}: {tok} into {field}")
+                ex = legacy_extract_expr(w, off)
+                args.append(f"Reg({ex} as u16)")
+            elif tok == "imm_minus_1":
+                _, _, w, off = imms[imm_idx]
+                imm_idx += 1
+                if field != "Imm" or w != 16:
+                    fail(f"legacy_table {variant}: imm_minus_1 expects u16 Imm")
+                ex = legacy_extract_expr(w, off)
+                args.append(f"Imm(({ex}).wrapping_sub(1) as i64)")
+            elif tok == "imm_as_id":
+                _, _, w, off = imms[imm_idx]
+                imm_idx += 1
+                if field != "EntityId":
+                    fail(f"legacy_table {variant}: imm_as_id expects EntityId")
+                ex = legacy_extract_expr(w, off)
+                args.append(f"EntityId(u32::from({ex}))")
+            elif tok == "imm":
+                _, signed, w, off = imms[imm_idx]
+                imm_idx += 1
+                if field != "Imm":
+                    fail(f"legacy_table {variant}: imm into {field}")
+                ex = legacy_extract_expr(w, off)
+                if w == 64:
+                    args.append(f"Imm({ex} as i64)")
+                elif signed:
+                    args.append(f"Imm(({ex}) as i{w} as i64)")
+                else:
+                    args.append(f"Imm(i64::from({ex}))")
+            elif tok == "id":
+                _, _, w, off = ids[id_idx]
+                id_idx += 1
+                if field != "EntityId":
+                    fail(f"legacy_table {variant}: id into {field}")
+                ex = legacy_extract_expr(w, off)
+                if w == 32:
+                    args.append(f"EntityId({ex})")
+                else:
+                    args.append(f"EntityId(u32::from({ex}))")
+            elif tok == "jmp":
+                _, _, w, off = imms[imm_idx]
+                imm_idx += 1
+                if field != "Label":
+                    fail(f"legacy_table {variant}: jmp into {field}")
+                ex = legacy_extract_expr(w, off)
+                args.append("Label(0)")
+                jump_expr = f"Some(({ex}) as i{w} as i64)"
+            else:
+                fail(f"legacy_table {variant}: unknown token {tok!r}")
+
+        kind_str = "core" if pbyte == 0 else "ecma"
+        fname = f"mk_{kind_str}_{sub:02x}"
+        ctor = f"Bytecode::{variant}({', '.join(args)})" if args else f"Bytecode::{variant}"
+        reads_bytes = any(t != "0" for t in tokens)
+        param = "b: &[u8]" if reads_bytes else "_b: &[u8]"
+        j_str = jump_expr if jump_expr else "None"
+        lines.append(f"/// legacy `{sig}` [{fmt}] -> `{variant}`")
+        lines.append(f"fn {fname}({param}) -> (Bytecode, Option<i64>) {{")
+        lines.append(f"    ({ctor}, {j_str})")
+        lines.append("}")
+        lines.append("")
+
+    for pbyte, name in ((0x00, "LEGACY_CORE"), (0xFF, "LEGACY_ECMA")):
+        desc = "core (unprefixed)" if pbyte == 0 else "0xff-prefixed ecma"
+        lines.append(f"/// Legacy {desc} opcode table.")
+        lines.append(f"pub(crate) static {name}: [Option<LegacyInsn>; 256] = {{")
+        lines.append("    let mut t = [None; 256];")
+        for p, sub, _sig, _fmt, size, _variant, _tokens in LEGACY_0_0_0_2_SPECS:
+            if p != pbyte:
+                continue
+            fn_kind = "core" if p == 0 else "ecma"
+            lines.append(
+                f"    t[0x{sub:02x}] = Some(LegacyInsn {{ size: {size}, make: mk_{fn_kind}_{sub:02x} }});"
+            )
+        lines.append("    t")
+        lines.append("};")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Full codegen pipeline (writes to target directories or staging root)
 # ---------------------------------------------------------------------------
 
@@ -844,16 +1453,22 @@ def generate_c_bridge_bindings(
 class CodegenTargets:
     vendor_gen: pathlib.Path
     isa_bridge_gen: pathlib.Path
+    isa_sys_src_gen: pathlib.Path
     isa_src_gen: pathlib.Path
-    file_src_gen: pathlib.Path
+    isa_test_gen: pathlib.Path
+    file_sys_src_gen: pathlib.Path
+    file_pandasm_gen: pathlib.Path
 
 
 def default_targets() -> CodegenTargets:
     return CodegenTargets(
         vendor_gen=VENDOR_GEN_DIR,
         isa_bridge_gen=ISA_SYS_DIR / "bridge" / "generated",
-        isa_src_gen=ISA_SYS_DIR / "src" / "generated",
-        file_src_gen=FILE_SYS_DIR / "src" / "generated",
+        isa_sys_src_gen=ISA_SYS_DIR / "src" / "generated",
+        isa_src_gen=ISA_DIR / "src" / "generated",
+        isa_test_gen=ISA_DIR / "tests" / "integration" / "generated",
+        file_sys_src_gen=FILE_SYS_DIR / "src" / "generated",
+        file_pandasm_gen=FILE_DIR / "src" / "pandasm" / "generated",
     )
 
 
@@ -864,8 +1479,11 @@ def run_codegen_into(targets: CodegenTargets) -> None:
     for d in (
         targets.vendor_gen,
         targets.isa_bridge_gen,
+        targets.isa_sys_src_gen,
         targets.isa_src_gen,
-        targets.file_src_gen,
+        targets.isa_test_gen,
+        targets.file_sys_src_gen,
+        targets.file_pandasm_gen,
     ):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -875,7 +1493,8 @@ def run_codegen_into(targets: CodegenTargets) -> None:
     pf_dir = SNAPSHOT_DIR / "libpandafile"
     pf_isapi = pf_dir / "pandafile_isapi.rb"
     pf_tpl = pf_dir / "templates"
-    isa_tpl = ISA_SYS_DIR / "templates"
+    isa_sys_tpl = ISA_SYS_DIR / "templates"
+    isa_tpl = ISA_DIR / "templates"
 
     # 1. Shared vendor C++ headers (used by isa-sys and/or file-sys)
     run_ruby_gen(
@@ -907,7 +1526,7 @@ def run_codegen_into(targets: CodegenTargets) -> None:
             targets.vendor_gen / out_name,
         )
 
-    # 2. abcd-isa-sys generated C++ & Rust
+    # 2. abcd-isa-sys generated C++ & raw FFI Rust bindings
     for erb_name, out_name in [
         ("isa_bridge_emit_dispatch.h.erb", "isa_bridge_emit_dispatch.h"),
         ("isa_bridge_valid_opcode.h.erb", "isa_bridge_valid_opcode.h"),
@@ -916,10 +1535,21 @@ def run_codegen_into(targets: CodegenTargets) -> None:
             gen_rb,
             isa_yaml,
             [isapi, pf_isapi],
-            isa_tpl / erb_name,
+            isa_sys_tpl / erb_name,
             targets.isa_bridge_gen / out_name,
         )
 
+    isa_bindings_rs = targets.isa_sys_src_gen / "bindings.rs"
+    isa_bindings_rs.write_text(
+        generate_c_bridge_bindings(
+            ISA_SYS_DIR / "bridge" / "isa_bridge.h",
+            ("isa_", "Isa", "ISA_"),
+        ),
+        encoding="utf-8",
+    )
+    run_rustfmt(isa_bindings_rs)
+
+    # 3. Pure-Rust abcd-isa generated tables + dev-only oracle helper + pandasm insn_ctor
     bytecode_rs = targets.isa_src_gen / "bytecode.rs"
     run_ruby_gen(
         gen_rb,
@@ -930,22 +1560,43 @@ def run_codegen_into(targets: CodegenTargets) -> None:
     )
     run_rustfmt(bytecode_rs)
 
-    isa_bindings_rs = targets.isa_src_gen / "bindings.rs"
-    isa_bindings_rs.write_text(
-        generate_c_bridge_bindings(
-            ISA_SYS_DIR / "bridge" / "isa_bridge.h",
-            ("isa_", "Isa", "ISA_"),
-        ),
+    version_table_rs = targets.isa_src_gen / "version_table.rs"
+    version_table_rs.write_text(
+        generate_version_table(targets.vendor_gen / "file_format_version.h"),
         encoding="utf-8",
     )
-    run_rustfmt(isa_bindings_rs)
+    run_rustfmt(version_table_rs)
 
-    # 3. abcd-file-sys generated Rust & C++ static_assert checks
+    legacy_table_rs = targets.isa_src_gen / "legacy_table.rs"
+    legacy_table_rs.write_text(generate_legacy_table(bytecode_rs), encoding="utf-8")
+    run_rustfmt(legacy_table_rs)
+
+    oracle_decode_rs = targets.isa_test_gen / "oracle_decode.rs"
+    run_ruby_gen(
+        gen_rb,
+        isa_yaml,
+        [isapi, pf_isapi],
+        isa_sys_tpl / "isa_oracle_decode.rs.erb",
+        oracle_decode_rs,
+    )
+    run_rustfmt(oracle_decode_rs)
+
+    insn_ctor_rs = targets.file_pandasm_gen / "insn_ctor.rs"
+    run_ruby_gen(
+        gen_rb,
+        isa_yaml,
+        [isapi, pf_isapi],
+        isa_tpl / "insn_ctor.rs.erb",
+        insn_ctor_rs,
+    )
+    run_rustfmt(insn_ctor_rs)
+
+    # 4. abcd-file-sys generated Rust & C++ static_assert checks
     enum_rs_text, enum_cpp_checks = generate_vendor_enums(
         SNAPSHOT_DIR, targets.vendor_gen
     )
     bridge_enum_checks: List[str] = []
-    file_bindings_rs = targets.file_src_gen / "bindings.rs"
+    file_bindings_rs = targets.file_sys_src_gen / "bindings.rs"
     file_bindings_rs.write_text(
         generate_c_bridge_bindings(
             FILE_SYS_DIR / "bridge" / "file_bridge.h",
@@ -956,7 +1607,7 @@ def run_codegen_into(targets: CodegenTargets) -> None:
     )
     run_rustfmt(file_bindings_rs)
 
-    enum_bindings_rs = targets.file_src_gen / "enum_bindings.rs"
+    enum_bindings_rs = targets.file_sys_src_gen / "enum_bindings.rs"
     enum_bindings_rs.write_text(enum_rs_text, encoding="utf-8")
     run_rustfmt(enum_bindings_rs)
 
@@ -1115,33 +1766,24 @@ def cmd_verify(_args: argparse.Namespace) -> None:
         fresh = CodegenTargets(
             vendor_gen=root / "vendor_gen",
             isa_bridge_gen=root / "isa_bridge_gen",
+            isa_sys_src_gen=root / "isa_sys_src_gen",
             isa_src_gen=root / "isa_src_gen",
-            file_src_gen=root / "file_src_gen",
+            isa_test_gen=root / "isa_test_gen",
+            file_sys_src_gen=root / "file_sys_src_gen",
+            file_pandasm_gen=root / "file_pandasm_gen",
         )
         run_codegen_into(fresh)
         errs: List[str] = []
-        errs.extend(compare_dirs(fresh.vendor_gen, committed.vendor_gen, "vendor/generated"))
-        errs.extend(
-            compare_dirs(
-                fresh.isa_bridge_gen,
-                committed.isa_bridge_gen,
-                "abcd-isa-sys/bridge/generated",
-            )
-        )
-        errs.extend(
-            compare_dirs(
-                fresh.isa_src_gen,
-                committed.isa_src_gen,
-                "abcd-isa-sys/src/generated",
-            )
-        )
-        errs.extend(
-            compare_dirs(
-                fresh.file_src_gen,
-                committed.file_src_gen,
-                "abcd-file-sys/src/generated",
-            )
-        )
+        for want_d, got_d, lbl in [
+            (fresh.vendor_gen, committed.vendor_gen, "vendor/generated"),
+            (fresh.isa_bridge_gen, committed.isa_bridge_gen, "abcd-isa-sys/bridge/generated"),
+            (fresh.isa_sys_src_gen, committed.isa_sys_src_gen, "abcd-isa-sys/src/generated"),
+            (fresh.isa_src_gen, committed.isa_src_gen, "abcd-isa/src/generated"),
+            (fresh.isa_test_gen, committed.isa_test_gen, "abcd-isa/tests/integration/generated"),
+            (fresh.file_sys_src_gen, committed.file_sys_src_gen, "abcd-file-sys/src/generated"),
+            (fresh.file_pandasm_gen, committed.file_pandasm_gen, "abcd-file/src/pandasm/generated"),
+        ]:
+            errs.extend(compare_dirs(want_d, got_d, lbl))
         if errs:
             fail(
                 "pre-generated files are out of sync (run `python3 scripts/vendor-gen.py codegen`):\n"
@@ -1150,7 +1792,7 @@ def cmd_verify(_args: argparse.Namespace) -> None:
     print("Generated files verified: 100% byte-identical to fresh codegen.")
 
 
-def main() -> None:
+def handle_cli() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -1168,12 +1810,12 @@ def main() -> None:
     p_cg = sub.add_parser("codegen", help="Regenerate C++ and Rust bindings from vendor/")
     p_cg.set_defaults(func=cmd_codegen)
 
-    p_ver = sub.add_parser("verify", help="Verify vendor snapshot hashes and generated files")
-    p_ver.set_defaults(func=cmd_verify)
+    p_vf = sub.add_parser("verify", help="Verify vendor snapshot and generated bindings")
+    p_vf.set_defaults(func=cmd_verify)
 
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    handle_cli()

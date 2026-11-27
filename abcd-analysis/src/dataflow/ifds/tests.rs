@@ -1051,3 +1051,454 @@ fn three_frame_uncaught_throw_propagates_and_local_catch_all_isolates() {
     assert!(result.is_reached(sw_first, &Fact::V(es)));
     assert!(!result.is_reached(sink_sw, &Fact::V(e_sw)));
 }
+
+/// Regression test for `D6` (`#94`): when a callee BOTH throws uncaught on one
+/// branch AND returns normally on another branch, and an identical global/heap
+/// fact (`SharedFact::Token`) is used for both uncaught-exit propagation and
+/// normal arrival at a call site in a middle frame `mid`:
+/// - `propagate_uncaught_exit(d1, call_site, Token)` MUST NOT mask normal
+///   arrival `(d1, call_site, Token)` (which feeds `by_target` + `process_call`
+///   call-to-return + second-call normal return!), AND
+/// - normal arrival `(d1, call_site, Token)` MUST NOT mask `propagate_uncaught_exit`
+///   from forwarding the uncaught throw up to `outer`'s catch handler!
+#[test]
+fn uncaught_edge_set_separation_preserves_both_normal_return_and_uncaught_throw() {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum SharedFact {
+        Zero,
+        Token,
+        Val(ValueId),
+    }
+
+    let mut m = mk_module();
+    let sink = add_external_sink(&mut m, "sink");
+
+    // `may_fail(cond)`: on `true` branch generates `Token` and throws; on
+    // `false` branch returns `"secret"` normally.
+    fn emit_call(
+        m: &mut Module,
+        b: BlockId,
+        callee: ValueId,
+        args: Vec<ValueId>,
+    ) -> (InstId, ValueId) {
+        let iid = InstId::new(m.insts.len() as u32);
+        let v = emit(
+            m,
+            b,
+            Op::Call {
+                callee,
+                this: None,
+                args,
+                kind: abcd_ir::CallKind::Direct,
+            },
+        );
+        (iid, v)
+    }
+    let may_fail = add_func_named(&mut m, "may_fail");
+    let mf_entry = entry_of(&m, may_fail);
+    let mf_throw = add_block(&mut m, may_fail);
+    let mf_ret = add_block(&mut m, may_fail);
+    add_param(&mut m, may_fail, 0);
+    let mf_cond = load_number(&mut m, mf_entry, 1.0);
+    emit_void(
+        &mut m,
+        mf_entry,
+        Op::CondBranch {
+            cond: mf_cond,
+            true_dest: mf_throw,
+            false_dest: mf_ret,
+        },
+    );
+    link(&mut m, mf_entry, mf_throw);
+    link(&mut m, mf_entry, mf_ret);
+
+    let thrown_src_iid = InstId::new(m.insts.len() as u32);
+    let thrown_sec = load_string(&mut m, mf_throw, "secret");
+    let mf_throw_iid = emit_void(&mut m, mf_throw, Op::Throw { value: thrown_sec });
+    emit_void(&mut m, mf_throw, Op::Unreachable);
+
+    let ret_src_iid = InstId::new(m.insts.len() as u32);
+    let ret_sec = load_string(&mut m, mf_ret, "secret");
+    let mf_ret_iid = emit_void(
+        &mut m,
+        mf_ret,
+        Op::Return {
+            value: Some(ret_sec),
+        },
+    );
+
+    // `echo_if_token()`: when entered with `SharedFact::Token`, returns `"ok"` tainted!
+    let echo = add_func_named(&mut m, "echo");
+    let echo_entry = entry_of(&m, echo);
+    add_param(&mut m, echo, 0);
+    let echo_val = load_number(&mut m, echo_entry, 42.0);
+    let echo_ret_iid = emit_void(
+        &mut m,
+        echo_entry,
+        Op::Return {
+            value: Some(echo_val),
+        },
+    );
+
+    // `mid()`:
+    //   1. Calls `may_fail()` FIRST (no catch-all): `may_fail`'s throw branch
+    //      records `(Zero, call1, Token)` in `uncaught_edge_set` BEFORE normal
+    //      return from `may_fail` generates `Token` after `call1`!
+    //   2. Also loops back so `Token` arrives NORMALLY at `call1` `(Zero, call1, Token)`!
+    //      With a single `edge_set`, `(Zero, call1, Token)` was already in `edge_set`
+    //      from `propagate_uncaught_exit`, suppressing `by_target` + `call_to_return_flow`
+    //      for `Token` across `call1` AND suppressing `echo()` at `call2`!
+    let mid = add_func_named(&mut m, "mid");
+    let mid_entry = entry_of(&m, mid);
+    let mid_loop = add_block(&mut m, mid);
+    let mid_after = add_block(&mut m, mid);
+    add_param(&mut m, mid, 0);
+    emit_void(&mut m, mid_entry, Op::Branch { dest: mid_loop });
+    link(&mut m, mid_entry, mid_loop);
+
+    let mf_ref = load_method_ref(&mut m, mid_loop, may_fail);
+    let (call1, call1_res) = emit_call(&mut m, mid_loop, mf_ref, Vec::new());
+    let loop_cond = load_number(&mut m, mid_loop, 0.0);
+    emit_void(
+        &mut m,
+        mid_loop,
+        Op::CondBranch {
+            cond: loop_cond,
+            true_dest: mid_loop,
+            false_dest: mid_after,
+        },
+    );
+    link(&mut m, mid_loop, mid_loop);
+    link(&mut m, mid_loop, mid_after);
+
+    let echo_ref = load_method_ref(&mut m, mid_after, echo);
+    let (call2, call2_res) = emit_call(&mut m, mid_after, echo_ref, Vec::new());
+    let mid_ret_iid = emit_void(
+        &mut m,
+        mid_after,
+        Op::Return {
+            value: Some(call2_res),
+        },
+    );
+
+    // `outer()`: `try { let r = mid(); sink(r); } catch (e) { sink(e); }`
+    let outer = add_func_named(&mut m, "outer");
+    let out_try = entry_of(&m, outer);
+    let out_catch = add_block(&mut m, outer);
+    let out_done = add_block(&mut m, outer);
+    add_param(&mut m, outer, 0);
+
+    let mid_ref = load_method_ref(&mut m, out_try, mid);
+    let (call_mid, mid_res) = emit_call(&mut m, out_try, mid_ref, Vec::new());
+    let sink_ref1 = load_method_ref(&mut m, out_try, sink);
+    let sink_norm = emit_void_call(&mut m, out_try, sink_ref1, vec![mid_res]);
+    emit_void(&mut m, out_try, Op::Branch { dest: out_done });
+
+    let exc_outer = add_exception_param(&mut m, out_catch);
+    let sink_ref2 = load_method_ref(&mut m, out_catch, sink);
+    let sink_exc = emit_void_call(&mut m, out_catch, sink_ref2, vec![exc_outer]);
+    emit_void(&mut m, out_catch, Op::Branch { dest: out_done });
+
+    emit_void(&mut m, out_done, Op::Return { value: None });
+    link(&mut m, out_try, out_done);
+    link(&mut m, out_catch, out_done);
+    add_try(&mut m, outer, vec![out_try], out_catch, exc_outer);
+
+    let mut cg = MapCallGraph::default();
+    cg.add(call_mid, mid);
+    cg.add(call1, may_fail);
+    cg.add(call2, echo);
+    cg.add(sink_norm, sink);
+    cg.add(sink_exc, sink);
+
+    struct DualExitProblem {
+        outer: FuncId,
+        thrown_src_iid: InstId,
+        ret_src_iid: InstId,
+        mf_throw_iid: InstId,
+        mf_ret_iid: InstId,
+        echo_ret_iid: InstId,
+        mid_ret_iid: InstId,
+        call1: InstId,
+        call1_res: ValueId,
+        call2: InstId,
+        call2_res: ValueId,
+        call_mid: InstId,
+        mid_res: ValueId,
+        exc_outer: ValueId,
+        out_catch_first: InstId,
+    }
+
+    impl IfdsProblem for DualExitProblem {
+        type Fact = SharedFact;
+
+        fn zero(&self) -> SharedFact {
+            SharedFact::Zero
+        }
+
+        fn initial_seeds(&self) -> Vec<(FuncId, SharedFact)> {
+            vec![(self.outer, SharedFact::Zero)]
+        }
+
+        fn normal_flow_out(
+            &self,
+            _module: &Module,
+            curr: InstId,
+            _succ: InstId,
+            _source_id: FactId,
+            source: &SharedFact,
+            out: &mut FlowSink<SharedFact>,
+        ) {
+            match *source {
+                SharedFact::Zero => {
+                    if curr == self.thrown_src_iid || curr == self.ret_src_iid {
+                        out.emit(SharedFact::Token);
+                    }
+                }
+                SharedFact::Token | SharedFact::Val(_) => out.pass_through(),
+            }
+        }
+
+        fn call_flow_out(
+            &self,
+            _module: &Module,
+            _call: InstId,
+            _callee: FuncId,
+            _source_id: FactId,
+            source: &SharedFact,
+            out: &mut FlowSink<SharedFact>,
+        ) {
+            if *source == SharedFact::Token {
+                out.pass_through();
+            }
+        }
+
+        fn return_flow_out(
+            &self,
+            _module: &Module,
+            call_site: Option<InstId>,
+            _callee: FuncId,
+            exit: InstId,
+            return_site: Option<InstId>,
+            _source_id: FactId,
+            source: &SharedFact,
+            out: &mut FlowSink<SharedFact>,
+        ) {
+            match *source {
+                SharedFact::Token => {
+                    if exit == self.mf_ret_iid && call_site == Some(self.call1) {
+                        out.pass_through();
+                        out.emit(SharedFact::Val(self.call1_res));
+                    } else if exit == self.echo_ret_iid && call_site == Some(self.call2) {
+                        out.pass_through();
+                        out.emit(SharedFact::Val(self.call2_res));
+                    } else if call_site == Some(self.call_mid)
+                        && return_site == Some(self.out_catch_first)
+                    {
+                        out.emit(SharedFact::Val(self.exc_outer));
+                    }
+                }
+                SharedFact::Val(v) => {
+                    if exit == self.mid_ret_iid
+                        && v == self.call2_res
+                        && call_site == Some(self.call_mid)
+                        && return_site != Some(self.out_catch_first)
+                    {
+                        out.emit(SharedFact::Val(self.mid_res));
+                    }
+                }
+                SharedFact::Zero => {}
+            }
+        }
+
+        fn call_to_return_flow_out(
+            &self,
+            _module: &Module,
+            _call: InstId,
+            _return_site: InstId,
+            _source_id: FactId,
+            source: &SharedFact,
+            out: &mut FlowSink<SharedFact>,
+        ) {
+            if *source != SharedFact::Zero {
+                out.pass_through();
+            }
+        }
+
+        fn call_uncaught_exit_flow_out(
+            &self,
+            _module: &Module,
+            _call_site: InstId,
+            _callee: FuncId,
+            callee_exit: InstId,
+            _source_id: FactId,
+            source: &SharedFact,
+            out: &mut FlowSink<SharedFact>,
+        ) {
+            if (*source == SharedFact::Zero && callee_exit == self.mf_throw_iid)
+                || *source == SharedFact::Token
+            {
+                out.emit(SharedFact::Token);
+            }
+        }
+    }
+
+    let out_catch_first = m.block(out_catch).unwrap().insts[0];
+    let prob = DualExitProblem {
+        outer,
+        thrown_src_iid,
+        ret_src_iid,
+        mf_throw_iid,
+        mf_ret_iid,
+        echo_ret_iid,
+        mid_ret_iid,
+        call1,
+        call1_res,
+        call2,
+        call2_res,
+        call_mid,
+        mid_res,
+        exc_outer,
+        out_catch_first,
+    };
+
+    let res = IfdsSolver::new(&m, &prob, &cg, IfdsConfig::default()).solve();
+    assert!(
+        res.is_reached(call2, &SharedFact::Token),
+        "Token must still traverse call1 via normal arrival + call_to_return_flow even after uncaught exit recorded (Zero, call1, Token)"
+    );
+    assert!(
+        res.is_reached(sink_norm, &SharedFact::Val(mid_res)),
+        "normal return path from mid() must reach sink_norm"
+    );
+    assert!(
+        res.is_reached(sink_exc, &SharedFact::Val(exc_outer)),
+        "uncaught throw path through mid() must ALSO reach outer's catch handler sink_exc"
+    );
+}
+
+/// Verify that `FlowSink::pass_through()` performs ZERO `Fact::clone()` calls
+/// across arbitrarily long intraprocedural and call-to-return bypass chains (`D6`).
+#[test]
+fn flow_sink_pass_through_is_zero_clone() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug)]
+    struct CountedFact {
+        tag: u32,
+    }
+
+    impl Clone for CountedFact {
+        fn clone(&self) -> Self {
+            CLONE_COUNT.fetch_add(1, Ordering::Relaxed);
+            Self { tag: self.tag }
+        }
+    }
+
+    impl PartialEq for CountedFact {
+        fn eq(&self, other: &Self) -> bool {
+            self.tag == other.tag
+        }
+    }
+
+    impl Eq for CountedFact {}
+
+    impl std::hash::Hash for CountedFact {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.tag.hash(state);
+        }
+    }
+
+    CLONE_COUNT.store(0, Ordering::Relaxed);
+
+    let mut m = mk_module();
+    let ext = add_external_sink(&mut m, "noop");
+    let f = add_func_named(&mut m, "chain");
+    let b = entry_of(&m, f);
+    let mut v = load_number(&mut m, b, 1.0);
+    let src_iid = m.blocks[b.index()].insts[0];
+    for _ in 0..25 {
+        v = emit(&mut m, b, Op::Mov { src: v });
+    }
+    let ext_ref = load_method_ref(&mut m, b, ext);
+    let call_iid = emit_void_call(&mut m, b, ext_ref, vec![v]);
+    for _ in 0..25 {
+        v = emit(&mut m, b, Op::Mov { src: v });
+    }
+    let ret_iid = emit_void(&mut m, b, Op::Return { value: Some(v) });
+
+    let mut cg = MapCallGraph::default();
+    cg.add(call_iid, ext);
+
+    struct ZeroCloneProblem {
+        func: FuncId,
+        src_iid: InstId,
+    }
+
+    impl IfdsProblem for ZeroCloneProblem {
+        type Fact = CountedFact;
+
+        fn zero(&self) -> CountedFact {
+            CountedFact { tag: 0 }
+        }
+
+        fn initial_seeds(&self) -> Vec<(FuncId, CountedFact)> {
+            vec![(self.func, self.zero())]
+        }
+
+        fn normal_flow_out(
+            &self,
+            _module: &Module,
+            curr: InstId,
+            _succ: InstId,
+            _source_id: FactId,
+            source: &CountedFact,
+            out: &mut FlowSink<CountedFact>,
+        ) {
+            if source.tag == 0 {
+                if curr == self.src_iid {
+                    out.emit(CountedFact { tag: 1 });
+                }
+            } else {
+                out.pass_through();
+            }
+        }
+
+        fn call_to_return_flow_out(
+            &self,
+            _module: &Module,
+            _call: InstId,
+            _return_site: InstId,
+            _source_id: FactId,
+            source: &CountedFact,
+            out: &mut FlowSink<CountedFact>,
+        ) {
+            if source.tag != 0 {
+                out.pass_through();
+            }
+        }
+    }
+
+    let prob = ZeroCloneProblem { func: f, src_iid };
+    let solver = IfdsSolver::new(&m, &prob, &cg, IfdsConfig::default());
+    // Reset after solver construction (`zero` interning clones once) and plant
+    // only propagation-loop clones: interning `tag: 1` clones once on first
+    // insertion into `fact_ids`, and all ~52 subsequent `pass_through()` hops
+    // perform ZERO clones!
+    CLONE_COUNT.store(0, Ordering::Relaxed);
+    let res = solver.solve();
+    let clones_during_solve = CLONE_COUNT.load(Ordering::Relaxed);
+    assert!(
+        clones_during_solve <= 1,
+        "expected <= 1 clone (initial interning of tag=1) across 52 pass-through steps, got {clones_during_solve}"
+    );
+    assert_eq!(
+        res.raw_path_edges()
+            .iter()
+            .filter(|&&(_, n, _)| n == ret_iid)
+            .count(),
+        2
+    );
+}

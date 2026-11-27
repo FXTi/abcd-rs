@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn static_arkts_methods_resolve_h0_and_h1_without_annotation() {
-        let mut m = mk_module();
+        let mut m = Module::with_dialect(Dialect::StaticArkTS);
         let sym = m.sym.intern("LArkPkg/Widget;");
         let mut cls = ClassData::new(sym, sym);
         cls.source_lang = SourceLang::ArkTS;
@@ -99,5 +99,18 @@ mod tests {
         assert_eq!(i_slots, FrameSlots::STATIC_INSTANCE);
         assert_eq!(i_slots.implicit_count(), 1);
         assert_eq!(i_slots.this_index(), Some(0));
+
+        // Dynamic container (`Dialect::DynamicEcma`) with `SourceLang::ArkTS` keeps N66 policy.
+        let mut dyn_m = mk_module();
+        let dyn_sym = dyn_m.sym.intern("LDynArk/Widget;");
+        let mut dyn_cls = ClassData::new(dyn_sym, dyn_sym);
+        dyn_cls.source_lang = SourceLang::ArkTS;
+        let dyn_cid = ClassId::new(dyn_m.classes.len() as u32);
+        dyn_m.classes.push(dyn_cls);
+        let dyn_fid = FuncId::new(dyn_m.functions.len() as u32);
+        let mut dyn_fd = FunctionData::new(dyn_cid, i_name, FunctionKind::Function);
+        dyn_fd.modifiers = Modifiers::PUBLIC;
+        dyn_m.functions.push(dyn_fd);
+        assert_eq!(frame_slots_of(&dyn_m, dyn_fid), None);
     }
 }

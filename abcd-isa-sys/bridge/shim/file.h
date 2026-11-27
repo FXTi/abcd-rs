@@ -21,8 +21,9 @@
 #include <optional>
 #include <array>
 #include <map>
+#include <stdexcept>
 
-//LOG macro — shim in `vendor/shim/utils/logger.h` replacing upstream logger.h.
+// LOG macro — shim in `vendor/shim/utils/logger.h` replacing upstream logger.h.
 // Use `<...>` so `/I` / `-I` include priority (`bridge/shim` -> `vendor/shim`)
 // always wins over MSVC `/FI` parent-TU directory lookup.
 #include <utils/logger.h>
@@ -31,25 +32,41 @@
 // ABORT_AND_UNREACHABLE / CHECK (library crates must never write to stderr).
 #include "macros.h"
 #undef ABORT_AND_UNREACHABLE
+#ifdef SUPPORT_KNOWN_EXCEPTION
+#define ABORT_AND_UNREACHABLE()                         \
+    do {                                                \
+        throw ::std::runtime_error("unreachable path"); \
+    } while (0)
+#else
 #define ABORT_AND_UNREACHABLE() \
     do {                        \
-        std::abort();           \
+        ::std::abort();         \
     } while (0)
+#endif
 
 #undef CHECK
+#ifdef SUPPORT_KNOWN_EXCEPTION
+#define CHECK(expr)                                              \
+    do {                                                         \
+        if (UNLIKELY(!(expr))) {                                 \
+            throw ::std::runtime_error("check failed: " #expr);  \
+        }                                                        \
+    } while (0)
+#else
 #define CHECK(expr)               \
     do {                          \
         if (UNLIKELY(!(expr))) {  \
-            std::abort();         \
+            ::std::abort();       \
         }                         \
     } while (0)
+#endif
 
 #undef CHECK_NOT_NULL
 #define CHECK_NOT_NULL(ptr) CHECK((ptr) != nullptr)
 
 // Transitive dependencies that the original file.h provides through helpers.h.
 // bytecode_emitter.cpp needs Span<T> and MinimumBitsToStore.
-#include "utils/span.h"
+#include <utils/span.h>
 #include "utils/bit_utils.h"
 
 namespace panda::panda_file {

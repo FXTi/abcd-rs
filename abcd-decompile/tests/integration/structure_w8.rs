@@ -74,30 +74,39 @@ fn structure(m: &Module, f: FuncId) -> Structured {
 /// Pre-order flattening of a node list (emission order, descending
 /// into arms/bodies).
 fn flat<'a>(nodes: &'a [SNode], out: &mut Vec<&'a SNode>) {
-    for n in nodes {
+    let mut stack: Vec<&'a [SNode]> = vec![nodes];
+    while let Some(slice) = stack.pop() {
+        let Some((n, rest)) = slice.split_first() else {
+            continue;
+        };
+        if !rest.is_empty() {
+            stack.push(rest);
+        }
         out.push(n);
         match n {
             SNode::If {
                 then, otherwise, ..
             } => {
-                flat(then, out);
-                flat(otherwise, out);
+                stack.push(otherwise);
+                stack.push(then);
             }
-            SNode::While { body, .. } | SNode::DoWhile { body, .. } => flat(body, out),
-            SNode::Labeled { body, .. } => flat(body, out),
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::Block(body) => stack.push(body),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                flat(body, out);
-                for c in catches {
-                    flat(&c.body, out);
-                }
                 if let Some(f) = finally {
-                    flat(f, out);
+                    stack.push(f);
                 }
+                for c in catches.iter().rev() {
+                    stack.push(&c.body);
+                }
+                stack.push(body);
             }
             _ => {}
         }
@@ -2875,8 +2884,8 @@ fn xarm_rejoin_mainline() {
     );
 }
 
-/// The shared tail exceeding the block budget declines the fold (the
-/// residual keeps the honesty note).
+/// The shared tail exceeding the block budget declines inline duplication
+/// and structures the cross-arm merge via Ramsey labeled blocks (`D4`).
 #[test]
 fn xarm_bail_block_budget() {
     let (m, xa) = xarm_base(&mut |m, xa| {
@@ -2906,14 +2915,20 @@ fn xarm_bail_block_budget() {
     });
     let s = structure(&m, xa.f);
     assert_eq!(s.stats.cross_arm_folds, 0, "no fold: {:?}", s.stats);
+    assert_eq!(
+        s.stats.cross_arm_notes, 0,
+        "Ramsey labeled merge drops zero edges: {:?}",
+        s.stats
+    );
     assert!(
-        s.stats.cross_arm_notes >= 1,
-        "the residual note: {:?}",
+        s.stats.alternates >= 1,
+        "Ramsey labeled merge emitted: {:?}",
         s.stats
     );
 }
 
-/// The shared tail exceeding the statement budget declines the fold.
+/// The shared tail exceeding the statement budget declines inline duplication
+/// and structures the cross-arm merge via Ramsey labeled blocks (`D4`).
 #[test]
 fn xarm_bail_stmt_budget() {
     let (m, xa) = xarm_base(&mut |m, xa| {
@@ -2926,8 +2941,13 @@ fn xarm_bail_stmt_budget() {
     let s = structure(&m, xa.f);
     assert_eq!(s.stats.cross_arm_folds, 0, "no fold: {:?}", s.stats);
     assert_eq!(
-        s.stats.cross_arm_notes, 1,
-        "the residual note: {:?}",
+        s.stats.cross_arm_notes, 0,
+        "Ramsey labeled merge drops zero edges: {:?}",
+        s.stats
+    );
+    assert!(
+        s.stats.alternates >= 1,
+        "Ramsey labeled merge emitted: {:?}",
         s.stats
     );
 }
@@ -3576,8 +3596,13 @@ fn xarm_tree_cond_tail_bails() {
         s.stats
     );
     assert_eq!(
-        s.stats.cross_arm_notes, 2,
-        "both residual edges noted: {:?}",
+        s.stats.cross_arm_notes, 0,
+        "Ramsey labeled merge drops zero edges: {:?}",
+        s.stats
+    );
+    assert!(
+        s.stats.alternates >= 1,
+        "Ramsey labeled merge emitted: {:?}",
         s.stats
     );
 }
@@ -4896,9 +4921,14 @@ fn xarm_bail_dup_stmt_budget() {
     });
     let s = structure(&m, xa.f);
     assert_eq!(s.stats.cross_arm_folds, 0, "no fold: {:?}", s.stats);
+    assert_eq!(
+        s.stats.cross_arm_notes, 0,
+        "Ramsey labeled merge drops zero edges: {:?}",
+        s.stats
+    );
     assert!(
-        s.stats.cross_arm_notes >= 1,
-        "the residual note: {:?}",
+        s.stats.alternates >= 1,
+        "Ramsey labeled merge emitted: {:?}",
         s.stats
     );
 }

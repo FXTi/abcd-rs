@@ -90,10 +90,49 @@ fn legacy_ecma_deprecated_layouts() {
         decode_one(&[0xff, 0x47, 0x01, 0x02]),
         Bytecode::DeprecatedCallarg1(Reg(1), Reg(2))
     ));
-    // callithisrangedyn pref_imm16_v8 -> Callthisrange(ic=0, argc, v0)
+    // callithisrangedyn pref_imm16_v8 -> DeprecatedCallthisrange(argc, v0)
     assert!(matches!(
         decode_one(&[0xff, 0x5c, 0x03, 0x00, 0x07]),
-        Bytecode::Callthisrange(Imm(0), Imm(3), Reg(7))
+        Bytecode::DeprecatedCallthisrange(Imm(3), Reg(7))
+    ));
+    // callirangedyn pref_imm16_v8 -> DeprecatedCallrange(argc, v0)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5b, 0x02, 0x00, 0x04]),
+        Bytecode::DeprecatedCallrange(Imm(2), Reg(4))
+    ));
+    // newobjdynrange pref_imm16_v8 -> WideNewobjrange(imm - 1, v0 + 1)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5a, 0x03, 0x00, 0x05]),
+        Bytecode::WideNewobjrange(Imm(2), Reg(6))
+    ));
+    // supercall pref_imm16_v8 -> WideSupercallarrowrange(argc, v0)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5d, 0x02, 0x00, 0x08]),
+        Bytecode::WideSupercallarrowrange(Imm(2), Reg(8))
+    ));
+    // newly mapped valid 0.0.0.2 opcodes (panda_file_translator.cpp parity)
+    assert!(matches!(decode_one(&[0xff, 0x02]), Bytecode::Ldglobal));
+    assert!(matches!(decode_one(&[0xff, 0x19]), Bytecode::Debugger));
+    assert!(matches!(decode_one(&[0xff, 0x85]), Bytecode::Ldfunction));
+    assert!(matches!(
+        decode_one(&[0xff, 0x30, 0x04]),
+        Bytecode::Exp(Imm(0), Reg(4))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x26, 0x04]),
+        Bytecode::Ashr2(Imm(0), Reg(4))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x27, 0x04]),
+        Bytecode::Shr2(Imm(0), Reg(4))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x42, 0x02, 0x09]),
+        Bytecode::Newobjapply(Imm(0), Reg(9))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x86, 0x03, 0x00, 0x12, 0x00]),
+        Bytecode::WideNewlexenvwithname(Imm(3), EntityId(0x12))
     ));
     // ldlexvardyn imm4_imm4: nibble-packed operands
     assert!(matches!(
@@ -135,9 +174,9 @@ fn legacy_errors() {
         decode_legacy(&[0x99]).unwrap_err(),
         DecodeError::InvalidOpcode(0)
     );
-    // unmapped legacy ecma opcode (newobjspreaddyn: no modern counterpart)
+    // unmapped legacy ecma opcode (iternext: fatal/unimplemented in panda_file_translator.cpp)
     assert_eq!(
-        decode_legacy(&[0xff, 0x42]).unwrap_err(),
+        decode_legacy(&[0xff, 0x3d, 0x00]).unwrap_err(),
         DecodeError::InvalidOpcode(0)
     );
     // truncated prefix

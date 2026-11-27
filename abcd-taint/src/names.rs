@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 
 use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
 use abcd_analysis::ohos_lifecycle::OHOS_CONTEXT_GLOBAL;
+use abcd_analysis::{OhmUrl, OhmUrlKind};
+use abcd_ir::module::ExportDecl;
 use abcd_ir::{CallKind, ClassId, Const, FuncId, Module, Op, Sym, ValueDef, ValueId};
 
 /// Pre-indexed `(ClassId, prop_name)` -> `(method FuncId, stored ValueId)` table
@@ -156,7 +158,7 @@ pub(crate) fn quick_callee_leaf_sym(
                     ) {
                         return None;
                     }
-                    if peel_namespace_index(module, *object).is_some() {
+                    if may_be_module_namespace_object(module, links, *object) {
                         return None;
                     }
                     let cid = links
@@ -180,6 +182,10 @@ enum ResolveStep {
         func: FuncId,
         value: ValueId,
     },
+    Leave {
+        func: FuncId,
+        value: ValueId,
+    },
     StartObjectPrefix {
         func: FuncId,
         object: ValueId,
@@ -200,7 +206,9 @@ enum ResolveStep {
     },
 }
 
-/// Iterative def-chain name resolver (zero call-stack recursion).
+/// Iterative def-chain name resolver (zero call-stack recursion), separating
+/// active-path cycle detection (`visiting`) from DAG memoization (`memo`) so
+/// diamond `Phi`/`LoadProp` sharing runs in `O(N)` without losing candidates.
 fn resolve_iterative(
     module: &Module,
     links: Option<&ModuleLinkTable>,
@@ -209,7 +217,9 @@ fn resolve_iterative(
     root_value: ValueId,
 ) -> Vec<String> {
     let mut visiting: HashSet<(FuncId, ValueId)> = HashSet::new();
+    let mut memo: HashMap<(FuncId, ValueId), Vec<String>> = HashMap::new();
     let mut bufs: Vec<Vec<String>> = vec![Vec::new()];
+    let mut had_cycle: Vec<bool> = vec![false];
     let mut stack: Vec<ResolveStep> = vec![ResolveStep::Enter {
         func: root_func,
         value: root_value,
@@ -218,13 +228,36 @@ fn resolve_iterative(
     while let Some(step) = stack.pop() {
         match step {
             ResolveStep::Enter { func, value } => {
-                if !visiting.insert((func, value)) {
+                if let Some(cached) = memo.get(&(func, value)) {
+                    if let Some(out) = bufs.last_mut() {
+                        for cand in cached {
+                            push_unique(out, cand.clone());
+                        }
+                    }
                     continue;
                 }
+                if !visiting.insert((func, value)) {
+                    if let Some(hc) = had_cycle.last_mut() {
+                        *hc = true;
+                    }
+                    continue;
+                }
+                bufs.push(Vec::new());
+                had_cycle.push(false);
+                stack.push(ResolveStep::Leave { func, value });
+
                 let Some(v) = module.value(value) else {
                     continue;
                 };
                 let ValueDef::Inst(iid) = v.def else {
+                    if let ValueDef::Const(c) = v.def
+                        && let Some(Const::MethodRef { func: f, .. }) = module.consts.get(c)
+                        && let Some(fd) = module.func(*f)
+                        && let Some(s) = module.sym.resolve(fd.name)
+                        && let Some(out) = bufs.last_mut()
+                    {
+                        push_unique(out, s.to_owned());
+                    }
                     continue;
                 };
                 match module.inst(iid).map(|i| &i.op) {
@@ -334,17 +367,26 @@ fn resolve_iterative(
                                 object: *object,
                                 name: *name,
                             });
-                            // Internal namespace member: `import * as ns from "./lib"; ns.foo()`.
-                            if let Some(links) = links
-                                && let Some(cid) = links.func_class(func)
-                                && let Some(req_idx) = peel_namespace_index(module, *object)
-                                && let Some(slots) =
-                                    links.resolve_namespace_member(cid, req_idx, *name)
-                            {
+                            // Internal namespace member (`import * as ns`, `export * as ns`,
+                            // and nested `ns.sub.foo()` chains).
+                            if let Some(links) = links {
+                                let ns_classes =
+                                    resolve_namespace_classes(module, links, func, *object);
                                 let mut ns_defs = Vec::new();
-                                for &sr in slots {
-                                    for &(def_fn, def_val) in links.stored_values(sr) {
-                                        ns_defs.push((def_fn, def_val));
+                                for ns_cid in ns_classes {
+                                    if let Some(slots) =
+                                        links.namespace_exports(ns_cid).and_then(|m| m.get(name))
+                                    {
+                                        for &sr in slots {
+                                            for &(def_fn, def_val) in links.stored_values(sr) {
+                                                ns_defs.push((def_fn, def_val));
+                                            }
+                                        }
+                                    }
+                                    if let Some(out) = bufs.last_mut() {
+                                        emit_namespace_external_reexports(
+                                            module, ns_cid, *name, leaf, out,
+                                        );
                                     }
                                 }
                                 for (def_fn, def_val) in ns_defs.into_iter().rev() {
@@ -358,6 +400,7 @@ fn resolve_iterative(
                     }
                     Some(Op::Call { callee, kind, .. }) => {
                         bufs.push(Vec::new());
+                        had_cycle.push(false);
                         stack.push(ResolveStep::FinishCall { kind: *kind });
                         stack.push(ResolveStep::Enter {
                             func,
@@ -383,7 +426,8 @@ fn resolve_iterative(
                     }
                     Some(Op::AllocClosure { func: inner })
                     | Some(Op::CreateGenerator { func: inner })
-                    | Some(Op::CreateAsyncGenerator { func: inner }) => {
+                    | Some(Op::CreateAsyncGenerator { func: inner })
+                    | Some(Op::DefineMethod { func: inner, .. }) => {
                         stack.push(ResolveStep::Enter {
                             func,
                             value: *inner,
@@ -392,8 +436,27 @@ fn resolve_iterative(
                     _ => {}
                 }
             }
+            ResolveStep::Leave { func, value } => {
+                visiting.remove(&(func, value));
+                let node_cands = bufs.pop().unwrap_or_default();
+                let node_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && node_cycled
+                {
+                    *parent_hc = true;
+                }
+                if !node_cycled {
+                    memo.insert((func, value), node_cands.clone());
+                }
+                if let Some(out) = bufs.last_mut() {
+                    for cand in node_cands {
+                        push_unique(out, cand);
+                    }
+                }
+            }
             ResolveStep::StartObjectPrefix { func, object, name } => {
                 bufs.push(Vec::new());
+                had_cycle.push(false);
                 stack.push(ResolveStep::FinishObjectPrefix { func, object, name });
                 stack.push(ResolveStep::Enter {
                     func,
@@ -402,6 +465,12 @@ fn resolve_iterative(
             }
             ResolveStep::FinishObjectPrefix { func, object, name } => {
                 let prefix = bufs.pop().unwrap_or_default();
+                let sub_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && sub_cycled
+                {
+                    *parent_hc = true;
+                }
                 let Some(leaf) = module.sym.resolve(name) else {
                     continue;
                 };
@@ -436,11 +505,18 @@ fn resolve_iterative(
             }
             ResolveStep::StartSdkStore { func, value } => {
                 bufs.push(Vec::new());
+                had_cycle.push(false);
                 stack.push(ResolveStep::FinishSdkStore);
                 stack.push(ResolveStep::Enter { func, value });
             }
             ResolveStep::FinishSdkStore => {
                 let sub = bufs.pop().unwrap_or_default();
+                let sub_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && sub_cycled
+                {
+                    *parent_hc = true;
+                }
                 if let Some(out) = bufs.last_mut() {
                     for cand in sub {
                         if cand.starts_with("@ohos.")
@@ -454,6 +530,12 @@ fn resolve_iterative(
             }
             ResolveStep::FinishCall { kind } => {
                 let callee_names = bufs.pop().unwrap_or_default();
+                let sub_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && sub_cycled
+                {
+                    *parent_hc = true;
+                }
                 if let Some(out) = bufs.last_mut() {
                     if matches!(kind, CallKind::New | CallKind::NewSpread) {
                         for cn in callee_names {
@@ -525,14 +607,186 @@ fn scan_class_prop_stores(module: &Module, cid: ClassId, prop_name: Sym) -> Vec<
     stores
 }
 
-fn peel_namespace_index(module: &Module, v: ValueId) -> Option<u32> {
+fn may_be_module_namespace_object(module: &Module, links: &ModuleLinkTable, v: ValueId) -> bool {
     let v = abcd_analysis::dataflow::heap::peel_movs(module, v);
-    let ValueDef::Inst(iid) = module.value(v)?.def else {
-        return None;
+    let Some(ValueDef::Inst(iid)) = module.value(v).map(|val| val.def) else {
+        return false;
     };
-    match &module.inst(iid)?.op {
-        Op::GetModuleNamespace { index } => Some(*index),
-        _ => None,
+    let Some(op) = module.inst(iid).map(|i| &i.op) else {
+        return false;
+    };
+    match op {
+        Op::GetModuleNamespace { .. } => true,
+        Op::LoadModuleVar { .. } | Op::LoadProp { .. } | Op::Phi { .. } => {
+            links.has_multi_record_esm()
+        }
+        _ => false,
+    }
+}
+
+enum NsEvalStep {
+    Enter(FuncId, ValueId),
+    FinishSubProp(FuncId, Sym),
+}
+
+/// Resolve all internal record [`ClassId`]s whose ES module namespace `value`
+/// (in `func`) may denote via `GetModuleNamespace`, `export * as ns` external
+/// imports (`ExternalSlotTarget::namespace_classes`), local module-slot copies,
+/// or chained sub-namespace `LoadProp` reads (`ModuleLinkTable::namespace_submodules`).
+pub(crate) fn resolve_namespace_classes(
+    module: &Module,
+    links: &ModuleLinkTable,
+    root_func: FuncId,
+    root_value: ValueId,
+) -> Vec<ClassId> {
+    let mut visiting: HashSet<(FuncId, ValueId)> = HashSet::new();
+    let mut frames: Vec<Vec<ClassId>> = vec![Vec::new()];
+    let mut stack: Vec<NsEvalStep> = vec![NsEvalStep::Enter(root_func, root_value)];
+
+    let push_cid = |out: &mut Vec<ClassId>, cid: ClassId| {
+        if !out.contains(&cid) {
+            out.push(cid);
+        }
+    };
+
+    while let Some(step) = stack.pop() {
+        match step {
+            NsEvalStep::Enter(func, value) => {
+                if !visiting.insert((func, value)) {
+                    continue;
+                }
+                let Some(ValueDef::Inst(iid)) = module.value(value).map(|v| v.def) else {
+                    continue;
+                };
+                let Some(op) = module.inst(iid).map(|i| &i.op) else {
+                    continue;
+                };
+                match op {
+                    Op::Mov { src } => stack.push(NsEvalStep::Enter(func, *src)),
+                    Op::Phi { entries } => {
+                        for (_, incoming) in entries.iter().rev() {
+                            stack.push(NsEvalStep::Enter(func, *incoming));
+                        }
+                    }
+                    Op::GetModuleNamespace { index } => {
+                        if let Some(cid) = links.func_class(func)
+                            && let Some(target_cid) = links.namespace_target(cid, *index)
+                            && let Some(out) = frames.last_mut()
+                        {
+                            push_cid(out, target_cid);
+                        }
+                    }
+                    Op::LoadModuleVar { index, kind } => {
+                        let Some(cid) = links.func_class(func) else {
+                            continue;
+                        };
+                        if kind.is_local() {
+                            let stored = links.stored_values(ModuleSlotRef {
+                                class_id: cid,
+                                slot: *index,
+                            });
+                            for &(def_fn, def_val) in stored.iter().rev() {
+                                stack.push(NsEvalStep::Enter(def_fn, def_val));
+                            }
+                        } else if let Some(target) = links.external_load(cid, *index) {
+                            if let Some(out) = frames.last_mut() {
+                                for &ns_cid in &target.namespace_classes {
+                                    push_cid(out, ns_cid);
+                                }
+                            }
+                            let mut defs = Vec::new();
+                            for &sr in &target.slots {
+                                for &(def_fn, def_val) in links.stored_values(sr) {
+                                    defs.push((def_fn, def_val));
+                                }
+                            }
+                            for (def_fn, def_val) in defs.into_iter().rev() {
+                                stack.push(NsEvalStep::Enter(def_fn, def_val));
+                            }
+                        }
+                    }
+                    Op::LoadProp { object, name } => {
+                        frames.push(Vec::new());
+                        stack.push(NsEvalStep::FinishSubProp(func, *name));
+                        stack.push(NsEvalStep::Enter(func, *object));
+                    }
+                    _ => {}
+                }
+            }
+            NsEvalStep::FinishSubProp(_func, name) => {
+                let parent_ns = frames.pop().unwrap_or_default();
+                let mut defs = Vec::new();
+                for p_cid in parent_ns {
+                    if let Some(sub_cids) =
+                        links.namespace_submodules(p_cid).and_then(|m| m.get(&name))
+                        && let Some(out) = frames.last_mut()
+                    {
+                        for &scid in sub_cids {
+                            push_cid(out, scid);
+                        }
+                    }
+                    if let Some(slots) = links.namespace_exports(p_cid).and_then(|m| m.get(&name)) {
+                        for &sr in slots {
+                            for &(def_fn, def_val) in links.stored_values(sr) {
+                                defs.push((def_fn, def_val));
+                            }
+                        }
+                    }
+                }
+                for (def_fn, def_val) in defs.into_iter().rev() {
+                    stack.push(NsEvalStep::Enter(def_fn, def_val));
+                }
+            }
+        }
+    }
+
+    frames.pop().unwrap_or_default()
+}
+
+/// Emit external SDK candidate names when an internal barrel namespace `ns_cid`
+/// re-exports an external SDK binding via `export { ... } from '@ohos.*'` or
+/// `export * from '@ohos.*'` (`R8`).
+fn emit_namespace_external_reexports(
+    module: &Module,
+    ns_cid: ClassId,
+    prop_sym: Sym,
+    prop_str: &str,
+    out: &mut Vec<String>,
+) {
+    let mut visited = HashSet::new();
+    let mut stack = vec![ns_cid];
+    while let Some(cur_cid) = stack.pop() {
+        if !visited.insert(cur_cid) {
+            continue;
+        }
+        let Some(cls) = module.classes.get(cur_cid.index()) else {
+            continue;
+        };
+        let Some(esm) = &cls.es_module else {
+            continue;
+        };
+        for exp in &esm.exports {
+            match exp {
+                ExportDecl::Indirect {
+                    export_name,
+                    import_name,
+                    module_request,
+                } if *export_name == prop_sym => {
+                    let raw_spec = module.sym.resolve(*module_request).unwrap_or("");
+                    if OhmUrl::is_sdk_specifier(raw_spec) {
+                        let imp = module.sym.resolve(*import_name).unwrap_or("");
+                        emit_external_import_names(raw_spec, imp, out);
+                    }
+                }
+                ExportDecl::Star { module_request } => {
+                    let raw_spec = module.sym.resolve(*module_request).unwrap_or("");
+                    if OhmUrl::is_sdk_specifier(raw_spec) {
+                        emit_external_import_names(raw_spec, prop_str, out);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -561,13 +815,24 @@ fn is_viewpu_intrinsic(leaf: &str) -> bool {
     )
 }
 
-/// Normalize `@ohos:foo` -> `@ohos.foo` and `@system:foo` -> `@system.foo`.
+/// Normalize OpenHarmony SDK / OHM URL specifiers (`@ohos:foo` -> `@ohos.foo`,
+/// `@hms:foo` -> `@hms.foo`, `@kit:foo` -> `@kit.foo`, `@arkts:foo` -> `@arkts.foo`,
+/// `@system:foo` -> `@system.foo`, `@normalized:...` -> logical `import_path`)
+/// via [`abcd_analysis::OhmUrl`].
 pub fn normalize_sdk_specifier(raw: &str) -> String {
-    if let Some(rest) = raw.strip_prefix("@ohos:") {
-        return format!("@ohos.{rest}");
-    }
-    if let Some(rest) = raw.strip_prefix("@system:") {
-        return format!("@system.{rest}");
+    if let Some(ohm) = OhmUrl::parse(raw) {
+        return match ohm.kind {
+            OhmUrlKind::OhosSdk => format!("@ohos.{}", ohm.import_path),
+            OhmUrlKind::HmsSdk => format!("@hms.{}", ohm.import_path),
+            OhmUrlKind::KitSdk => format!("@kit.{}", ohm.import_path),
+            OhmUrlKind::ArktsSdk => format!("@arkts.{}", ohm.import_path),
+            OhmUrlKind::SystemSdk => format!("@system.{}", ohm.import_path),
+            OhmUrlKind::Native => format!("@native:{}", ohm.import_path),
+            OhmUrlKind::Normalized { .. }
+            | OhmUrlKind::Bundle
+            | OhmUrlKind::Package
+            | OhmUrlKind::App => ohm.import_path.to_owned(),
+        };
     }
     raw.to_owned()
 }
@@ -650,17 +915,31 @@ fn push_unique(out: &mut Vec<String>, s: String) {
     }
 }
 
-/// The base (receiver) value of a call: the explicit `this`, or — for
-/// the `obj.m()` shape where `Dynamic` calls carry no `this` — the
-/// object of the `LoadProp` that produced the callee value.
+/// The base (receiver) value of a call: the explicit `this` (peeled through
+/// `Op::Mov` chains), or — for the `obj.m()` shape where `Dynamic` calls carry
+/// no `this` — the receiver object of the `LoadProp` / `LoadPropDyn` /
+/// `LoadPropIdx` / `LoadPrivate` / `LoadSuper` that produced `callee` (also
+/// peeled through `Op::Mov` chains).
 pub fn call_base_value(module: &Module, call: &abcd_ir::Inst) -> Option<ValueId> {
     let Op::Call { callee, this, .. } = &call.op else {
         return None;
     };
     if let Some(t) = this {
-        return Some(*t);
+        return Some(abcd_analysis::dataflow::heap::peel_movs(module, *t));
     }
     base_through_movs(module, *callee)
+        .map(|obj| abcd_analysis::dataflow::heap::peel_movs(module, obj))
+}
+
+fn receiver_of_member_load(op: &Op) -> Option<ValueId> {
+    match op {
+        Op::LoadProp { object, .. }
+        | Op::LoadPropDyn { object, .. }
+        | Op::LoadPropIdx { object, .. } => Some(*object),
+        Op::LoadPrivate { obj, .. } => Some(*obj),
+        Op::LoadSuper { this_value, .. } => Some(*this_value),
+        _ => None,
+    }
 }
 
 fn base_through_movs(module: &Module, value: ValueId) -> Option<ValueId> {
@@ -668,10 +947,12 @@ fn base_through_movs(module: &Module, value: ValueId) -> Option<ValueId> {
     let ValueDef::Inst(iid) = v.def else {
         return None;
     };
-    match module.inst(iid).map(|i| &i.op)? {
-        Op::LoadProp { object, .. } => return Some(*object),
-        Op::Mov { .. } | Op::Phi { .. } => {}
-        _ => return None,
+    let op = module.inst(iid).map(|i| &i.op)?;
+    if let Some(obj) = receiver_of_member_load(op) {
+        return Some(obj);
+    }
+    if !matches!(op, Op::Mov { .. } | Op::Phi { .. }) {
+        return None;
     }
     let mut visiting = HashSet::new();
     let mut stack = vec![value];
@@ -688,6 +969,9 @@ fn base_through_movs(module: &Module, value: ValueId) -> Option<ValueId> {
         let Some(op) = module.inst(ciid).map(|i| &i.op) else {
             continue;
         };
+        if let Some(obj) = receiver_of_member_load(op) {
+            return Some(obj);
+        }
         match op {
             Op::Mov { src } => stack.push(*src),
             // Loop rotation: the callee phi merges the pre-loop LoadProp
@@ -698,7 +982,6 @@ fn base_through_movs(module: &Module, value: ValueId) -> Option<ValueId> {
                     stack.push(*incoming);
                 }
             }
-            Op::LoadProp { object, .. } => return Some(*object),
             _ => {}
         }
     }

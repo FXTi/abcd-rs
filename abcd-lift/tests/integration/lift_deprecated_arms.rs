@@ -107,31 +107,46 @@ fn returned_value(m: &abcd_ir::Module) -> Option<ValueId> {
     }
 }
 
-// ── deprecated.ldlexenv / deprecated.ldhomeobject → LoadFunction ─────
+// ── deprecated.ldlexenv / deprecated.ldhomeobject (`D8`) ────────────
 
 #[test]
-fn deprecated_ldlexenv_ldhomeobject_fold_to_load_function() {
-    // translate.rs:1927-1932: both deprecated forms load acc — v0.1
-    // models them as LoadFunction (parity fold; the lexenv/homeobject
-    // distinction is NOT preserved).
-    for bc in [
-        Bytecode::DeprecatedLdlexenv,
-        Bytecode::DeprecatedLdhomeobject,
-    ] {
-        let file = build(&[bc, Bytecode::Return], 0);
-        let m = lift_file(&file).expect("lift");
-        verify_clean(&m);
-        let lf = find_op(&m, |op| matches!(op, Op::LoadFunction));
-        assert!(matches!(lf, Op::LoadFunction), "{bc:?} → LoadFunction");
-        // The result reaches acc (Return returns it).
-        let Some(rv) = returned_value(&m) else {
-            panic!("return carries a value")
-        };
-        let ValueDef::Inst(iid) = m.values[rv.index()].def else {
-            panic!("the returned value is the LoadFunction result")
-        };
-        assert!(matches!(m.insts[iid.index()].op, Op::LoadFunction));
-    }
+fn deprecated_ldlexenv_and_ldhomeobject_do_not_miscompile_to_load_function() {
+    // 1. `deprecated.ldlexenv` emits pure `LoadConst(Undefined)` rather than
+    //    miscompiling the lexical environment as the executing closure (`LoadFunction`).
+    let lex_file = build(&[Bytecode::DeprecatedLdlexenv, Bytecode::Return], 0);
+    let lex_m = lift_file(&lex_file).expect("lift deprecated.ldlexenv");
+    verify_clean(&lex_m);
+    assert!(
+        !ops(&lex_m).iter().any(|op| matches!(op, Op::LoadFunction)),
+        "deprecated.ldlexenv must not emit LoadFunction"
+    );
+    let rv_lex = returned_value(&lex_m).expect("return carries acc");
+    assert_eq!(const_of(&lex_m, rv_lex), Const::Undefined);
+
+    // 2. `deprecated.ldhomeobject` loads `func["[[HomeObject]]"]` (`LoadFunction`
+    //    + `LoadProp`), never returning `LoadFunction` directly as `acc`.
+    let home_file = build(&[Bytecode::DeprecatedLdhomeobject, Bytecode::Return], 0);
+    let mut home_m = lift_file(&home_file).expect("lift deprecated.ldhomeobject");
+    verify_clean(&home_m);
+    let home_sym = home_m.sym.intern("[[HomeObject]]");
+    let Op::LoadProp { object, name } = find_op(&home_m, |op| matches!(op, Op::LoadProp { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(*name, home_sym);
+    let ValueDef::Inst(obj_iid) = home_m.values[object.index()].def else {
+        panic!("LoadProp receiver must come from LoadFunction")
+    };
+    assert!(matches!(home_m.insts[obj_iid.index()].op, Op::LoadFunction));
+
+    let rv_home = returned_value(&home_m).expect("return carries LoadProp result");
+    let ValueDef::Inst(rv_iid) = home_m.values[rv_home.index()].def else {
+        panic!("returned value must be an instruction result")
+    };
+    assert!(
+        matches!(home_m.insts[rv_iid.index()].op, Op::LoadProp { .. }),
+        "acc holds `[[HomeObject]]` LoadProp, never LoadFunction"
+    );
 }
 
 // ── deprecated.poplexenv → PopLexEnv ─────────────────────────────────
@@ -350,23 +365,26 @@ fn deprecated_callargs3_reg_callee_three_args() {
     }
 }
 
-// ── deprecated.callrange → Call{Dynamic}, callee = ACC ───────────────
+// ── deprecated.callrange → Call{Dynamic}, window [callee, args...] (`D8`) ─
 
 #[test]
-fn deprecated_callrange_reads_callee_from_acc() {
-    // translate.rs:2077-2091: unlike the callargN forms, the callee is
-    // the ACC; the register window is args-only.
+fn deprecated_callrange_reads_callee_and_args_from_register_window() {
+    // Legacy `0.0.0.2` `ecma.callirangedyn imm16, v8` (`isa.yaml` `acc: out:top`):
+    // `start` (`v0`) holds `callee` and `start+1..=start+argc` (`v1, v2`) hold
+    // the `argc` positional arguments (`argc + 1` total registers read).
     let file = build(
         &[
+            Bytecode::Ldai(Imm(11)),
+            Bytecode::Sta(Reg(0)), // callee = v0
             Bytecode::Ldai(Imm(31)),
-            Bytecode::Sta(Reg(0)),
+            Bytecode::Sta(Reg(1)), // arg0 = v1
             Bytecode::Ldai(Imm(32)),
-            Bytecode::Sta(Reg(1)),
-            Bytecode::Ldai(Imm(99)), // acc = the callee
+            Bytecode::Sta(Reg(2)),   // arg1 = v2
+            Bytecode::Ldai(Imm(99)), // acc decoy — must NOT be read!
             Bytecode::DeprecatedCallrange(Imm(2), Reg(0)),
             Bytecode::Return,
         ],
-        2,
+        3,
     );
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
@@ -383,12 +401,28 @@ fn deprecated_callrange_reads_callee_from_acc() {
     assert_eq!(this, &None);
     assert_eq!(
         const_of(&m, *callee),
-        Const::number(99.0),
-        "deprecated.callrange's callee is the ACC"
+        Const::number(11.0),
+        "deprecated.callrange's callee is start (`v0`), never acc"
     );
     assert_eq!(args.len(), 2);
     assert_eq!(const_of(&m, args[0]), Const::number(31.0));
     assert_eq!(const_of(&m, args[1]), Const::number(32.0));
+
+    // Frame bounds check covers all `argc + 1` registers (`v2` out-of-range when `num_vregs = 2`).
+    let oob_file = build(
+        &[
+            Bytecode::DeprecatedCallrange(Imm(2), Reg(0)),
+            Bytecode::Return,
+        ],
+        2,
+    );
+    assert!(matches!(
+        lift_file(&oob_file),
+        Err(abcd_lift::LiftError::InvalidRegister {
+            reg: 2,
+            frame_limit: 2
+        })
+    ));
 }
 
 // ── deprecated.callthisrange → window [func, this, args...] ──────────
@@ -782,43 +816,186 @@ fn deprecated_stmodulevar_carries_the_symbol_index() {
 }
 
 #[test]
-fn deprecated_ldmodulevar_carries_the_symbol_index() {
-    let file = build_with_string(
+fn deprecated_ldmodulevar_polarity_and_es_module_slot_resolution() {
+    // 1. Without an `EsModule`, `flag == 0` -> `External` and `flag != 0` ->
+    //    `Local` (`D8`, matching `0.0.0.2` `panda_file_translator.cpp`), falling
+    //    back to the interned symbol index.
+    let ext_file = build_with_string(
         &[
             Bytecode::DeprecatedLdmodulevar(PLACEHOLDER, Imm(0)),
             Bytecode::Return,
         ],
         0,
         0,
-        "mod-ld",
+        "mod-ext",
     );
-    let mut m = lift_file(&file).expect("lift");
-    verify_clean(&m);
-    let sym_idx = m.sym.intern("mod-ld").0;
-    let Op::LoadModuleVar { index, kind } = find_op(&m, |o| matches!(o, Op::LoadModuleVar { .. }))
+    let mut ext_m = lift_file(&ext_file).expect("lift external deprecated.ldmodulevar");
+    verify_clean(&ext_m);
+    let sym_idx = ext_m.sym.intern("mod-ext").0;
+    let Op::LoadModuleVar { index, kind } =
+        find_op(&ext_m, |o| matches!(o, Op::LoadModuleVar { .. }))
     else {
         unreachable!()
     };
     assert_eq!(*index, sym_idx);
-    assert_eq!(*kind, abcd_ir::ModuleVarKind::Local);
+    assert_eq!(*kind, abcd_ir::ModuleVarKind::External);
 
-    let ext_file = build_with_string(
+    let loc_file = build_with_string(
         &[
             Bytecode::DeprecatedLdmodulevar(PLACEHOLDER, Imm(1)),
             Bytecode::Return,
         ],
         0,
         0,
-        "mod-ext",
+        "mod-loc",
     );
-    let ext_m = lift_file(&ext_file).expect("lift external deprecated.ldmodulevar");
-    verify_clean(&ext_m);
-    let Op::LoadModuleVar { kind: ext_kind, .. } =
-        find_op(&ext_m, |o| matches!(o, Op::LoadModuleVar { .. }))
+    let loc_m = lift_file(&loc_file).expect("lift local deprecated.ldmodulevar");
+    verify_clean(&loc_m);
+    let Op::LoadModuleVar { kind: loc_kind, .. } =
+        find_op(&loc_m, |o| matches!(o, Op::LoadModuleVar { .. }))
     else {
         unreachable!()
     };
-    assert_eq!(*ext_kind, abcd_ir::ModuleVarKind::External);
+    assert_eq!(*loc_kind, abcd_ir::ModuleVarKind::Local);
+
+    // 2. With an enclosing `ClassData::es_module`, string operands on
+    //    `DeprecatedLdmodulevar`, `DeprecatedStmodulevar`, and
+    //    `DeprecatedGetmodulenamespace` resolve to dense 0-based `u32` slots!
+    let mut strings = abcd_file::StringPool::default();
+    let rec_desc = strings.get_or_intern("Lentry/index;");
+    let mod_field = strings.get_or_intern("moduleRecordIdx");
+    let fn_name = strings.get_or_intern("func_main_0");
+    let req0 = strings.get_or_intern("./a");
+    let req1 = strings.get_or_intern("./b");
+    let ns_local = strings.get_or_intern("nsB");
+    let imp0 = strings.get_or_intern("firstImp");
+    let imp1 = strings.get_or_intern("secondImp");
+    let exp0 = strings.get_or_intern("firstExp");
+    let exp1_local = strings.get_or_intern("secondLocal");
+    let exp1_pub = strings.get_or_intern("secondPub");
+
+    let method = abcd_file::Method {
+        name: fn_name,
+        offset: 0x100,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: abcd_file::FunctionKind::Function,
+        source_lang: abcd_file::SourceLang::EcmaScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(abcd_file::MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            bytecodes: vec![
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // External `secondImp` -> slot 1
+                Bytecode::DeprecatedStmodulevar(EntityId(1)),         // Local `secondPub` -> slot 1
+                Bytecode::DeprecatedLdmodulevar(EntityId(2), Imm(1)), // Local `secondLocal` -> slot 1
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(3)), // Namespace `nsB` -> request 1
+                Bytecode::Return,
+            ],
+            entities: std::collections::HashMap::from([
+                (
+                    (abcd_isa::EntityKind::StringId, 0),
+                    abcd_file::EntityRef::string(imp1),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 1),
+                    abcd_file::EntityRef::string(exp1_pub),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 2),
+                    abcd_file::EntityRef::string(exp1_local),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 3),
+                    abcd_file::EntityRef::string(ns_local),
+                ),
+            ]),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    };
+    let cls = abcd_file::Class {
+        descriptor: rec_desc,
+        name: rec_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: abcd_file::SourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![method],
+        fields: vec![abcd_file::Field {
+            name: mod_field,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(abcd_file::FieldValue::ModuleData(abcd_file::ModuleData {
+                source_offset: 0,
+                requests: vec![req0, req1],
+                records: vec![
+                    abcd_file::ModuleRecord::NamespaceImport {
+                        local_name: ns_local,
+                        module_request_idx: 1,
+                    },
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp0,
+                        import_name: imp0,
+                        module_request_idx: 0,
+                    },
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp1,
+                        import_name: imp1,
+                        module_request_idx: 1,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp0,
+                        export_name: exp0,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp1_local,
+                        export_name: exp1_pub,
+                    },
+                ],
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+    let esm_file = abcd_file::File {
+        version: abcd_isa::Version::new(0, 0, 0, 2),
+        checksum: 0,
+        size: 0,
+        file_type: abcd_file::FileType::Dynamic,
+        strings,
+        classes: [(rec_desc, cls)].into_iter().collect(),
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let esm_ir = lift_file(&esm_file).expect("lift --merge-abc legacy ESM");
+    verify_clean(&esm_ir);
+    let lifted = ops(&esm_ir);
+    assert!(matches!(
+        lifted[0],
+        Op::LoadModuleVar {
+            index: 1,
+            kind: abcd_ir::ModuleVarKind::External
+        }
+    ));
+    assert!(matches!(lifted[1], Op::StoreModuleVar { index: 1, .. }));
+    assert!(matches!(
+        lifted[2],
+        Op::LoadModuleVar {
+            index: 1,
+            kind: abcd_ir::ModuleVarKind::Local
+        }
+    ));
+    assert!(matches!(lifted[3], Op::GetModuleNamespace { index: 1 }));
 }
 
 // ── deprecated.ldobjbyname → LoadProp (reg object) ───────────────────

@@ -54,34 +54,26 @@ fn embedded_nul_decodes_via_c0_80() {
     let cls = b.add_global_class();
     b.class_set_source_lang(cls, SourceLang::EcmaScript);
     let proto = b.create_proto(Type::Tagged, &[]);
-    let m = b.class_add_method(cls, "f", proto, AccessFlags::PUBLIC, &[0x65], 1, 0);
+    // Use a 4-byte ASCII name ("ffff": 1-byte tag `(4<<1)|1 = 9` + 4 chars + NUL = 6 bytes)
+    // so replacing it in-place with `'a' C0 80 'b' NUL` (also 6 bytes) preserves every item offset.
+    let m = b.class_add_method(cls, "ffff", proto, AccessFlags::PUBLIC, &[0x65], 1, 0);
     b.method_set_source_lang(m, SourceLang::EcmaScript);
     let data = b.finalize().expect("finalize");
 
-    // Locate the method item via the class's method stream: class offset
-    // from the class index table, then method is inline after the class
-    // header. Easier: the method name string offset is a u32 at
-    // (method_off + 4); find the method offset through the index section
-    // is complex — instead, scan for the method name string "f\0" pattern
-    // is fragile. Use the bridge's static accessor through decode-side
-    // knowledge: the only string containing exactly "f" at offset > header
-    // is the method name; we locate it by scanning for the ULEB tag
-    // (2<<1|1 = 5) followed by 'f' 0x00.
     let mut patched: Vec<u8> = Vec::new();
     let mut i = 60usize;
     let mut found = false;
-    while i + 4 < data.len() {
-        // candidate string item: tag = (1<<1)|0 or ascii flag variants
+    while i + 6 <= data.len() {
         let tag = data[i];
         let utf16_len = tag >> 1;
         let is_ascii = tag & 1;
-        if is_ascii == 1 && utf16_len == 1 && data[i + 1] == b'f' && data[i + 2] == 0 {
-            // rewrite: 'a' C0 80 'b' — utf16 len 3, not ascii: tag = 3<<1 = 6
-            let new_item = vec![6u8, b'a', 0xC0, 0x80, b'b', 0x00];
-            let mut tmp: Vec<u8> = Vec::new();
+        if is_ascii == 1 && utf16_len == 4 && &data[i + 1..i + 5] == b"ffff" && data[i + 5] == 0 {
+            // rewrite in-place (6 bytes -> 6 bytes): 'a' C0 80 'b' — utf16 len 3, not ascii: tag = 3<<1 = 6
+            let new_item = [6u8, b'a', 0xC0, 0x80, b'b', 0x00];
+            let mut tmp: Vec<u8> = Vec::with_capacity(data.len());
             tmp.extend_from_slice(&data[..i]);
             tmp.extend_from_slice(&new_item);
-            tmp.extend_from_slice(&data[i + 4..]);
+            tmp.extend_from_slice(&data[i + 6..]);
             patched = tmp;
             found = true;
             break;

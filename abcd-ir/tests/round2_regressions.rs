@@ -27,6 +27,7 @@ fn add_func(m: &mut Module) -> FuncId {
         name,
         FunctionKind::Function,
     ));
+    m.classes[0].methods.push(id);
     add_block(m, id);
     id
 }
@@ -338,12 +339,13 @@ fn r2_d2_effects_in_refinement_and_symbol_m9() {
         .effects_in(&m)
         .is_pure()
     );
-    // Static integer Div: unknown divisor may_throw, non-zero const divisor is PURE.
+    // Static integer Div (`N36`: `left` = divisor, `right` = dividend):
+    // unknown divisor `may_throw`, proven non-zero non-(-1) const divisor is PURE.
     assert!(
         Op::BinaryOp {
             op: BinOp::Div,
             left: v_i32,
-            right: v_i32
+            right: v_nz
         }
         .effects_in(&m)
         .may_throw
@@ -351,8 +353,8 @@ fn r2_d2_effects_in_refinement_and_symbol_m9() {
     assert!(
         Op::BinaryOp {
             op: BinOp::Div,
-            left: v_i32,
-            right: v_nz
+            left: v_nz,
+            right: v_i32
         }
         .effects_in(&m)
         .is_pure()
@@ -834,10 +836,11 @@ fn scale_256kib_stack_cfg_const_and_ty_chains() {
             }
             assert!(verify_module(&mc).is_ok());
 
-            // 4. 10,000-deep nested Ty::Union: clone, ==, Hash, Debug, Drop on 256 KiB stack.
+            // 4. 10,000-deep nested raw `Ty::Union` + canonical `Ty::union`:
+            //    clone, ==, Hash, Debug, canonicalize, and Drop on 256 KiB stack.
             let mut deep_ty = Ty::DynPrim(DynPrim::Number);
             for _ in 0..10_000 {
-                deep_ty = Ty::union([deep_ty]);
+                deep_ty = Ty::Union(Box::new([deep_ty]));
             }
             let cloned_ty = deep_ty.clone();
             assert_eq!(deep_ty, cloned_ty);
@@ -848,7 +851,7 @@ fn scale_256kib_stack_cfg_const_and_ty_chains() {
             assert_eq!(hasher1.finish(), hasher2.finish());
             let dbg = format!("{deep_ty:?}");
             assert!(dbg.starts_with("Union([Union(["));
-            drop(cloned_ty);
+            assert_eq!(Ty::union([cloned_ty]), Ty::DynPrim(DynPrim::Number));
             drop(deep_ty);
         })
         .unwrap();

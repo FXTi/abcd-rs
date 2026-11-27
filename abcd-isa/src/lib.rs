@@ -1,25 +1,24 @@
-//! Safe Rust API for the ArkCompiler bytecode instruction set.
+//! Pure Safe Rust API for the ArkCompiler bytecode instruction set.
 //!
-//! This crate provides five core capabilities:
+//! This crate operates in 100% safe, FFI-free Rust (`#![forbid(unsafe_code)]`)
+//! with zero production C/C++ build or link dependencies; the vendored C++
+//! implementation in `abcd-isa-sys` is linked solely under `[dev-dependencies]`
+//! as an exhaustive differential test oracle.
 //!
-//! - [`decode`] — parse modern (`9.0.0.0`..`24.0.0.0`) bytecode bytes into
-//!   `(Bytecode, byte_offset)` pairs with resolved jump targets in pure Safe Rust.
+//! Core capabilities:
+//!
+//! - [`decode`] / [`decode_for`] — parse modern (`9.0.0.0`..`24.0.0.0`) or
+//!   version-dispatched bytecode streams into `(Bytecode, byte_offset)` pairs
+//!   with resolved jump targets.
 //! - [`decode_legacy`] — translate legacy (`0.0.0.2`, OpenHarmony 3.0/3.1)
-//!   bytecode streams into the same `(Bytecode, byte_offset)` representation in
-//!   pure Safe Rust.
+//!   bytecode streams into the same `(Bytecode, byte_offset)` representation.
 //! - [`encode`] — assemble a slice of [`Bytecode`] instructions into raw bytes
-//!   in pure Safe Rust using deterministic Fenwick-tree branch relaxation,
-//!   automatic format selection, and far-jump trampoline widening.
+//!   using deterministic Fenwick-tree branch relaxation, automatic narrowest
+//!   format selection, and inverted-condition far-jump trampolines.
 //! - [`relocate_entity_id`] — patch an instruction's `n`-th entity-ID operand
-//!   in place in pure Safe Rust with zero heap allocation.
-//! - [`Version`] — query and compare `.abc` file format versions (backed by the
-//!   vendored `file_format_version` table via [`abcd_isa_sys`]).
-//!
-//! `decode`, `decode_legacy`, `encode`, `relocate_entity_id`, and all
-//! [`Bytecode`] classification/operand helpers execute in 100% safe, FFI-free
-//! Rust (`#[forbid(unsafe_code)]`), verified against the vendored C++
-//! implementation as a differential test oracle. `unsafe` is confined solely to
-//! internal version-table FFI queries in `version`.
+//!   in place with zero heap allocation.
+//! - [`Version`] — query and compare `.abc` file format versions from the
+//!   pre-generated version table.
 //!
 //! # Quick start
 //!
@@ -48,39 +47,54 @@
 //! assert_eq!(decoded[1].0, Bytecode::Jmp(Label(3)));
 //! assert!(Version::new(12, 0, 6, 0).is_in_supported_range());
 //! ```
-//!
-//! # Re-exported types
-//!
-//! The following types are re-exported from [`abcd_isa_sys`] for convenience:
-//! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`EntityKind`], [`Label`],
-//! [`Operand`], [`insn`], [`BytecodeFlags`], [`ExceptionType`].
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-pub use abcd_isa_sys::{Bytecode, EntityId, EntityKind, Imm, Label, Operand, Reg};
-pub use abcd_isa_sys::{BytecodeFlags, ExceptionType, insn};
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    unused_parens,
+    clippy::all,
+    clippy::allow_attributes_without_reason,
+    reason = "pre-generated pure-Rust ISA and version tables emitted by scripts/vendor-gen.py"
+)]
+mod generated {
+    include!("generated/bytecode.rs");
+    include!("generated/version_table.rs");
+    pub(crate) mod legacy_table {
+        include!("generated/legacy_table.rs");
+    }
+}
 
-#[forbid(unsafe_code)]
+pub use generated::{
+    Bytecode, BytecodeFlags, EntityId, EntityKind, ExceptionType, Imm, Label, MIN_PREFIX_OPCODE,
+    ModernDecodeFault, Operand, Reg, insn,
+};
+
 mod decoder;
 pub use decoder::{DecodeError, decode};
 
-#[forbid(unsafe_code)]
 mod legacy;
-#[expect(
-    clippy::unnecessary_cast,
-    reason = "tools/gen_legacy_table.py emits uniform explicit width casts for operand clarity"
-)]
-#[forbid(unsafe_code)]
-mod legacy_table;
 pub use legacy::decode_legacy;
 
-#[forbid(unsafe_code)]
 mod emitter;
 pub use emitter::{EncodeError, encode};
 
-#[forbid(unsafe_code)]
 mod relocation;
 pub use relocation::{RelocationError, relocate_entity_id};
 
 mod version;
 pub use version::Version;
+
+/// Dispatch bytecode decoding by `.abc` container [`Version`] (`0.0.0.2` uses
+/// [`decode_legacy`]; all modern versions use [`decode`]).
+pub fn decode_for(version: Version, bytes: &[u8]) -> Result<Vec<(Bytecode, u32)>, DecodeError> {
+    if version == Version::new(0, 0, 0, 2) {
+        decode_legacy(bytes)
+    } else {
+        decode(bytes)
+    }
+}

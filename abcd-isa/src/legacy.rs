@@ -31,10 +31,9 @@
 //! This module is never entered for non-legacy files (the caller gates on
 //! the file version), so it adds zero cost to the modern decode path.
 
-use abcd_isa_sys::{Bytecode, Label};
-
 use crate::decoder::DecodeError;
-use crate::legacy_table::{LEGACY_CORE, LEGACY_ECMA};
+use crate::generated::legacy_table::{LEGACY_CORE, LEGACY_ECMA};
+use crate::generated::{Bytecode, Label};
 
 /// Legacy ecmascript prefix byte.
 const ECMA_PREFIX: u8 = 0xff;

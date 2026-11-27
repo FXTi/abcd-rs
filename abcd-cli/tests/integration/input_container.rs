@@ -95,16 +95,15 @@ fn bare_abc_never_touches_the_container_path() {
 }
 
 #[test]
-fn hostile_module_json_name_is_a_hard_error() {
-    // A container-provided module name lands in OUTPUT PATHS downstream
-    // (`extract`, `decompile --all`); "../evil" must be rejected, never
-    // sanitized into silent use.
+fn hostile_module_json_name_is_deterministically_sanitized() {
+    // Container-provided module names may come from quirky or hostile manifests;
+    // read-only subcommands (`info`, `analyze`, `taint`) must still load them,
+    // while writer commands receive a strictly safe single path segment.
     let hap = common::hap("../evil", &common::tiny_abc());
-    let err = input::load_bytes(&hap, "evil.hap", ModuleSelection::Single).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("../evil"), "message: {msg}");
-    assert!(msg.contains("safe"), "message: {msg}");
-    assert_eq!(err.exit_code(), 2, "hostile content is a tool error");
+    let modules = input::load_bytes(&hap, "evil.hap", ModuleSelection::Single).unwrap();
+    assert_eq!(modules.len(), 1);
+    assert!(input::is_safe_path_segment(&modules[0].name));
+    assert_eq!(modules[0].name, ".._evil");
 }
 
 #[test]
@@ -182,7 +181,7 @@ fn load_from_disk_moves_bare_abc_and_enforces_selection() {
 }
 
 #[test]
-fn windows_reserved_device_names_and_trailing_dot_or_space_are_rejected() {
+fn windows_reserved_device_names_and_trailing_dot_or_space_are_sanitized() {
     for bad_name in [
         "CON",
         "con.txt",
@@ -195,15 +194,31 @@ fn windows_reserved_device_names_and_trailing_dot_or_space_are_rejected() {
         "entry ",
         "bad:name",
         "bad*name",
+        ".",
+        "..",
     ] {
         let hap = common::hap(bad_name, &common::tiny_abc());
-        let err = input::load_bytes(&hap, "evil.hap", ModuleSelection::Single).unwrap_err();
-        assert_eq!(err.exit_code(), 2, "bad_name={bad_name:?} -> {err}");
+        let modules = input::load_bytes(&hap, "evil.hap", ModuleSelection::Single)
+            .unwrap_or_else(|e| panic!("bad_name={bad_name:?} blocked load: {e}"));
+        assert_eq!(modules.len(), 1);
         assert!(
-            err.to_string().contains("not a safe output path component"),
-            "bad_name={bad_name:?} -> {err}"
+            input::is_safe_path_segment(&modules[0].name),
+            "bad_name={bad_name:?} -> unsafe {:?}",
+            modules[0].name
         );
     }
+}
+
+#[test]
+fn fa_model_config_json_distro_module_name_resolves() {
+    let config_json = br#"{"app":{"bundleName":"com.demo"},"module":{"distro":{"moduleName":"fa_entry","moduleType":"entry"}}}"#;
+    let hap = common::zip(&[
+        ("config.json", config_json),
+        ("assets/js/default/pages/index.abc", &common::tiny_abc()),
+    ]);
+    let modules = input::load_bytes(&hap, "legacy_fa.hap", ModuleSelection::Single).unwrap();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].name, "fa_entry");
 }
 
 #[test]

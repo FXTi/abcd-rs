@@ -227,8 +227,8 @@ fn typed_array_tags_decode_to_model_values() {
     let vals = &file.literal_arrays[0].values;
     assert_eq!(
         vals.as_slice(),
-        &[LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(0))],
-        "the typed-array value must be delivered and normalized to its owning LiteralArrayIdx"
+        &[LiteralValue::ArrayU8(Vec::new())],
+        "the typed-array value must decode into its owned element Vec"
     );
 }
 
@@ -236,10 +236,13 @@ fn typed_array_tags_decode_to_model_values() {
 // Encode-side matrix (decode -> hand-built model -> encode -> decode)
 // ---------------------------------------------------------------------------
 
-/// Canonical text form of a literal value: StringIds are resolved through
-/// the pool and method handles through the method table.
-/// Typed-array (`ArrayXxx`) values compare by discriminant only.
-fn canon_literal(file: &abcd_file::File, v: &LiteralValue) -> String {
+/// Canonical text form of a literal-array slice using an explicit workstack.
+fn canon_literal_slice(file: &abcd_file::File, root_values: &[LiteralValue]) -> String {
+    enum Step<'a> {
+        Text(&'static str),
+        Slice(&'a [LiteralValue], usize),
+        Val(&'a LiteralValue),
+    }
     let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
     let method_name_by_idx = |idx: abcd_file::MethodIdx| {
         file.method_by_idx(idx)
@@ -247,43 +250,55 @@ fn canon_literal(file: &abcd_file::File, v: &LiteralValue) -> String {
             .unwrap_or("<unresolved>")
             .to_string()
     };
-    match v {
-        LiteralValue::String(sid) => format!("String({})", r(*sid)),
-        LiteralValue::EtsImplements(sid) => format!("EtsImplements({})", r(*sid)),
-        LiteralValue::Method(idx) => format!("Method({})", method_name_by_idx(*idx)),
-        LiteralValue::GeneratorMethod(idx) => {
-            format!("GeneratorMethod({})", method_name_by_idx(*idx))
+    let mut out = String::new();
+    let mut stack = vec![Step::Slice(root_values, 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Text(s) => out.push_str(s),
+            Step::Slice(slice, idx) => {
+                if idx < slice.len() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    stack.push(Step::Slice(slice, idx + 1));
+                    stack.push(Step::Val(&slice[idx]));
+                }
+            }
+            Step::Val(v) => match v {
+                LiteralValue::String(sid) => out.push_str(&format!("String({})", r(*sid))),
+                LiteralValue::EtsImplements(sid) => {
+                    out.push_str(&format!("EtsImplements({})", r(*sid)));
+                }
+                LiteralValue::Method(idx) => {
+                    out.push_str(&format!("Method({})", method_name_by_idx(*idx)));
+                }
+                LiteralValue::GeneratorMethod(idx) => {
+                    out.push_str(&format!("GeneratorMethod({})", method_name_by_idx(*idx)));
+                }
+                LiteralValue::AsyncGeneratorMethod(idx) => out.push_str(&format!(
+                    "AsyncGeneratorMethod({})",
+                    method_name_by_idx(*idx)
+                )),
+                LiteralValue::Getter(idx) => {
+                    out.push_str(&format!("Getter({})", method_name_by_idx(*idx)));
+                }
+                LiteralValue::Setter(idx) => {
+                    out.push_str(&format!("Setter({})", method_name_by_idx(*idx)));
+                }
+                LiteralValue::LiteralArray(idx) => {
+                    out.push_str("LiteralArray[");
+                    stack.push(Step::Text("]"));
+                    stack.push(Step::Slice(&file.literal_arrays[idx.0 as usize].values, 0));
+                }
+                LiteralValue::ArrayString(sids) => out.push_str(&format!(
+                    "ArrayString({:?})",
+                    sids.iter().map(|&s| r(s)).collect::<Vec<_>>()
+                )),
+                other => out.push_str(&format!("{other:?}")),
+            },
         }
-        LiteralValue::AsyncGeneratorMethod(idx) => {
-            format!("AsyncGeneratorMethod({})", method_name_by_idx(*idx))
-        }
-        LiteralValue::Getter(idx) => format!("Getter({})", method_name_by_idx(*idx)),
-        LiteralValue::Setter(idx) => format!("Setter({})", method_name_by_idx(*idx)),
-        // Content-based recursion: the table order is not guaranteed, so
-        // comparing by content is order-independent.
-        LiteralValue::LiteralArray(idx) => format!(
-            "LiteralArray[{}]",
-            file.literal_arrays[idx.0 as usize]
-                .values
-                .iter()
-                .map(|v| canon_literal(file, v))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        LiteralValue::ArrayU1(_) => "ArrayU1".into(),
-        LiteralValue::ArrayU8(_) => "ArrayU8".into(),
-        LiteralValue::ArrayI8(_) => "ArrayI8".into(),
-        LiteralValue::ArrayU16(_) => "ArrayU16".into(),
-        LiteralValue::ArrayI16(_) => "ArrayI16".into(),
-        LiteralValue::ArrayU32(_) => "ArrayU32".into(),
-        LiteralValue::ArrayI32(_) => "ArrayI32".into(),
-        LiteralValue::ArrayU64(_) => "ArrayU64".into(),
-        LiteralValue::ArrayI64(_) => "ArrayI64".into(),
-        LiteralValue::ArrayF32(_) => "ArrayF32".into(),
-        LiteralValue::ArrayF64(_) => "ArrayF64".into(),
-        LiteralValue::ArrayString(_) => "ArrayString".into(),
-        other => format!("{other:?}"),
     }
+    out
 }
 
 /// Canonical form of a whole literal-array TABLE, order-independent.
@@ -291,13 +306,7 @@ fn canon_table(file: &abcd_file::File) -> Vec<String> {
     let mut v: Vec<String> = file
         .literal_arrays
         .iter()
-        .map(|la| {
-            la.values
-                .iter()
-                .map(|v| canon_literal(file, v))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+        .map(|la| canon_literal_slice(file, &la.values))
         .collect();
     v.sort();
     v
@@ -364,21 +373,22 @@ fn full_literal_tag_matrix_encodes() {
         abcd_file::LiteralArray::new(vec![LiteralValue::Integer(99)]),
     ];
     // One single-element array per typed-array kind (ARRAY_* is always the
-    // last item of its array upstream). LiteralArrayIdx(0) encodes as an
-    // empty payload (element count 0), which reads back cleanly.
+    // sole item of its array upstream), carrying non-empty payloads.
+    let arr_s0 = file.strings.get_or_intern("arr_alpha");
+    let arr_s1 = file.strings.get_or_intern("arr_beta");
     for v in [
-        LiteralValue::ArrayU1(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI8(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU16(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI16(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayF32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayF64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayString(abcd_file::LiteralArrayIdx(0)),
+        LiteralValue::ArrayU1(vec![true, false, true]),
+        LiteralValue::ArrayU8(vec![0, 42, 255]),
+        LiteralValue::ArrayI8(vec![-128, 0, 127]),
+        LiteralValue::ArrayU16(vec![0, 1024, u16::MAX]),
+        LiteralValue::ArrayI16(vec![i16::MIN, -1, i16::MAX]),
+        LiteralValue::ArrayU32(vec![0, 0xDEAD_BEEF, u32::MAX]),
+        LiteralValue::ArrayI32(vec![i32::MIN, -42, i32::MAX]),
+        LiteralValue::ArrayU64(vec![0, 0x0123_4567_89AB_CDEF, u64::MAX]),
+        LiteralValue::ArrayI64(vec![i64::MIN, -99, i64::MAX]),
+        LiteralValue::ArrayF32(vec![-0.0, 1.5, -3.25]),
+        LiteralValue::ArrayF64(vec![-0.0, 2.5, 1e100]),
+        LiteralValue::ArrayString(vec![arr_s0, arr_s1]),
     ] {
         file.literal_arrays
             .push(abcd_file::LiteralArray::new(vec![v]));

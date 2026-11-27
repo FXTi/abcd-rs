@@ -39,13 +39,16 @@ pub(in crate::folds) struct LexStoreSite {
 }
 
 /// Reconstruct block-scoped declarations at provable lexenv push
-/// sites. Runs AFTER the desugar folds (it consumes their output).
-pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats) {
+/// sites and balanced `ScopePush`..`ScopePop` lexical blocks.
+/// Runs AFTER the desugar folds (it consumes their output).
+pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldStats) {
+    wrap_lexical_scope_blocks(nodes, params, stats);
+
     // Pass 1: census of every LexStore name → its sites.
     let mut runs = 0usize;
     let mut stores: std::collections::HashMap<String, Vec<LexStoreSite>> =
         std::collections::HashMap::new();
-    let mut cstack: Vec<&[SNode]> = vec![nodes];
+    let mut cstack: Vec<&[SNode]> = vec![nodes.as_slice()];
     while let Some(seq) = cstack.pop() {
         let Some((first, rest)) = seq.split_first() else {
             continue;
@@ -72,7 +75,8 @@ pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats)
                 cstack.push(otherwise);
                 cstack.push(then);
             }
-            SNode::While { body, .. }
+            SNode::Block(body)
+            | SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
@@ -133,9 +137,12 @@ pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats)
             let mut j = p + 1;
             while j < leaves.len() {
                 match &leaves[j] {
-                    Leaf::Raw(Stmt::LexStore { level, slot, .. })
-                        if *level == 0 && (*slot as usize) < slot_count =>
-                    {
+                    Leaf::Raw(Stmt::LexStore {
+                        level,
+                        slot,
+                        own: true,
+                        ..
+                    }) if *level == 0 && (*slot as usize) < slot_count => {
                         if inits.iter().any(|&(_, s)| s == *slot) {
                             // A re-store of an initialized slot ends the
                             // initialization run (conservative).
@@ -257,6 +264,495 @@ pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats)
     });
 }
 
+/// Wrap balanced `ScopePush` .. `ScopePop` spans into `SNode::Block` scopes
+/// with local `let` declarations (e.g. per-iteration loop `let` closures and
+/// sibling lexical blocks), unwrapping redundant single-block bodies whose
+/// parent construct already introduces a JS block scope.
+fn wrap_lexical_scope_blocks(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldStats) {
+    fold_snode_vecs_postorder(nodes, |seq| wrap_seq_scopes(seq, params, stats));
+    unwrap_redundant_single_blocks(nodes);
+}
+
+fn seq_has_push_and_pop_markers(seq: &[SNode]) -> bool {
+    let mut saw_push = false;
+    for n in seq {
+        if let SNode::Stmts(leaves) = n {
+            for l in leaves {
+                match l {
+                    Leaf::Raw(Stmt::ScopePush { .. }) => saw_push = true,
+                    Leaf::Raw(Stmt::ScopePop) if saw_push => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+fn split_seq_at_scope_markers(seq: Vec<SNode>) -> Vec<SNode> {
+    let mut out = Vec::with_capacity(seq.len());
+    for mut n in seq {
+        if let SNode::Stmts(leaves) = &mut n
+            && leaves
+                .iter()
+                .any(|l| matches!(l, Leaf::Raw(Stmt::ScopePush { .. } | Stmt::ScopePop)))
+        {
+            let taken = std::mem::take(leaves);
+            let mut cur = Vec::new();
+            for l in taken {
+                if matches!(l, Leaf::Raw(Stmt::ScopePush { .. } | Stmt::ScopePop)) {
+                    if !cur.is_empty() {
+                        out.push(SNode::Stmts(std::mem::take(&mut cur)));
+                    }
+                    out.push(SNode::Stmts(vec![l]));
+                } else {
+                    cur.push(l);
+                }
+            }
+            if !cur.is_empty() {
+                out.push(SNode::Stmts(cur));
+            }
+        } else {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn leaves_tail_diverges(tail: &[Leaf]) -> bool {
+    tail.iter().any(|l| {
+        matches!(
+            l,
+            Leaf::Raw(Stmt::Return(_) | Stmt::Throw(_) | Stmt::Unreachable)
+        )
+    })
+}
+
+fn slice_diverges_after(nodes: &[SNode]) -> bool {
+    for n in nodes {
+        if crate::structure::is_terminal_node(n) {
+            return true;
+        }
+        if let SNode::Stmts(ls) = n
+            && leaves_tail_diverges(ls)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Verify that compound subtrees inside `span` contain no unwrapped `ScopePush`
+/// and that any nested `ScopePop` occurs only on a diverging early-exit path.
+fn subtrees_valid_for_scope_wrap(span: &[SNode]) -> bool {
+    let mut stack: Vec<&[SNode]> = Vec::new();
+    for n in span {
+        match n {
+            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            SNode::Block(body)
+            | SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => stack.push(body),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                stack.push(otherwise);
+                stack.push(then);
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                stack.push(body);
+                for c in catches {
+                    stack.push(&c.body);
+                }
+                if let Some(fin) = finally {
+                    stack.push(fin);
+                }
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    stack.push(&c.body);
+                }
+            }
+        }
+    }
+    while let Some(slice) = stack.pop() {
+        for (ni, n) in slice.iter().enumerate() {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for (li, l) in leaves.iter().enumerate() {
+                        match l {
+                            Leaf::Raw(Stmt::ScopePush { .. }) => return false,
+                            Leaf::Raw(Stmt::ScopePop) => {
+                                let diverges = leaves_tail_diverges(&leaves[li + 1..])
+                                    || slice_diverges_after(&slice[ni + 1..]);
+                                if !diverges {
+                                    return false;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                SNode::Block(_) => {
+                    // Already-wrapped inner blocks adjusted their internal
+                    // LexStore levels; inspect their leaves only for raw
+                    // unwrapped ScopePush/ScopePop leaks.
+                    if let SNode::Block(body) = n {
+                        stack.push(body);
+                    }
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    stack.push(body);
+                    for c in catches {
+                        stack.push(&c.body);
+                    }
+                    if let Some(fin) = finally {
+                        stack.push(fin);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    true
+}
+
+fn nodes_contain_closure(nodes: &[SNode]) -> bool {
+    let mut found = false;
+    walk_leaves(nodes, &mut |l| {
+        if found {
+            return;
+        }
+        for e in leaf_exprs(l) {
+            let mut estack = vec![e];
+            while let Some(cur) = estack.pop() {
+                if matches!(cur, Expr::Closure { .. }) {
+                    found = true;
+                    return;
+                }
+                estack.extend(expr_children(cur));
+            }
+        }
+    });
+    found
+}
+
+fn wrap_seq_scopes(seq: &mut Vec<SNode>, params: &[String], stats: &mut FoldStats) {
+    if !seq_has_push_and_pop_markers(seq) {
+        return;
+    }
+    let mut work = split_seq_at_scope_markers(std::mem::take(seq));
+    let mut wrapped_any = false;
+    let mut blocked_pushes: BTreeSet<usize> = BTreeSet::new();
+
+    loop {
+        let mut candidate: Option<(usize, usize)> = None;
+        let mut last_open: Option<usize> = None;
+        for (idx, n) in work.iter().enumerate() {
+            if let SNode::Stmts(ls) = n
+                && ls.len() == 1
+            {
+                match &ls[0] {
+                    Leaf::Raw(Stmt::ScopePush { .. }) => {
+                        if !blocked_pushes.contains(&idx) {
+                            last_open = Some(idx);
+                        } else {
+                            last_open = None;
+                        }
+                    }
+                    Leaf::Raw(Stmt::ScopePop) => {
+                        if let Some(p_idx) = last_open.take() {
+                            candidate = Some((p_idx, idx));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some((p_idx, q_idx)) = candidate else {
+            break;
+        };
+        let push_names: Vec<Option<String>> = match &work[p_idx] {
+            SNode::Stmts(ls) => match &ls[0] {
+                Leaf::Raw(Stmt::ScopePush { names }) => names.clone(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let span = &work[p_idx + 1..q_idx];
+        if !subtrees_valid_for_scope_wrap(span) {
+            blocked_pushes.insert(p_idx);
+            continue;
+        }
+
+        let has_closure = nodes_contain_closure(span);
+        let slot_count = push_names.len();
+        let mut slot_idents: Vec<Option<String>> = push_names
+            .iter()
+            .map(|opt| opt.as_deref().map(crate::legalize::sanitize))
+            .collect();
+        let mut saw_own_level0 = false;
+        let mut ok = true;
+
+        walk_leaves(span, &mut |l| {
+            if !ok {
+                return;
+            }
+            if let Leaf::Raw(Stmt::LexStore {
+                level: 0,
+                slot,
+                own: true,
+                name,
+                ..
+            }) = l
+            {
+                let s = *slot as usize;
+                if s >= slot_count {
+                    ok = false;
+                    return;
+                }
+                saw_own_level0 = true;
+                let san = crate::legalize::sanitize(name);
+                match &slot_idents[s] {
+                    Some(existing) if existing != &san => {
+                        ok = false;
+                    }
+                    None => {
+                        if has_closure {
+                            ok = false;
+                        } else {
+                            slot_idents[s] = Some(san);
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        });
+
+        if !ok || !saw_own_level0 {
+            blocked_pushes.insert(p_idx);
+            continue;
+        }
+        // If any unnamed slot has no store and a closure exists inside, bail
+        // so module-top G1 orphan fallback stays intact.
+        if has_closure && slot_idents.iter().any(Option::is_none) {
+            blocked_pushes.insert(p_idx);
+            continue;
+        }
+
+        let mut seen_names = BTreeSet::new();
+        for sname in slot_idents.iter().flatten() {
+            if params.contains(sname)
+                || matches!(sname.as_str(), "undefined" | "NaN" | "Infinity")
+                || !seen_names.insert(sname.clone())
+            {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            blocked_pushes.insert(p_idx);
+            continue;
+        }
+
+        wrapped_any = true;
+        blocked_pushes.clear();
+        let mut drained: Vec<SNode> = work.drain(p_idx..=q_idx).collect();
+        // Remove opening `ScopePush` and closing `ScopePop`.
+        drained.pop();
+        drained.remove(0);
+
+        // Strip early-exit `ScopePop`s inside `drained` and drop empty runs.
+        fold_snode_vecs_postorder(&mut drained, |s| {
+            s.retain_mut(|n| match n {
+                SNode::Stmts(ls) => {
+                    ls.retain(|l| !matches!(l, Leaf::Raw(Stmt::ScopePop)));
+                    !ls.is_empty()
+                }
+                _ => true,
+            });
+        });
+
+        // Convert leading immediate `level == 0, own == true` initializers in
+        // place when RHS does not self-reference the binding (avoiding TDZ).
+        let mut declared_slots = vec![false; slot_count];
+        if let Some(SNode::Stmts(first_leaves)) = drained.first_mut() {
+            for l in first_leaves.iter_mut() {
+                match l {
+                    Leaf::Raw(Stmt::LexStore {
+                        level: 0,
+                        slot,
+                        own: true,
+                        name,
+                        value,
+                    }) => {
+                        let s = *slot as usize;
+                        if declared_slots[s] {
+                            break;
+                        }
+                        let san = crate::legalize::sanitize(name);
+                        if expr_uses_name(value, &san) {
+                            break;
+                        }
+                        let val = value.clone();
+                        *l = Leaf::Decl {
+                            name: san,
+                            mutable: true,
+                            value: Some(val),
+                        };
+                        declared_slots[s] = true;
+                    }
+                    Leaf::Raw(Stmt::Elided { .. } | Stmt::Fallback { .. }) => {}
+                    _ => break,
+                }
+            }
+        }
+
+        let mut prelude_decls = Vec::new();
+        let mut num_decls = declared_slots.iter().filter(|&&d| d).count();
+        for (s, maybe_ident) in slot_idents.iter().enumerate() {
+            if !declared_slots[s]
+                && let Some(ident_name) = maybe_ident
+            {
+                prelude_decls.push(Leaf::Decl {
+                    name: ident_name.clone(),
+                    mutable: true,
+                    value: None,
+                });
+                num_decls += 1;
+            }
+        }
+        if !prelude_decls.is_empty() {
+            match drained.first_mut() {
+                Some(SNode::Stmts(first_leaves)) => {
+                    prelude_decls.append(first_leaves);
+                    *first_leaves = prelude_decls;
+                }
+                _ => drained.insert(0, SNode::Stmts(prelude_decls)),
+            }
+        }
+
+        // Rewrite remaining `level == 0, own == true` LexStores to Assign, and
+        // shift outer `level > 0, own == true` LexStores down by 1.
+        walk_stmts_runs_mut(&mut drained, |leaves| {
+            for l in leaves.iter_mut() {
+                if let Leaf::Raw(Stmt::LexStore {
+                    level,
+                    own: true,
+                    name,
+                    value,
+                    ..
+                }) = l
+                {
+                    if *level == 0 {
+                        let san = crate::legalize::sanitize(name);
+                        let val = value.clone();
+                        *l = Leaf::Assign {
+                            target: san,
+                            value: val,
+                        };
+                    } else {
+                        *level -= 1;
+                    }
+                }
+            }
+        });
+
+        stats.scope_fold += num_decls;
+        work.insert(p_idx, SNode::Block(drained));
+    }
+
+    let _ = wrapped_any;
+    let mut merged: Vec<SNode> = Vec::with_capacity(work.len());
+    for mut n in work {
+        if let (Some(SNode::Stmts(prev)), SNode::Stmts(next)) = (merged.last_mut(), &mut n) {
+            prev.append(next);
+        } else {
+            merged.push(n);
+        }
+    }
+    *seq = merged;
+}
+
+fn unwrap_single_block_vec(v: &mut Vec<SNode>) {
+    while v.len() == 1 && matches!(v[0], SNode::Block(_)) {
+        if let SNode::Block(inner) = &mut v[0] {
+            let extracted = std::mem::take(inner);
+            *v = extracted;
+        }
+    }
+}
+
+fn unwrap_redundant_single_blocks(root: &mut Vec<SNode>) {
+    fold_snode_vecs_postorder(root, |seq| {
+        for n in seq.iter_mut() {
+            match n {
+                SNode::Block(body) => unwrap_single_block_vec(body),
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    unwrap_single_block_vec(then);
+                    unwrap_single_block_vec(otherwise);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => unwrap_single_block_vec(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    unwrap_single_block_vec(body);
+                    for c in catches {
+                        unwrap_single_block_vec(&mut c.body);
+                    }
+                    if let Some(fin) = finally {
+                        unwrap_single_block_vec(fin);
+                    }
+                }
+                SNode::Switch { .. }
+                | SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
+        }
+    });
+    unwrap_single_block_vec(root);
+}
+
 // ── N74-W4: late declaration-site reconstruction (TDZ honesty) ─────
 //
 // The v1 scope model hoists every lexical/global binding: `let n;`
@@ -323,6 +819,8 @@ pub(in crate::folds) struct LateStore {
     pub(in crate::folds) func_valued: bool,
     /// Lexical store (vs global store).
     pub(in crate::folds) lexical: bool,
+    /// Whether the lexical store targets an own pushed frame of this function.
+    pub(in crate::folds) own: bool,
     /// The scope-chain level (lexical only; 0 for globals).
     pub(in crate::folds) level: u16,
     /// The innermost DECLARATION-CAPABLE region: `Some(0)` at the root
@@ -483,7 +981,11 @@ pub(in crate::folds) fn late_decl_census(
                                     cx.scope_edges.push(cx.seq);
                                 }
                                 Leaf::Raw(Stmt::LexStore {
-                                    level, name, value, ..
+                                    level,
+                                    own,
+                                    name,
+                                    value,
+                                    ..
                                 }) => {
                                     let name = crate::legalize::sanitize(name);
                                     collect_ident_uses(value, region_stack, &mut cx.uses);
@@ -495,6 +997,7 @@ pub(in crate::folds) fn late_decl_census(
                                         ),
                                         name,
                                         lexical: true,
+                                        own: *own,
                                         level: *level,
                                         region: capable
                                             .then(|| region_stack.last().copied().unwrap_or(0)),
@@ -513,6 +1016,7 @@ pub(in crate::folds) fn late_decl_census(
                                         ),
                                         name,
                                         lexical: false,
+                                        own: true,
                                         level: 0,
                                         region: capable
                                             .then(|| region_stack.last().copied().unwrap_or(0)),
@@ -577,7 +1081,7 @@ pub(in crate::folds) fn late_decl_census(
                             capable: false,
                         });
                     }
-                    SNode::Labeled { body, .. } => {
+                    SNode::Block(body) | SNode::Labeled { body, .. } => {
                         stack.push(Task::EnterRegion {
                             nodes: body,
                             capable: true,
@@ -695,7 +1199,7 @@ pub fn late_decl_fold(
         // `lex_decls` rule); a capture store belongs to an ancestor.
         if sites
             .iter()
-            .any(|s| s.lexical && s.level as usize >= cx.pushes)
+            .any(|s| s.lexical && (!s.own || s.level as usize >= cx.pushes))
         {
             continue;
         }
@@ -903,11 +1407,13 @@ pub fn late_decl_fold(
                         slice: body,
                         capable: false,
                     }),
-                    SNode::Labeled { body, .. } => rstack.push(RewriteTask::EnterRegion {
-                        nodes: body,
-                        capable: true,
-                        push_new_id: true,
-                    }),
+                    SNode::Block(body) | SNode::Labeled { body, .. } => {
+                        rstack.push(RewriteTask::EnterRegion {
+                            nodes: body,
+                            capable: true,
+                            push_new_id: true,
+                        });
+                    }
                     SNode::Try {
                         body,
                         catches,
@@ -1087,7 +1593,9 @@ pub(in crate::folds) fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&m
                         stack.push(Task::Expr(cond));
                         stack.push(Task::Nodes(body));
                     }
-                    SNode::Labeled { body, .. } => stack.push(Task::Nodes(body)),
+                    SNode::Block(body) | SNode::Labeled { body, .. } => {
+                        stack.push(Task::Nodes(body));
+                    }
                     SNode::ForOf { iter, body, .. } => {
                         one_expr(iter, f);
                         stack.push(Task::Nodes(body));

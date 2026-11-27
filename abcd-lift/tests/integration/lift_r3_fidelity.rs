@@ -698,7 +698,7 @@ fn r3_d2_a6_h9_typed_catch_synthesizes_external_class_and_deduplicates_source_co
         LiteralValue::Setter(MethodIdx(1)),
         LiteralValue::LiteralArray(LiteralArrayIdx(1)),
         LiteralValue::LiteralBufferIndex(LiteralArrayIdx(1)),
-        LiteralValue::ArrayU8(LiteralArrayIdx(1)),
+        LiteralValue::ArrayU8(vec![42]),
     ]);
 
     let class = abcd_file::Class {
@@ -1083,11 +1083,9 @@ fn deep_5000_nested_literal_and_typed_arrays_lift_on_256kib_stack() {
             let mut literal_arrays = Vec::with_capacity(depth);
             for i in 0..depth {
                 let val = if i + 1 == depth {
-                    LiteralValue::Integer(777)
-                } else if i % 3 == 0 {
+                    LiteralValue::ArrayI32(vec![-777, 777])
+                } else if i % 2 == 0 {
                     LiteralValue::LiteralArray(LiteralArrayIdx((i + 1) as u32))
-                } else if i % 3 == 1 {
-                    LiteralValue::ArrayI32(LiteralArrayIdx((i + 1) as u32))
                 } else {
                     LiteralValue::LiteralBufferIndex(LiteralArrayIdx((i + 1) as u32))
                 };
@@ -1153,4 +1151,232 @@ fn deep_5000_nested_literal_and_typed_arrays_lift_on_256kib_stack() {
         })
         .unwrap();
     handle.join().unwrap();
+}
+
+// ─── #93 D3: Module::dialect & Pre-Method ClassData / Standalone Module ────
+
+#[test]
+fn module_dialect_and_pre_method_es_module_visibility() {
+    // 1. DynamicModern (`12.0.6.0`), DynamicLegacy (`0.0.0.2`), and Static (`0.1.0.7`)
+    //    map to `Dialect::DynamicEcma` vs `Dialect::StaticArkTS`.
+    let make_dialect_file = |version: Version, file_type: FileType| -> File {
+        let mut strings = StringPool::default();
+        let desc = strings.get_or_intern("LDialect;");
+        let cls = abcd_file::Class {
+            descriptor: desc,
+            name: desc,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: FileSourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            annotations: Default::default(),
+        };
+        File {
+            version,
+            checksum: 0,
+            size: 0,
+            file_type,
+            strings,
+            classes: [(desc, cls)].into_iter().collect(),
+            literal_arrays: Vec::new(),
+            literal_array_header_offsets: Vec::new(),
+        }
+    };
+
+    let m_mod = lift_file(&make_dialect_file(
+        Version::new(12, 0, 6, 0),
+        FileType::Dynamic,
+    ))
+    .unwrap();
+    assert_eq!(m_mod.dialect, abcd_ir::Dialect::DynamicEcma);
+
+    let m_leg = lift_file(&make_dialect_file(
+        Version::new(0, 0, 0, 2),
+        FileType::Dynamic,
+    ))
+    .unwrap();
+    assert_eq!(m_leg.dialect, abcd_ir::Dialect::DynamicEcma);
+
+    let m_stat = lift_file(&make_dialect_file(
+        Version::new(0, 1, 0, 7),
+        FileType::Static,
+    ))
+    .unwrap();
+    assert_eq!(m_stat.dialect, abcd_ir::Dialect::StaticArkTS);
+
+    // 2. Standalone `_ESModuleRecord` interned AFTER `L_GLOBAL;` (so `L_GLOBAL;`
+    //    sorts earlier in `file.classes` `BTreeMap`) is STILL already lifted into
+    //    `Module::{imports, exports, module_requests}` before `L_GLOBAL;::main`
+    //    is translated (`D3`).
+    let mut strings = StringPool::default();
+    let global_desc = strings.get_or_intern("L_GLOBAL;"); // StringId(0) — sorts FIRST!
+    let esm_desc = strings.get_or_intern(abcd_file::ES_MODULE_RECORD_DESCRIPTOR); // StringId(1) — sorts SECOND!
+    let mod_field_name = strings.get_or_intern("moduleRecordIdx");
+    let main_name = strings.get_or_intern("func_main_0");
+    let req_dep = strings.get_or_intern("./dep");
+    let imp_a = strings.get_or_intern("impA");
+    let imp_b = strings.get_or_intern("impB");
+    let exp_x = strings.get_or_intern("expX");
+    let exp_y = strings.get_or_intern("expY");
+
+    let main_method = Method {
+        name: main_name,
+        offset: 0x100,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: FileSourceLang::EcmaScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            bytecodes: vec![
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // External `impB` -> slot 1
+                Bytecode::DeprecatedStmodulevar(EntityId(1)),         // Local `expY` -> slot 1
+                Bytecode::Returnundefined,
+            ],
+            entities: HashMap::from([
+                ((EntityKind::StringId, 0), EntityRef::string(imp_b)),
+                ((EntityKind::StringId, 1), EntityRef::string(exp_y)),
+            ]),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    };
+    let global_cls = abcd_file::Class {
+        descriptor: global_desc,
+        name: global_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![main_method],
+        fields: Vec::new(),
+        annotations: Default::default(),
+    };
+    let esm_cls = abcd_file::Class {
+        descriptor: esm_desc,
+        name: esm_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: vec![abcd_file::Field {
+            name: mod_field_name,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(abcd_file::FieldValue::ModuleData(abcd_file::ModuleData {
+                source_offset: 0,
+                requests: vec![req_dep],
+                records: vec![
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp_a,
+                        import_name: imp_a,
+                        module_request_idx: 0,
+                    },
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp_b,
+                        import_name: imp_b,
+                        module_request_idx: 0,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp_x,
+                        export_name: exp_x,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp_y,
+                        export_name: exp_y,
+                    },
+                ],
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+    let standalone_esm_file = File {
+        version: Version::new(0, 0, 0, 2),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings,
+        classes: [(global_desc, global_cls), (esm_desc, esm_cls)]
+            .into_iter()
+            .collect(),
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let ir = lift_file(&standalone_esm_file).expect("lift standalone legacy ESM");
+    verify_clean(&ir);
+    let ld = ir
+        .insts
+        .iter()
+        .find_map(|i| match &i.op {
+            Op::LoadModuleVar { index, kind } => Some((*index, *kind)),
+            _ => None,
+        })
+        .expect("LoadModuleVar");
+    let st = ir
+        .insts
+        .iter()
+        .find_map(|i| match &i.op {
+            Op::StoreModuleVar { index, .. } => Some(*index),
+            _ => None,
+        })
+        .expect("StoreModuleVar");
+    assert_eq!(ld, (1, abcd_ir::ModuleVarKind::External));
+    assert_eq!(st, 1);
+}
+
+#[test]
+fn dead_predecessor_sweep_cascades_newly_trivial_phi_to_zero_phis() {
+    // Bytecode layout:
+    //   0..3: `ldai 5; sta v0; jmp 6` (live entry jumps directly to join at 6)
+    //   3..6: `ldai 99; sta v0; jmp 6` (dead unreachable island feeding join at 6!)
+    //   6..8: `lda v0; return` (join has 2 predecessors during Braun SSA: live [0..3)
+    //         with `v0 = 5` and dead [3..6) with `v0 = 99` -> non-trivial 2-entry Phi
+    //         before `sweep_dead_blocks`; once `sweep_dead_blocks` prunes [3..6),
+    //         `finalize_function` collapses the 1-entry Phi to `5` and removes it!)
+    let f = build_single(
+        &[
+            Bytecode::Ldai(Imm(5)),  // 0
+            Bytecode::Sta(Reg(0)),   // 1
+            Bytecode::Jmp(Label(6)), // 2 -> join
+            Bytecode::Ldai(Imm(99)), // 3 (unreachable island)
+            Bytecode::Sta(Reg(0)),   // 4
+            Bytecode::Jmp(Label(6)), // 5 -> join
+            Bytecode::Lda(Reg(0)),   // 6 (join)
+            Bytecode::Return,        // 7
+        ],
+        1,
+        0,
+    );
+    let ir = lift_file(&f).expect("lift dead-island join");
+    verify_clean(&ir);
+    let func = &ir.functions[0];
+    let phi_count: usize = func
+        .blocks
+        .iter()
+        .flat_map(|&bb| &ir.blocks[bb.index()].insts)
+        .filter(|&&iid| ir.insts[iid.index()].op.is_phi())
+        .count();
+    assert_eq!(
+        phi_count, 0,
+        "post-sweep 1-predecessor trivial phi must be collapsed and removed"
+    );
 }

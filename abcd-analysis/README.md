@@ -22,16 +22,17 @@ expression recovery, control-flow folding, and AST emission live in
 
 | Module | Responsibility |
 |---|---|
-| `control` | Normal (`block_succs`, `inst_succs`) and exception-augmented (`augmented_succs`) CFG relations, iterative reverse post-order (`compute_rpo`), BFS reachability (`reachable_blocks`), Cooper–Harvey–Kennedy `Dominators` / `PostDominators` with $O(1)$ Euler-tour ancestry intervals, natural-loop detection (`back_edges`, `natural_loop`), and dense-bitset pattern-independent region structuring (`structure_regions`, `structure_subgraph`). |
-| `frame` | Analysis-side adapter over `abcd_ir::frame::FrameSlots`: decodes `L_ESCallTypeAnnotation;` when present, uses canonical `StaticArkTS` (`H = 0` static / `H = 1` instance) frames on ArkTS methods, applies the `0xF` default for `DynamicEcma` `STATIC` callees, and returns `None` for unannotated non-static `DynamicEcma` functions (`N66`). |
+| `control` | Normal (`block_succs`, `inst_succs`) and exception-augmented (`augmented_succs`, `augmented_succs_with_map`) CFG relations and iterative reverse post-order (`compute_rpo`, `compute_rpo_with`) re-exported from `abcd_ir::cfg`, BFS reachability (`reachable_blocks`, `reachable_from`), iterative Semi-NCA `Dominators` (wrapping `abcd_ir::cfg::DomTree`, with `depth`, `dom_children`, and `dominates(dead, dead) == false`) and `PostDominators`, and natural-loop detection (`back_edges`, `back_edges_in_blocks`, `natural_loop`). |
+| `frame` | Analysis-side adapter over `abcd_ir::frame::FrameSlots`: decodes `L_ESCallTypeAnnotation;` when present, uses canonical `StaticArkTS` (`H = 0` static / `H = 1` instance) frames on `Dialect::StaticArkTS` modules, applies the `0xF` default for `DynamicEcma` `STATIC` callees, and returns `None` for unannotated non-static `DynamicEcma` functions (`N66`). |
 | `dataflow::usedef` | Per-function `UseDefChains` (plain operand uses and edge-carrying SSA `Phi` uses). |
-| `dataflow::ifds` | Binary-lattice Reps–Horwitz–Sagiv IFDS tabulation solver (`IfdsProblem`, `IfdsSolver`) with Naeem–Lhoták–Rodriguez practical extensions: start-anchored path edges, `incoming` / `end_summary` second-arriver replay, zero-fact (`Λ`) preservation with optional `IfdsProblem::propagate_zero_to_callee` call-edge gating, multi-return-site exceptional edges, and `CallGraphOracle` decoupling. |
-| `dataflow::heap` | Rung-0 allocation-site keying (`HeapRef`, `AllocSiteSet`, `FieldChain`, `UpdateKind`, `AliasOracle<F>`, `Rung0AliasOracle`). |
-| `dataflow::alias` | Rung-1 demand-driven backward alias queries (`Rung1AliasOracle`, `QueryAnswer`, `AliasEngineStats`). |
-| `dataflow::pta` | Rung-2 whole-module and root-sliced `k=1` context-sensitive subset pointer analysis (`analyze`, `analyze_with_links_and_roots`, `PtaConfig`, `Rung2AliasOracle`, `EnvAnswer`). |
-| `callgraph` | `CallGraph::build` backward callee-value resolution across `Mov` / `Phi` / `LoadConst(MethodRef)` / `AllocClosure` / `DefineFunc` / `DefineClass` and cross-record ES imports, `CallGraph::refine_with_points_to` (Rung 1), co-evolved PTA assembly (Rung 2), and explicit `CallTargets::UnknownCallees` retention. |
-| `module_link` | `ModuleLinkTable` and `merge_ir_modules`: cross-record ES `import` / `export` (`Local`, `Indirect`, cycle-safe `Star`), OHMUrl (`@bundle:` / `@package:` / `@normalized:`) and POSIX relative specifier resolution, bundled JSON asset imports, and topological `func_main_0` initialization ordering. |
-| `ohos_lifecycle` | `parse_manifest_src_entries`, `discover_components`, and `synthesize_ohos_harness`: discovers OpenHarmony `UIAbility` / `*ExtensionAbility` and ArkUI `ViewPU` / `View` classes and synthesizes a deterministic `__abcd_ohos_harness__` entry function with per-component receivers and `Want` / context bindings. |
+| `dataflow::ifds` | Binary-lattice Reps–Horwitz–Sagiv IFDS tabulation solver (`IfdsProblem`, `IfdsSolver`, `FactId`, `FlowOut`, `FlowSink`) with Naeem–Lhoták–Rodriguez practical extensions: start-anchored path edges, separated `edge_set` vs `uncaught_edge_set` domains (`D6`), zero-copy `FlowSink::pass_through()` identity transfer, `incoming` / `end_summary` second-arriver replay, zero-fact (`Λ`) preservation with optional `IfdsProblem::propagate_zero_to_callee` call-edge gating, multi-return-site exceptional edges, and `CallGraphOracle` decoupling. |
+| `dataflow::heap` | Rung-0 allocation-site keying (`HeapRef`, `AllocSiteSet`, `FieldChain`, `UpdateKind`, `AliasOracle<F>`, `Rung0AliasOracle`) and `O(1)` concrete-runtime-singleton classification (`SingletonSiteClassifier`, `is_concrete_singleton_site`, `update_kind_for` — `D5`, gating strong updates on single-execution functions and Tarjan-SCC loop-free blocks). |
+| `dataflow::alias` | Rung-1 demand-driven backward alias queries (`Rung1AliasOracle`, `QueryAnswer`, `AliasEngineStats`) with balanced-parentheses CFL-reachability, context-isolated cross-module `ModuleHop` transitions, bounds-checked arena queries, and concrete-singleton strong-update gating. |
+| `dataflow::pta` | Rung-2 whole-module and root-sliced `k=1` context-sensitive subset pointer analysis (`analyze`, `analyze_with_links_and_roots`, `PtaConfig`, `Rung2AliasOracle`, `EnvAnswer`), modeling prototype/static class inheritance (`DefineClass` / `SetObjectWithProto` / `LoadSuper` / `Super*`), variadic `GetUnmappedArgs` / `CopyRestArgs` excess & spread actuals, private fields (`StorePrivate` / `LoadPrivate`), activation-compatible lexical environments, and concrete-singleton strong updates. |
+| `callgraph` | `CallGraph::build` backward callee-value resolution across `Mov` / `Phi` / `LoadConst(MethodRef)` / `AllocClosure` / `DefineFunc` / `DefineClass`, static + dynamic `extends` `ClassHierarchyIndex` virtual/override resolution, `CallGraph::refine_with_points_to` (Rung 1), co-evolved PTA assembly (Rung 2), and explicit `CallTargets::UnknownCallees` retention. |
+| `ohmurl` | Canonical zero-copy `OhmUrl` / `OhmUrlKind` parser (`D3`) supporting 5-field and 4-field `@normalized:`, bare `&...`, `@bundle:`, `@package:`, `@app:`, `@ohos:`, `@hms:`, `@kit.`, `@arkts.`, `@system:`, and `@native:` module specifiers and `L...;` descriptors. |
+| `module_link` | `ModuleLinkTable` and `merge_ir_modules`: cross-record ES `import` / `export` (`Local`, `Indirect`, Tarjan-SCC memoized cyclic `Star` with monotone `unresolved_external`), `OhmUrl` and POSIX/dot relative specifier resolution, bundled JSON asset imports, and topological `func_main_0` initialization ordering. |
+| `ohos_lifecycle` | `EntryModel`, `parse_manifest_src_entries`, `discover_components`, and `synthesize_ohos_harness` (`D3`): discovers OpenHarmony `UIAbility` / `*ExtensionAbility` and ArkUI `ViewPU` / `View` classes and synthesizes `__abcd_ohos_harness__` with creation, non-deterministic `while (*)` steady-state callback dispatch, and teardown phases. |
 
 ### Heap & Call-Graph Precision Ladder
 
@@ -44,8 +45,7 @@ expression recovery, control-flow folding, and AST emission live in
 ## 3. Core Soundness, Determinism & Stack-Safety Invariants
 
 - **Zero Input-Depth Native Recursion**: Every graph, tree, SSA def-chain,
-  literal, type, and module-export traversal (`Dominators`,
-  `structure_regions`, `walk_region`, `Rung0`/`Rung1`/`Rung2` resolvers,
+  literal, type, and module-export traversal (`Dominators`, `Rung0`/`Rung1`/`Rung2` resolvers,
   `CallGraph::build`, `ModuleLinkTable`, `ohos_lifecycle`) executes on
   explicit heap stacks or flat worklists, guaranteeing bounded native
   call-stack usage on deeply nested inputs (verified on `256 KiB` threads).
@@ -73,14 +73,13 @@ specifications and decision records.
 
 ```rust,no_run
 use abcd_analysis::callgraph::CallGraph;
-use abcd_analysis::control::{Dominators, structure_regions};
+use abcd_analysis::control::Dominators;
 use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle, analyze};
 use abcd_ir::{FuncId, InstId, Module, ValueId};
 
 fn inspect_module(module: &Module, func: FuncId, ptr: ValueId, at: InstId) {
     let dom = Dominators::normal(module, func);
-    let regions = structure_regions(module, func);
-    assert!(regions.errors.is_empty() && !dom.rpo().is_empty());
+    assert!(!dom.rpo().is_empty());
 
     let base_cg = CallGraph::build(module);
     let (cg, tables, stats) = analyze(module, &base_cg, &PtaConfig::default()).into_parts();

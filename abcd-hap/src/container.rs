@@ -12,7 +12,10 @@
 //!   application package (`.app`);
 //! - anything else carries no extractable bytecode.
 
+use std::sync::Arc;
+
 use crate::Error;
+use crate::manifest::{ManifestSummary, parse_manifest_summary};
 use crate::zip::{Compression, EntryData, EntryMeta, Limits, ZipArchive};
 
 /// Fixed path of the first-class Ark bytecode entry inside a module
@@ -132,6 +135,14 @@ pub struct AbcModule<'a> {
 }
 
 impl AbcModule<'_> {
+    /// Parse [`ManifestSummary`] from this module's `module_json` payload
+    /// (`module.json` or `config.json`), returning `None` when absent or
+    /// malformed.
+    pub fn manifest_summary(&self) -> Option<ManifestSummary> {
+        let raw = self.module_json.as_ref()?;
+        parse_manifest_summary(raw.as_slice())
+    }
+
     /// Lift into an `'static` module by owning all payloads (used when the
     /// backing bytes of a nested container do not outlive the call).
     fn into_static(self) -> AbcModule<'static> {
@@ -163,19 +174,6 @@ fn read_checked<'a>(
     Ok(data)
 }
 
-/// Read a named entry against the running `Limits` budget.
-fn read_named_checked<'a>(
-    archive: &ZipArchive<'a>,
-    name: &str,
-    limits: Limits,
-    remaining_total: &mut u64,
-) -> Result<EntryData<'a>, Error> {
-    let meta = archive
-        .entry(name)
-        .ok_or_else(|| Error::EntryNotFound(name.to_string()))?;
-    read_checked(archive, meta, limits, remaining_total)
-}
-
 /// Read an optional entry if present, `Ok(None)` otherwise.
 fn read_optional_checked<'a>(
     archive: &ZipArchive<'a>,
@@ -189,11 +187,15 @@ fn read_optional_checked<'a>(
     }
 }
 
-/// Force owned payloads when extracting from a nested container whose
-/// backing bytes are dropped on return.
+/// Force `Arc`-backed owned payloads when extracting from a nested container
+/// whose backing bytes are dropped on return, preserving existing
+/// [`EntryData::Owned`] buffers in `O(1)`.
 fn coerce<'a>(data: EntryData<'a>, force_owned: bool) -> EntryData<'a> {
     if force_owned {
-        EntryData::Owned(data.into_owned())
+        match data {
+            EntryData::Borrowed(s) => EntryData::Owned(Arc::from(s)),
+            EntryData::Owned(a) => EntryData::Owned(a),
+        }
     } else {
         data
     }
@@ -201,7 +203,8 @@ fn coerce<'a>(data: EntryData<'a>, force_owned: bool) -> EntryData<'a> {
 
 /// Extract every `.abc` entry of a module container as its own module
 /// (`ets/modules.abc` first, then the rest in central-directory order). The
-/// container-level manifests are read once and shared by all modules.
+/// container-level manifests are read and coerced once, then shared in `O(1)`
+/// across all extracted modules.
 fn extract_modules<'a>(
     archive: &ZipArchive<'a>,
     container_path: Vec<String>,
@@ -213,37 +216,20 @@ fn extract_modules<'a>(
         Some(json) => Some(json),
         None => read_optional_checked(archive, CONFIG_JSON, limits, remaining_total)?,
     };
-    let patch_json = read_optional_checked(archive, PATCH_JSON, limits, remaining_total)?;
+    let module_json = module_json.map(|d| coerce(d, force_owned));
+    let patch_json = read_optional_checked(archive, PATCH_JSON, limits, remaining_total)?
+        .map(|d| coerce(d, force_owned));
     let metas = abc_entry_metas(archive);
     let mut out = Vec::with_capacity(metas.len());
-    for (idx, meta) in metas.into_iter().enumerate() {
+    for meta in metas {
         let data = read_checked(archive, meta, limits, remaining_total)?;
         let compression = archive.entry_compression(meta)?;
-        // Additional owned manifest clones (beyond the first module in a
-        // nested container) allocate heap copies and are charged to the
-        // cumulative total budget.
-        if force_owned && idx > 0 {
-            let extra_manifest_bytes = module_json
-                .as_ref()
-                .map_or(0u64, |d| d.as_slice().len() as u64)
-                .saturating_add(
-                    patch_json
-                        .as_ref()
-                        .map_or(0u64, |d| d.as_slice().len() as u64),
-                );
-            if extra_manifest_bytes > *remaining_total {
-                return Err(Error::EntryTooLarge {
-                    name: meta.name.as_ref().to_owned(),
-                });
-            }
-            *remaining_total -= extra_manifest_bytes;
-        }
         out.push(AbcModule {
             data: coerce(data, force_owned),
             entry_name: meta.name.as_ref().to_owned(),
             compression,
-            module_json: module_json.clone().map(|d| coerce(d, force_owned)),
-            patch_json: patch_json.clone().map(|d| coerce(d, force_owned)),
+            module_json: module_json.clone(),
+            patch_json: patch_json.clone(),
             container_path: container_path.clone(),
         });
     }
@@ -252,8 +238,8 @@ fn extract_modules<'a>(
 
 /// Heap workstack frame for iterative nested container traversal (zero
 /// call-stack recursion).
-struct PendingContainer {
-    bytes: Vec<u8>,
+struct PendingContainer<'a> {
+    bytes: EntryData<'a>,
     depth: usize,
     path: Vec<String>,
 }
@@ -297,22 +283,20 @@ pub fn abc_modules_with_limits(bytes: &[u8], limits: Limits) -> Result<Vec<AbcMo
                 &mut remaining_total,
             )?);
         }
-        Container::App { outer, modules } => {
-            let mut workstack: Vec<PendingContainer> = Vec::new();
-            for top_name in modules {
-                let nested_bytes =
-                    read_named_checked(&outer, &top_name, limits, &mut remaining_total)?
-                        .into_owned();
+        Container::App { outer, .. } => {
+            let mut workstack: Vec<PendingContainer<'_>> = Vec::new();
+            for meta in outer.entries().filter(|e| is_nested_module_name(&e.name)) {
+                let nested_bytes = read_checked(&outer, meta, limits, &mut remaining_total)?;
                 workstack.push(PendingContainer {
                     bytes: nested_bytes,
                     depth: 2,
-                    path: vec![top_name],
+                    path: vec![meta.name.as_ref().to_owned()],
                 });
                 while let Some(item) = workstack.pop() {
                     if item.depth > MAX_CONTAINER_DEPTH {
                         continue;
                     }
-                    let sniffed = match Container::sniff(&item.bytes) {
+                    let sniffed = match Container::sniff(item.bytes.as_slice()) {
                         Ok(container) => container,
                         // Resource-only or native-only nested .hsp/.hap modules
                         // inside an .app bundle carry no .abc entries; skip them
@@ -336,21 +320,23 @@ pub fn abc_modules_with_limits(bytes: &[u8], limits: Limits) -> Result<Vec<AbcMo
                             }
                         }
                         Container::App {
-                            outer: inner_outer,
-                            modules: inner_modules,
+                            outer: inner_outer, ..
                         } => {
                             if item.depth < MAX_CONTAINER_DEPTH {
-                                let mut children = Vec::with_capacity(inner_modules.len());
-                                for child_name in inner_modules {
-                                    let child_bytes = read_named_checked(
+                                let mut children = Vec::new();
+                                for child_meta in inner_outer
+                                    .entries()
+                                    .filter(|e| is_nested_module_name(&e.name))
+                                {
+                                    let child_bytes = read_checked(
                                         &inner_outer,
-                                        &child_name,
+                                        child_meta,
                                         limits,
                                         &mut remaining_total,
                                     )?
-                                    .into_owned();
+                                    .into_static();
                                     let mut child_path = item.path.clone();
-                                    child_path.push(child_name);
+                                    child_path.push(child_meta.name.as_ref().to_owned());
                                     children.push(PendingContainer {
                                         bytes: child_bytes,
                                         depth: item.depth + 1,

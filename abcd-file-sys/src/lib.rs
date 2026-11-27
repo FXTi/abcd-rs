@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 //! Low-level C FFI bindings for the ArkCompiler `.abc` container format (`libpandafile`).
 //!
 //! Built from the workspace `vendor/` snapshot (`OpenHarmony-v7.0-Release`),
@@ -746,12 +748,8 @@ mod tests {
             assert_eq!(compile_entries.len(), 1);
             assert_eq!(compile_entries[0].0, 0);
 
-            // Runtime item: vendor MethodParamItem keeps a SINGLE annotation
-            // vector per param (file_items.h:828-845; HasRuntimeAnnotations
-            // unconditionally returns false), and ParamAnnotationsItem's
-            // constructor snapshots whatever is staged at seal time. The
-            // runtime seal happened after both buckets were staged, so it
-            // contains param 0's compile-time annotation as well.
+            // Runtime item: dual-bucket staging in AbcBuilder isolates runtime
+            // parameter annotations from compile-time parameter annotations.
             let mut runtime_entries: Vec<(u32, u32)> = Vec::new();
             assert_eq!(
                 abc_param_annotations_enumerate(
@@ -762,15 +760,13 @@ mod tests {
                 ),
                 0
             );
-            assert_eq!(runtime_entries.len(), 2);
-            assert_eq!(runtime_entries[0].0, 0);
-            assert_eq!(runtime_entries[1].0, 1);
-            assert_eq!(runtime_entries[0].1, compile_entries[0].1);
+            assert_eq!(runtime_entries.len(), 1);
+            assert_eq!(runtime_entries[0].0, 1);
 
             // The referenced annotation items carry the expected values.
             for (off, want) in [
                 (compile_entries[0].1, 1111u32),
-                (runtime_entries[1].1, 2222u32),
+                (runtime_entries[0].1, 2222u32),
             ] {
                 let a = abc_annotation_open(f, off);
                 assert!(!a.is_null(), "annotation at {off} must open");
@@ -1405,6 +1401,184 @@ mod tests {
             abc_builder_free(b);
 
             assert_eq!(rows, vec![(0, 10), (2, 13), (50, 500)]);
+        }
+    }
+
+    /// Pass-2 Ring 1 (`#91`): typed literal-array reader, short EOF MethodHandle,
+    /// truncated annotation/module headers, IndexHeader 64-bit bounds, trailing
+    /// padding in `abc_file_get_type`, and deterministic `header.literalarray_idx`.
+    #[test]
+    fn pass2_bridge_hardening_and_deterministic_literalarray_idx() {
+        unsafe {
+            // 1. Deterministic `header.literalarray_idx` (`<= 12.0.6.0`) + `abc_literal_read_typed_array`.
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
+            let cls = abc_builder_add_global_class(b);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                c"f".as_ptr(),
+                proto,
+                AbcAccessFlags_ABC_ACC_PUBLIC,
+                [0x65u8].as_ptr(),
+                1,
+                1,
+                0,
+            );
+            // Stage 5 literal arrays with keys whose hash order differs from creation order.
+            let keys = [c"zeta", c"alpha", c"mu", c"beta", c"omega"];
+            let mut handles = Vec::new();
+            for k in keys {
+                handles.push(abc_builder_add_literal_array(b, k.as_ptr()));
+            }
+            // Populate handle 0 (`zeta`) as ARRAY_U32 `[10, 20, 30]`, others with distinct integers.
+            abc_builder_literal_array_add_u8(b, handles[0], LiteralTag_ARRAY_U32);
+            abc_builder_literal_array_add_u32(b, handles[0], 3);
+            abc_builder_literal_array_add_u32(b, handles[0], 10);
+            abc_builder_literal_array_add_u32(b, handles[0], 20);
+            abc_builder_literal_array_add_u32(b, handles[0], 30);
+            for (idx, &h) in handles.iter().enumerate().skip(1) {
+                abc_builder_literal_array_add_u8(b, h, LiteralTag_INTEGER);
+                abc_builder_literal_array_add_u32(b, h, (100 + idx) as u32);
+            }
+
+            let mut out_len = 0u32;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null());
+            let bytes = std::slice::from_raw_parts(ptr, out_len as usize).to_vec();
+            abc_builder_free(b);
+
+            // Trailing zero padding must still classify as Dynamic in `abc_file_get_type`.
+            let mut padded = bytes.clone();
+            padded.extend_from_slice(&[0u8; 16]);
+            assert_eq!(
+                abc_file_get_type(padded.as_ptr(), padded.len() as i32),
+                FileType::Dynamic as i8
+            );
+
+            let f = abc_file_open(bytes.as_ptr(), bytes.len());
+            assert!(!f.is_null());
+            assert_eq!(abc_file_validate_checksum(f), 1);
+            assert_eq!(abc_file_num_literalarrays(f), 5);
+
+            // Entry 0 in header.literalarray_idx MUST be `zeta` (ARRAY_U32 `[10, 20, 30]`),
+            // and entries 1..5 MUST carry 101, 102, 103, 104 in exact handle-creation order!
+            unsafe extern "C" fn collect_val(
+                val: *const AbcLiteralVal,
+                ctx: *mut std::ffi::c_void,
+            ) {
+                unsafe {
+                    let v = &*val;
+                    (*(ctx as *mut Vec<(u8, u32)>)).push((v.tag, v.data.u32_val));
+                }
+            }
+            let off0 = abc_file_literalarray_offset(f, 0);
+            let mut v0: Vec<(u8, u32)> = Vec::new();
+            assert_eq!(
+                abc_literal_enumerate_vals_checked(
+                    f,
+                    off0,
+                    Some(collect_val),
+                    (&raw mut v0).cast()
+                ),
+                0
+            );
+            assert_eq!(v0.len(), 1);
+            assert_eq!(v0[0].0, LiteralTag_ARRAY_U32);
+            let payload_off = v0[0].1;
+            assert_eq!(
+                abc_literal_read_typed_array(f, payload_off, 4, std::ptr::null_mut(), 0),
+                3
+            );
+            let mut elems = [0u64; 3];
+            assert_eq!(
+                abc_literal_read_typed_array(f, payload_off, 4, elems.as_mut_ptr(), 3),
+                3
+            );
+            assert_eq!(elems, [10, 20, 30]);
+
+            for idx in 1..5u32 {
+                let off = abc_file_literalarray_offset(f, idx);
+                let mut vs: Vec<(u8, u32)> = Vec::new();
+                assert_eq!(
+                    abc_literal_enumerate_vals_checked(
+                        f,
+                        off,
+                        Some(collect_val),
+                        (&raw mut vs).cast()
+                    ),
+                    0
+                );
+                assert_eq!(vs, vec![(LiteralTag_INTEGER, 100 + idx)]);
+            }
+            abc_file_close(f);
+
+            // 2. 2-byte MethodHandleItem at exact EOF (`sp.Size() == 2`), plus truncated
+            // annotation (`4 + count * 8` without tags) and IndexHeader 32-bit overflow.
+            let mut raw = Vec::new();
+            raw.extend_from_slice(b"PANDA\0\0\0");
+            raw.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            raw.extend_from_slice(&[12, 0, 6, 0]); // version
+            raw.extend_from_slice(&0u32.to_le_bytes()); // file_size
+            for _ in 0..10 {
+                raw.extend_from_slice(&0u32.to_le_bytes());
+            }
+            // Offset 60: truncated annotation (class_idx=0, count=1, 8-byte elem, NO 1-byte tag -> 12 bytes)
+            raw.extend_from_slice(&0u16.to_le_bytes());
+            raw.extend_from_slice(&1u16.to_le_bytes());
+            raw.extend_from_slice(&[0u8; 8]);
+            // Offset 72 (last 2 bytes in file): valid 2-byte MethodHandle (type=4, entity_off=60)
+            let mh_off = raw.len() as u32;
+            raw.push(4u8);
+            raw.push(60u8);
+            let fsz = raw.len() as u32;
+            raw[16..20].copy_from_slice(&fsz.to_le_bytes());
+
+            let f2 = abc_file_open(raw.as_ptr(), raw.len());
+            assert!(!f2.is_null());
+            // Annotation at 60 has only 14 remaining bytes? Wait: 12 + 2 = 14 >= 13; test at mh_off - 12 where count=2 needs 4 + 18 = 22 > 14!
+            let mut mh_ty = 0u8;
+            let mut mh_ent = 0u32;
+            assert_eq!(
+                abc_method_handle_read(f2, mh_off, &mut mh_ty, &mut mh_ent),
+                0
+            );
+            assert_eq!((mh_ty, mh_ent), (4, 60));
+            abc_file_close(f2);
+
+            // Truncated annotation at EOF (`count = 1` needs 13 bytes, give it 12):
+            let mut trunc_ann = raw[..72].to_vec();
+            let fsz_ann = trunc_ann.len() as u32;
+            trunc_ann[16..20].copy_from_slice(&fsz_ann.to_le_bytes());
+            let f_ann = abc_file_open(trunc_ann.as_ptr(), trunc_ann.len());
+            assert!(!f_ann.is_null());
+            assert!(abc_annotation_open(f_ann, 60).is_null());
+            assert!(abc_module_open(f_ann, 68).is_null()); // only 4 bytes left (< 8)
+            abc_file_close(f_ann);
+
+            // IndexHeader 32-bit overflow (`class_idx_size = 0x4000_0001` -> `size * 4` wraps 32-bit):
+            let mut bad_ih = Vec::new();
+            bad_ih.extend_from_slice(b"PANDA\0\0\0");
+            bad_ih.extend_from_slice(&0u32.to_le_bytes());
+            bad_ih.extend_from_slice(&[12, 0, 6, 0]);
+            bad_ih.extend_from_slice(&100u32.to_le_bytes()); // file_size = 100 (60 hdr + 40 IndexHeader)
+            for _ in 0..8 {
+                bad_ih.extend_from_slice(&0u32.to_le_bytes());
+            }
+            bad_ih.extend_from_slice(&1u32.to_le_bytes()); // num_indexes = 1
+            bad_ih.extend_from_slice(&60u32.to_le_bytes()); // index_section_off = 60
+            // 40-byte IndexHeader: start=60, end=100, class_idx_size=0x4000_0001, class_idx_off=60
+            bad_ih.extend_from_slice(&60u32.to_le_bytes());
+            bad_ih.extend_from_slice(&100u32.to_le_bytes());
+            bad_ih.extend_from_slice(&0x4000_0001u32.to_le_bytes());
+            bad_ih.extend_from_slice(&60u32.to_le_bytes());
+            for _ in 0..6 {
+                bad_ih.extend_from_slice(&0u32.to_le_bytes());
+            }
+            assert_eq!(bad_ih.len(), 100);
+            assert!(abc_file_open(bad_ih.as_ptr(), bad_ih.len()).is_null());
         }
     }
 }

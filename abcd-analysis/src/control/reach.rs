@@ -3,10 +3,7 @@
 use abcd_ir::{BlockId, FuncId, Module};
 
 /// Blocks reachable from `entry` under `succ`, in deterministic BFS order.
-pub(crate) fn reachable_from(
-    entry: BlockId,
-    succ: &dyn Fn(BlockId) -> Vec<BlockId>,
-) -> Vec<BlockId> {
+pub fn reachable_from(entry: BlockId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Vec<BlockId> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::from([entry]);

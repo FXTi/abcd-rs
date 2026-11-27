@@ -345,57 +345,143 @@ fn literal_tree_cache_hit_on_second_reference() {
 
 #[test]
 fn typed_array_payloads_preserve_exact_typed_array_tags() {
-    let inner = vec![LiteralValue::Integer(9)];
+    let mut strings = abcd_file::StringPool::default();
+    let desc = strings.get_or_intern("LK;");
+    let s1 = strings.get_or_intern("alpha");
+    let s2 = strings.get_or_intern("beta");
+    let nan32 = f32::from_bits(0x7fc0_1234);
+    let nan64 = f64::from_bits(0x7ff8_0000_1234_5678);
+
     let outer = vec![
-        LiteralValue::ArrayU1(LiteralArrayIdx(1)),
-        LiteralValue::ArrayU8(LiteralArrayIdx(1)),
-        LiteralValue::ArrayI8(LiteralArrayIdx(1)),
-        LiteralValue::ArrayU16(LiteralArrayIdx(1)),
-        LiteralValue::ArrayI16(LiteralArrayIdx(1)),
-        LiteralValue::ArrayU32(LiteralArrayIdx(1)),
-        LiteralValue::ArrayI32(LiteralArrayIdx(1)),
-        LiteralValue::ArrayU64(LiteralArrayIdx(1)),
-        LiteralValue::ArrayI64(LiteralArrayIdx(1)),
-        LiteralValue::ArrayF32(LiteralArrayIdx(1)),
-        LiteralValue::ArrayF64(LiteralArrayIdx(1)),
-        LiteralValue::ArrayString(LiteralArrayIdx(1)),
+        LiteralValue::ArrayU1(vec![true, false]),
+        LiteralValue::ArrayU8(vec![0, 255]),
+        LiteralValue::ArrayI8(vec![i8::MIN, -1, i8::MAX]),
+        LiteralValue::ArrayU16(vec![0, 258, u16::MAX]),
+        LiteralValue::ArrayI16(vec![i16::MIN, -258, i16::MAX]),
+        LiteralValue::ArrayU32(vec![0, 0x89AB_CDEF, u32::MAX]),
+        LiteralValue::ArrayI32(vec![i32::MIN, -123_456, i32::MAX]),
+        LiteralValue::ArrayU64(vec![0, 0x0123_4567_89AB_CDEF, u64::MAX]),
+        LiteralValue::ArrayI64(vec![i64::MIN, -9_876_543_210, i64::MAX]),
+        LiteralValue::ArrayF32(vec![-0.0, nan32]),
+        LiteralValue::ArrayF64(vec![-0.0, nan64]),
+        LiteralValue::ArrayString(vec![s1, s2]),
     ];
-    let file = literal_consumer_file(
+    let f = method(
+        &mut strings,
+        "f",
+        0,
         vec![
             Bytecode::DeprecatedCreatearraywithbuffer(Imm(0)),
             Bytecode::Returnundefined,
         ],
-        vec![outer, inner],
+        HashMap::new(),
     );
+    let file = model(strings, desc, vec![f], vec![outer]);
     let (mut m, shape) = lifted_array_shape(&file);
-    let c9 = m.consts.intern(Const::Int32(9));
-    let expected_tags = [
-        TypedArrayTag::U1,
-        TypedArrayTag::U8,
-        TypedArrayTag::I8,
-        TypedArrayTag::U16,
-        TypedArrayTag::I16,
-        TypedArrayTag::U32,
-        TypedArrayTag::I32,
-        TypedArrayTag::U64,
-        TypedArrayTag::I64,
-        TypedArrayTag::F32,
-        TypedArrayTag::F64,
-        TypedArrayTag::String,
+    let sym_alpha = m.sym.intern("alpha");
+    let sym_beta = m.sym.intern("beta");
+    fn intern_ta(
+        m: &mut abcd_ir::Module,
+        tag: TypedArrayTag,
+        vals: Vec<Const>,
+    ) -> abcd_ir::ConstId {
+        let items = vals.into_iter().map(|c| m.consts.intern(c)).collect();
+        m.consts.intern(Const::TypedArrayLiteral { tag, items })
+    }
+    let expected_ids = vec![
+        intern_ta(
+            &mut m,
+            TypedArrayTag::U1,
+            vec![Const::Bool(true), Const::Bool(false)],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::U8,
+            vec![Const::Int8(0), Const::Int8(255)],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::I8,
+            vec![
+                Const::Int8(i8::MIN as u8),
+                Const::Int8(-1i8 as u8),
+                Const::Int8(i8::MAX as u8),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::U16,
+            vec![
+                Const::Int32(0),
+                Const::Int32(258),
+                Const::Int32(u32::from(u16::MAX)),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::I16,
+            vec![
+                Const::Int32(i32::from(i16::MIN) as u32),
+                Const::Int32(-258i32 as u32),
+                Const::Int32(i32::from(i16::MAX) as u32),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::U32,
+            vec![
+                Const::Int32(0),
+                Const::Int32(0x89AB_CDEF),
+                Const::Int32(u32::MAX),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::I32,
+            vec![
+                Const::Int32(i32::MIN as u32),
+                Const::Int32(-123_456i32 as u32),
+                Const::Int32(i32::MAX as u32),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::U64,
+            vec![
+                Const::UInt64(0),
+                Const::UInt64(0x0123_4567_89AB_CDEF),
+                Const::UInt64(u64::MAX),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::I64,
+            vec![
+                Const::Int64(i64::MIN),
+                Const::Int64(-9_876_543_210),
+                Const::Int64(i64::MAX),
+            ],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::F32,
+            vec![Const::float32(-0.0), Const::float32(nan32)],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::F64,
+            vec![Const::number(-0.0), Const::number(nan64)],
+        ),
+        intern_ta(
+            &mut m,
+            TypedArrayTag::String,
+            vec![Const::String(sym_alpha), Const::String(sym_beta)],
+        ),
     ];
-    let expected_ids: Vec<abcd_ir::ConstId> = expected_tags
-        .into_iter()
-        .map(|tag| {
-            m.consts.intern(Const::TypedArrayLiteral {
-                tag,
-                items: vec![c9],
-            })
-        })
-        .collect();
     assert_eq!(
         m.consts.get(shape),
         Some(&Const::ArrayLiteral(expected_ids)),
-        "every typed-array payload preserves its TypedArrayTag (`R3-H9`)"
+        "every inline typed-array payload preserves its TypedArrayTag and exact bits (`R1-5`)"
     );
 }
 
@@ -421,21 +507,73 @@ fn literal_buffer_index_wraps_in_literal_buffer_ref() {
 }
 
 #[test]
-fn out_of_range_typed_array_payload_is_an_error() {
-    let inner = vec![LiteralValue::Integer(9)];
-    let outer = vec![LiteralValue::ArrayU1(LiteralArrayIdx(99))];
+fn dangling_typed_array_string_element_is_an_error() {
+    let mut other = abcd_file::StringPool::default();
+    for i in 0..8 {
+        other.get_or_intern(format!("pad{i}"));
+    }
+    let ghost = other.get_or_intern("ghost");
+    let outer = vec![LiteralValue::ArrayString(vec![ghost])];
     let file = literal_consumer_file(
         vec![
             Bytecode::DeprecatedCreatearraywithbuffer(Imm(0)),
             Bytecode::Returnundefined,
         ],
-        vec![outer, inner],
+        vec![outer],
     );
-    let err = lift_file(&file).expect_err("payload 99 out of range");
+    let err = lift_file(&file).expect_err("dangling StringId in ArrayString must fail");
     assert!(
-        matches!(err, LiftError::LiteralArrayOutOfRange(99)),
+        matches!(err, LiftError::UnresolvedEntity(id) if id == ghost.index() as u32),
         "got {err:?}"
     );
+}
+
+#[test]
+fn field_value_string_lifts_to_string_constant() {
+    let mut strings = abcd_file::StringPool::default();
+    let desc = strings.get_or_intern("LStrField;");
+    let str_cls = strings.get_or_intern("Lstd/core/String;");
+    let fname = strings.get_or_intern("GREETING");
+    let fval = strings.get_or_intern("hello arkts");
+    let cls = abcd_file::Class {
+        descriptor: desc,
+        name: desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::ArkTs,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: vec![abcd_file::Field {
+            name: fname,
+            offset: 0,
+            field_type: abcd_file::Type::Reference(str_cls),
+            access_flags: abcd_file::AccessFlags::PUBLIC | abcd_file::AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(abcd_file::FieldValue::String(fval)),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+    let file = abcd_file::File {
+        version: Version::new(0, 1, 0, 7),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Static,
+        strings,
+        classes: [(desc, cls)].into_iter().collect(),
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+    let mut m = lift_file(&file).expect("FieldValue::String lifts cleanly");
+    verify_clean(&m);
+    assert_eq!(m.dialect, abcd_ir::Dialect::StaticArkTS);
+    let want_sym = m.sym.intern("hello arkts");
+    let init_cid = m.classes[0].fields[0]
+        .initial_value
+        .expect("initial_value populated");
+    assert_eq!(m.consts.get(init_cid), Some(&Const::String(want_sym)));
 }
 
 // ── Error paths ──────────────────────────────────────────────────────

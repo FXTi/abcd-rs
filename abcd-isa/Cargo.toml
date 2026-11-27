@@ -1,6 +1,6 @@
 [package]
 name = "abcd-isa"
-description = "Safe Rust API for ArkCompiler bytecode ISA (decode, encode, version)"
+description = "Pure Safe Rust API for ArkCompiler bytecode ISA (decode, encode, relocate, version)"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -10,8 +10,11 @@ keywords = ["arkcompiler", "bytecode", "isa", "decoder"]
 categories = ["compilers", "parser-implementations"]
 
 [dependencies]
-abcd-isa-sys.workspace = true
+bitflags.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+abcd-isa-sys.workspace = true
 
 [lints]
 workspace = true

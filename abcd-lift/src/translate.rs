@@ -30,10 +30,10 @@
 //! definefieldbyname/definepropertybyname → `StoreOwnPropName`,
 //! stownbyvalue(+withnameset)/callruntime.definefieldbyvalue →
 //! `StoreOwnPropDyn`, stownbyindex(+wide)/callruntime.
-//! definefieldbyindex → `StoreOwnPropIdx`, ld/stthisby* →
-//! hard [`LiftError::UnsupportedThisByAccess`] (N51: es2panda never
-//! emits the IC-fused this-by-* family — never silently invented),
-//! ld/stsuperbyname →
+//! definefieldbyindex → `StoreOwnPropIdx`, ldthisbyname/stthisbyname →
+//! `LoadProp`/`StoreProp` over `this_param_index` (`D8`, repealing `N51`),
+//! ldthisbyvalue/stthisbyvalue → `LoadPropDyn`/`StorePropDyn` over
+//! `this_param_index`, ld/stsuperbyname →
 //! `LoadSuper`/`StoreSuper` (Name), ld/stsuperbyvalue → (Dynamic),
 //! delobjprop → `DeleteProp`, private-property family →
 //! `LoadPrivate`/`StorePrivate`/`DefinePrivate`/`TestPrivate`/
@@ -77,7 +77,9 @@
 //! `CopyDataProps` (acc := dst after, v0.1 parity), copyrestargs →
 //! `CopyRestArgs{start_index}`, getunmappedargs → `GetUnmappedArgs`,
 //! ldnewtarget → `LoadNewTarget`, ldglobal → `LoadGlobalObject`,
-//! ldfunction (+deprecated.ldlexenv/ldhomeobject) → `LoadFunction`,
+//! ldfunction → `LoadFunction`, deprecated.ldlexenv → `LoadConst(Undefined)`
+//! (lexenv is IR-implicit via `NewLexEnv`/`PopLexEnv`/`GetLexVar`),
+//! deprecated.ldhomeobject → `LoadFunction` + `LoadProp("[[HomeObject]]")`,
 //! ldthis → the `this` VALUE (the this-role frame slot — N67, the
 //! vendored frame-slot model, [`abcd_ir::frame`]: `params[2]` under
 //! the `0xF` default, annotation-aware; `LoadConst(Undefined)` for
@@ -119,15 +121,16 @@
 //! distinct from `Super`, N58; v0.1's SuperCall approximation — args
 //! [this], lowering to supercallthisrange argc=1 — kept verbatim).
 //!
-//! Deprecated opcodes fold to the modern ops (v0.1 convention), with
-//! v0.1's exact operand reads preserved (including its DISCARDED reads
-//! — they drive phi materialization): deprecated.ld/stmodulevar and
-//! deprecated.getmodulenamespace keep v0.1's raw-symbol-index payload
-//! hack (documented), deprecated.createarray/objectwithbuffer and
-//! deprecated.createobjecthavingmethod resolve the RAW table index
-//! (v0.1 parity — and v0.1 lifts BOTH deprecated buffer forms to
-//! CreateArrayWithBuffer, so both fold to `AllocArray{shape:
-//! Some(shape)}` here, N59), and
+//! Deprecated opcodes fold to the modern ops (`ADR-08`), with
+//! vendor-grounded operand roles preserved: `deprecated.callrange imm, v`
+//! reads `[callee = v, args = v+1..=v+imm]`, `deprecated.ldmodulevar`
+//! (`flag == 0` -> `External`, `flag != 0` -> `Local`),
+//! `deprecated.stmodulevar`, and `deprecated.getmodulenamespace` resolve
+//! string entity names against enclosing `EsModule` import/export/request
+//! tables when present (falling back to the interned symbol index otherwise),
+//! `deprecated.createarraywithbuffer` → `AllocArray{shape: Some(shape)}`,
+//! `deprecated.createobjectwithbuffer` /
+//! `deprecated.createobjecthavingmethod` → `AllocObject{shape}`, and
 //! `deprecated.defineclasswithbuffer` lifts to `DefineClass{ctor,
 //! heritage: Some(base), members, member_attrs, count}` with the
 //! vendor-grounded operand roles `v1 = lexenv`, `v2 = proto`
@@ -490,6 +493,125 @@ impl<'l, 'f> FnLift<'l, 'f> {
                 len: self.body.bytecodes.len(),
             })
     }
+
+    /// Return `(imports, exports, module_requests)` for the enclosing class's
+    /// `EsModule` (`--merge-abc`) or top-level standalone module tables when
+    /// present (`D3`, `D8`).
+    fn active_module_tables(
+        &self,
+    ) -> Option<(
+        &[abcd_ir::ImportDecl],
+        &[abcd_ir::ExportDecl],
+        &[abcd_ir::ModuleRequest],
+    )> {
+        let class_id = self.lf.module.functions[self.func_id.index()].class_id;
+        if let Some(esm) = self
+            .lf
+            .module
+            .classes
+            .get(class_id.index())
+            .and_then(|c| c.es_module.as_ref())
+        {
+            return Some((&esm.imports, &esm.exports, &esm.module_requests));
+        }
+        if !self.lf.module.imports.is_empty()
+            || !self.lf.module.exports.is_empty()
+            || !self.lf.module.module_requests.is_empty()
+        {
+            return Some((
+                &self.lf.module.imports,
+                &self.lf.module.exports,
+                &self.lf.module.module_requests,
+            ));
+        }
+        None
+    }
+
+    /// Resolve a legacy `0.0.0.2` local module-var string `name` against the
+    /// enclosing `EsModule` (or standalone module) distinct `ExportDecl::Local`
+    /// slots (`D8`), falling back to `name.0` when no matching export exists.
+    pub fn resolve_legacy_local_module_slot(&self, name: Sym) -> u32 {
+        let Some((_, exports, _)) = self.active_module_tables() else {
+            return name.0;
+        };
+        let mut distinct_locals: Vec<Sym> = Vec::new();
+        let mut export_name_fallback: Option<u32> = None;
+        for exp in exports {
+            if let abcd_ir::ExportDecl::Local {
+                export_name,
+                local_name,
+            } = exp
+            {
+                let slot = match distinct_locals.iter().position(|&s| s == *local_name) {
+                    Some(idx) => idx as u32,
+                    None => {
+                        let idx = distinct_locals.len() as u32;
+                        distinct_locals.push(*local_name);
+                        idx
+                    }
+                };
+                if *local_name == name {
+                    return slot;
+                }
+                if *export_name == name && export_name_fallback.is_none() {
+                    export_name_fallback = Some(slot);
+                }
+            }
+        }
+        export_name_fallback.unwrap_or(name.0)
+    }
+
+    /// Resolve a legacy `0.0.0.2` external module-var string `name` against the
+    /// enclosing `EsModule` (or standalone module) 0-based `ImportDecl::Regular`
+    /// slots (`D8`), falling back to `name.0` when no matching import exists.
+    pub fn resolve_legacy_external_module_slot(&self, name: Sym) -> u32 {
+        let Some((imports, _, _)) = self.active_module_tables() else {
+            return name.0;
+        };
+        let mut ext_slot = 0u32;
+        let mut import_name_fallback: Option<u32> = None;
+        for imp in imports {
+            if let abcd_ir::ImportDecl::Regular {
+                local_name,
+                import_name,
+                ..
+            } = imp
+            {
+                if *local_name == name {
+                    return ext_slot;
+                }
+                if *import_name == name && import_name_fallback.is_none() {
+                    import_name_fallback = Some(ext_slot);
+                }
+                ext_slot += 1;
+            }
+        }
+        import_name_fallback.unwrap_or(name.0)
+    }
+
+    /// Resolve a legacy `0.0.0.2` module-namespace string `name` against the
+    /// enclosing `EsModule` (or standalone module) 0-based `module_requests`
+    /// table (`D8`), falling back to `name.0` when no matching request exists.
+    pub fn resolve_legacy_module_namespace_slot(&self, name: Sym) -> u32 {
+        let Some((imports, _, requests)) = self.active_module_tables() else {
+            return name.0;
+        };
+        if let Some(idx) = requests.iter().position(|r| r.specifier == name) {
+            return idx as u32;
+        }
+        for imp in imports {
+            if let abcd_ir::ImportDecl::Namespace {
+                local_name,
+                module_request,
+            } = imp
+                && *local_name == name
+                && let Some(idx) = requests.iter().position(|r| r.specifier == *module_request)
+            {
+                return idx as u32;
+            }
+        }
+        name.0
+    }
 }
 
 /// Translate a single bytecode instruction into v0.2 IR.
@@ -806,24 +928,41 @@ pub fn translate_bytecode(
                 loc,
             );
         }
-        // N51: the `this-by-*` family (isa.yaml:1627-1642) is IC-fused
-        // `this` property access that es2panda NEVER emits (`this[k] = v`
-        // compiles to `ldthis` + `stobjbyvalue`; upstream source grep zero
-        // hits). Zero corpus coverage means no VM evidence for the IC
-        // semantics — hard error, never silently invented (maintainer
-        // ruling 2026-09-20; mirrors v0.1's
-        // `LiftError::UnsupportedThisByAccess`).
-        Bytecode::Ldthisbyname(..) => {
-            return Err(LiftError::UnsupportedThisByAccess("ldthisbyname"));
+        // `D8` (repealing `N51`): IC-fused `this` property accesses
+        // (`isa.yaml:1627-1646`) bind the implicit `this` receiver via
+        // `FnLift::this_value` (`this_param_index`, matching `Bytecode::Ldthis`)
+        // and emit `LoadProp` / `StoreProp` / `LoadPropDyn` / `StorePropDyn`.
+        Bytecode::Ldthisbyname(_ic, eid) => {
+            let name = fx.resolve_str(*eid)?;
+            let object = fx.this_value(block, loc);
+            let v = fx.emit_val(block, Op::LoadProp { object, name }, loc);
+            fx.write_acc(block, v);
         }
-        Bytecode::Stthisbyname(..) => {
-            return Err(LiftError::UnsupportedThisByAccess("stthisbyname"));
+        Bytecode::Stthisbyname(_ic, eid) => {
+            let name = fx.resolve_str(*eid)?;
+            let value = fx.read_acc(block);
+            let object = fx.this_value(block, loc);
+            fx.emit_void(
+                block,
+                Op::StoreProp {
+                    object,
+                    name,
+                    value,
+                },
+                loc,
+            );
         }
-        Bytecode::Ldthisbyvalue(..) => {
-            return Err(LiftError::UnsupportedThisByAccess("ldthisbyvalue"));
+        Bytecode::Ldthisbyvalue(_ic) => {
+            let key = fx.read_acc(block);
+            let object = fx.this_value(block, loc);
+            let v = fx.emit_val(block, Op::LoadPropDyn { object, key }, loc);
+            fx.write_acc(block, v);
         }
-        Bytecode::Stthisbyvalue(..) => {
-            return Err(LiftError::UnsupportedThisByAccess("stthisbyvalue"));
+        Bytecode::Stthisbyvalue(_ic, key_reg) => {
+            let value = fx.read_acc(block);
+            let object = fx.this_value(block, loc);
+            let key = fx.read_reg(*key_reg, block)?;
+            fx.emit_void(block, Op::StorePropDyn { object, key, value }, loc);
         }
         Bytecode::Ldsuperbyname(_ic, eid) => {
             let name = fx.resolve_str(*eid)?;
@@ -1771,9 +1910,11 @@ pub fn translate_bytecode(
             let value = fx.read_reg(*val_reg, block)?;
             fx.emit_void(block, Op::ThrowIfNotObject { value }, loc);
         }
-        Bytecode::ThrowUndefinedifhole(name_reg, val_reg) => {
-            let name = fx.read_reg(*name_reg, block)?;
+        Bytecode::ThrowUndefinedifhole(val_reg, name_reg) => {
+            // Vendor `throw.undefinedifhole v1, v2` (`isa.yaml`, `interpreter-inl.h`,
+            // `D8`): `v1` is the hole-checked value and `v2` is the variable name.
             let value = fx.read_reg(*val_reg, block)?;
+            let name = fx.read_reg(*name_reg, block)?;
             fx.emit_void(block, Op::ThrowUndefinedIfHole { name, value }, loc);
         }
         Bytecode::ThrowUndefinedifholewithname(eid) => {
@@ -2044,12 +2185,23 @@ pub fn translate_bytecode(
         }
 
         // ── Deprecated variants ──────────────────────────────────────
-        // Map deprecated instructions to the same IR as their modern
-        // equivalents (v0.1 convention).
-        Bytecode::DeprecatedLdlexenv | Bytecode::DeprecatedLdhomeobject => {
-            // These load environment/home object into acc — v0.1 models
-            // them as LoadFunction (parity).
-            let v = fx.emit_val(block, Op::LoadFunction, loc);
+        Bytecode::DeprecatedLdlexenv => {
+            // Legacy `0.0.0.2` `ecma.ldlexenvdyn` (`D8`): lexical environments
+            // are implicit in `abcd-ir` (`NewLexEnv` / `PopLexEnv` / `GetLexVar`),
+            // and `DeprecatedDefineclasswithbuffer` discards its `lexenv` vreg
+            // after reading it for SSA completeness. Emit pure `LoadConst(Undefined)`
+            // so `acc` is populated without miscompiling as `Op::LoadFunction`
+            // or perturbing `NewLexEnv` scope depth.
+            let v = fx.load_const(block, Const::Undefined, loc);
+            fx.write_acc(block, v);
+        }
+        Bytecode::DeprecatedLdhomeobject => {
+            // Legacy `0.0.0.2` `ecma.ldhomeobject` (`D8`): reads the enclosing
+            // method closure's `[[HomeObject]]` internal slot
+            // (`JSFunction::GetHomeObject()`), never the closure itself.
+            let func = fx.emit_val(block, Op::LoadFunction, loc);
+            let name = fx.lf.sym("[[HomeObject]]");
+            let v = fx.emit_val(block, Op::LoadProp { object: func, name }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedPoplexenv => {
@@ -2211,8 +2363,25 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallrange(argc, start) => {
-            let callee = fx.read_acc(block);
-            let args = fx.read_reg_range(start.0, argc.0, block)?;
+            // Legacy `0.0.0.2` `ecma.callirangedyn imm16, v8` (`isa.yaml`
+            // `acc: out:top`, `D8`): `start` holds `callee` and
+            // `start + 1 ..= start + argc` hold the `argc` positional args.
+            if argc.0 < 0 {
+                return Err(LiftError::RegisterRangeOverflow {
+                    start: start.0,
+                    count: argc.0,
+                });
+            }
+            let total = argc
+                .0
+                .checked_add(1)
+                .ok_or(LiftError::RegisterRangeOverflow {
+                    start: start.0,
+                    count: argc.0,
+                })?;
+            let window = fx.read_reg_range(start.0, total, block)?;
+            let callee = window[0];
+            let args = window[1..].to_vec();
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2412,20 +2581,15 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedGetmodulenamespace(eid) => {
             let name = fx.resolve_str(*eid)?;
-            let v = fx.emit_val(block, Op::GetModuleNamespace { index: name.0 }, loc);
+            let index = fx.resolve_legacy_module_namespace_slot(name);
+            let v = fx.emit_val(block, Op::GetModuleNamespace { index }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStmodulevar(eid) => {
             let name = fx.resolve_str(*eid)?;
+            let index = fx.resolve_legacy_local_module_slot(name);
             let value = fx.read_acc(block);
-            fx.emit_void(
-                block,
-                Op::StoreModuleVar {
-                    index: name.0,
-                    value,
-                },
-                loc,
-            );
+            fx.emit_void(block, Op::StoreModuleVar { index, value }, loc);
         }
         Bytecode::DeprecatedLdobjbyname(eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
@@ -2443,20 +2607,23 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdmodulevar(eid, flag) => {
+            // Legacy `0.0.0.2` `panda_file_translator.cpp` (`D8`):
+            // `flag == 0` is `External` (`Import`); `flag != 0` is `Local`
+            // (`LocalExport`). Resolve string `name` against enclosing
+            // `EsModule` import/export tables when present.
             let name = fx.resolve_str(*eid)?;
-            let kind = if flag.0 == 0 {
-                abcd_ir::ModuleVarKind::Local
+            let (kind, index) = if flag.0 == 0 {
+                (
+                    abcd_ir::ModuleVarKind::External,
+                    fx.resolve_legacy_external_module_slot(name),
+                )
             } else {
-                abcd_ir::ModuleVarKind::External
+                (
+                    abcd_ir::ModuleVarKind::Local,
+                    fx.resolve_legacy_local_module_slot(name),
+                )
             };
-            let v = fx.emit_val(
-                block,
-                Op::LoadModuleVar {
-                    index: name.0,
-                    kind,
-                },
-                loc,
-            );
+            let v = fx.emit_val(block, Op::LoadModuleVar { index, kind }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStconsttoglobalrecord(eid) => {

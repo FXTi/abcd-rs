@@ -225,6 +225,7 @@ fn stmts_with_x() -> Vec<Stmt> {
         Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: "l".to_string(),
             value: x(),
         },
@@ -282,6 +283,7 @@ fn name_use_walkers_cover_every_statement_kind() {
         &Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: "x".to_string(),
             value: ident("y"),
         },
@@ -729,6 +731,7 @@ fn all_leaves() -> Vec<(Leaf, usize)> {
             Leaf::Raw(Stmt::LexStore {
                 level: 0,
                 slot: 0,
+                own: true,
                 name: "l".to_string(),
                 value: ident("v"),
             }),
@@ -1510,6 +1513,7 @@ fn canon_stmt_covers_every_statement_kind() {
         |e| Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: "l".to_string(),
             value: e,
         },
@@ -2691,7 +2695,7 @@ fn switch_chain_extension_loop_and_default_arm() {
     assert_eq!(cases[0].body.last(), Some(&SNode::Break { label: None }));
     // A terminal case body keeps its own ending.
     let single = if_node(
-        cmp(CmpOp::Eq, tm("x", 1), num(9.0)),
+        cmp(CmpOp::StrictEq, tm("x", 1), num(9.0)),
         vec![run(vec![Leaf::Raw(Stmt::Return(None))])],
         vec![],
     );
@@ -2844,18 +2848,25 @@ fn switch_chain_bail_pins() {
     // Non-if / non-chain nodes are not chains.
     assert!(match_switch_chain(&SNode::Honest("h".to_string())).is_none());
     assert!(match_switch_chain(&if_node(ident("c"), vec![], vec![])).is_none());
-    // switch_test: polarity and operand-order variants.
+    // switch_test: polarity and operand-order variants (strict `===` only;
+    // loose `==` is rejected so coercing cascades never mis-fold into `switch`).
     let (d, l, pos) = switch_test(&cmp(CmpOp::StrictEq, tm("x", 1), num(1.0))).unwrap();
     assert!(pos && d == tm("x", 1) && l == num(1.0));
-    let (d, l, pos) = switch_test(&cmp(CmpOp::Eq, num(1.0), tm("x", 1))).unwrap();
+    let (d, l, pos) = switch_test(&cmp(CmpOp::StrictEq, num(1.0), tm("x", 1))).unwrap();
     assert!(pos && d == tm("x", 1) && l == num(1.0));
-    let (.., pos) = switch_test(&isfalse(cmp(CmpOp::Eq, tm("x", 1), num(1.0)))).unwrap();
+    let (.., pos) = switch_test(&isfalse(cmp(CmpOp::StrictEq, tm("x", 1), num(1.0)))).unwrap();
     assert!(!pos);
-    let (.., pos) = switch_test(&isfalse(isfalse(cmp(CmpOp::Eq, tm("x", 1), num(1.0))))).unwrap();
+    let (.., pos) = switch_test(&isfalse(isfalse(cmp(
+        CmpOp::StrictEq,
+        tm("x", 1),
+        num(1.0),
+    ))))
+    .unwrap();
     assert!(pos);
+    assert!(switch_test(&cmp(CmpOp::Eq, tm("x", 1), num(1.0))).is_none());
     assert!(switch_test(&cmp(CmpOp::NotEq, tm("x", 1), num(1.0))).is_none());
-    assert!(switch_test(&cmp(CmpOp::Eq, num(1.0), num(2.0))).is_none());
-    assert!(switch_test(&cmp(CmpOp::Eq, tm("x", 1), tm("y", 2))).is_none());
+    assert!(switch_test(&cmp(CmpOp::StrictEq, num(1.0), num(2.0))).is_none());
+    assert!(switch_test(&cmp(CmpOp::StrictEq, tm("x", 1), tm("y", 2))).is_none());
     assert!(switch_test(&ident("c")).is_none());
     // A negative-polarity head swaps the case/continuation arms.
     let swapped = if_node(
@@ -2935,6 +2946,7 @@ fn finally_template() -> Vec<Leaf> {
         Leaf::Raw(Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: "lx".to_string(),
             value: ident("v"),
         }),
@@ -4005,6 +4017,7 @@ fn rest_param_body() -> Vec<SNode> {
             Leaf::Raw(Stmt::LexStore {
                 level: 0,
                 slot: 0,
+                own: true,
                 name: "lx".to_string(),
                 value: ident("v"),
             }),
@@ -4155,6 +4168,7 @@ fn late_decl_body() -> Vec<SNode> {
         Leaf::Raw(Stmt::LexStore {
             level: 0,
             slot,
+            own: true,
             name: name.to_string(),
             value: ident("v"),
         })
@@ -4283,6 +4297,7 @@ fn late_decl_fold_bail_pins() {
         Leaf::Raw(Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: name.to_string(),
             value: ident("v"),
         })
@@ -4322,6 +4337,7 @@ fn late_decl_fold_bail_pins() {
             run(vec![Leaf::Raw(Stmt::LexStore {
                 level: 5,
                 slot: 0,
+                own: false,
                 name: "cap".to_string(),
                 value: ident("v"),
             })]),
@@ -4346,6 +4362,7 @@ fn late_decl_fold_bail_pins() {
             run(vec![Leaf::Raw(Stmt::LexStore {
                 level: 0,
                 slot: 0,
+                own: true,
                 name: "fv".to_string(),
                 value: Expr::Closure {
                     body: FuncId::new(0),
@@ -4444,6 +4461,7 @@ fn scope_fold_push_site_variants() {
         Leaf::Raw(Stmt::LexStore {
             level: 0,
             slot,
+            own: true,
             name: name.to_string(),
             value: ident("v"),
         })

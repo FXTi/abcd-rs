@@ -1,4 +1,4 @@
-use abcd_isa_sys::{EntityId, ModernEntitySlotFault, modern_entity_id_slot};
+use crate::generated::{EntityId, ModernEntitySlotFault, modern_entity_id_slot};
 
 /// Errors when rewriting an entity operand without changing instruction size.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

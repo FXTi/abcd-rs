@@ -1,4 +1,6 @@
-use abcd_isa_sys::{Bytecode, EncodeInsnKind, JMP_IMM32_OPCODE, JumpEncodeMeta, WideJumpKind};
+use crate::generated::{
+    Bytecode, EncodeInsnKind, JMP_IMM32_OPCODE, JumpEncodeMeta, NOP_OPCODE, WideJumpKind,
+};
 
 /// Errors from [`encode`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -17,15 +19,21 @@ pub enum EncodeError {
     /// beyond the program length `{1}`.
     #[error("label index {0} is out of bounds (program length: {1})")]
     LabelOutOfBounds(u32, usize),
-    /// The instruction slice is too large for [`Label`](abcd_isa_sys::Label)'s
+    /// The instruction slice is too large for [`Label`](crate::Label)'s
     /// `u32` index space.
     #[error("instruction count {0} exceeds Label index capacity")]
     TooManyInstructions(usize),
 }
 
 /// Byte width of a jump instruction at relaxation `tier` (`0 = imm8`, `1 = imm16`, `2 = wide`).
+///
+/// When `tier == 2` expands a conditional jump into an inverted-branch + `jmp.32`
+/// trampoline and the jump is the very last instruction (`is_last`), a 1-byte
+/// `nop` (`0x00`) fallthrough landing pad is appended so the inverted skip
+/// branch (`+7` / `+8`) targets a valid instruction boundary inside `bytes`
+/// rather than `bytes.len()`.
 #[inline]
-const fn jump_tier_size(meta: &JumpEncodeMeta, tier: u8) -> u8 {
+const fn jump_tier_size(meta: &JumpEncodeMeta, tier: u8, is_last: bool) -> u8 {
     match tier {
         0 => {
             if meta.reg.is_some() {
@@ -41,11 +49,14 @@ const fn jump_tier_size(meta: &JumpEncodeMeta, tier: u8) -> u8 {
                 3
             }
         }
-        _ => match meta.wide {
-            WideJumpKind::NativeImm32(_) => 5,
-            WideJumpKind::InvertImm8(_) => 7,
-            WideJumpKind::InvertV8Imm8(_) => 8,
-        },
+        _ => {
+            let tail_pad = is_last as u8;
+            match meta.wide {
+                WideJumpKind::NativeImm32(_) => 5,
+                WideJumpKind::InvertImm8(_) => 7 + tail_pad,
+                WideJumpKind::InvertV8Imm8(_) => 8 + tail_pad,
+            }
+        }
     }
 }
 
@@ -75,6 +86,7 @@ fn fenwick_add(bit: &mut [u64], i: usize, delta: u64) {
 #[inline]
 fn relax_jump_site(
     site: &mut (usize, JumpEncodeMeta, u8),
+    n: usize,
     sizes: &mut [u8],
     bit: &mut [u64],
 ) -> bool {
@@ -82,6 +94,7 @@ fn relax_jump_site(
     if *tier >= 2 {
         return false;
     }
+    let is_last = insn_idx + 1 == n;
 
     let insn_off = fenwick_sum(bit, insn_idx) as i64;
     let target_off = fenwick_sum(bit, meta.target.0 as usize) as i64;
@@ -93,7 +106,7 @@ fn relax_jump_site(
         }
         *tier = 1;
         let old_sz = sizes[insn_idx];
-        let new_sz = jump_tier_size(&meta, 1);
+        let new_sz = jump_tier_size(&meta, 1, is_last);
         sizes[insn_idx] = new_sz;
         fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
 
@@ -104,7 +117,7 @@ fn relax_jump_site(
         if !(i16::MIN as i64..=i16::MAX as i64).contains(&disp) {
             *tier = 2;
             let old_sz = sizes[insn_idx];
-            let new_sz = jump_tier_size(&meta, 2);
+            let new_sz = jump_tier_size(&meta, 2, is_last);
             sizes[insn_idx] = new_sz;
             fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
         }
@@ -117,7 +130,7 @@ fn relax_jump_site(
     }
     *tier = 2;
     let old_sz = sizes[insn_idx];
-    let new_sz = jump_tier_size(&meta, 2);
+    let new_sz = jump_tier_size(&meta, 2, is_last);
     sizes[insn_idx] = new_sz;
     fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
     true
@@ -125,13 +138,15 @@ fn relax_jump_site(
 
 /// Encode a sequence of instructions into bytecode bytes in pure Safe Rust.
 ///
-/// [`Label`](abcd_isa_sys::Label) operands in jump instructions are
-/// interpreted as instruction indices into `instructions`.
+/// [`Label`](crate::Label) operands in jump instructions are interpreted as
+/// instruction indices into `instructions`.
 ///
-/// Returns `(bytes, offsets)` where `offsets[i]` is the starting byte offset of
-/// instruction `i` within `bytes` (`offsets.len() == instructions.len()` even
-/// when a far `> 32 KiB` conditional jump expands into an inverted-branch +
-/// `jmp.32` trampoline).
+/// Uses Szymanski monotone narrow-to-wide span relaxation backed by a Fenwick
+/// prefix-sum tree (`O(N + P * J log N)` where `P <= 3` on typical control flow
+/// and `P <= 2J` worst-case). Returns `(bytes, offsets)` where `offsets[i]` is
+/// the starting byte offset of instruction `i` within `bytes`
+/// (`offsets.len() == instructions.len()` even when a far `> 32 KiB`
+/// conditional jump expands into an inverted-branch + `jmp.32` trampoline).
 ///
 /// ```
 /// use abcd_isa::{Bytecode, Label, encode, insn};
@@ -171,14 +186,14 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
                 if meta.target.0 as usize >= n {
                     return Err(EncodeError::LabelOutOfBounds(meta.target.0, n));
                 }
-                sizes.push(jump_tier_size(&meta, 0));
+                sizes.push(jump_tier_size(&meta, 0, idx + 1 == n));
                 jumps.push((idx, meta, 0));
             }
         }
         kinds.push(kind);
     }
 
-    // 2. Deterministic O(N + J log N) Fenwick-tree branch relaxation.
+    // 2. Deterministic Fenwick-tree monotone branch relaxation (`O(N + P * J log N)`).
     if !jumps.is_empty() {
         let mut bit = vec![0u64; n + 1];
         for (i, &sz) in sizes.iter().enumerate() {
@@ -193,12 +208,12 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
         loop {
             let mut changed = false;
             for site in jumps.iter_mut().rev() {
-                if relax_jump_site(site, &mut sizes, &mut bit) {
+                if relax_jump_site(site, n, &mut sizes, &mut bit) {
                     changed = true;
                 }
             }
             for site in &mut jumps {
-                if relax_jump_site(site, &mut sizes, &mut bit) {
+                if relax_jump_site(site, n, &mut sizes, &mut bit) {
                     changed = true;
                 }
             }
@@ -230,6 +245,7 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
                 let (j_idx, _, tier) = jumps[jump_cursor];
                 debug_assert_eq!(j_idx, i);
                 jump_cursor += 1;
+                let is_last = i + 1 == n;
 
                 let insn_off = i64::from(offsets[i]);
                 let target_off = i64::from(offsets[meta.target.0 as usize]);
@@ -270,6 +286,9 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
                             out.push(7u8);
                             out.push(JMP_IMM32_OPCODE);
                             out.extend_from_slice(&disp32.to_le_bytes());
+                            if is_last {
+                                out.push(NOP_OPCODE); // trailing `nop` fallthrough target
+                            }
                         }
                         WideJumpKind::InvertV8Imm8(inv_op8) => {
                             let r = meta.reg.ok_or(EncodeError::Internal)?;
@@ -282,6 +301,9 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
                             out.push(8u8);
                             out.push(JMP_IMM32_OPCODE);
                             out.extend_from_slice(&disp32.to_le_bytes());
+                            if is_last {
+                                out.push(NOP_OPCODE); // trailing `nop` fallthrough target
+                            }
                         }
                     },
                 }

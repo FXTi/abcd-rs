@@ -170,3 +170,20 @@ fn empty_zip_container_is_recognized_as_container_and_returns_tool_error() {
     );
     assert!(err.to_string().contains("no .abc entry found"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_at_output_path_is_rejected_without_force() {
+    let hap = common::hap("entry", &common::tiny_abc());
+    let dir = common::tempdir("extract-dangling-symlink");
+    let victim = dir.join("outside_target.bin");
+    std::os::unix::fs::symlink(&victim, dir.join("entry.abc")).unwrap();
+
+    let err = extract::extract_bytes(&hap, "entry.hap", &dir, false).unwrap_err();
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert!(err.to_string().contains("--force"), "{err}");
+    assert!(
+        !victim.exists(),
+        "dangling symlink target must never be created without --force"
+    );
+}

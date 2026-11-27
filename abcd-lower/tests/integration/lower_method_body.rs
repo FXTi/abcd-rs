@@ -712,48 +712,88 @@ fn literal_dedup_matches_rare_method_kinds_tag_exactly() {
 #[test]
 fn literal_dedup_matches_the_typed_array_and_buffer_ref_family() {
     let (mut file, _) = build_input_file();
+    let str_sid = file.strings.get_or_intern("ta-elem");
     let inner = push_array(&mut file, vec![LiteralValue::Integer(7)]);
     let outer_values = vec![
         LiteralValue::LiteralBufferIndex(inner),
-        LiteralValue::ArrayU1(inner),
-        LiteralValue::ArrayU8(inner),
-        LiteralValue::ArrayI8(inner),
-        LiteralValue::ArrayU16(inner),
-        LiteralValue::ArrayI16(inner),
-        LiteralValue::ArrayU32(inner),
-        LiteralValue::ArrayI32(inner),
-        LiteralValue::ArrayU64(inner),
-        LiteralValue::ArrayI64(inner),
-        LiteralValue::ArrayF32(inner),
-        LiteralValue::ArrayF64(inner),
-        LiteralValue::ArrayString(inner),
+        LiteralValue::ArrayU1(vec![true]),
+        LiteralValue::ArrayU8(vec![7]),
+        LiteralValue::ArrayI8(vec![-7]),
+        LiteralValue::ArrayU16(vec![7]),
+        LiteralValue::ArrayI16(vec![-7]),
+        LiteralValue::ArrayU32(vec![7]),
+        LiteralValue::ArrayI32(vec![-7]),
+        LiteralValue::ArrayU64(vec![7]),
+        LiteralValue::ArrayI64(vec![-7]),
+        LiteralValue::ArrayF32(vec![1.5]),
+        LiteralValue::ArrayF64(vec![2.5]),
+        LiteralValue::ArrayString(vec![str_sid]),
     ];
     let outer = push_array(&mut file, outer_values);
 
     let mut module = Module::new();
+    let sym = module.sym.intern("ta-elem");
+    let c_true = module.consts.push(Const::Bool(true));
     let c7 = module.consts.push(Const::Int32(7));
+    let c_neg7 = module.consts.push(Const::Int32((-7_i32) as u32));
+    let c_u64 = module.consts.push(Const::UInt64(7));
+    let c_i64 = module.consts.push(Const::Int64(-7));
+    let c_f32 = module.consts.push(Const::float32(1.5));
+    let c_f64 = module.consts.push(Const::number(2.5));
+    let c_str = module.consts.push(Const::String(sym));
     let plain_inner = module.consts.push_array(vec![c7]);
     let buf_ref = module.consts.push(Const::LiteralBufferRef(plain_inner));
-    let mut children = vec![buf_ref];
-    for tag in [
-        TypedArrayTag::U1,
-        TypedArrayTag::U8,
-        TypedArrayTag::I8,
-        TypedArrayTag::U16,
-        TypedArrayTag::I16,
-        TypedArrayTag::U32,
-        TypedArrayTag::I32,
-        TypedArrayTag::U64,
-        TypedArrayTag::I64,
-        TypedArrayTag::F32,
-        TypedArrayTag::F64,
-        TypedArrayTag::String,
-    ] {
-        children.push(module.consts.push(Const::TypedArrayLiteral {
-            tag,
+    let children = vec![
+        buf_ref,
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::U1,
+            items: vec![c_true],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::U8,
             items: vec![c7],
-        }));
-    }
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I8,
+            items: vec![c_neg7],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::U16,
+            items: vec![c7],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I16,
+            items: vec![c_neg7],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::U32,
+            items: vec![c7],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I32,
+            items: vec![c_neg7],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::U64,
+            items: vec![c_u64],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::I64,
+            items: vec![c_i64],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::F32,
+            items: vec![c_f32],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::F64,
+            items: vec![c_f64],
+        }),
+        module.consts.push(Const::TypedArrayLiteral {
+            tag: TypedArrayTag::String,
+            items: vec![c_str],
+        }),
+    ];
     let shape = module.consts.push_array(children);
     let body = resolve_shape(&file, &module, shape)
         .expect("every typed-array and buffer-ref payload resolves tag-exactly");
@@ -773,13 +813,15 @@ fn literal_dedup_rejects_non_array_trees_and_oob_nested_indices() {
         })
     ));
 
-    push_array(&mut file, vec![LiteralValue::ArrayU8(LiteralArrayIdx(999))]);
+    push_array(
+        &mut file,
+        vec![LiteralValue::LiteralBufferIndex(LiteralArrayIdx(999))],
+    );
     let mut module = Module::new();
-    let typed_arr = module.consts.push(Const::TypedArrayLiteral {
-        tag: TypedArrayTag::U8,
-        items: vec![],
-    });
-    let shape = module.consts.push_array(vec![typed_arr]);
+    let c0 = module.consts.push(Const::Int32(0));
+    let inner = module.consts.push_array(vec![c0]);
+    let buf_ref = module.consts.push(Const::LiteralBufferRef(inner));
+    let shape = module.consts.push_array(vec![buf_ref]);
     assert!(matches!(
         resolve_shape(&file, &module, shape),
         Err(LowerError::UntraceableEntity {
@@ -838,7 +880,6 @@ fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
 
     let func = V2Builder::create_function(&mut module, "high_sym_fn", FunctionKind::Function);
     module.functions[func.index()].modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
-    module.classes[0].methods.push(func);
 
     while module.sym.len() < 65_590 {
         let idx = module.sym.len();

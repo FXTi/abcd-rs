@@ -14,9 +14,12 @@
 //!   panic or recurse on hostile input.
 //! - **In-memory only.** Entry names are lookup keys, never filesystem paths,
 //!   so no Zip Slip machinery is needed inside the unpacker.
-//! - **Zero-copy where possible.** Valid UTF-8 central-directory names borrow
-//!   directly into the input buffer (`Cow::Borrowed`), and top-level `STORED`
-//!   entries are returned as borrowed slices (`EntryData::Borrowed`).
+//! - **Zero-copy where possible, shared `Arc<[u8]>` when owned.** Valid UTF-8
+//!   central-directory names borrow directly into the input buffer
+//!   (`Cow::Borrowed`), top-level `STORED` entries are returned as borrowed
+//!   slices (`EntryData::Borrowed`), and inflated or nested payloads use
+//!   `EntryData::Owned(Arc<[u8]>)` so container-level manifests are shared in
+//!   `O(1)` across multi-`.abc` modules.
 //! - **Mandatory IEEE CRC-32 & decompression-bomb guards.** Every entry read
 //!   verifies its IEEE 802.3 CRC-32 checksum against the central directory and
 //!   enforces configurable [`Limits`] alongside the RFC 1951 `1032×` DEFLATE
@@ -34,9 +37,11 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 mod container;
 mod error;
+mod manifest;
 mod zip;
 
 pub use container::{
@@ -44,6 +49,7 @@ pub use container::{
     abc_modules, abc_modules_with_limits,
 };
 pub use error::Error;
+pub use manifest::{ManifestSummary, parse_manifest_summary};
 pub use zip::{
     Compression, EntryData, EntryMeta, Limits, METHOD_DEFLATE, METHOD_STORED, ZipArchive,
 };

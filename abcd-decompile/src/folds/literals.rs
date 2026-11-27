@@ -150,7 +150,7 @@ pub(in crate::folds) fn collect_value_uses_in_snodes(
                     }
                     stack.push(body);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
@@ -1123,20 +1123,60 @@ pub(in crate::folds) fn fold_rest_destructure(leaves: &mut Vec<Leaf>, stats: &mu
                 continue;
             }
         };
-        // Find one sibling declare per excluded key: `const t = obj.k`
+        // `obj` must be a repeatable pure reference, and excluded keys must not
+        // contain duplicates (duplicate indices in `drop` would shift/panic).
+        if !matches!(obj, Expr::Temp { .. } | Expr::Ident(_)) {
+            i += 1;
+            continue;
+        }
+        let mut seen_keys = BTreeSet::new();
+        if keys.iter().any(|k| !seen_keys.insert(k.as_str())) {
+            i += 1;
+            continue;
+        }
+        // Find one distinct sibling declare per excluded key: `const t = obj.k`
         // (or `obj["k"]`) with a structurally equal object expression.
-        let mut found: Vec<(usize, String, String)> = Vec::new(); // (leaf idx, key, target)
+        let mut found: Vec<(usize, String, String, ValueId)> = Vec::new();
+        let mut used_indices = BTreeSet::new();
         let mut ok = true;
         for key in &keys {
             let hit = leaves.iter().enumerate().find(|(idx, l)| {
                 *idx != i
+                    && !used_indices.contains(idx)
                     && matches!(l, Leaf::Raw(Stmt::Declare { value, .. }) if key_load_target(value, &obj) == Some(key))
             });
             match hit {
-                Some((idx, Leaf::Raw(Stmt::Declare { name, .. }))) => {
-                    found.push((idx, key.clone(), name.clone()))
+                Some((idx, Leaf::Raw(Stmt::Declare { name, value_id, .. }))) => {
+                    used_indices.insert(idx);
+                    found.push((idx, key.clone(), name.clone(), *value_id));
                 }
                 _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            i += 1;
+            continue;
+        }
+        let span_lo = used_indices.iter().copied().min().unwrap_or(i).min(i);
+        let span_hi = used_indices.iter().copied().max().unwrap_or(i).max(i);
+        for (m, leaf_m) in leaves.iter().enumerate().take(span_hi + 1).skip(span_lo) {
+            if m == i || used_indices.contains(&m) {
+                continue;
+            }
+            if !is_pure_intervening_for_rest(leaf_m) {
+                ok = false;
+                break;
+            }
+            // Any matched load at `d < m < i` moves down to `i`, so `leaf_m`
+            // must not read its temporary/name before `i` (TDZ / ordering).
+            if m < i {
+                let reads_moved = found.iter().any(|(d, _, tname, tvid)| {
+                    *d < m && leaf_mentions_temp_or_ident(leaf_m, *tvid, tname)
+                });
+                if reads_moved {
                     ok = false;
                     break;
                 }
@@ -1149,9 +1189,9 @@ pub(in crate::folds) fn fold_rest_destructure(leaves: &mut Vec<Leaf>, stats: &mu
         stats.rest += 1;
         let pairs: Vec<(String, String)> = found
             .iter()
-            .map(|(_, k, t)| (k.clone(), t.clone()))
+            .map(|(_, k, t, _)| (k.clone(), t.clone()))
             .collect();
-        let mut drop: Vec<usize> = found.iter().map(|(idx, _, _)| *idx).collect();
+        let mut drop: Vec<usize> = found.iter().map(|(idx, _, _, _)| *idx).collect();
         drop.sort_unstable_by(|a, b| b.cmp(a));
         for d in drop {
             leaves.remove(d);
@@ -1166,6 +1206,42 @@ pub(in crate::folds) fn fold_rest_destructure(leaves: &mut Vec<Leaf>, stats: &mu
         };
         i += 1;
     }
+}
+
+fn is_pure_intervening_for_rest(l: &Leaf) -> bool {
+    match l {
+        Leaf::Raw(Stmt::Elided { .. }) => true,
+        Leaf::Raw(Stmt::Declare { value, .. })
+        | Leaf::Decl {
+            value: Some(value), ..
+        } => {
+            let mut stack = vec![value];
+            while let Some(cur) = stack.pop() {
+                if !expr_root_is_pure_for_lit(cur) {
+                    return false;
+                }
+                stack.extend(expr_children(cur));
+            }
+            true
+        }
+        Leaf::Decl { value: None, .. } => true,
+        _ => false,
+    }
+}
+
+fn leaf_mentions_temp_or_ident(l: &Leaf, vid: ValueId, ident: &str) -> bool {
+    for e in leaf_exprs(l) {
+        let mut stack = vec![e];
+        while let Some(cur) = stack.pop() {
+            match cur {
+                Expr::Temp { value, name } if *value == vid || name == ident => return true,
+                Expr::Ident(n) if n == ident => return true,
+                _ => {}
+            }
+            stack.extend(expr_children(cur));
+        }
+    }
+    false
 }
 
 /// The key a `obj.k` / `obj["k"]` load extracts, when `value` is such

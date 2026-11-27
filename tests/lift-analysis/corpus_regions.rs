@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use abcd_analysis::control::{
-    EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree, reachable_blocks, structure_regions,
+use abcd_analysis::control::reachable_blocks;
+use abcd_decompile::structure::regions::{
+    EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree, structure_regions,
 };
 use abcd_ir::{FuncId, Module};
 

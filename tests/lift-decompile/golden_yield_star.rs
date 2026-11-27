@@ -97,7 +97,6 @@ function func_main_0() {
   return "inner-done";
 };
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B24→B31); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v39 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const inner$1 = inner;
@@ -138,7 +137,6 @@ fn golden_yield_star_delegate_array() {
 let log;
 function func_main_0() {
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B14→B21); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v5 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   yield 0.0;
@@ -194,7 +192,6 @@ function func_main_0() {
   /* unreachable */
 };
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B21→B28); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v33 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const boom$1 = boom;
@@ -217,13 +214,10 @@ function func_main_0() {
       const done = v125.done;
       if (done) {
         v130 = false;
-        v135 = v125;
       } else {
         v130 = true;
-        v135 = v125;
       }
       var v130; /* phi */
-      var v135; /* phi */
       if (!v130) {
         break;
       }
@@ -278,27 +272,15 @@ fn golden_yield_star_delegate_async() {
         .expect("outer present");
     let outer = outer.split("};").next().expect("outer body end");
     let expected = r#"
-  var inner$1; /* hoisted temp: used outside its def's block */
-  /* cross-arm edges unfolded (B44→B52); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
-  try {
-    const v131 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
-    inner$1 = inner;
-  } catch (e$1) {
-    var v257; /* phi */
-    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @7:0 */
-    throw e$1;
-  }
-  try {
-    /* try region 1: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
-    const value$2 = yield* inner$1();
-    yield value$2;
-    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow */
-    return undefined;
-  } catch (e$1) {
-    var v257; /* phi */
-    /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow @7:0 */
-    throw e$1;
-  }
+  /* rethrow-only try/catch dissolved (semantic no-op) */
+  const v131 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
+  const inner$1 = inner;
+  /* rethrow-only try/catch dissolved (semantic no-op) */
+  /* try region 1: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
+  const value$2 = yield* inner$1();
+  yield value$2;
+  /* elided SetGeneratorState: generator state-machine transition bookkeeping; implicit in `function*`/`async function*` control flow */
+  return undefined;
 "#;
     assert_eq!(outer, expected);
 }
@@ -393,7 +375,9 @@ fn golden_yield_star_delegate_async_main_for_await() {
 }
 
 /// Bail: a hand-rolled iterator-protocol loop inside a generator is
-/// NOT `yield*` — the fold must not fire; the machinery stays loud.
+/// NOT `yield*` — `yield_star_fold` must not collapse it to `yield*`,
+/// while `generator_machine_fold` folds the ordinary `yield value`
+/// inside the explicit `while (true)` loop cleanly.
 #[test]
 #[ignore = "requires exported corpus"]
 fn golden_yield_star_bail_manual_iterator() {
@@ -402,13 +386,8 @@ fn golden_yield_star_bail_manual_iterator() {
         !text.contains("yield*"),
         "the bail shape must not produce yield*:\n{text}"
     );
-    // The loud fallback markers of the unfolded machine stay.
     assert!(
-        text.contains("hard-fallback ResumeGenerator"),
-        "bail keeps the loud fallbacks:\n{text}"
-    );
-    assert!(
-        text.contains("/*iter-result*/"),
-        "bail keeps the iter-result wrap:\n{text}"
+        text.contains("while (true)") && text.contains("yield value;"),
+        "bail preserves the explicit iterator-protocol loop and plain yield:\n{text}"
     );
 }

@@ -1017,7 +1017,8 @@ fn build_param_annotation() -> Vec<u8> {
         }],
     );
     b.method_param_add_annotation(m, p0, ann);
-    b.method_seal_param_annotations(m, false);
+    b.method_seal_param_annotations(m, false)
+        .expect("seal param annotations");
     b.finalize().expect("finalize")
 }
 

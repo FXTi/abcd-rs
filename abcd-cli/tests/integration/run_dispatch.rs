@@ -653,4 +653,45 @@ fn stdout_helpers_and_binary_treat_broken_pipe_as_clean_exit_zero() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    // `stderr` BrokenPipe must also complete cleanly with the intended exit
+    // code (1 for user error, never panicking with exit code 101).
+    abcd_cli::write_stderr_fmt_to(
+        ErrWriter(std::io::ErrorKind::BrokenPipe),
+        format_args!("error: pipe closed\n"),
+    )
+    .expect("BrokenPipe on stderr writer must return Ok(())");
+
+    let mut err_child = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+        .args(["info", "/nonexistent/__abcd_missing__.abc"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn abcd binary with closed stderr");
+    drop(err_child.stderr.take());
+    let err_status = err_child.wait().expect("wait abcd binary");
+    assert_eq!(err_status.code(), Some(1));
+}
+
+#[test]
+fn taint_pta_budget_conflicts_with_alias_rung_below_two() {
+    let (_dir, abc) = tiny_abc_file("dispatch-taint-budget-rung");
+    let err = run_argv(&[
+        "abcd",
+        "taint",
+        &abc,
+        "--preset",
+        "ohos",
+        "--alias-rung",
+        "1",
+        "--pta-budget",
+        "5000",
+    ])
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 1, "{err}");
+    assert!(
+        err.to_string()
+            .contains("--pta-budget requires --alias-rung 2"),
+        "{err}"
+    );
 }

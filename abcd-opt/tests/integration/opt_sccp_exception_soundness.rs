@@ -422,9 +422,10 @@ fn peephole_fold_binop(op: BinOp, lhs: Const, rhs: Const) -> (Module, Op) {
     (module, op)
 }
 
-/// N41 red pins: peephole must not treat null as 0.0 — `null == 0` is
-/// FALSE in JS loose equality (it folded to true), and `null` arithmetic
-/// must not constant-fold through a coerced zero.
+/// N41 / N38(iii) red pins: loose equality (`==`/`!=`) must never coerce
+/// `null` or `undefined` through `ToNumber` (`null == 0` is FALSE in JS),
+/// while ECMA-262 arithmetic folds `null` (`+0.0`) and `undefined` (`NaN`)
+/// identically in `Peephole` and `Sccp`.
 #[test]
 fn peephole_does_not_treat_null_as_zero() {
     let (_m, data) = peephole_fold_cmp(CmpOp::Eq, Const::Null, Const::number(0.0));
@@ -432,9 +433,28 @@ fn peephole_does_not_treat_null_as_zero() {
         matches!(&data, Op::Compare { .. }),
         "null == 0 must not fold (N41), got {data:?}"
     );
-    let (_m, data) = peephole_fold_binop(BinOp::Add, Const::Null, Const::number(5.0));
+    let (_m, data) = peephole_fold_cmp(CmpOp::NotEq, Const::Null, Const::number(0.0));
     assert!(
-        matches!(&data, Op::BinaryOp { .. }),
-        "null + 5 must not fold through coerced 0.0 (N41), got {data:?}"
+        matches!(&data, Op::Compare { .. }),
+        "null != 0 must not fold (N41), got {data:?}"
+    );
+    let (m_null, data_null) = peephole_fold_binop(BinOp::Add, Const::Null, Const::number(5.0));
+    assert!(
+        matches!(
+            &data_null,
+            Op::LoadConst(cid) if m_null.consts.get(*cid) == Some(&Const::number(5.0))
+        ),
+        "5 + null folds to 5.0 via ECMA-262 ToNumber(null)=+0.0, got {data_null:?}"
+    );
+    let (m_undef, data_undef) =
+        peephole_fold_binop(BinOp::Add, Const::Undefined, Const::number(5.0));
+    assert!(
+        matches!(
+            &data_undef,
+            Op::LoadConst(cid)
+                if m_undef.consts.get(*cid)
+                    == Some(&Const::Number(abcd_opt::const_eval::CANONICAL_NAN_BITS))
+        ),
+        "5 + undefined folds to canonical NaN, got {data_undef:?}"
     );
 }

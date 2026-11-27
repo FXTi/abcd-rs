@@ -1,15 +1,21 @@
-use std::ffi::CString;
 use std::fmt;
 
-/// .abc file format version (`major.minor.patch.build`).
+use crate::generated::{
+    API_12, API_12_SUB_QUALIFIERS, API_12_SUB_VERSION, API_VERSION_MAP, CURRENT_VERSION,
+    INCOMPATIBLE_VERSIONS, MIN_VERSION,
+};
+
+/// `.abc` file format version (`major.minor.patch.build`).
 ///
-/// Wraps the 4-byte version tuple used by ArkCompiler panda files.
+/// Wraps the 4-byte version tuple used by ArkCompiler panda files in 100% pure
+/// Safe Rust, backed by constants generated from `file_format_version.h.erb`
+/// via `scripts/vendor-gen.py`.
 ///
 /// ```
 /// use abcd_isa::Version;
 ///
 /// let v = Version::current();
-/// println!("ISA version: {v}");  // e.g. "24.0.0.0"
+/// assert_eq!(v, Version::new(24, 0, 0, 0));
 ///
 /// let file_ver = Version::new(12, 0, 6, 0);
 /// assert!(file_ver.is_in_supported_range());
@@ -20,54 +26,58 @@ pub struct Version([u8; 4]);
 impl Version {
     /// Create a version from individual components.
     #[inline]
+    #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u8, build: u8) -> Self {
         Self([major, minor, patch, build])
     }
 
     /// Major version component.
     #[inline]
+    #[must_use]
     pub const fn major(&self) -> u8 {
         self.0[0]
     }
 
     /// Minor version component.
     #[inline]
+    #[must_use]
     pub const fn minor(&self) -> u8 {
         self.0[1]
     }
 
     /// Patch version component.
     #[inline]
+    #[must_use]
     pub const fn patch(&self) -> u8 {
         self.0[2]
     }
 
     /// Build version component.
     #[inline]
+    #[must_use]
     pub const fn build(&self) -> u8 {
         self.0[3]
     }
 
     /// Raw 4-byte representation.
     #[inline]
+    #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 4] {
         &self.0
     }
 
     /// Current ISA file format version.
-    pub fn current() -> Self {
-        let mut out = [0u8; 4];
-        // SAFETY: out is a 4-byte array on the stack; C side writes exactly 4 bytes.
-        unsafe { abcd_isa_sys::isa_get_version(out.as_mut_ptr()) };
-        Self(out)
+    #[inline]
+    #[must_use]
+    pub const fn current() -> Self {
+        Self(CURRENT_VERSION)
     }
 
     /// Minimum supported file format version.
-    pub fn min_supported() -> Self {
-        let mut out = [0u8; 4];
-        // SAFETY: out is a 4-byte array on the stack; C side writes exactly 4 bytes.
-        unsafe { abcd_isa_sys::isa_get_min_version(out.as_mut_ptr()) };
-        Self(out)
+    #[inline]
+    #[must_use]
+    pub const fn min_supported() -> Self {
+        Self(MIN_VERSION)
     }
 
     /// Check if this version is within the supported range
@@ -75,59 +85,54 @@ impl Version {
     ///
     /// Note: a version can be in the supported range yet still be
     /// explicitly blocked — check [`is_blocked`](Self::is_blocked) separately.
+    #[inline]
+    #[must_use]
     pub fn is_in_supported_range(&self) -> bool {
-        // SAFETY: self.0 is a 4-byte array; C side reads exactly 4 bytes.
-        unsafe { abcd_isa_sys::isa_is_version_compatible(self.0.as_ptr()) != 0 }
+        *self >= Self::min_supported() && *self <= Self::current()
     }
 
     /// Check if this version is in the known-incompatible blocklist.
     ///
     /// This is independent of [`is_in_supported_range`](Self::is_in_supported_range):
     /// a version can be both in range and blocked.
+    #[inline]
+    #[must_use]
     pub fn is_blocked(&self) -> bool {
-        // SAFETY: self.0 is a 4-byte array; C side reads exactly 4 bytes.
-        unsafe { abcd_isa_sys::isa_is_version_incompatible(self.0.as_ptr()) != 0 }
+        INCOMPATIBLE_VERSIONS.contains(&self.0)
     }
 
     /// Look up the file format version for a HarmonyOS API level.
     ///
-    /// Returns `None` if the API level is not in the mapping.
+    /// Returns `None` if the API level is not in `api_version_map`.
+    #[must_use]
     pub fn for_api(api_level: u8) -> Option<Self> {
-        let mut out = [0u8; 4];
-        // SAFETY: out is a 4-byte array on the stack; C side writes exactly 4 bytes on success.
-        let rc = unsafe { abcd_isa_sys::isa_get_version_by_api(api_level, out.as_mut_ptr()) };
-        if rc == 0 { Some(Self(out)) } else { None }
+        API_VERSION_MAP
+            .binary_search_by_key(&api_level, |&(api, _)| api)
+            .ok()
+            .map(|idx| Self(API_VERSION_MAP[idx].1))
     }
 
     /// Look up the file format version for an API level with a sub-API
     /// qualifier (e.g. API 12 `"beta1"`).
     ///
-    /// Returns `None` if `sub_api` contains a NUL byte. Note that the
-    /// underlying C++ implementation does not validate the sub-API string;
-    /// an unrecognised qualifier may still return `Some`.
+    /// Returns `None` if `sub_api` contains an interior NUL byte. Matches
+    /// upstream `GetVersionByApi`: unknown API levels fall back to
+    /// [`Self::current`].
+    #[must_use]
     pub fn for_api_sub(api_level: u8, sub_api: &str) -> Option<Self> {
-        let c_sub = CString::new(sub_api).ok()?;
-        let mut out = [0u8; 4];
-        // SAFETY: c_sub is a valid NUL-terminated C string; out is a 4-byte
-        // stack array; C side writes exactly 4 bytes on success.
-        let rc = unsafe {
-            abcd_isa_sys::isa_get_version_by_api_sub(api_level, c_sub.as_ptr(), out.as_mut_ptr())
-        };
-        if rc == 0 { Some(Self(out)) } else { None }
+        if sub_api.as_bytes().contains(&0) {
+            return None;
+        }
+        if api_level == API_12 && API_12_SUB_QUALIFIERS.contains(&sub_api) {
+            return Some(Self(API_12_SUB_VERSION));
+        }
+        Some(Self::for_api(api_level).unwrap_or_else(Self::current))
     }
 
     /// All versions in the known-incompatible set.
+    #[must_use]
     pub fn incompatible_versions() -> Vec<Self> {
-        // SAFETY: pure query, no preconditions.
-        let count = unsafe { abcd_isa_sys::isa_incompatible_version_count() };
-        let mut result = Vec::with_capacity(count);
-        for i in 0..count {
-            let mut out = [0u8; 4];
-            // SAFETY: i < count (loop bound); out is a 4-byte stack array.
-            unsafe { abcd_isa_sys::isa_incompatible_version_at(i, out.as_mut_ptr()) };
-            result.push(Self(out));
-        }
-        result
+        INCOMPATIBLE_VERSIONS.iter().copied().map(Self).collect()
     }
 }
 

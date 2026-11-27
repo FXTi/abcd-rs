@@ -1,10 +1,10 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-21`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-22`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-21`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-22`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
 - **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; `Catch::type_class: Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
@@ -37,11 +37,11 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   - Opcode-distinct runtime semantics stay distinct in IR: `DeleteProp` (`v0=obj, acc=key`, `N65`), `StoreOwnProp*` vs. `StoreProp` (`N60`), `TryStoreGlobal` vs. `StoreGlobal` vs. lexical `StoreGlobalRecord` (`N61`, `N72-C4`), `DefineSendableClass` vs. `DefineClass` (`N53`), `CallKind::{Apply, SuperSpread, SuperForwardAllArgs}` (`N57`, `N58`), `AllocArray` vs. `AllocObject` (`N59`), and accumulator-carried `AwaitUncaught`/`AsyncResolve`/`AsyncReject` (`N68`).
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-decompile`.
 
-### ADR-07 — Hard-Error Boundary for Unimplemented Upstream Opcodes (`N51`, Fused Branches)
+### ADR-07 — Hard-Error Boundary for Unimplemented Upstream Opcodes (Fused Branches)
 - **Ruling**: Only opcodes that have **zero upstream VM semantics and zero compiler producers** are rejected with `LiftError`:
-  1. `ldthisbyname` / `stthisbyname` / `ldthisbyvalue` / `stthisbyvalue` (`LiftError::UnsupportedThisByAccess`, `N51` — never emitted by `es2panda`, zero occurrences across corpus and wild apps).
-  2. The 14 fused compare-and-branch opcodes (`jeq*`, `jne*`, `jstricteq*`, `jnstricteq*`, `jeqnull*`, `jequndefined*`, `jstricteqz*` — `LiftError::UnsupportedFusedCompareBranch`; `isa.yaml` specifies `pc += imm` with no comparison, the C++ interpreter `FATAL`s all 24 widths, and the assembly interpreter `NOP`-skips them). `abcd-lower` exclusively emits unfused `cmp + jnez`/`jeqz`.
-  3. Super-property access by integer index (`LiftError::UnsupportedSuperByIndex` — no opcode exists in `isa.yaml`).
+  1. The 14 fused compare-and-branch opcodes (`jeq*`, `jne*`, `jstricteq*`, `jnstricteq*`, `jeqnull*`, `jequndefined*`, `jstricteqz*` — `LiftError::UnsupportedFusedCompareBranch`; `isa.yaml` specifies `pc += imm` with no comparison, the C++ interpreter `FATAL`s all 24 widths, and the assembly interpreter `NOP`-skips them). `abcd-lower` exclusively emits unfused `cmp + jnez`/`jeqz`.
+  2. Super-property access by integer index (`LiftError::UnsupportedSuperByIndex` — no opcode exists in `isa.yaml`).
+  *(Note: historical `N51` `UnsupportedThisByAccess` was repealed in `#93`; `ldthisbyname`/`ldthisbyvalue`/`stthisbyname`/`stthisbyvalue` lift directly via `this_param_index` + `LoadProp`/`StoreProp`.)*
 - **Crates**: `abcd-lift`, `abcd-lower`.
 
 ### ADR-08 — Full Read/Lift/Analyze/Decompile Support for Legacy `0.0.0.2` Bytecode
@@ -70,8 +70,8 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
 - **Ruling**: `abcd-cli` sets `mimalloc` (`#[global_allocator]`) across target platforms for fast multi-threaded arena allocation on macOS, Windows MSVC, and Linux; library crates never install a global allocator. Arena page-purge tuning or platform-specific allocator adjustments are governed by empirical multi-module RSS benchmarks (`#33`).
 - **Crates**: `abcd-cli`.
 
-### ADR-13 — Pure-Rust Table-Driven Modern ISA Codec & Fenwick Branch Relaxation (`D1`, `#43`, `#47`)
-- **Ruling**: Modern `9.0.0.0`–`24.0.0.0` `abcd_isa::decode`, `relocate_entity_id`, and `encode` run in 100% Safe Rust over `isa.yaml`-generated tables (`abcd-isa-sys/src/generated/`), using deterministic (`N20`) `O(N + J log N)` Fenwick-tree branch relaxation and inverted-branch + `jmp.32` trampolines across all 17 jump mnemonics when displacements exceed `±32 KiB`. Vendored C++ `BytecodeInst` and `BytecodeEmitter` in `isa_bridge.cpp` are retained strictly as automated differential test oracles.
+### ADR-13 — Pure-Rust Table-Driven Modern ISA Codec & Fenwick Branch Relaxation (`D1`, `#43`, `#47`, `#91`)
+- **Ruling**: Modern `9.0.0.0`–`24.0.0.0` `abcd_isa::decode`, `decode_for`, `relocate_entity_id`, `Version`, and `encode` run in 100% Safe Rust (`#![forbid(unsafe_code)]`, zero runtime FFI dependencies) over `isa.yaml`-generated tables (`abcd-isa/src/generated/`), using deterministic (`N20`) `O(N + P * J log N)` Fenwick-tree branch relaxation and inverted-branch + `jmp.32` trampolines across all 17 jump mnemonics when displacements exceed `±32 KiB`. Vendored C++ `BytecodeInst` and `BytecodeEmitter` in `isa_bridge.cpp` (`abcd-isa-sys`, dev-dependency only) are retained strictly as automated differential test oracles.
 - **Crates**: `abcd-isa-sys`, `abcd-isa`.
 
 ### ADR-14 — Pure-Rust Bounded LNP Decoder, Opt-In `EncodeOptions` Verification & Explicit `Dialect` (`D2`, `D4`, `D6`, `#44`, `#47`)
@@ -91,10 +91,10 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   2. `Op::effects_in(&self, module: &Module)` refines dynamic `UnaryOp`, `BinaryOp`, and `Compare` back to `Effects::PURE` when operand `Value::ty` or `ConstPool` definitions prove non-trapping primitive types, and `Effects::is_removable_if_unused()` governs dead-instruction removal in `abcd-opt::Adce`.
 - **Crates**: `abcd-ir`, `abcd-opt`.
 
-### ADR-17 — Flat `ConstId` Arena Literals, Shared Cooper–Harvey–Kennedy `DomTree` & Boxed Cold `Op`s (`R2-D3`, `R2-D4`, `R2-D5`, `#53`, `#54`)
+### ADR-17 — Flat `ConstId` Arena Literals, Shared Georgiadis Semi-NCA `DomTree` & Boxed Cold `Op`s (`R2-D3`, `R2-D4`, `R2-D5`, `#53`, `#54`, `#92`)
 - **Ruling**:
   1. `Const::ArrayLiteral(Vec<ConstId>)` and `Const::ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }` reference `ConstPool` entries by `ConstId` (eliminating recursive `Const` trees and enabling structural sub-literal sharing and iterative 3-color `ConstCycle` verification), `Const::{Int64, UInt64}` preserve exact 64-bit integers for `#36`, and `Ty::Union(Box<[Ty]>)` uses iterative heap-workstack trait implementations.
-  2. `abcd_ir::cfg` provides the canonical iterative RPO + **Cooper–Harvey–Kennedy** `idom` + Euler `(tin, tout)` `DomTree` (`O(B)` memory, `O(1)` dominance queries), and `Op::DefineClass` / `Op::DefineSendableClass` box `DefineClassData` so `size_of::<Op>() <= 40` bytes across module-wide instruction arenas.
+  2. `abcd_ir::cfg` provides the canonical iterative RPO + **Georgiadis–Tarjan–Werneck Semi-NCA** `idom` + Euler `(tin, tout)` `DomTree` (`O((V + E) log V)` worst-case time even on adversarial irreducible CFGs, `O(B)` memory, `O(1)` dominance & depth queries), and `Op::DefineClass` / `Op::DefineSendableClass` box `DefineClassData` so `size_of::<Op>() <= 40` bytes across module-wide instruction arenas.
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`.
 
 ### ADR-18 — Typed `EntityRef` Decoupling, Lossless `LiteralArray` Tagging & Reconstructed Debug PCs (`R3-D2`, `R3-D3`, `#50`, `#57`)
@@ -126,6 +126,15 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   3. **CLI verification, telemetry & portable path containment (`#89`, `R5-D2`)**: `abcd rewrite --check` runs full `decode + lift_file + verify_module`, `abcd analyze` / `abcd taint` surface `root_sliced` / `pta_root_sliced` / `ohos_lifecycle` and `"any_param_from:N"` summaries while rejecting contradictory `--pta` / `--alias-rung < 2` flags (`exit 1`), `stdout` `BrokenPipe` exits cleanly (`0`), `PK\x05\x06` empty ZIPs are sniffed as containers, and both `abcd-cli` and `split.rs` enforce Windows device-stem rejection plus ASCII case-folded collision deduplication across all 13 Rust 2024 workspace crates (`[lints] workspace = true`, `#![forbid(unsafe_code)]` on pure-Rust crates).
 - **Crates**: `abcd-decompile`, `abcd-cli`, root `abcd-rs`.
 
+### ADR-22 — Pass-2 Full-Estate Algorithmic Upgrades, Ring Purification & Zero-Recursion Gate (`#90`–`#95`)
+- **Ruling**:
+  1. **Ring & Dependency Purification**: `abcd-isa` runs with `#![forbid(unsafe_code)]` and zero runtime `abcd-*` dependencies (`abcd-isa-sys` in `[dev-dependencies]` only); `abcd-lower` drops `abcd-analysis` and imports CFG/dominator primitives directly from `abcd-ir`; `regions.rs` moves from `abcd-analysis` into `abcd-decompile::structure::regions` with single-pass iterative Tarjan SCC loop discovery; `abcd_ir::Module` carries explicit `Dialect::{DynamicEcma, StaticArkTS}` (`D3`).
+  2. **Dominance-Tree SSA Coloring + CSSA (`D7`, `#93`)**: `abcd-lower::regalloc` replaces $O(V^2)$ materialized interference graphs and MCS with **Hack–Grund–Goos (*CC* 2006)** dominance-tree preorder SSA coloring paired with **Boissinot et al. (*CGO* 2009)** Conventional SSA parallel-copy isolation & biased coalescing (`O(V + E)` memory, zero exception-edge copies).
+  3. **Ramsey Forward Labeled-Block Merges (`D4`, `#95`)**: `abcd-decompile::structure` resolves irreducible/cross-arm forward DAG merges via **Ramsey (*ICFP* 2022)** labeled blocks (`L$M: { ... break L$M; }`), preserving 100% of control-flow edges without exponential duplication or dispatch loops, and emits executable JS expressions for `for..in` iterator primitives (`GetPropIterator`, `NextPropName`).
+  4. **Sound Taint Strong-Kill & Zero-Copy IFDS Identity (`D5`, `D6`, `#94`)**: `abcd-taint` never strong-kills on `EdgeKind::Exceptional` edges and gates heap strong updates on `abcd_analysis::heap::is_concrete_singleton_site` (non-loop, single-execution entry/module-init allocation sites only); `IfdsProblem` supports `FlowOut::PassThrough` (`FactId(u32)`) to bypass `D::Fact` cloning/hashing on identity edges.
+  5. **Workspace-Wide Zero Recursion (`#95`)**: Direct recursion, mutual function-call cycles, and compiler-derived recursive traits on recursive types are banned across all 13 Rust crates, C/C++ bridges/shims, and `scripts/*.py`, enforced by `unconditional_recursion = "deny"` and `tests/zero_recursion_gate.rs`.
+- **Crates**: All 13 workspace crates + root `abcd-rs`.
+
 ---
 
 ## 2. Quick Lookup of Code-Referenced `N*` Tags
@@ -144,7 +153,7 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
 | `N45` / `N64` | Normal-edge SSA dominance check excluding unreachable Normal predecessors |
 | `N46` / `N52` | IR stores table-local `ClassId`/`ConstId`/`FuncId`/`Sym`, never raw file offsets |
 | `N48` / `N50` | `Op::effects()` single source of truth; `TryGetGlobal` may invoke getters and throw |
-| `N51` | `ldthisby*` / `stthisby*` rejected with `LiftError::UnsupportedThisByAccess` |
+| `N51` | *(Repealed in `#93` — `ldthisby*` / `stthisby*` lifted via `this_param_index` + `LoadProp`/`StoreProp`)* |
 | `N55` / `N56` | Loud `DebugInfoExtraction` error on corrupt LNP; `moduleRequestPhaseIdx` guard before `_ESModuleRecord` |
 | `N57`–`N61` | Distinct `CallKind::{Apply, SuperSpread, SuperForwardAllArgs}`, `AllocArray`, `StoreOwnProp*`, `TryStoreGlobal` |
 | `N62` | Accepted content-keyed `LiteralArray` deduplication during rewrite |

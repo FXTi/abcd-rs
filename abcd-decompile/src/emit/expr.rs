@@ -55,7 +55,8 @@ impl<'m> Emitter<'m> {
             }
             Expr::PrivateLoad { object, name } => {
                 if self.class_depth > 0 {
-                    tasks.push(PrintTask::RawOwned(format!(".#{name}")));
+                    let pname = format_private_ident(name);
+                    tasks.push(PrintTask::RawOwned(format!(".#{pname}")));
                     tasks.push(PrintTask::Expr {
                         expr: object,
                         prec: 19,
@@ -79,7 +80,8 @@ impl<'m> Emitter<'m> {
             }
             Expr::PrivateTest { object, name } => {
                 if self.class_depth > 0 {
-                    out.push_str(&format!("#{name} in "));
+                    let pname = format_private_ident(name);
+                    out.push_str(&format!("#{pname} in "));
                     tasks.push(PrintTask::Expr {
                         expr: object,
                         prec: 12,
@@ -400,6 +402,27 @@ impl<'m> Emitter<'m> {
                 tasks.push(PrintTask::Raw(
                     "[Symbol.asyncIterator]() /*sync-fallback elided*/",
                 ));
+                tasks.push(PrintTask::Expr {
+                    expr: obj,
+                    prec: 19,
+                });
+            }
+            Expr::Iter {
+                op: IterOp::GetPropIterator,
+                obj,
+                ..
+            } => {
+                out.push_str("((function*(o) { for (const k in o) yield k; })(");
+                tasks.push(PrintTask::Raw("))"));
+                tasks.push(PrintTask::Expr { expr: obj, prec: 0 });
+            }
+            Expr::Iter {
+                op: IterOp::NextPropName,
+                obj,
+                ..
+            } => {
+                out.push('(');
+                tasks.push(PrintTask::Raw(".next().value)"));
                 tasks.push(PrintTask::Expr {
                     expr: obj,
                     prec: 19,
@@ -842,15 +865,16 @@ impl<'m> Emitter<'m> {
     ) {
         match op {
             UnOp::IsTrue | UnOp::JumpNez => {
+                out.push_str("!!");
                 tasks.push(PrintTask::Expr {
-                    expr: operand,
-                    prec: 0,
+                    expr: peel_truthiness(operand),
+                    prec: 17,
                 });
             }
             UnOp::IsFalse | UnOp::JumpEqz | UnOp::LogicalNot => {
                 out.push('!');
                 tasks.push(PrintTask::Expr {
-                    expr: operand,
+                    expr: peel_truthiness(operand),
                     prec: 17,
                 });
             }
@@ -970,7 +994,15 @@ impl<'m> Emitter<'m> {
     }
 }
 
-fn peel_truthiness(mut e: &Expr) -> &Expr {
+pub(in crate::emit) fn format_private_ident(raw: &str) -> String {
+    if crate::legalize::is_ident_name(raw) {
+        raw.to_string()
+    } else {
+        sanitize(raw)
+    }
+}
+
+pub(in crate::emit) fn peel_truthiness(mut e: &Expr) -> &Expr {
     while let Expr::Unary {
         op: UnOp::IsTrue | UnOp::JumpNez,
         operand,
@@ -982,8 +1014,7 @@ fn peel_truthiness(mut e: &Expr) -> &Expr {
 }
 
 fn is_emitted_unary_lhs(e: &Expr) -> bool {
-    let cur = peel_truthiness(e);
-    match cur {
+    match e {
         Expr::Unary {
             op: UnOp::Inc | UnOp::Dec | UnOp::ToPropertyKey,
             ..
@@ -993,7 +1024,78 @@ fn is_emitted_unary_lhs(e: &Expr) -> bool {
             operand,
         } if matches!(operand.as_ref(), Expr::Lit(Lit::BigInt(s)) if !s.starts_with('-')) => false,
         Expr::Unary { .. } | Expr::Delete { .. } | Expr::Await { .. } => true,
-        _ => cur.is_negative_numeric_lit(),
+        _ => e.is_negative_numeric_lit(),
+    }
+}
+
+/// Whether `cur` printed at statement-expression precedence (`0`) begins with
+/// `{`, `function`, `async function`, or `class` (ignoring leading comments),
+/// requiring `(...);` parenthesization in JS `ExpressionStatement` position.
+pub(in crate::emit) fn expr_needs_stmt_parens(mut cur: &Expr) -> bool {
+    loop {
+        match cur {
+            Expr::ObjectLit { .. } | Expr::ObjectBuild { .. } | Expr::IterResultObj { .. } => {
+                return true;
+            }
+            Expr::Class { .. } => return true,
+            Expr::Closure { kind, .. } => {
+                return !matches!(kind, FunctionKind::Arrow | FunctionKind::AsyncArrow);
+            }
+            Expr::PropName { object: left, .. }
+            | Expr::PropIndex { object: left, .. }
+            | Expr::PropDyn { object: left, .. }
+            | Expr::PrivateLoad { object: left, .. }
+            | Expr::TaggedTemplate { tag: left, .. }
+            | Expr::ArraySpread { dst: left, .. }
+            | Expr::Iter {
+                op: IterOp::GetIterator | IterOp::GetAsyncIterator,
+                obj: left,
+                ..
+            } => {
+                if left.precedence() < 19 {
+                    return false;
+                }
+                cur = left;
+            }
+            Expr::Call { callee, kind, .. }
+                if *kind != CallKind::New && !matches!(callee.as_ref(), Expr::SuperMarker) =>
+            {
+                if callee.precedence() < 19 {
+                    return false;
+                }
+                cur = callee;
+            }
+            Expr::Binary { op, left, .. } => {
+                let prec = cur.precedence();
+                let left_prec = if *op == BinOp::Exp { 17 } else { prec };
+                if (*op == BinOp::Exp && is_emitted_unary_lhs(left))
+                    || left.precedence() < left_prec
+                {
+                    return false;
+                }
+                cur = left;
+            }
+            Expr::Compare { left, .. } => {
+                let prec = cur.precedence();
+                if left.precedence() < prec {
+                    return false;
+                }
+                cur = left;
+            }
+            Expr::Iter {
+                op: IterOp::Next | IterOp::Return | IterOp::Throw,
+                obj: left,
+                ..
+            }
+            | Expr::CreateGenerator { func: left }
+            | Expr::GeneratorDriver { genobj: left, .. }
+            | Expr::AsyncDriver { value: left, .. }
+            | Expr::AsyncGeneratorResolve { value: left, .. }
+            | Expr::RestObject { obj: left, .. } => {
+                cur = left;
+            }
+            _ => return false,
+        }
     }
 }
 

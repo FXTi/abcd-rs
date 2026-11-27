@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::Arc;
 
 use crate::Error;
 
@@ -165,14 +166,15 @@ pub enum Compression {
     Deflated,
 }
 
-/// Entry payload: borrowed for STORED entries, owned for DEFLATE.
+/// Entry payload: borrowed for top-level STORED entries, reference-counted
+/// owned bytes for DEFLATE or nested-container payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryData<'a> {
     /// Zero-copy slice into the archive bytes (STORED entries).
     Borrowed(&'a [u8]),
-    /// Inflated data (DEFLATE entries), or owned data lifted out of a nested
-    /// container.
-    Owned(Vec<u8>),
+    /// Reference-counted inflated data (DEFLATE entries), or owned data lifted
+    /// out of a nested container and shared in `O(1)` across modules.
+    Owned(Arc<[u8]>),
 }
 
 impl EntryData<'_> {
@@ -180,7 +182,7 @@ impl EntryData<'_> {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             EntryData::Borrowed(s) => s,
-            EntryData::Owned(v) => v,
+            EntryData::Owned(a) => a,
         }
     }
 
@@ -188,14 +190,18 @@ impl EntryData<'_> {
     pub fn into_owned(self) -> Vec<u8> {
         match self {
             EntryData::Borrowed(s) => s.to_vec(),
-            EntryData::Owned(v) => v,
+            EntryData::Owned(a) => a.as_ref().to_vec(),
         }
     }
 
-    /// Lift into an `'static` owned payload (used for nested containers whose
-    /// backing bytes do not outlive the caller's archive).
+    /// Lift into an `'static` owned payload in `O(1)` when already [`EntryData::Owned`]
+    /// (used for nested containers whose backing bytes do not outlive the
+    /// caller's archive).
     pub(crate) fn into_static(self) -> EntryData<'static> {
-        EntryData::Owned(self.into_owned())
+        match self {
+            EntryData::Borrowed(s) => EntryData::Owned(Arc::from(s)),
+            EntryData::Owned(a) => EntryData::Owned(a),
+        }
     }
 }
 
@@ -432,6 +438,21 @@ impl<'a> ZipArchive<'a> {
         })
     }
 
+    /// Number of central-directory entries in the archive.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` when the archive contains zero central-directory entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Look up a central-directory entry by zero-based archive ordinal.
+    pub fn entry_at(&self, index: usize) -> Option<&EntryMeta<'a>> {
+        self.entries.get(index)
+    }
+
     /// Iterate over central-directory entries in archive order.
     pub fn entries(&self) -> impl Iterator<Item = &EntryMeta<'a>> {
         self.entries.iter()
@@ -555,7 +576,7 @@ impl<'a> ZipArchive<'a> {
                         actual,
                     });
                 }
-                Ok(EntryData::Owned(inflated))
+                Ok(EntryData::Owned(Arc::from(inflated)))
             }
             method => Err(Error::UnsupportedMethod {
                 name: meta.name.as_ref().to_owned(),

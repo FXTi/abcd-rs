@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use abcd_file::{AccessFlags, Builder, CodeEntity, Type};
+use abcd_file::{AccessFlags, Builder, Type};
 
 // ---------------------------------------------------------------------------
 // Mini ZIP writer (STORED entries only — ~50 lines by design)
@@ -136,29 +136,24 @@ pub fn tiny_abc() -> Vec<u8> {
     b.finalize().expect("tiny_abc must finalize")
 }
 
-/// Decode-ok / lift-fail fixture: `f() { return this.key; }` via the
-/// `ldthisbyname` opcode. The `this-by-*` family is IC-fused `this`
-/// property access that es2panda never emits, and the lifter refuses it
-/// loudly (`LiftError::UnsupportedThisByAccess`, N51 ruling — precedent:
-/// abcd-lift/tests/lift_this_by_unsupported.rs). The file itself decodes
-/// cleanly, so CLI commands reach their lift stage and must map the
-/// failure to a tool error.
+/// Decode-ok / lift-fail fixture: `f()` carrying `jeqnull` (`ADR-07`).
+/// The fused compare-and-branch family has zero comparison semantics in
+/// `isa.yaml` and FATALs in the C++ interpreter, so the lifter rejects it
+/// loudly (`LiftError::UnsupportedFusedCompareBranch`). The file itself decodes
+/// cleanly, so CLI commands reach their lift stage and must map the failure to
+/// a tool error.
 pub fn lift_fail_abc() -> Vec<u8> {
-    use abcd_isa::{Bytecode, EntityId, Imm};
+    use abcd_isa::{Bytecode, Label};
     let mut b = Builder::new();
     b.set_api(12, "");
     let cls = b.add_global_class();
     let proto = b.create_proto(Type::Void, &[]);
-    let placeholder = EntityId(u16::MAX as u32);
-    let (code, offsets) = abcd_isa::encode(&[
-        Bytecode::Ldthisbyname(Imm(0), placeholder), // 0: acc = this.key
-        Bytecode::Returnundefined,                   // 1
+    let (code, _offsets) = abcd_isa::encode(&[
+        Bytecode::Jeqnull(Label(0)), // 0: unsupported fused compare-branch
+        Bytecode::Returnundefined,   // 1
     ])
     .unwrap();
-    let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
-    let key = b.add_string("key");
-    b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(key))
-        .unwrap();
+    b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
     b.deduplicate();
     b.finalize().expect("lift_fail_abc must finalize")
 }

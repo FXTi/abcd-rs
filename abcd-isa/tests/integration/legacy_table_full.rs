@@ -66,15 +66,20 @@ fn pref_v8_ic_slot_mappings() {
         decode_one(&[0xff, 0x25, 0x11]),
         Bytecode::Shl2(Imm(0), Reg(0x11))
     ));
-    // ecma.shr2dyn (305-308)
+    // ecma.shr2dyn -> Ashr2 (upstream panda_file_translator.cpp: old Shr2/Ashr2 were swapped)
     assert!(matches!(
         decode_one(&[0xff, 0x26, 0x12]),
-        Bytecode::Shr2(Imm(0), Reg(0x12))
+        Bytecode::Ashr2(Imm(0), Reg(0x12))
     ));
-    // ecma.ashr2dyn (310-313)
+    // ecma.ashr2dyn -> Shr2 (upstream panda_file_translator.cpp: old Shr2/Ashr2 were swapped)
     assert!(matches!(
         decode_one(&[0xff, 0x27, 0x13]),
-        Bytecode::Ashr2(Imm(0), Reg(0x13))
+        Bytecode::Shr2(Imm(0), Reg(0x13))
+    ));
+    // ecma.expdyn -> Exp(Imm(0), Reg(v))
+    assert!(matches!(
+        decode_one(&[0xff, 0x30, 0x17]),
+        Bytecode::Exp(Imm(0), Reg(0x17))
     ));
     // ecma.or2dyn (320-323)
     assert!(matches!(
@@ -207,25 +212,80 @@ fn pref_imm16_mappings() {
     ));
 }
 
-/// legacy pref_imm16_v8 mapping: `[0xff, opcode, imm_lo, imm_hi, v]`.
+/// legacy pref_imm16_v8 mappings: `[0xff, opcode, imm_lo, imm_hi, v]`.
 #[test]
 fn pref_imm16_v8_mapping() {
-    // ecma.callirangedyn -> Callrange(ic=0, argc, v0); multi-byte argc pins
-    // endianness (661-671)
+    // ecma.newobjdynrange -> WideNewobjrange(imm - 1, Reg(v + 1)) (upstream panda_file_translator.cpp)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5a, 0x05, 0x01, 0x21]),
+        Bytecode::WideNewobjrange(Imm(0x0104), Reg(0x22))
+    ));
+    // ecma.callirangedyn -> DeprecatedCallrange(argc, v0); multi-byte argc pins endianness
     assert!(matches!(
         decode_one(&[0xff, 0x5b, 0x05, 0x01, 0x21]),
-        Bytecode::Callrange(Imm(0), Imm(0x0105), Reg(0x21))
+        Bytecode::DeprecatedCallrange(Imm(0x0105), Reg(0x21))
+    ));
+    // ecma.callithisrangedyn -> DeprecatedCallthisrange(argc, v0)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5c, 0x06, 0x01, 0x22]),
+        Bytecode::DeprecatedCallthisrange(Imm(0x0106), Reg(0x22))
+    ));
+    // ecma.supercall(arrowrange) -> WideSupercallarrowrange(argc, v0)
+    assert!(matches!(
+        decode_one(&[0xff, 0x5d, 0x04, 0x01, 0x23]),
+        Bytecode::WideSupercallarrowrange(Imm(0x0104), Reg(0x23))
     ));
 }
 
 /// legacy pref_imm16_v8_v8 mapping: `[0xff, opcode, imm_lo, imm_hi, v1, v2]`.
 #[test]
 fn pref_imm16_v8_v8_mapping() {
-    // ecma.createobjectwithexcludedkeys: imm16 key count, then the object
-    // and first-key registers (697-707)
+    // ecma.createobjectwithexcludedkeys: 16-bit key count -> WideCreateobjectwithexcludedkeys
     assert!(matches!(
         decode_one(&[0xff, 0x5e, 0x07, 0x01, 0x21, 0x37]),
-        Bytecode::Createobjectwithexcludedkeys(Imm(0x0107), Reg(0x21), Reg(0x37))
+        Bytecode::WideCreateobjectwithexcludedkeys(Imm(0x0107), Reg(0x21), Reg(0x37))
+    ));
+}
+
+/// Additional upstream `panda_file_translator.cpp` parity pins (`R1-8`).
+#[test]
+fn translator_parity_additional_mappings() {
+    // core jmp imm32 (0x24): single instruction to self (disp = 0)
+    assert!(matches!(
+        decode_one(&[0x24, 0x00, 0x00, 0x00, 0x00]),
+        Bytecode::Jmp(abcd_isa::Label(0))
+    ));
+    // ecma.ldglobalthis (0x02) -> Ldglobal, ecma.debugger (0x19) -> Debugger, ecma.ldfunction (0x85) -> Ldfunction
+    assert!(matches!(decode_one(&[0xff, 0x02]), Bytecode::Ldglobal));
+    assert!(matches!(decode_one(&[0xff, 0x19]), Bytecode::Debugger));
+    assert!(matches!(decode_one(&[0xff, 0x85]), Bytecode::Ldfunction));
+    // ecma.newobjspreaddyn (0x42): [0xff, 0x42, newtarget_reg, ctor_reg] -> Newobjapply(0, ctor_reg)
+    assert!(matches!(
+        decode_one(&[0xff, 0x42, 0x11, 0x22]),
+        Bytecode::Newobjapply(Imm(0), Reg(0x22))
+    ));
+    // ecma.stobjbyindex (0x52) / ecma.stownbyindex (0x53) -> Wide* (32-bit index)
+    assert!(matches!(
+        decode_one(&[0xff, 0x52, 0x09, 0x78, 0x56, 0x34, 0x12]),
+        Bytecode::WideStobjbyindex(Reg(0x09), Imm(0x12345678))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x53, 0x0a, 0xef, 0xbe, 0xad, 0xde]),
+        Bytecode::WideStownbyindex(Reg(0x0a), Imm(0xdeadbeef))
+    ));
+    // ecma.newlexenvdyn (0x64) / ecma.copyrestargs (0x65) -> Wide* (16-bit immediate)
+    assert!(matches!(
+        decode_one(&[0xff, 0x64, 0x02, 0x01]),
+        Bytecode::WideNewlexenv(Imm(0x0102))
+    ));
+    assert!(matches!(
+        decode_one(&[0xff, 0x65, 0x03, 0x01]),
+        Bytecode::WideCopyrestargs(Imm(0x0103))
+    ));
+    // ecma.newlexenvwithnamedyn (0x86): [0xff, 0x86, slots_u16, lit_id_u16]
+    assert!(matches!(
+        decode_one(&[0xff, 0x86, 0x04, 0x01, 0x34, 0x12]),
+        Bytecode::WideNewlexenvwithname(Imm(0x0104), EntityId(0x1234))
     ));
 }
 

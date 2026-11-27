@@ -426,39 +426,50 @@ fn to_number_of_undefined_is_nan() {
     );
 }
 
-/// `StrictEq` is not folded by the lattice comparison (runtime-only),
-/// and neither are non-scalar / dangling const loads.
+/// `StrictEq` folds over scalar primitives (`N40`), whereas runtime-only
+/// `In`/`InstanceOf` comparisons and non-scalar / dangling const loads stay.
 #[test]
 fn non_foldable_compare_and_non_scalar_consts_stay() {
     let mut module = Module::new();
     let f = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
-    let (i_eq, i_str, i_dangling);
+    let (i_seq, i_in, i_hole, i_dangling);
     {
         let mut b = V2Builder::new(&mut module, f);
         let one = b.emit_number(1.0);
         let two = b.emit_number(2.0);
-        i_eq = b
+        i_seq = b
             .emit(Op::Compare {
                 op: CmpOp::StrictEq,
                 left: one,
                 right: two,
             })
             .0;
-        let s_sym = b.sym("s");
-        let s = b.konst(Const::String(s_sym));
-        i_str = b.emit(Op::LoadConst(s)).0;
+        i_in = b
+            .emit(Op::Compare {
+                op: CmpOp::In,
+                left: one,
+                right: two,
+            })
+            .0;
+        let hole = b.konst(Const::Hole);
+        i_hole = b.emit(Op::LoadConst(hole)).0;
         i_dangling = b.emit(Op::LoadConst(abcd_ir::ConstId::new(9999))).0;
         b.emit_void(Op::Return { value: None });
     }
     let changed = run(&mut module, f);
-    let _ = changed;
-    assert!(
-        matches!(module.insts[i_eq.index()].op, Op::Compare { .. }),
-        "StrictEq never folds"
+    assert!(changed, "StrictEq(2.0, 1.0) folds to false");
+    assert_eq!(
+        loaded_const(&module, i_seq),
+        Some(Const::Bool(false)),
+        "StrictEq folds identically across Sccp and Peephole"
     );
     assert!(
-        matches!(module.insts[i_str.index()].op, Op::LoadConst(_)),
-        "a non-scalar const is Bottom, not folded"
+        matches!(module.insts[i_in.index()].op, Op::Compare { .. }),
+        "In comparison never folds"
+    );
+    assert!(
+        matches!(module.insts[i_hole.index()].op, Op::LoadConst(_)),
+        "TDZ Hole const is Bottom, not rewritten"
     );
     assert!(
         matches!(module.insts[i_dangling.index()].op, Op::LoadConst(_)),
@@ -588,8 +599,8 @@ fn sccp_pass_guards() {
     assert!(!run(&mut module, no_blocks));
 }
 
-/// `normal_succs`/`augmented_succs`/`replace_uses_in_func` tolerate
-/// dangling ids (the opt-analysis guards).
+/// `abcd_ir::block_succs` / `abcd_ir::augmented_succs` and `CopyProp` / `Adce`
+/// tolerate dangling ids cleanly.
 #[test]
 fn analysis_helpers_tolerate_dangling_ids() {
     let mut module = Module::new();
@@ -610,36 +621,32 @@ fn analysis_helpers_tolerate_dangling_ids() {
             .insts
             .push(abcd_ir::InstId::new(9999));
     }
-    // normal_succs arms.
-    assert!(abcd_opt::analysis::normal_succs(&module, BlockId::new(9999)).is_empty());
-    assert!(abcd_opt::analysis::normal_succs(&module, empty).is_empty());
-    assert!(abcd_opt::analysis::normal_succs(&module, dangling_last).is_empty());
-    assert_eq!(abcd_opt::analysis::normal_succs(&module, entry), vec![out]);
+    assert!(abcd_ir::block_succs(&module, BlockId::new(9999)).is_empty());
+    assert!(abcd_ir::block_succs(&module, empty).is_empty());
+    assert!(abcd_ir::block_succs(&module, dangling_last).is_empty());
+    assert_eq!(abcd_ir::block_succs(&module, entry), vec![out]);
     // augmented_succs: a missing function yields the terminator succs only.
-    let aug = abcd_opt::analysis::augmented_succs(&module, FuncId::new(999), entry);
-    assert_eq!(aug, vec![(out, EdgeKind::Normal)]);
-    // replace_uses_in_func: missing func, dangling block, dangling inst.
-    let v = ValueId::new(0);
-    assert_eq!(
-        abcd_opt::analysis::replace_uses_in_func(&mut module, FuncId::new(999), v, v),
-        0
-    );
+    let aug = abcd_ir::augmented_succs(&module, FuncId::new(999), entry);
+    assert_eq!(aug, vec![out]);
+    // CopyProp / Adce tolerate missing func, dangling block, and dangling inst.
+    assert!(!abcd_opt::copyprop::CopyProp.run(&mut module, FuncId::new(999)));
     module.functions[f.index()].blocks.push(BlockId::new(9998));
     module.blocks[entry.index()]
         .insts
         .push(abcd_ir::InstId::new(9997));
-    let n = abcd_opt::analysis::replace_uses_in_func(&mut module, f, v, v);
-    assert_eq!(n, 0, "no uses of v exist; the dangling ids are skipped");
+    let _ = abcd_opt::copyprop::CopyProp.run(&mut module, f);
+    let _ = abcd_opt::dce::Adce.run(&mut module, f);
 }
 
 /// A binop with a Bottom operand (a Mov of a constant — the generic
-/// arm's Bottom) evaluates to Bottom (never folded); a const-DEFINED
-/// non-scalar (a string) is Bottom on read.
+/// arm's Bottom) evaluates to Bottom (never folded in Sccp alone); a
+/// const-DEFINED TDZ `Hole` is Bottom on read, while a non-empty string has
+/// known ECMA-262 `ToBoolean == true`.
 #[test]
 fn bottom_operands_and_non_scalar_const_values() {
     let mut module = Module::new();
     let f = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
-    let (i_add, i_str);
+    let (i_add, i_hole, i_str);
     {
         let mut b = V2Builder::new(&mut module, f);
         let one = b.emit_number(1.0);
@@ -652,7 +659,14 @@ fn bottom_operands_and_non_scalar_const_values() {
                 right: one,
             })
             .0;
-        // A const-defined non-scalar: Bottom via get_lattice's `_` arm.
+        // A const-defined TDZ Hole: Bottom via get_lattice's `_` arm.
+        let hv = b.create_const_value(Const::Hole);
+        i_hole = b
+            .emit(Op::UnaryOp {
+                op: UnOp::IsTrue,
+                operand: hv,
+            })
+            .0;
         let ssym = b.module.sym.intern("s");
         let sv = b.create_const_value(Const::String(ssym));
         i_str = b
@@ -664,14 +678,19 @@ fn bottom_operands_and_non_scalar_const_values() {
         b.emit_void(Op::Return { value: None });
     }
     let changed = run(&mut module, f);
-    let _ = changed;
+    assert!(changed);
     assert!(
         matches!(module.insts[i_add.index()].op, Op::BinaryOp { .. }),
         "a Bottom operand never folds"
     );
     assert!(
-        matches!(module.insts[i_str.index()].op, Op::UnaryOp { .. }),
-        "a non-scalar const operand is Bottom"
+        matches!(module.insts[i_hole.index()].op, Op::UnaryOp { .. }),
+        "a Hole const operand is Bottom"
+    );
+    assert_eq!(
+        loaded_const(&module, i_str),
+        Some(Const::Bool(true)),
+        "non-empty String IsTrue folds to true"
     );
 }
 

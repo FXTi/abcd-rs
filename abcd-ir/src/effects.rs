@@ -1,11 +1,12 @@
 //! First-class per-op effects (`design/ir.md`, requirement T3;
-//! `design/decisions.md` N48/N50, R2-D2).
+//! `design/decisions.md` N48/N50, R2-D2, `#92`).
 //!
 //! [`Op::effects`] provides the conservative mechanical baseline for untyped
-//! dynamic JS/TS (modeling `ToNumeric`/`ToPrimitive`/`ToPropertyKey` coercion
-//! and global accessor setters), while [`Op::effects_in`] refines compute ops
-//! (`UnaryOp`, `BinaryOp`, `Compare`) to [`Effects::PURE`] whenever operands
-//! are proven coercion-free and non-throwing via [`Ty`] or [`crate::ConstPool`].
+//! dynamic JS/TS (modeling `ToNumeric`/`ToPrimitive`/`ToPropertyKey` coercion,
+//! Proxy/private-accessor traps, module-binding abrupt completions, and global
+//! accessor setters), while [`Op::effects_in`] refines compute ops (`UnaryOp`,
+//! `BinaryOp`, `Compare`) to [`Effects::PURE`] whenever operands are proven
+//! coercion-free and non-throwing via [`Ty`] or [`crate::ConstPool`].
 
 use crate::consts::Const;
 use crate::function::ValueDef;
@@ -29,7 +30,7 @@ impl MemClasses {
     pub const GLOBAL: Self = Self(1 << 2);
     /// Module-variable slots.
     pub const MODULE: Self = Self(1 << 3);
-    /// Iterator/generator internal state.
+    /// Iterator/generator/coroutine internal state.
     pub const ITERATOR: Self = Self(1 << 4);
     /// Prototype chains.
     pub const PROTOTYPE: Self = Self(1 << 5);
@@ -94,7 +95,7 @@ pub enum AllocKind {
     RegExp,
     /// An iterator / property-name iterator record.
     Iterator,
-    /// A generator object.
+    /// A generator or async-generator object.
     GeneratorObj,
     /// May allocate arbitrary objects (calls, dynamic import).
     Unknown,
@@ -216,18 +217,82 @@ const fn is_static_float_or_bool(s: StaticTy) -> bool {
     matches!(s, StaticTy::U1 | StaticTy::F32 | StaticTy::F64)
 }
 
-fn is_nonzero_const(module: &Module, v: ValueId) -> bool {
-    match proven_const(module, v) {
-        Some(Const::Int8(n)) => *n != 0,
-        Some(Const::Int32(n)) => *n != 0,
-        Some(Const::Int64(n)) => *n != 0,
-        Some(Const::UInt64(n)) => *n != 0,
-        Some(Const::Number(bits)) => {
-            let f = f64::from_bits(*bits);
-            f.is_finite() && f != 0.0 && (f as i64) != 0
-        }
-        _ => false,
+const fn signed_static_int_min(s: StaticTy) -> Option<i128> {
+    match s {
+        StaticTy::I8 => Some(i8::MIN as i128),
+        StaticTy::I16 => Some(i16::MIN as i128),
+        StaticTy::I32 => Some(i32::MIN as i128),
+        StaticTy::I64 => Some(i64::MIN as i128),
+        _ => None,
     }
+}
+
+fn static_int_const_val(module: &Module, v: ValueId, ty: StaticTy) -> Option<i128> {
+    let raw: i128 = match proven_const(module, v)? {
+        Const::Int8(n) => i128::from(*n),
+        Const::Int32(n) => i128::from(*n as i32),
+        Const::Int64(n) => i128::from(*n),
+        Const::UInt64(n) => i128::from(*n),
+        Const::Number(bits) => {
+            let f = f64::from_bits(*bits);
+            if !f.is_finite()
+                || f.fract() != 0.0
+                || f < (i64::MIN as f64)
+                || f >= 9_223_372_036_854_775_808.0
+            {
+                return None;
+            }
+            i128::from(f as i64)
+        }
+        _ => return None,
+    };
+    Some(match ty {
+        StaticTy::I8 => i128::from(raw as i8),
+        StaticTy::U8 => i128::from(raw as u8),
+        StaticTy::I16 => i128::from(raw as i16),
+        StaticTy::U16 => i128::from(raw as u16),
+        StaticTy::I32 => i128::from(raw as i32),
+        StaticTy::U32 => i128::from(raw as u32),
+        StaticTy::I64 => i128::from(raw as i64),
+        StaticTy::U64 => i128::from(raw as u64),
+        _ => return None,
+    })
+}
+
+/// Static integer `Div` / `Mod` purity check honoring `N36` (`right OP left`:
+/// `left` = `acc` divisor, `right` = `vreg` dividend):
+/// - Divisor (`left`) must be a proven non-zero constant at both operand widths.
+/// - For signed integer widths, divisor `-1` traps on `MIN / -1` (`MIN % -1`),
+///   so `-1` requires dividend (`right`) proven constant and `!= MIN`.
+fn is_safe_static_int_div_mod(
+    module: &Module,
+    divisor: ValueId,
+    dividend: ValueId,
+    div_ty: StaticTy,
+    dvd_ty: StaticTy,
+) -> bool {
+    let Some(d_div) = static_int_const_val(module, divisor, div_ty) else {
+        return false;
+    };
+    let Some(d_dvd) = static_int_const_val(module, divisor, dvd_ty) else {
+        return false;
+    };
+    if d_div == 0 || d_dvd == 0 {
+        return false;
+    }
+    for (ty, d_at_ty) in [(dvd_ty, d_dvd), (div_ty, d_div)] {
+        if let Some(min_val) = signed_static_int_min(ty)
+            && d_at_ty == -1
+        {
+            let Some(n_val) = static_int_const_val(module, dividend, ty) else {
+                return false;
+            };
+            if n_val == min_val {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl Op {
@@ -308,10 +373,7 @@ impl Op {
             },
 
             // Allocation sites (T7).
-            AllocObject { .. }
-            | GetUnmappedArgs
-            | CreateIterResultObj { .. }
-            | CreateAsyncGenerator { .. } => Effects {
+            AllocObject { .. } | GetUnmappedArgs | CreateIterResultObj { .. } => Effects {
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
@@ -328,7 +390,7 @@ impl Op {
                 allocs: AllocKind::Closure,
                 ..Effects::PURE
             },
-            CreateGenerator { .. } => Effects {
+            CreateGenerator { .. } | CreateAsyncGenerator { .. } => Effects {
                 allocs: AllocKind::GeneratorObj,
                 ..Effects::PURE
             },
@@ -356,19 +418,11 @@ impl Op {
             | StorePropDyn { .. }
             | StoreSuper { .. }
             | StorePropIdx { .. }
-            | DeleteProp { .. } => Effects {
-                writes: MemClasses::HEAP,
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee,
-                ..Effects::PURE
-            },
-            StoreOwnPropName { .. } | StoreOwnPropIdx { .. } => Effects {
-                writes: MemClasses::HEAP,
-                may_throw: true,
-                ..Effects::PURE
-            },
-            // Computed key triggers ToPropertyKey on object keys (`R2-M3`).
-            StoreOwnPropDyn { .. } | DefineGetterSetterByValue { .. } => Effects {
+            | DeleteProp { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropIdx { .. }
+            | StoreOwnPropDyn { .. }
+            | DefineGetterSetterByValue { .. } => Effects {
                 writes: MemClasses::HEAP,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
@@ -423,17 +477,14 @@ impl Op {
                 may_call: CallEffect::UnknownCallee, // Proxy `ownKeys` trap
                 allocs: AllocKind::Iterator,
             },
-            IteratorNext { .. } | IteratorReturn { .. } | IteratorThrow { .. } => Effects {
+            IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | NextPropName { .. } => Effects {
                 reads: MemClasses::ITERATOR | MemClasses::HEAP,
                 writes: MemClasses::ITERATOR,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
-                ..Effects::PURE
-            },
-            NextPropName { .. } => Effects {
-                reads: MemClasses::ITERATOR | MemClasses::HEAP,
-                writes: MemClasses::ITERATOR,
-                may_throw: true,
                 ..Effects::PURE
             },
 
@@ -471,6 +522,15 @@ impl Op {
                 allocs: AllocKind::Unknown,
             },
             LoadModuleVar {
+                kind: ModuleVarKind::External | ModuleVarKind::SendableExternal,
+                ..
+            } => Effects {
+                reads: MemClasses::MODULE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            LoadModuleVar {
                 kind: ModuleVarKind::SendableClass,
                 ..
             } => reads(MemClasses::MODULE.union(MemClasses::LEX_ENV)),
@@ -478,6 +538,8 @@ impl Op {
             StoreModuleVar { .. } => writes(MemClasses::MODULE),
             GetModuleNamespace { .. } => Effects {
                 reads: MemClasses::MODULE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
@@ -507,12 +569,25 @@ impl Op {
             },
 
             // Private properties (`R2-M2`).
-            LoadPrivate { .. } | TestPrivate { .. } => Effects {
+            LoadPrivate { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::LEX_ENV,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            TestPrivate { .. } => Effects {
                 reads: MemClasses::HEAP | MemClasses::LEX_ENV,
                 may_throw: true,
                 ..Effects::PURE
             },
-            StorePrivate { .. } | DefinePrivate { .. } => Effects {
+            StorePrivate { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::LEX_ENV,
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            DefinePrivate { .. } => Effects {
                 reads: MemClasses::HEAP | MemClasses::LEX_ENV,
                 writes: MemClasses::HEAP,
                 may_throw: true,
@@ -542,9 +617,11 @@ impl Op {
             // Generator / async suspension: while suspended (`SuspendGenerator`,
             // `Await`, `AwaitUncaught`), arbitrary host/caller JS may run before
             // resumption (`may_call: UnknownCallee` acts as the memory clobber
-            // barrier for analyses; `ResumeGenerator` reads the saved resume
-            // value from the generator object in `ecmascript`).
-            SuspendGenerator { .. } | ResumeGenerator { .. } => Effects {
+            // barrier for analyses; coroutine ops read/write `ITERATOR` state).
+            SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | Await { .. }
+            | AwaitUncaught { .. } => Effects {
                 reads: MemClasses::ITERATOR,
                 writes: MemClasses::ITERATOR,
                 may_throw: true,
@@ -552,22 +629,19 @@ impl Op {
                 ..Effects::PURE
             },
             GetResumeMode { .. } => reads(MemClasses::ITERATOR),
-            SetGeneratorState { .. } => writes(MemClasses::HEAP),
+            SetGeneratorState { .. } => writes(MemClasses::ITERATOR),
             LoadSymbol => reads(MemClasses::GLOBAL),
             NotifyConcurrentResult { .. } => writes(MemClasses::GLOBAL),
-            Await { .. } | AwaitUncaught { .. } => Effects {
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee,
-                ..Effects::PURE
-            },
             AsyncGeneratorResolve { .. } => Effects {
-                reads: MemClasses::HEAP | MemClasses::GLOBAL,
-                writes: MemClasses::HEAP | MemClasses::GLOBAL,
+                reads: MemClasses::ITERATOR | MemClasses::HEAP | MemClasses::GLOBAL,
+                writes: MemClasses::ITERATOR | MemClasses::HEAP | MemClasses::GLOBAL,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
             AsyncResolve { .. } | AsyncReject { .. } | AsyncGeneratorReject { .. } => Effects {
+                reads: MemClasses::ITERATOR,
+                writes: MemClasses::ITERATOR,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
@@ -578,7 +652,8 @@ impl Op {
     /// [`Effects::PURE`] on `UnaryOp`, `BinaryOp`, and non-brand `Compare`
     /// whenever operand types or constant definitions in `module` rule out
     /// object coercion (`valueOf`/`toString`/`@@toPrimitive`) and runtime
-    /// exceptions (such as `Symbol` numeric coercion or `BigInt` division by zero).
+    /// exceptions (such as `Symbol` numeric coercion, `N36` static integer
+    /// division by zero, or signed `MIN / -1` overflow).
     #[must_use]
     pub fn effects_in(&self, module: &Module) -> Effects {
         match self {
@@ -632,7 +707,7 @@ impl Op {
                             Effects::PURE
                         } else if is_static_int(l) && is_static_int(r) {
                             if matches!(op, BinOp::Div | BinOp::Mod)
-                                && !is_nonzero_const(module, *right)
+                                && !is_safe_static_int_div_mod(module, *left, *right, l, r)
                             {
                                 self.effects()
                             } else {
@@ -673,7 +748,7 @@ mod tests {
     use super::*;
     use crate::function::Value;
     use crate::id::{BlockId, ConstId, ValueId};
-    use crate::op::CallKind;
+    use crate::op::{CallKind, OwnStoreKind};
 
     #[test]
     fn effects_spot_table_and_refinement() {
@@ -716,11 +791,15 @@ mod tests {
             Effects::PURE
         );
 
-        // AsyncFunctionEnter allocates Object, removable when unused.
+        // AsyncFunctionEnter allocates Object; CreateAsyncGenerator allocates GeneratorObj.
         let afe = Op::AsyncFunctionEnter.effects();
         assert_eq!(afe.allocs, AllocKind::Object);
         assert!(!afe.is_pure());
         assert!(afe.is_removable_if_unused());
+        assert_eq!(
+            Op::CreateAsyncGenerator { func: v }.effects().allocs,
+            AllocKind::GeneratorObj
+        );
 
         // StoreGlobal & TryStoreGlobal both read/write GLOBAL, may_throw, may_call.
         for op in [
@@ -780,6 +859,193 @@ mod tests {
     }
 
     #[test]
+    fn static_int_div_mod_n36_divisor_and_min_overflow_soundness() {
+        let mut m = Module::new();
+        let mk_const_i32 = |m: &mut Module, n: i32| -> ValueId {
+            let cid = m.consts.push(Const::Int32(n as u32));
+            let vid = ValueId::new(m.values.len() as u32);
+            m.values.push(Value {
+                def: ValueDef::Const(cid),
+                ty: Ty::Static(StaticTy::I32),
+            });
+            vid
+        };
+        let v_zero = mk_const_i32(&mut m, 0);
+        let v_ten = mk_const_i32(&mut m, 10);
+        let v_five = mk_const_i32(&mut m, 5);
+        let v_neg1 = mk_const_i32(&mut m, -1);
+        let v_min = mk_const_i32(&mut m, i32::MIN);
+        let v_unk = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(0),
+            ty: Ty::Static(StaticTy::I32),
+        });
+
+        // Under N36 (`right OP left`), `left` is the divisor and `right` is the dividend!
+        // `10 / 0`: `left = 0, right = 10` MUST report `may_throw: true`!
+        for op in [BinOp::Div, BinOp::Mod] {
+            assert!(
+                Op::BinaryOp {
+                    op,
+                    left: v_zero,
+                    right: v_ten,
+                }
+                .effects_in(&m)
+                .may_throw,
+                "10 {op:?} 0 must never be marked PURE"
+            );
+            assert!(
+                Op::BinaryOp {
+                    op,
+                    left: v_neg1,
+                    right: v_min,
+                }
+                .effects_in(&m)
+                .may_throw,
+                "i32::MIN {op:?} -1 must report may_throw"
+            );
+            assert!(
+                Op::BinaryOp {
+                    op,
+                    left: v_neg1,
+                    right: v_unk,
+                }
+                .effects_in(&m)
+                .may_throw,
+                "unknown {op:?} -1 must report may_throw"
+            );
+            assert!(
+                Op::BinaryOp {
+                    op,
+                    left: v_five,
+                    right: v_unk,
+                }
+                .effects_in(&m)
+                .is_pure(),
+                "unknown {op:?} 5 must refine to PURE"
+            );
+            assert!(
+                Op::BinaryOp {
+                    op,
+                    left: v_neg1,
+                    right: v_ten,
+                }
+                .effects_in(&m)
+                .is_pure(),
+                "10 {op:?} -1 must refine to PURE"
+            );
+        }
+    }
+
+    #[test]
+    fn module_coroutine_and_proxy_private_effects_are_complete() {
+        let v = ValueId::new(0);
+        let name = Sym::new(0);
+
+        for op in [
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::SendableExternal,
+            },
+            Op::GetModuleNamespace { index: 0 },
+        ] {
+            let e = op.effects();
+            assert!(e.may_throw, "{op:?} must may_throw");
+            assert_eq!(e.may_call, CallEffect::UnknownCallee, "{op:?}");
+            assert!(!e.is_removable_if_unused(), "{op:?}");
+        }
+
+        // Proxy / private getter-setter call effects.
+        for op in [
+            Op::LoadPrivate {
+                level: 0,
+                slot: 0,
+                obj: v,
+            },
+            Op::StorePrivate {
+                level: 0,
+                slot: 0,
+                obj: v,
+                value: v,
+            },
+            Op::StoreOwnPropName {
+                object: v,
+                name,
+                value: v,
+                kind: OwnStoreKind::OwnProp,
+            },
+            Op::StoreOwnPropIdx {
+                object: v,
+                index: v,
+                value: v,
+                kind: OwnStoreKind::OwnProp,
+            },
+            Op::StoreOwnPropDyn {
+                object: v,
+                key: v,
+                value: v,
+                kind: OwnStoreKind::OwnProp,
+            },
+            Op::NextPropName { iterator: v },
+        ] {
+            assert_eq!(op.effects().may_call, CallEffect::UnknownCallee, "{op:?}");
+        }
+
+        // Coroutine ITERATOR state coverage.
+        assert!(
+            Op::SetGeneratorState {
+                genobj: v,
+                state: 1
+            }
+            .effects()
+            .writes
+            .contains(MemClasses::ITERATOR)
+        );
+        for op in [
+            Op::SuspendGenerator {
+                genobj: v,
+                value: v,
+            },
+            Op::ResumeGenerator { genobj: v },
+            Op::AwaitUncaught {
+                funcobj: v,
+                value: v,
+            },
+            Op::AsyncResolve {
+                funcobj: v,
+                value: v,
+            },
+            Op::AsyncReject {
+                funcobj: v,
+                value: v,
+            },
+            Op::AsyncGeneratorResolve {
+                genobj: v,
+                value: v,
+                done: v,
+            },
+            Op::AsyncGeneratorReject {
+                genobj: v,
+                value: v,
+            },
+        ] {
+            let e = op.effects();
+            assert!(e.reads.contains(MemClasses::ITERATOR), "{op:?}");
+            assert!(e.writes.contains(MemClasses::ITERATOR), "{op:?}");
+        }
+        assert!(
+            Op::GetResumeMode { genobj: v }
+                .effects()
+                .reads
+                .contains(MemClasses::ITERATOR)
+        );
+    }
+
+    #[test]
     fn effects_cover_observable_loads() {
         let v = ValueId::new(0);
         let name = Sym::new(0);
@@ -808,9 +1074,6 @@ mod tests {
                 pattern: name,
                 flags: 0,
             },
-            // `ldglobalvar` (`default: None`) throws ReferenceError on missing binding
-            // and calls getters; `tryldglobalbyname` (`default: Some`) tolerates
-            // absence (`undefined`) yet still calls prototype getters (`N48`/`N50`).
             Op::TryGetGlobal {
                 name,
                 default: None,
@@ -827,6 +1090,11 @@ mod tests {
                 index: 0,
                 kind: ModuleVarKind::Lazy,
             },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+            Op::GetModuleNamespace { index: 0 },
         ];
         for op in cases {
             assert!(

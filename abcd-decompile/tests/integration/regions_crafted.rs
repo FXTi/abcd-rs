@@ -7,7 +7,7 @@
 //! test asserts the exact tree shape / escape-hatch / error record.
 
 use crate::common;
-use abcd_analysis::control::{
+use abcd_decompile::structure::regions::{
     EscapeHatch, LoopKind, RegionError, RegionNode, RegionTree, structure_regions,
 };
 use abcd_ir::{BlockId, FuncId, Module, Op};
@@ -33,6 +33,12 @@ fn branch(m: &mut Module, b: BlockId, to: BlockId) {
 
 fn ret(m: &mut Module, b: BlockId) {
     emit_void(m, b, Op::Return { value: None });
+}
+
+fn add_external_func(m: &mut Module, name: &str) -> FuncId {
+    let f = add_func_named(m, name);
+    m.functions[f.index()].blocks.clear();
+    f
 }
 
 /// Depth-first collection of the tree's Block leaves.

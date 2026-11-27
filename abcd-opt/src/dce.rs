@@ -1,8 +1,9 @@
 //! Aggressive Dead Code Elimination (ADCE) + CFG simplification (`design/ir.md`).
 //!
 //! ADCE: mark essential roots (side-effecting instructions + terminators),
-//! propagate liveness backward along use-def chains, sweep dead
-//! instructions and unused `frame_init_consts`.
+//! propagate liveness backward along use-def chains, sweep dead instructions,
+//! unused `frame_init_consts`, and stale `DebugData` instruction references
+//! (`line_table`, `column_table`, `local_names` scope extents).
 //!
 //! ## Essentiality is DERIVED, not listed (`N48`/`N50`, `design/decisions.md`)
 //!
@@ -12,17 +13,12 @@
 //! `ReferenceError` / `TypeError` even when their result is dead. Rather than
 //! maintaining a separate list in the optimizer, that runtime evidence lives in
 //! ONE place — the `T3` effects model ([`abcd_ir::Op::effects_in`] and
-//! [`abcd_ir::Effects::is_removable_if_unused`], `design/ir.md`): untyped
-//! dynamic compute ops conservatively model `ToNumeric`/`ToPrimitive` coercion,
-//! while operands proven primitive via `Value::ty` or `ConstPool` refine back
-//! to `Effects::PURE`. Pure reads (lexical/module loads that cannot throw or
-//! call), proven coercion-free compute ops, and pure allocations remain
-//! dead-deletable.
+//! [`abcd_ir::Effects::is_removable_if_unused`], `design/ir.md`).
 //!
-//! CFG simplify: merge single-pred/single-succ block pairs, eliminate
-//! empty jump-only blocks, remove unreachable blocks — all
-//! exception-neutral (`N11`: reachability and predecessor rebuilds use the
-//! AUGMENTED successor relation; merges/eliminations refuse to disturb
+//! CFG simplify: merge single-pred/single-succ block pairs, eliminate empty
+//! jump-only blocks, remove unreachable blocks — all exception-neutral (`N11`:
+//! reachability and predecessor rebuilds use [`abcd_ir::ExceptionHandlerMap`] +
+//! [`abcd_ir::normal_succs_inline`]; merges/eliminations refuse to disturb
 //! try-region semantics or handler-phi edge values).
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -33,7 +29,7 @@ use abcd_ir::{
 };
 
 use crate::FuncPass;
-use crate::analysis::replace_uses_map_in_func;
+use crate::const_eval::{block_phis, prune_func_debug_data, replace_uses_map_in_func};
 
 // ─── ADCE ────────────────────────────────────────────────────────────────────
 
@@ -72,9 +68,7 @@ impl FuncPass for Adce {
             }
         }
 
-        // Build Value → defining Inst map (only instruction-defined
-        // values have a defining instruction to keep alive; params,
-        // const-defined values, and exception params have none).
+        // Build Value → defining Inst map.
         let mut def_inst: HashMap<ValueId, InstId> = HashMap::new();
         for &(_bb, inst_id) in &all_insts {
             let Some(inst) = module.inst(inst_id) else {
@@ -139,17 +133,15 @@ impl FuncPass for Adce {
             }
         }
 
+        // Sweep dead or foreign InstIds from DebugData (`DebugInstNotInFunc`).
+        changed |= prune_func_debug_data(module, func);
+
         changed
     }
 }
 
 /// An instruction is essential if it is a terminator or its context-refined
 /// effects forbid dead-result removal (`R2-D2`, `N48`/`N50`, `design/ir.md`).
-///
-/// [`Op::effects_in`] refines `UnaryOp`/`BinaryOp`/`Compare` to
-/// [`abcd_ir::Effects::PURE`] when operand types or constants prove
-/// coercion-free, non-throwing execution, while keeping untyped coercing ops,
-/// global stores, and observable loads alive.
 fn is_essential(module: &Module, op: &Op) -> bool {
     op.is_terminator() || !op.effects_in(module).is_removable_if_unused()
 }
@@ -166,22 +158,11 @@ impl FuncPass for CfgSimplify {
         changed |= merge_single_succ_pred(module, func);
         changed |= eliminate_empty_jumps(module, func);
         changed |= remove_unreachable_blocks(module, func);
+        if changed {
+            let _ = prune_func_debug_data(module, func);
+        }
         changed
     }
-}
-
-/// The phi instructions of a block (the leading phi prefix).
-fn block_phis(module: &Module, bb: BlockId) -> Vec<InstId> {
-    module
-        .block(bb)
-        .map(|b| {
-            b.insts
-                .iter()
-                .copied()
-                .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Contract all maximal mergeable single-pred/single-succ block chains
@@ -232,8 +213,7 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
         return false;
     };
 
-    // Pre-index handler leading phis and their per-pred incoming values once
-    // (`O(∑ |handler_phi_entries|)`).
+    // Pre-index handler leading phis and their per-pred incoming values once.
     let mut handler_phis: HashMap<BlockId, Vec<InstId>> = HashMap::new();
     let mut handler_phi_vals: HashMap<(InstId, BlockId), ValueId> = HashMap::new();
     for (idx, &bb) in blocks.iter().enumerate() {
@@ -283,7 +263,6 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
         if succ_block.preds.len() != 1 || succ_block.preds[0].from != bb {
             continue;
         }
-        // Handler-phi incoming values must agree on `bb` and `succ`.
         if !regions_of[ui].is_empty() {
             let phis_agree = exc_map.handlers_of_index(ui).iter().all(|h| {
                 handler_phis.get(h).is_none_or(|phis| {
@@ -296,7 +275,6 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
                 continue;
             }
         }
-        // Single-pred phis on `succ` must have exactly 1 entry keyed by `bb`.
         let succ_phis = block_phis(module, succ);
         let phi_inputs_match = succ_phis.iter().all(|&phi_id| {
             matches!(
@@ -332,7 +310,6 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
             }
         }
     }
-    // Handle any detached unreachable pure cycles (`A -> B -> A`).
     for start in 0..n {
         if merge_next[start].is_some() && !visited[start] {
             visited[start] = true;
@@ -385,9 +362,6 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
         replace_uses_map_in_func(module, func, &phi_subst);
     }
 
-    // Splice each chain once (`head` pops its branch; intermediate blocks drop
-    // leading phis and trailing branch; `tail` drops leading phis and keeps its
-    // terminator).
     for &(head_idx, ref absorbed) in &chains {
         let head_bb = blocks[head_idx];
         let last_abs_pos = absorbed.len() - 1;
@@ -432,8 +406,7 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
             })
             .unwrap_or_default();
         for s in succs {
-            let phi_ids = block_phis(module, s);
-            for phi_id in phi_ids {
+            for phi_id in block_phis(module, s) {
                 if let Some(inst) = module.inst_mut(phi_id)
                     && let Op::Phi { entries } = &mut inst.op
                 {
@@ -447,8 +420,6 @@ fn contract_chains_once(module: &mut Module, func: FuncId) -> bool {
         }
     }
 
-    // Rewrite any terminators targeting absorbed blocks, compact `func.blocks`
-    // and `try_regions`, and rebuild `preds` once.
     for (idx, &bb) in blocks.iter().enumerate() {
         if !is_absorbed[idx] {
             redirect_terminator_map(module, bb, &redirect_to_head);
@@ -484,10 +455,14 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
         .iter()
         .flat_map(|r| r.catches.iter().map(|c| c.handler))
         .collect();
-    let mut region_sets: Vec<HashSet<BlockId>> = func_data
+    let mut region_vecs: Vec<Vec<BlockId>> = func_data
         .try_regions
         .iter()
-        .map(|r| r.protected.iter().copied().collect())
+        .map(|r| r.protected.clone())
+        .collect();
+    let mut region_sets: Vec<HashSet<BlockId>> = region_vecs
+        .iter()
+        .map(|v| v.iter().copied().collect())
         .collect();
     let mut removed_jumps: HashSet<BlockId> = HashSet::new();
     let mut redirect_map: HashMap<BlockId, BlockId> = HashMap::new();
@@ -519,9 +494,6 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
 
         let preds: Vec<BlockId> = block.preds.iter().map(|e| e.from).collect();
 
-        // Exception-neutrality: neither `bb` nor `target` may be a catch
-        // handler, and every region protecting `bb` must already protect all of
-        // `bb`'s predecessors.
         if handler_set.contains(&bb) || handler_set.contains(&target) {
             continue;
         }
@@ -532,7 +504,6 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
             continue;
         }
 
-        // Converging-edge phi guard (V4).
         if elimination_loses_converging_phi_value(module, bb, target, &preds) {
             continue;
         }
@@ -561,8 +532,7 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
             target_block.preds.retain(|p| p.from != bb);
         }
 
-        let phi_ids = block_phis(module, target);
-        for phi_id in phi_ids {
+        for phi_id in block_phis(module, target) {
             let Some(inst) = module.inst_mut(phi_id) else {
                 continue;
             };
@@ -585,9 +555,14 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
             }
         }
 
-        for rset in &mut region_sets {
+        for (rvec, rset) in region_vecs.iter_mut().zip(region_sets.iter_mut()) {
             if rset.remove(&bb) {
-                rset.extend(preds.iter().copied());
+                rvec.retain(|&b| b != bb);
+                for &p in &preds {
+                    if rset.insert(p) {
+                        rvec.push(p);
+                    }
+                }
             }
         }
         removed_jumps.insert(bb);
@@ -598,8 +573,6 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
         return false;
     }
 
-    // Batch finalize: redirect any remaining unlisted terminators, compact
-    // `func.blocks` and `try_regions` once, and rebuild `preds` once (`R3-A1`).
     for &bb in &blocks {
         if !removed_jumps.contains(&bb) {
             redirect_terminator_map(module, bb, &redirect_map);
@@ -607,9 +580,9 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
     }
     if let Some(func_data) = module.func_mut(func) {
         func_data.blocks.retain(|b| !removed_jumps.contains(b));
-        for (region, rset) in func_data.try_regions.iter_mut().zip(region_sets) {
-            let mut protected: Vec<BlockId> = rset.into_iter().collect();
+        for (region, mut protected) in func_data.try_regions.iter_mut().zip(region_vecs) {
             protected.sort_by_key(|b| b.index());
+            protected.dedup();
             region.protected = protected;
         }
     }
@@ -624,33 +597,17 @@ fn redirect_terminator(
     old_target: BlockId,
     new_target: BlockId,
 ) {
-    let Some(b) = module.block(block) else {
+    let Some(&last) = module.block(block).and_then(|b| b.insts.last()) else {
         return;
     };
-    let Some(&last) = b.insts.last() else {
-        return;
-    };
-    if let Some(inst) = module.inst_mut(last) {
-        match &mut inst.op {
-            Op::Branch { dest } => {
-                if *dest == old_target {
-                    *dest = new_target;
-                }
+    if let Some(inst) = module.inst_mut(last)
+        && inst.op.is_terminator()
+    {
+        inst.op.for_each_block_id_mut(|dest| {
+            if *dest == old_target {
+                *dest = new_target;
             }
-            Op::CondBranch {
-                true_dest,
-                false_dest,
-                ..
-            } => {
-                if *true_dest == old_target {
-                    *true_dest = new_target;
-                }
-                if *false_dest == old_target {
-                    *false_dest = new_target;
-                }
-            }
-            _ => {}
-        }
+        });
     }
 }
 
@@ -676,21 +633,12 @@ fn redirect_terminator_map(
     let Some(&last) = module.block(block).and_then(|b| b.insts.last()) else {
         return;
     };
-    if let Some(inst) = module.inst_mut(last) {
-        match &mut inst.op {
-            Op::Branch { dest } => {
-                *dest = resolve_block_redirect(redirects, *dest);
-            }
-            Op::CondBranch {
-                true_dest,
-                false_dest,
-                ..
-            } => {
-                *true_dest = resolve_block_redirect(redirects, *true_dest);
-                *false_dest = resolve_block_redirect(redirects, *false_dest);
-            }
-            _ => {}
-        }
+    if let Some(inst) = module.inst_mut(last)
+        && inst.op.is_terminator()
+    {
+        inst.op.for_each_block_id_mut(|dest| {
+            *dest = resolve_block_redirect(redirects, *dest);
+        });
     }
 }
 
@@ -707,9 +655,6 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
             b.preds.clear();
         }
     }
-    // Predecessors derive from the augmented successor relation (`R3-A1`):
-    // inline terminator edges (`Normal`) plus `ExceptionHandlerMap` (`Exceptional`),
-    // deduplicating in `O(1)` amortized time.
     let mut seen_preds: HashMap<BlockId, HashSet<Edge>> = HashMap::new();
     for (bi, &block) in blocks.iter().enumerate() {
         let (targets, count) = module
@@ -797,14 +742,7 @@ fn push_pred_unique(
     }
 }
 
-/// Would eliminating the jump-only block `bb` (predecessors `preds`,
-/// branch target `target`) drop a phi value? For every predecessor that
-/// ALSO has a direct edge to `target` (i.e. is already one of target's
-/// preds), threading bb's edge onto `target` merges two converging
-/// edges into one per-pred phi entry. The merge is value-preserving
-/// only when every phi in `target` carries the SAME incoming value for
-/// the bb-mediated path (entry keyed `bb`) as for the direct path
-/// (entry keyed `pred`); any difference means one value would be lost.
+/// Converging-edge phi value guard (`V4`).
 fn elimination_loses_converging_phi_value(
     module: &Module,
     bb: BlockId,
@@ -855,7 +793,6 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
         return false;
     };
 
-    // BFS from entry over terminator successors + exception edges.
     let mut reachable: HashSet<BlockId> = HashSet::with_capacity(blocks.len());
     let mut queue = VecDeque::new();
     reachable.insert(entry);
@@ -880,12 +817,7 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
         }
     }
 
-    let unreachable: HashSet<BlockId> = blocks
-        .iter()
-        .copied()
-        .filter(|b| !reachable.contains(b))
-        .collect();
-    if unreachable.is_empty() {
+    if blocks.iter().all(|b| reachable.contains(b)) {
         return false;
     }
 

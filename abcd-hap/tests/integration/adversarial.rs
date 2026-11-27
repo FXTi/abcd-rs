@@ -2,8 +2,10 @@
 //! sizes, and a deterministic no-panic fuzz sweep. The iron rule is that no
 //! input byte pattern may panic the parser.
 
+use std::sync::Arc;
+
 use crate::common;
-use abcd_hap::{Error, ZipArchive};
+use abcd_hap::{EntryData, Error, ManifestSummary, ZipArchive, parse_manifest_summary};
 use common::*;
 
 fn two_entry_zip() -> Built {
@@ -178,10 +180,17 @@ fn eocd_comment_does_not_confuse_the_scan() {
 /// Read every entry; must never panic, whatever `open` accepted.
 fn read_all(archive: &ZipArchive<'_>, input: &[u8]) {
     for meta in archive.entries().cloned().collect::<Vec<_>>() {
-        let _ = archive.read_entry(&meta);
+        if let Ok(data) = archive.read_entry(&meta) {
+            let _ = parse_manifest_summary(data.as_slice());
+        }
         let _ = archive.entry_compression(&meta);
     }
-    let _ = abcd_hap::abc_modules(input);
+    if let Ok(modules) = abcd_hap::abc_modules(input) {
+        for m in &modules {
+            let _ = m.manifest_summary();
+        }
+    }
+    let _ = parse_manifest_summary(input);
 }
 
 #[test]
@@ -309,11 +318,43 @@ fn eocd_candidate_flood_is_capped_and_survives_256kib_stack() {
             .copy_from_slice(&(remaining_after as u16).to_le_bytes());
     }
 
-    // Build a nested .app bundle as well to exercise iterative container unpacking
-    // under the Engineering Invariant #1 256 KiB stack budget.
-    let inner_hap = build_zip(&[
-        ZipEntry::stored("module.json", br#"{"module":{"name":"entry"}}"#),
-        ZipEntry::stored("ets/modules.abc", b"PANDA\x00abc"),
+    // Build a nested .app bundle (including duplicate CD names, multi-.abc
+    // shared manifest, and 10,000-deep JSON nesting) to exercise iterative
+    // container unpacking + iterative manifest parsing under the Engineering
+    // Invariant #1 256 KiB stack budget.
+    let depth = 10_000usize;
+    let mut deep_manifest = String::with_capacity(depth * 8 + 128);
+    deep_manifest.push_str(r#"{"deep":"#);
+    for i in 0..depth {
+        if i % 2 == 0 {
+            deep_manifest.push('[');
+        } else {
+            deep_manifest.push_str(r#"{"k":"#);
+        }
+    }
+    deep_manifest.push_str("42");
+    for i in (0..depth).rev() {
+        if i % 2 == 0 {
+            deep_manifest.push(']');
+        } else {
+            deep_manifest.push('}');
+        }
+    }
+    deep_manifest.push_str(r#","module":{"name":"deep_entry","type":"entry"}}"#);
+    let truncated_deep = deep_manifest.as_bytes()[..deep_manifest.len() - 16].to_vec();
+
+    let inner_hap_1 = build_zip(&[
+        ZipEntry::stored("module.json", deep_manifest.as_bytes()),
+        ZipEntry::stored("ets/modules.abc", b"PANDA\x00abc1"),
+        ZipEntry::stored("ets/SecondAbility.abc", b"PANDA\x00abc2"),
+    ])
+    .bytes;
+    let inner_hap_2 = build_zip(&[
+        ZipEntry::stored(
+            "config.json",
+            br#"{"module":{"name":".Pkg","distro":{"moduleName":"dup_fa","moduleType":"feature"}}}"#,
+        ),
+        ZipEntry::stored("assets/js/default/app.abc", b"PANDA\x00abc3"),
     ])
     .bytes;
     let res_hsp = build_zip(&[ZipEntry::stored(
@@ -323,7 +364,8 @@ fn eocd_candidate_flood_is_capped_and_survives_256kib_stack() {
     .bytes;
     let app = build_zip(&[
         ZipEntry::deflated("res.hsp", &res_hsp),
-        ZipEntry::deflated("entry.hap", &inner_hap),
+        ZipEntry::deflated("dup.hap", &inner_hap_1),
+        ZipEntry::deflated("dup.hap", &inner_hap_2),
     ])
     .bytes;
 
@@ -335,9 +377,37 @@ fn eocd_candidate_flood_is_capped_and_survives_256kib_stack() {
                 ZipArchive::open(&flood),
                 Err(Error::BadCentralDirectory(_))
             ));
+            assert_eq!(parse_manifest_summary(&truncated_deep), None);
+
             let modules = abcd_hap::abc_modules(&app).expect("iterative app unpack");
-            assert_eq!(modules.len(), 1);
-            assert_eq!(modules[0].container_path, ["entry.hap".to_string()]);
+            assert_eq!(modules.len(), 3);
+            assert_eq!(modules[0].container_path, ["dup.hap".to_string()]);
+            assert_eq!(modules[1].container_path, ["dup.hap".to_string()]);
+            assert_eq!(modules[2].container_path, ["dup.hap".to_string()]);
+
+            let (Some(EntryData::Owned(m0)), Some(EntryData::Owned(m1))) =
+                (&modules[0].module_json, &modules[1].module_json)
+            else {
+                panic!("expected shared Arc module.json");
+            };
+            assert!(Arc::ptr_eq(m0, m1));
+
+            assert_eq!(
+                modules[0].manifest_summary(),
+                Some(ManifestSummary {
+                    module_name: Some("deep_entry".to_string()),
+                    module_type: Some("entry".to_string()),
+                    is_stage_model: true,
+                })
+            );
+            assert_eq!(
+                modules[2].manifest_summary(),
+                Some(ManifestSummary {
+                    module_name: Some("dup_fa".to_string()),
+                    module_type: Some("feature".to_string()),
+                    is_stage_model: false,
+                })
+            );
         })
         .expect("spawn 256 KiB thread");
     handle.join().expect("256 KiB stack thread panicked");

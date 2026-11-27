@@ -34,7 +34,6 @@ pub enum NodeStatus {
 }
 
 /// A literal, rendered from [`abcd_ir::Const`] trees.
-#[derive(Debug)]
 pub enum Lit {
     /// `undefined`.
     Undefined,
@@ -72,7 +71,6 @@ pub enum Lit {
 }
 
 /// An expression-tree node.
-#[derive(Debug)]
 pub enum Expr {
     /// A literal.
     Lit(Lit),
@@ -462,7 +460,6 @@ pub enum Expr {
 }
 
 /// One entry of a Stage-B folded object literal ([`Expr::ObjectBuild`]).
-#[derive(Clone, Debug, PartialEq)]
 pub enum ObjEntry {
     /// `key: value` with a literal key (identifier/string/number form
     /// chosen by the emitter).
@@ -487,7 +484,6 @@ pub enum ObjEntry {
 }
 
 /// An object-literal key: a source name or a computed expression.
-#[derive(Clone, Debug, PartialEq)]
 pub enum ObjKey {
     /// A plain name (`get name() {}`).
     Name(String),
@@ -496,7 +492,6 @@ pub enum ObjKey {
 }
 
 /// One element of a Stage-B folded array literal ([`Expr::ArrayBuild`]).
-#[derive(Clone, Debug, PartialEq)]
 pub enum ArrayElem {
     /// A plain element.
     Item(Expr),
@@ -774,6 +769,37 @@ impl PartialEq for Lit {
     }
 }
 
+fn drain_obj_key_children(key: &mut ObjKey, stack: &mut Vec<Expr>) {
+    if let ObjKey::Computed(ke) = key {
+        stack.push(std::mem::replace(ke.as_mut(), Expr::SuperMarker));
+    }
+}
+
+fn drain_obj_entry_children(entry: &mut ObjEntry, stack: &mut Vec<Expr>) {
+    match entry {
+        ObjEntry::KeyValue(_, v)
+        | ObjEntry::Spread(v)
+        | ObjEntry::Proto(v)
+        | ObjEntry::Method(_, v) => stack.push(std::mem::replace(v, Expr::SuperMarker)),
+        ObjEntry::Computed(k, v) => {
+            stack.push(std::mem::replace(k, Expr::SuperMarker));
+            stack.push(std::mem::replace(v, Expr::SuperMarker));
+        }
+        ObjEntry::Getter(k, v) | ObjEntry::Setter(k, v) => {
+            drain_obj_key_children(k, stack);
+            stack.push(std::mem::replace(v, Expr::SuperMarker));
+        }
+    }
+}
+
+fn drain_array_elem_children(elem: &mut ArrayElem, stack: &mut Vec<Expr>) {
+    match elem {
+        ArrayElem::Item(e) | ArrayElem::Spread(e) => {
+            stack.push(std::mem::replace(e, Expr::SuperMarker));
+        }
+    }
+}
+
 fn drain_expr_children(expr: &mut Expr, stack: &mut Vec<Expr>) {
     let take_box = |b: &mut Box<Expr>| std::mem::replace(b.as_mut(), Expr::SuperMarker);
     match expr {
@@ -870,30 +896,13 @@ fn drain_expr_children(expr: &mut Expr, stack: &mut Vec<Expr>) {
             stack.push(take_box(setter));
         }
         Expr::ObjectBuild { entries } if !entries.is_empty() => {
-            for entry in std::mem::take(entries) {
-                match entry {
-                    ObjEntry::KeyValue(_, v)
-                    | ObjEntry::Spread(v)
-                    | ObjEntry::Proto(v)
-                    | ObjEntry::Method(_, v) => stack.push(v),
-                    ObjEntry::Computed(k, v) => {
-                        stack.push(k);
-                        stack.push(v);
-                    }
-                    ObjEntry::Getter(k, v) | ObjEntry::Setter(k, v) => {
-                        if let ObjKey::Computed(mut ke) = k {
-                            stack.push(take_box(&mut ke));
-                        }
-                        stack.push(v);
-                    }
-                }
+            for mut entry in std::mem::take(entries) {
+                drain_obj_entry_children(&mut entry, stack);
             }
         }
         Expr::ArrayBuild { elements } if !elements.is_empty() => {
-            for elem in std::mem::take(elements) {
-                match elem {
-                    ArrayElem::Item(e) | ArrayElem::Spread(e) => stack.push(e),
-                }
+            for mut elem in std::mem::take(elements) {
+                drain_array_elem_children(&mut elem, stack);
             }
         }
         Expr::Fallback { operands, .. } if !operands.is_empty() => {
@@ -1988,5 +1997,625 @@ impl PartialEq for Expr {
             }
         }
         true
+    }
+}
+
+impl Eq for Lit {}
+impl Eq for Expr {}
+
+impl Drop for ObjKey {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        drain_obj_key_children(self, &mut stack);
+        while let Some(mut cur) = stack.pop() {
+            drain_expr_children(&mut cur, &mut stack);
+        }
+    }
+}
+
+impl Drop for ObjEntry {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        drain_obj_entry_children(self, &mut stack);
+        while let Some(mut cur) = stack.pop() {
+            drain_expr_children(&mut cur, &mut stack);
+        }
+    }
+}
+
+impl Drop for ArrayElem {
+    fn drop(&mut self) {
+        let mut stack: Vec<Expr> = Vec::new();
+        drain_array_elem_children(self, &mut stack);
+        while let Some(mut cur) = stack.pop() {
+            drain_expr_children(&mut cur, &mut stack);
+        }
+    }
+}
+
+impl Clone for ObjKey {
+    fn clone(&self) -> Self {
+        match self {
+            ObjKey::Name(n) => ObjKey::Name(n.clone()),
+            ObjKey::Computed(e) => ObjKey::Computed(Box::new((**e).clone())),
+        }
+    }
+}
+
+impl Clone for ObjEntry {
+    fn clone(&self) -> Self {
+        match self {
+            ObjEntry::KeyValue(k, v) => ObjEntry::KeyValue(k.clone(), v.clone()),
+            ObjEntry::Computed(k, v) => ObjEntry::Computed(k.clone(), v.clone()),
+            ObjEntry::Spread(v) => ObjEntry::Spread(v.clone()),
+            ObjEntry::Proto(v) => ObjEntry::Proto(v.clone()),
+            ObjEntry::Method(n, v) => ObjEntry::Method(n.clone(), v.clone()),
+            ObjEntry::Getter(k, v) => ObjEntry::Getter(k.clone(), v.clone()),
+            ObjEntry::Setter(k, v) => ObjEntry::Setter(k.clone(), v.clone()),
+        }
+    }
+}
+
+impl Clone for ArrayElem {
+    fn clone(&self) -> Self {
+        match self {
+            ArrayElem::Item(e) => ArrayElem::Item(e.clone()),
+            ArrayElem::Spread(e) => ArrayElem::Spread(e.clone()),
+        }
+    }
+}
+
+impl PartialEq for ObjKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ObjKey::Name(a), ObjKey::Name(b)) => a == b,
+            (ObjKey::Computed(a), ObjKey::Computed(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ObjKey {}
+
+impl PartialEq for ObjEntry {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ObjEntry::KeyValue(ka, va), ObjEntry::KeyValue(kb, vb)) => ka == kb && va == vb,
+            (ObjEntry::Computed(ka, va), ObjEntry::Computed(kb, vb)) => ka == kb && va == vb,
+            (ObjEntry::Spread(a), ObjEntry::Spread(b))
+            | (ObjEntry::Proto(a), ObjEntry::Proto(b)) => a == b,
+            (ObjEntry::Method(na, va), ObjEntry::Method(nb, vb)) => na == nb && va == vb,
+            (ObjEntry::Getter(ka, va), ObjEntry::Getter(kb, vb))
+            | (ObjEntry::Setter(ka, va), ObjEntry::Setter(kb, vb)) => ka == kb && va == vb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ObjEntry {}
+
+impl PartialEq for ArrayElem {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ArrayElem::Item(a), ArrayElem::Item(b))
+            | (ArrayElem::Spread(a), ArrayElem::Spread(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ArrayElem {}
+
+enum LitDebugTask<'a> {
+    Lit(&'a Lit),
+    Raw(&'static str),
+}
+
+fn fmt_lit_debug_iter(root: &Lit, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mut stack = vec![LitDebugTask::Lit(root)];
+    while let Some(task) = stack.pop() {
+        match task {
+            LitDebugTask::Raw(s) => f.write_str(s)?,
+            LitDebugTask::Lit(lit) => match lit {
+                Lit::Undefined => f.write_str("Undefined")?,
+                Lit::Hole => f.write_str("Hole")?,
+                Lit::Null => f.write_str("Null")?,
+                Lit::Bool(b) => write!(f, "Bool({b:?})")?,
+                Lit::Number(n) => write!(f, "Number({n:?})")?,
+                Lit::Int64(n) => write!(f, "Int64({n:?})")?,
+                Lit::UInt64(n) => write!(f, "UInt64({n:?})")?,
+                Lit::String(s) => write!(f, "String({s:?})")?,
+                Lit::Utf16(u) => write!(f, "Utf16({u:?})")?,
+                Lit::BigInt(s) => write!(f, "BigInt({s:?})")?,
+                Lit::MethodRef(id) => write!(f, "MethodRef({id:?})")?,
+                Lit::Array(items) => {
+                    f.write_str("Array([")?;
+                    stack.push(LitDebugTask::Raw("])"));
+                    for (idx, it) in items.iter().enumerate().rev() {
+                        stack.push(LitDebugTask::Lit(it));
+                        if idx > 0 {
+                            stack.push(LitDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Lit::Object(entries) => {
+                    f.write_str("Object([")?;
+                    stack.push(LitDebugTask::Raw("])"));
+                    for (idx, (k, v)) in entries.iter().enumerate().rev() {
+                        stack.push(LitDebugTask::Raw(")"));
+                        stack.push(LitDebugTask::Lit(v));
+                        stack.push(LitDebugTask::Raw(", "));
+                        stack.push(LitDebugTask::Lit(k));
+                        stack.push(LitDebugTask::Raw("("));
+                        if idx > 0 {
+                            stack.push(LitDebugTask::Raw(", "));
+                        }
+                    }
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for Lit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_lit_debug_iter(self, f)
+    }
+}
+
+enum ExprDebugTask<'a> {
+    Expr(&'a Expr),
+    ObjEntry(&'a ObjEntry),
+    ObjKey(&'a ObjKey),
+    ArrayElem(&'a ArrayElem),
+    Lit(&'a Lit),
+    Raw(&'static str),
+    Owned(String),
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "iterative heap-workstack Debug formatter across all Expr/ObjEntry/ObjKey/ArrayElem variants"
+)]
+fn run_expr_debug_tasks(
+    mut stack: Vec<ExprDebugTask<'_>>,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    while let Some(task) = stack.pop() {
+        match task {
+            ExprDebugTask::Raw(s) => f.write_str(s)?,
+            ExprDebugTask::Owned(s) => f.write_str(&s)?,
+            ExprDebugTask::Lit(l) => fmt_lit_debug_iter(l, f)?,
+            ExprDebugTask::ObjKey(k) => match k {
+                ObjKey::Name(n) => write!(f, "Name({n:?})")?,
+                ObjKey::Computed(e) => {
+                    f.write_str("Computed(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(e));
+                }
+            },
+            ExprDebugTask::ObjEntry(entry) => match entry {
+                ObjEntry::KeyValue(k, v) => {
+                    f.write_str("KeyValue(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                    stack.push(ExprDebugTask::Raw(", "));
+                    stack.push(ExprDebugTask::Lit(k));
+                }
+                ObjEntry::Computed(k, v) => {
+                    f.write_str("Computed(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                    stack.push(ExprDebugTask::Raw(", "));
+                    stack.push(ExprDebugTask::Expr(k));
+                }
+                ObjEntry::Spread(v) => {
+                    f.write_str("Spread(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                }
+                ObjEntry::Proto(v) => {
+                    f.write_str("Proto(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                }
+                ObjEntry::Method(n, v) => {
+                    write!(f, "Method({n:?}, ")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                }
+                ObjEntry::Getter(k, v) => {
+                    f.write_str("Getter(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                    stack.push(ExprDebugTask::Raw(", "));
+                    stack.push(ExprDebugTask::ObjKey(k));
+                }
+                ObjEntry::Setter(k, v) => {
+                    f.write_str("Setter(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(v));
+                    stack.push(ExprDebugTask::Raw(", "));
+                    stack.push(ExprDebugTask::ObjKey(k));
+                }
+            },
+            ExprDebugTask::ArrayElem(el) => match el {
+                ArrayElem::Item(e) => {
+                    f.write_str("Item(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(e));
+                }
+                ArrayElem::Spread(e) => {
+                    f.write_str("Spread(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Expr(e));
+                }
+            },
+            ExprDebugTask::Expr(expr) => match expr {
+                Expr::Lit(l) => {
+                    f.write_str("Lit(")?;
+                    stack.push(ExprDebugTask::Raw(")"));
+                    stack.push(ExprDebugTask::Lit(l));
+                }
+                Expr::Ident(s) => write!(f, "Ident({s:?})")?,
+                Expr::Temp { value, name } => {
+                    write!(f, "Temp {{ value: {value:?}, name: {name:?} }}")?;
+                }
+                Expr::PropName {
+                    object,
+                    name,
+                    dot_legal,
+                } => {
+                    f.write_str("PropName { object: ")?;
+                    stack.push(ExprDebugTask::Owned(format!(
+                        ", name: {name:?}, dot_legal: {dot_legal:?} }}"
+                    )));
+                    stack.push(ExprDebugTask::Expr(object));
+                }
+                Expr::PropIndex { object, index } => {
+                    f.write_str("PropIndex { object: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(index));
+                    stack.push(ExprDebugTask::Raw(", index: "));
+                    stack.push(ExprDebugTask::Expr(object));
+                }
+                Expr::PropDyn { object, key } => {
+                    f.write_str("PropDyn { object: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(key));
+                    stack.push(ExprDebugTask::Raw(", key: "));
+                    stack.push(ExprDebugTask::Expr(object));
+                }
+                Expr::PrivateLoad { object, name } => {
+                    f.write_str("PrivateLoad { object: ")?;
+                    stack.push(ExprDebugTask::Owned(format!(", name: {name:?} }}")));
+                    stack.push(ExprDebugTask::Expr(object));
+                }
+                Expr::PrivateTest { object, name } => {
+                    f.write_str("PrivateTest { object: ")?;
+                    stack.push(ExprDebugTask::Owned(format!(", name: {name:?} }}")));
+                    stack.push(ExprDebugTask::Expr(object));
+                }
+                Expr::SuperProp { name, key } => match key {
+                    Some(k) => {
+                        write!(f, "SuperProp {{ name: {name:?}, key: Some(")?;
+                        stack.push(ExprDebugTask::Raw(") }"));
+                        stack.push(ExprDebugTask::Expr(k));
+                    }
+                    None => write!(f, "SuperProp {{ name: {name:?}, key: None }}")?,
+                },
+                Expr::Call {
+                    callee,
+                    this,
+                    args,
+                    kind,
+                } => {
+                    f.write_str("Call { callee: ")?;
+                    stack.push(ExprDebugTask::Owned(format!("], kind: {kind:?} }}")));
+                    for (idx, a) in args.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Expr(a));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                    match this {
+                        Some(t) => {
+                            stack.push(ExprDebugTask::Raw("), args: ["));
+                            stack.push(ExprDebugTask::Expr(t));
+                            stack.push(ExprDebugTask::Raw(", this: Some("));
+                        }
+                        None => stack.push(ExprDebugTask::Raw(", this: None, args: [")),
+                    }
+                    stack.push(ExprDebugTask::Expr(callee));
+                }
+                Expr::SuperMarker => f.write_str("SuperMarker")?,
+                Expr::DynamicImport { specifier } => {
+                    f.write_str("DynamicImport { specifier: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(specifier));
+                }
+                Expr::Unary { op, operand } => {
+                    write!(f, "Unary {{ op: {op:?}, operand: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(operand));
+                }
+                Expr::Delete { target } => {
+                    f.write_str("Delete { target: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(target));
+                }
+                Expr::Binary { op, left, right } => {
+                    write!(f, "Binary {{ op: {op:?}, left: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(right));
+                    stack.push(ExprDebugTask::Raw(", right: "));
+                    stack.push(ExprDebugTask::Expr(left));
+                }
+                Expr::Compare { op, left, right } => {
+                    write!(f, "Compare {{ op: {op:?}, left: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(right));
+                    stack.push(ExprDebugTask::Raw(", right: "));
+                    stack.push(ExprDebugTask::Expr(left));
+                }
+                Expr::RegExp { pattern, flags } => {
+                    write!(f, "RegExp {{ pattern: {pattern:?}, flags: {flags:?} }}")?;
+                }
+                Expr::ObjectLit { entries } => {
+                    f.write_str("ObjectLit { entries: [")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, (k, v)) in entries.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Raw(")"));
+                        stack.push(ExprDebugTask::Lit(v));
+                        stack.push(ExprDebugTask::Raw(", "));
+                        stack.push(ExprDebugTask::Lit(k));
+                        stack.push(ExprDebugTask::Raw("("));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Expr::ArrayLit { elements } => {
+                    f.write_str("ArrayLit { elements: [")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, el) in elements.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Lit(el));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Expr::Closure {
+                    body,
+                    name,
+                    kind,
+                    captures,
+                } => {
+                    write!(
+                        f,
+                        "Closure {{ body: {body:?}, name: {name:?}, kind: {kind:?}, captures: ["
+                    )?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, (cn, cv)) in captures.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Raw(")"));
+                        stack.push(ExprDebugTask::Expr(cv));
+                        stack.push(ExprDebugTask::Owned(format!("({cn:?}, ")));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Expr::Class {
+                    ctor,
+                    name,
+                    heritage,
+                    members,
+                    member_attrs,
+                    sendable,
+                } => {
+                    write!(f, "Class {{ ctor: {ctor:?}, name: {name:?}, heritage: ")?;
+                    let tail = format!(
+                        ", members: {members:?}, member_attrs: {member_attrs:?}, sendable: {sendable:?} }}"
+                    );
+                    match heritage {
+                        Some(h) => {
+                            f.write_str("Some(")?;
+                            stack.push(ExprDebugTask::Owned(format!("){tail}")));
+                            stack.push(ExprDebugTask::Expr(h));
+                        }
+                        None => write!(f, "None{tail}")?,
+                    }
+                }
+                Expr::Yield { value } => {
+                    f.write_str("Yield { value: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(value));
+                }
+                Expr::YieldStar { value } => {
+                    f.write_str("YieldStar { value: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(value));
+                }
+                Expr::Await { value, uncaught } => {
+                    f.write_str("Await { value: ")?;
+                    stack.push(ExprDebugTask::Owned(format!(", uncaught: {uncaught:?} }}")));
+                    stack.push(ExprDebugTask::Expr(value));
+                }
+                Expr::NewTarget => f.write_str("NewTarget")?,
+                Expr::GlobalThis => f.write_str("GlobalThis")?,
+                Expr::SelfFunction(s) => write!(f, "SelfFunction({s:?})")?,
+                Expr::Arguments => f.write_str("Arguments")?,
+                Expr::RestArgs { start_index } => {
+                    write!(f, "RestArgs {{ start_index: {start_index:?} }}")?;
+                }
+                Expr::TemplateObject { raw, cooked } => {
+                    write!(f, "TemplateObject {{ raw: {raw:?}, cooked: {cooked:?} }}")?;
+                }
+                Expr::TaggedTemplate { tag, quasis, exprs } => {
+                    f.write_str("TaggedTemplate { tag: ")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, ex) in exprs.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Expr(ex));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                    stack.push(ExprDebugTask::Owned(format!(
+                        ", quasis: {quasis:?}, exprs: ["
+                    )));
+                    stack.push(ExprDebugTask::Expr(tag));
+                }
+                Expr::IterResultObj { value, done } => {
+                    f.write_str("IterResultObj { value: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(done));
+                    stack.push(ExprDebugTask::Raw(", done: "));
+                    stack.push(ExprDebugTask::Expr(value));
+                }
+                Expr::Iter { op, obj, status } => {
+                    write!(f, "Iter {{ op: {op:?}, obj: ")?;
+                    stack.push(ExprDebugTask::Owned(format!(", status: {status:?} }}")));
+                    stack.push(ExprDebugTask::Expr(obj));
+                }
+                Expr::CreateGenerator { func } => {
+                    f.write_str("CreateGenerator { func: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(func));
+                }
+                Expr::GeneratorDriver { resume, genobj } => {
+                    write!(f, "GeneratorDriver {{ resume: {resume:?}, genobj: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(genobj));
+                }
+                Expr::AsyncDriver { resolve, value } => {
+                    write!(f, "AsyncDriver {{ resolve: {resolve:?}, value: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(value));
+                }
+                Expr::AsyncGeneratorResolve {
+                    genobj,
+                    value,
+                    done,
+                } => {
+                    f.write_str("AsyncGeneratorResolve { genobj: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(done));
+                    stack.push(ExprDebugTask::Raw(", done: "));
+                    stack.push(ExprDebugTask::Expr(value));
+                    stack.push(ExprDebugTask::Raw(", value: "));
+                    stack.push(ExprDebugTask::Expr(genobj));
+                }
+                Expr::CopyDataProps { dst, src } => {
+                    f.write_str("CopyDataProps { dst: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(src));
+                    stack.push(ExprDebugTask::Raw(", src: "));
+                    stack.push(ExprDebugTask::Expr(dst));
+                }
+                Expr::SetObjectWithProto { obj, proto } => {
+                    f.write_str("SetObjectWithProto { obj: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(proto));
+                    stack.push(ExprDebugTask::Raw(", proto: "));
+                    stack.push(ExprDebugTask::Expr(obj));
+                }
+                Expr::ArraySpread { dst, index, src } => {
+                    f.write_str("ArraySpread { dst: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(src));
+                    stack.push(ExprDebugTask::Raw(", src: "));
+                    stack.push(ExprDebugTask::Expr(index));
+                    stack.push(ExprDebugTask::Raw(", index: "));
+                    stack.push(ExprDebugTask::Expr(dst));
+                }
+                Expr::RestObject { obj, excluded } => {
+                    f.write_str("RestObject { obj: ")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, ex) in excluded.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Expr(ex));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                    stack.push(ExprDebugTask::Raw(", excluded: ["));
+                    stack.push(ExprDebugTask::Expr(obj));
+                }
+                Expr::DefineGetterSetter {
+                    obj,
+                    key,
+                    getter,
+                    setter,
+                } => {
+                    f.write_str("DefineGetterSetter { obj: ")?;
+                    stack.push(ExprDebugTask::Raw(" }"));
+                    stack.push(ExprDebugTask::Expr(setter));
+                    stack.push(ExprDebugTask::Raw(", setter: "));
+                    stack.push(ExprDebugTask::Expr(getter));
+                    stack.push(ExprDebugTask::Raw(", getter: "));
+                    stack.push(ExprDebugTask::Expr(key));
+                    stack.push(ExprDebugTask::Raw(", key: "));
+                    stack.push(ExprDebugTask::Expr(obj));
+                }
+                Expr::ModuleNamespace { index } => {
+                    write!(f, "ModuleNamespace {{ index: {index:?} }}")?;
+                }
+                Expr::ObjectBuild { entries } => {
+                    f.write_str("ObjectBuild { entries: [")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, ent) in entries.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::ObjEntry(ent));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Expr::ArrayBuild { elements } => {
+                    f.write_str("ArrayBuild { elements: [")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, el) in elements.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::ArrayElem(el));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+                Expr::Fallback { op, note, operands } => {
+                    write!(f, "Fallback {{ op: {op:?}, note: {note:?}, operands: [")?;
+                    stack.push(ExprDebugTask::Raw("] }"));
+                    for (idx, opnd) in operands.iter().enumerate().rev() {
+                        stack.push(ExprDebugTask::Expr(opnd));
+                        if idx > 0 {
+                            stack.push(ExprDebugTask::Raw(", "));
+                        }
+                    }
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        run_expr_debug_tasks(vec![ExprDebugTask::Expr(self)], f)
+    }
+}
+
+impl std::fmt::Debug for ObjEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        run_expr_debug_tasks(vec![ExprDebugTask::ObjEntry(self)], f)
+    }
+}
+
+impl std::fmt::Debug for ObjKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        run_expr_debug_tasks(vec![ExprDebugTask::ObjKey(self)], f)
+    }
+}
+
+impl std::fmt::Debug for ArrayElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        run_expr_debug_tasks(vec![ExprDebugTask::ArrayElem(self)], f)
     }
 }

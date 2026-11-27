@@ -9,8 +9,8 @@
 use crate::common;
 use abcd_ir::{Catch, Edge, EdgeKind, FunctionKind, Module, Op, TryRegion, ValueDef};
 use abcd_isa::{Bytecode, Imm};
-use abcd_lower::analysis::compute_rpo;
 use abcd_lower::lower_function;
+use abcd_lower::regalloc::compute_rpo;
 
 use common::{Halt, Machine, V2Builder};
 

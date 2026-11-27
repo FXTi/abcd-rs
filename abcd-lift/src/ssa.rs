@@ -17,7 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use abcd_ir::{BlockId, ConstId, Edge, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
+use abcd_ir::{
+    BlockId, ConstId, Edge, FuncId, InstId, LocalScope, Module, Op, Ty, Value, ValueDef, ValueId,
+};
 
 use crate::emit_inst;
 
@@ -76,6 +78,17 @@ pub struct SsaBuilder {
     pub frame_init_consts: Vec<ValueId>,
     undefined_const: ConstId,
     hole_const: ConstId,
+    /// Iterative path-compressed union-find map (`trivial_phi -> replacement`)
+    /// for Braun et al. (*CC* 2013) Algorithm 3 trivial-phi elimination.
+    alias: HashMap<ValueId, ValueId>,
+    /// Result `ValueId` -> defining `InstId` for every `Op::Phi` created in
+    /// this function.
+    phi_insts: HashMap<ValueId, InstId>,
+    /// Reverse phi-use adjacency (`operand_phi -> consumer_phis` in deterministic
+    /// registration order) driving iterative user-cascade collapse.
+    phi_users: HashMap<ValueId, Vec<ValueId>>,
+    /// Set of `InstId`s belonging to collapsed trivial `Op::Phi` instructions.
+    removed_phis: HashSet<InstId>,
 }
 
 impl SsaBuilder {
@@ -96,6 +109,10 @@ impl SsaBuilder {
             frame_init_consts: Vec::new(),
             undefined_const,
             hole_const,
+            alias: HashMap::new(),
+            phi_insts: HashMap::new(),
+            phi_users: HashMap::new(),
+            removed_phis: HashSet::new(),
         }
     }
 
@@ -105,9 +122,36 @@ impl SsaBuilder {
         Self::with_blocks(undefined_const, hole_const, 0, 0)
     }
 
+    /// Resolve `v` through the trivial-phi union-find forest with iterative
+    /// two-pass path compression (zero recursion, `O(1)` stack).
+    #[inline]
+    pub fn resolve_alias(&mut self, mut v: ValueId) -> ValueId {
+        if self.alias.is_empty() {
+            return v;
+        }
+        let start = v;
+        while let Some(&next) = self.alias.get(&v) {
+            if next == v {
+                break;
+            }
+            v = next;
+        }
+        let root = v;
+        let mut cur = start;
+        while let Some(&next) = self.alias.get(&cur) {
+            if next == root || next == cur {
+                break;
+            }
+            self.alias.insert(cur, root);
+            cur = next;
+        }
+        root
+    }
+
     /// Record a definition: `loc` is defined as `val` in `block`.
     pub fn write_variable(&mut self, loc: RegOrAcc, block: BlockId, val: ValueId) {
-        self.defs.entry(block).or_default().insert(loc, val);
+        let canonical = self.resolve_alias(val);
+        self.defs.entry(block).or_default().insert(loc, canonical);
     }
 
     /// Read a variable in `block`. If not locally defined, iteratively
@@ -115,9 +159,14 @@ impl SsaBuilder {
     /// nodes as needed.
     pub fn read_variable(&mut self, loc: RegOrAcc, block: BlockId, module: &mut Module) -> ValueId {
         if let Some(val) = self.defs.get(&block).and_then(|m| m.get(&loc)).copied() {
-            return val;
+            let resolved = self.resolve_alias(val);
+            if resolved != val {
+                self.defs.entry(block).or_default().insert(loc, resolved);
+            }
+            return resolved;
         }
-        self.run_ssa_stack(vec![SsaFrame::EnterRead { loc, block }], module)
+        let val = self.run_ssa_stack(vec![SsaFrame::EnterRead { loc, block }], module);
+        self.resolve_alias(val)
     }
 
     /// Drive Braun SSA resolution and phi-operand filling without native
@@ -135,7 +184,11 @@ impl SsaBuilder {
 
                     let resolved = loop {
                         if let Some(val) = self.defs.get(&cur).and_then(|m| m.get(&loc)).copied() {
-                            break Some(val);
+                            let canonical = self.resolve_alias(val);
+                            if canonical != val {
+                                self.defs.entry(cur).or_default().insert(loc, canonical);
+                            }
+                            break Some(canonical);
                         }
 
                         let in_chain = if let Some(set) = &seen_large {
@@ -243,7 +296,8 @@ impl SsaBuilder {
                         if let Some(val) =
                             self.defs.get(&edge.from).and_then(|m| m.get(&loc)).copied()
                         {
-                            entries.push((edge, val));
+                            let canonical = self.resolve_alias(val);
+                            entries.push((edge, canonical));
                         } else {
                             let child_block = edge.from;
                             stack.push(SsaFrame::FillPhi {
@@ -265,8 +319,18 @@ impl SsaBuilder {
                         ValueDef::Inst(inst) => inst,
                         _ => unreachable!("phi_val must be an instruction result"),
                     };
+                    for (_, op_val) in &mut entries {
+                        let resolved = self.resolve_alias(*op_val);
+                        *op_val = resolved;
+                        if resolved != phi_val && self.phi_insts.contains_key(&resolved) {
+                            let users = self.phi_users.entry(resolved).or_default();
+                            if !users.contains(&phi_val) {
+                                users.push(phi_val);
+                            }
+                        }
+                    }
                     module.insts[phi_inst.index()].op = Op::Phi { entries };
-                    returned = Some(self.try_remove_trivial_phi(phi_val, phi_inst, module));
+                    returned = Some(self.try_remove_trivial_phi(phi_val, module));
                 }
             }
         }
@@ -338,9 +402,10 @@ impl SsaBuilder {
             .unwrap_or(false)
     }
 
-    /// Emit an empty phi node in `block` and return its result value.
-    fn emit_empty_phi(&self, block: BlockId, module: &mut Module) -> ValueId {
-        let (_inst_id, result) = emit_inst(
+    /// Emit an empty phi node in `block`, register it in `phi_insts`, and
+    /// return its result value.
+    fn emit_empty_phi(&mut self, block: BlockId, module: &mut Module) -> ValueId {
+        let (inst_id, result) = emit_inst(
             module,
             block,
             Op::Phi {
@@ -348,7 +413,9 @@ impl SsaBuilder {
             },
             None,
         );
-        result.expect("phi has a result")
+        let phi_val = result.expect("phi has a result");
+        self.phi_insts.insert(phi_val, inst_id);
+        phi_val
     }
 
     /// Fill phi operands by reading the variable from each predecessor
@@ -374,57 +441,231 @@ impl SsaBuilder {
         )
     }
 
-    /// If a phi is trivial (all operands are the same value or the phi
-    /// itself), remove it and replace uses with the single value.
-    fn try_remove_trivial_phi(
-        &mut self,
-        phi_val: ValueId,
-        phi_inst: InstId,
-        module: &mut Module,
-    ) -> ValueId {
-        let entries = match &module.insts[phi_inst.index()].op {
-            Op::Phi { entries } => entries.clone(),
-            _ => return phi_val,
-        };
+    /// Iteratively collapse `phi_val` and any cascading consumer `Op::Phi`s
+    /// that become trivial (Braun et al. *CC* 2013 Algorithm 3, iterative
+    /// union-find + phi-user worklist), removing dead `Op::Phi` instructions
+    /// from `block.insts` immediately.
+    fn try_remove_trivial_phi(&mut self, phi_val: ValueId, module: &mut Module) -> ValueId {
+        self.collapse_trivial_phis_from(vec![phi_val], module);
+        self.resolve_alias(phi_val)
+    }
 
-        let mut same: Option<ValueId> = None;
-        for (_, val) in &entries {
-            if *val == phi_val {
-                continue; // self-reference
-            }
-            if let Some(s) = same {
-                if *val == s {
-                    continue; // same as existing
-                }
-                return phi_val; // non-trivial: at least two distinct values
-            }
-            same = Some(*val);
-        }
-
-        // If same is None, all operands are self-references (unreachable
-        // in practice).
-        let replacement = match same {
-            Some(v) => v,
-            None => return phi_val,
-        };
-
-        // Replace all uses of phi_val with replacement in the definition
-        // maps.
-        for block_defs in self.defs.values_mut() {
-            for val in block_defs.values_mut() {
-                if *val == phi_val {
-                    *val = replacement;
-                }
+    /// Run iterative worklist trivial-phi elimination starting from `seeds`
+    /// (`O(1)` call stack, zero `HashMap`/`HashSet` iteration for `N20`).
+    fn collapse_trivial_phis_from(&mut self, seeds: Vec<ValueId>, module: &mut Module) {
+        let mut worklist: Vec<ValueId> = Vec::with_capacity(seeds.len());
+        let mut queued: HashSet<ValueId> = HashSet::with_capacity(seeds.len());
+        for s in seeds {
+            if !self.alias.contains_key(&s) && queued.insert(s) {
+                worklist.push(s);
             }
         }
 
-        // Keep the phi in the block during SSA construction. Earlier
-        // instructions may already refer to its value; removing it here
-        // without a function-wide use rewrite would create an undefined
-        // SSA value. (CopyProp performs that rewrite before removing
-        // dead phis — a pass-layer concern.)
+        while let Some(p_val) = worklist.pop() {
+            queued.remove(&p_val);
+            if self.alias.contains_key(&p_val) {
+                continue;
+            }
+            let Some(&p_inst) = self.phi_insts.get(&p_val) else {
+                continue;
+            };
+            if self.removed_phis.contains(&p_inst) {
+                continue;
+            }
 
-        replacement
+            let mut entries = match &module.insts[p_inst.index()].op {
+                Op::Phi { entries } if !entries.is_empty() => entries.clone(),
+                // Incomplete phi in an unsealed block (or non-phi): never collapse yet.
+                _ => continue,
+            };
+
+            let mut same: Option<ValueId> = None;
+            let mut non_trivial = false;
+            for (_, op_val) in &mut entries {
+                let resolved = self.resolve_alias(*op_val);
+                *op_val = resolved;
+                if resolved == p_val {
+                    continue; // self-reference
+                }
+                match same {
+                    None => same = Some(resolved),
+                    Some(s) if s == resolved => {}
+                    Some(_) => {
+                        non_trivial = true;
+                    }
+                }
+            }
+
+            if non_trivial {
+                // Keep live non-trivial phi's operands canonicalized and ensure
+                // `p_val` is subscribed to any phi operand it now references
+                // after intermediate forwarding.
+                for &(_, op_val) in &entries {
+                    if op_val != p_val && self.phi_insts.contains_key(&op_val) {
+                        let users = self.phi_users.entry(op_val).or_default();
+                        if !users.contains(&p_val) {
+                            users.push(p_val);
+                        }
+                    }
+                }
+                module.insts[p_inst.index()].op = Op::Phi { entries };
+                continue;
+            }
+
+            // If `same` is `None`, all incoming operands self-reference `p_val`
+            // (an unreachable sealed cycle prior to `sweep_dead_blocks`).
+            let Some(replacement) = same else {
+                module.insts[p_inst.index()].op = Op::Phi { entries };
+                continue;
+            };
+            let replacement = self.resolve_alias(replacement);
+            if replacement == p_val {
+                continue;
+            }
+
+            self.alias.insert(p_val, replacement);
+            self.removed_phis.insert(p_inst);
+            let owner_bb = module.insts[p_inst.index()].block;
+            module.blocks[owner_bb.index()]
+                .insts
+                .retain(|&iid| iid != p_inst);
+
+            if let Some(users) = self.phi_users.remove(&p_val) {
+                let rep_is_phi = self.phi_insts.contains_key(&replacement)
+                    && !self.alias.contains_key(&replacement);
+                for u_phi in users {
+                    if u_phi == p_val || self.alias.contains_key(&u_phi) {
+                        continue;
+                    }
+                    if rep_is_phi && u_phi != replacement {
+                        let rep_users = self.phi_users.entry(replacement).or_default();
+                        if !rep_users.contains(&u_phi) {
+                            rep_users.push(u_phi);
+                        }
+                    }
+                    if queued.insert(u_phi) {
+                        worklist.push(u_phi);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-run the iterative trivial-phi cascade over all surviving `Op::Phi`s
+    /// in `func_id` (catching phis reduced to trivial by dead-block sweeping),
+    /// prune collapsed `Op::Phi` instructions from `block.insts`, and rewrite
+    /// every SSA use across instructions (`Op::for_each_operand_mut`), catch
+    /// handlers, and `func.debug`.
+    pub fn finalize_function(&mut self, module: &mut Module, func_id: FuncId) {
+        let blocks = module.functions[func_id.index()].blocks.clone();
+        let mut seeds: Vec<ValueId> = Vec::new();
+
+        for &bb in &blocks {
+            let inst_ids = module.blocks[bb.index()].insts.clone();
+            for iid in inst_ids {
+                if self.removed_phis.contains(&iid) {
+                    continue;
+                }
+                let Some(phi_val) = module.insts[iid.index()].result else {
+                    continue;
+                };
+                if !module.insts[iid.index()].op.is_phi() {
+                    break; // Phis form a contiguous prefix of `block.insts`.
+                }
+                self.phi_insts.entry(phi_val).or_insert(iid);
+                if let Op::Phi { entries } = &mut module.insts[iid.index()].op {
+                    let mut operand_phis: Vec<ValueId> = Vec::new();
+                    for (_, v) in entries.iter_mut() {
+                        let resolved = self.resolve_alias(*v);
+                        *v = resolved;
+                        if resolved != phi_val && self.phi_insts.contains_key(&resolved) {
+                            operand_phis.push(resolved);
+                        }
+                    }
+                    for op_phi in operand_phis {
+                        let users = self.phi_users.entry(op_phi).or_default();
+                        if !users.contains(&phi_val) {
+                            users.push(phi_val);
+                        }
+                    }
+                }
+                seeds.push(phi_val);
+            }
+        }
+
+        if !seeds.is_empty() {
+            self.collapse_trivial_phis_from(seeds, module);
+        }
+
+        if self.alias.is_empty() && self.removed_phis.is_empty() {
+            return;
+        }
+
+        let mut surviving_insts: Vec<InstId> = Vec::new();
+        let need_debug_fix = module.functions[func_id.index()].debug.is_some();
+
+        for &bb in &blocks {
+            if !self.removed_phis.is_empty() {
+                module.blocks[bb.index()]
+                    .insts
+                    .retain(|iid| !self.removed_phis.contains(iid));
+            }
+            let inst_ids = module.blocks[bb.index()].insts.clone();
+            for iid in inst_ids {
+                if need_debug_fix {
+                    surviving_insts.push(iid);
+                }
+                if !self.alias.is_empty() {
+                    module.insts[iid.index()]
+                        .op
+                        .for_each_operand_mut(|v| *v = self.resolve_alias(*v));
+                }
+            }
+        }
+
+        if !self.alias.is_empty() {
+            let num_regions = module.functions[func_id.index()].try_regions.len();
+            for ri in 0..num_regions {
+                let num_catches = module.functions[func_id.index()].try_regions[ri]
+                    .catches
+                    .len();
+                for ci in 0..num_catches {
+                    let old_exc =
+                        module.functions[func_id.index()].try_regions[ri].catches[ci].exception;
+                    let new_exc = self.resolve_alias(old_exc);
+                    module.functions[func_id.index()].try_regions[ri].catches[ci].exception =
+                        new_exc;
+                }
+            }
+        }
+
+        if let Some(dbg) = &mut module.functions[func_id.index()].debug
+            && !self.removed_phis.is_empty()
+        {
+            dbg.line_table
+                .retain(|e| !self.removed_phis.contains(&e.inst));
+            dbg.column_table
+                .retain(|e| !self.removed_phis.contains(&e.inst));
+            for ln in &mut dbg.local_names {
+                if let Some(scope) = ln.scope {
+                    let start = surviving_insts
+                        .iter()
+                        .copied()
+                        .find(|iid| iid.index() >= scope.start.index());
+                    let end = surviving_insts
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|iid| iid.index() <= scope.end.index());
+                    ln.scope = match (start, end) {
+                        (Some(s), Some(e)) if s.index() <= e.index() => {
+                            Some(LocalScope { start: s, end: e })
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -536,12 +777,34 @@ mod tests {
                     prev = merge;
                 }
 
-                // Trivial phis collapse all 2,000 diamonds back to `v0`.
+                // Trivial phis collapse all 2,000 diamonds back to `v0` and
+                // leave zero dead `Op::Phi` instructions for `Reg(0)`.
                 assert_eq!(ssa.read_variable(RegOrAcc::Reg(0), prev, &mut module), v0);
-                // Non-trivial phi at diamond 0 survives and propagates cleanly.
+                let live_phis_after_r0: usize = module
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .filter(|&&iid| module.insts[iid.index()].op.is_phi())
+                    .count();
+                assert_eq!(
+                    live_phis_after_r0, 0,
+                    "all 2,000 trivial diamond phis for Reg(0) must be removed from block.insts"
+                );
+                // Non-trivial phi at diamond 0 survives and propagates cleanly,
+                // while all 1,999 downstream diamonds collapse to `joined`.
                 let joined = ssa.read_variable(RegOrAcc::Reg(1), prev, &mut module);
                 assert_ne!(joined, v0);
                 assert_ne!(joined, v1);
+                let live_phis_after_r1: usize = module
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .filter(|&&iid| module.insts[iid.index()].op.is_phi())
+                    .count();
+                assert_eq!(
+                    live_phis_after_r1, 1,
+                    "only the single non-trivial join phi at diamond 0 survives across 2,000 diamonds"
+                );
             })
             .unwrap();
         handle.join().unwrap();
@@ -564,5 +827,201 @@ mod tests {
 
         let val = ssa.read_variable(RegOrAcc::Reg(0), b3, &mut module);
         assert!(matches!(module.values[val.index()].def, ValueDef::Inst(_)));
+    }
+
+    #[test]
+    fn cascading_cyclic_trivial_phi_web_rewrites_uses_and_debug() {
+        use abcd_ir::{
+            BinOp, ClassData, ClassId, ColumnEntry, DebugData, FunctionData, FunctionKind,
+            LineEntry, LocalName,
+        };
+
+        let (mut module, mut ssa) = fresh_builder();
+        let sym = module.sym.intern("test");
+        let mut cls = ClassData::new(sym, sym);
+        let func_id = FuncId::new(0);
+        cls.methods.push(func_id);
+        module.classes.push(cls);
+
+        // CFG with mutual cycle `h1 <-> h2` entered from `entry`, joining at `exit`:
+        // - `entry` defines `Reg(0) = param0`
+        // - `h1` (unsealed first) creates incomplete `P1`, emits `add(P1, P1)`
+        // - `h2` (unsealed first) creates incomplete `P2`
+        // - `exit` merges `h1` and `h2` (`P3 = phi(P1, P2)`), emits `return P3`
+        // When `h1`, `h2`, and `exit` seal, `{P1, P2, P3}` form a mutually
+        // dependent trivial-phi web that must cascade completely to `param0`!
+        let entry = push_block(&mut module);
+        let h1 = push_block(&mut module);
+        let h2 = push_block(&mut module);
+        let exit = push_block(&mut module);
+
+        add_normal_edge(&mut module, entry, h1);
+        add_normal_edge(&mut module, h2, h1);
+        add_normal_edge(&mut module, h1, h2);
+        add_normal_edge(&mut module, h1, exit);
+        add_normal_edge(&mut module, h2, exit);
+
+        let param0 = ValueId::new(module.values.len() as u32);
+        module.values.push(Value {
+            def: ValueDef::Param(0),
+            ty: Ty::Any,
+        });
+        let cond_cid = module.consts.intern(Const::Bool(true));
+
+        let mut fd = FunctionData::new(ClassId::new(0), sym, FunctionKind::Function);
+        fd.params.push(param0);
+        fd.blocks = vec![entry, h1, h2, exit];
+        module.functions.push(fd);
+
+        // Translate `entry` and seal it.
+        ssa.write_variable(RegOrAcc::Reg(0), entry, param0);
+        emit_inst(&mut module, entry, Op::Branch { dest: h1 }, None);
+        ssa.seal_block(entry, &mut module);
+
+        // Read `Reg(0)` in unsealed `h1` -> incomplete `p1`, used by `BinaryOp` BEFORE sealing!
+        let p1 = ssa.read_variable(RegOrAcc::Reg(0), h1, &mut module);
+        let p1_iid = match module.values[p1.index()].def {
+            ValueDef::Inst(iid) => iid,
+            _ => panic!("expected incomplete phi inst"),
+        };
+        let (add_iid, add_res) = emit_inst(
+            &mut module,
+            h1,
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: p1,
+                right: p1,
+            },
+            None,
+        );
+        let (_, cond1) = emit_inst(&mut module, h1, Op::LoadConst(cond_cid), None);
+        emit_inst(
+            &mut module,
+            h1,
+            Op::CondBranch {
+                cond: cond1.unwrap(),
+                true_dest: h2,
+                false_dest: exit,
+            },
+            None,
+        );
+
+        // Read `Reg(0)` in unsealed `h2` -> incomplete `p2`.
+        let p2 = ssa.read_variable(RegOrAcc::Reg(0), h2, &mut module);
+        let (_, cond2) = emit_inst(&mut module, h2, Op::LoadConst(cond_cid), None);
+        emit_inst(
+            &mut module,
+            h2,
+            Op::CondBranch {
+                cond: cond2.unwrap(),
+                true_dest: h1,
+                false_dest: exit,
+            },
+            None,
+        );
+
+        // Seal `exit` while `h1`/`h2` are still unsealed so `p3 = phi(p1, p2)` is non-trivial initially!
+        ssa.seal_block(exit, &mut module);
+        let p3 = ssa.read_variable(RegOrAcc::Reg(0), exit, &mut module);
+        assert_ne!(
+            p3, param0,
+            "p3 initially joins two distinct incomplete phis"
+        );
+        let (ret_iid, _) = emit_inst(
+            &mut module,
+            exit,
+            Op::Return {
+                value: Some(add_res.unwrap()),
+            },
+            None,
+        );
+        let (use_p3_iid, _) = emit_inst(&mut module, h2, Op::Mov { src: p2 }, None);
+        // Move `Mov` before `CondBranch` in `h2` so terminator stays last.
+        let h2_len = module.blocks[h2.index()].insts.len();
+        module.blocks[h2.index()].insts.swap(h2_len - 2, h2_len - 1);
+        let _ = use_p3_iid;
+
+        // Also attach a `DebugData` referencing `p1_iid` to test debug cleanup.
+        module.functions[func_id.index()].debug = Some(DebugData {
+            source_file: Some(sym),
+            source_code: None,
+            line_table: vec![
+                LineEntry {
+                    inst: p1_iid,
+                    line: 1,
+                },
+                LineEntry {
+                    inst: add_iid,
+                    line: 2,
+                },
+            ],
+            column_table: vec![ColumnEntry {
+                inst: p1_iid,
+                column: 5,
+            }],
+            local_names: vec![LocalName {
+                name: sym,
+                ty: None,
+                scope: Some(LocalScope {
+                    start: p1_iid,
+                    end: ret_iid,
+                }),
+            }],
+            param_names: Vec::new(),
+            scope_names: None,
+        });
+
+        // Now seal `h1` and `h2`: `p1`, `p2`, AND downstream consumer `p3` must
+        // all cascade to `param0`!
+        ssa.seal_block(h1, &mut module);
+        ssa.seal_block(h2, &mut module);
+        assert_eq!(ssa.resolve_alias(p1), param0);
+        assert_eq!(ssa.resolve_alias(p2), param0);
+        assert_eq!(
+            ssa.resolve_alias(p3),
+            param0,
+            "consumer phi p3 collapsed via user-cascade"
+        );
+
+        ssa.finalize_function(&mut module, func_id);
+
+        // Zero `Op::Phi` instructions remain in any block!
+        for &bb in &[entry, h1, h2, exit] {
+            assert!(
+                module.blocks[bb.index()]
+                    .insts
+                    .iter()
+                    .all(|&iid| !module.insts[iid.index()].op.is_phi()),
+                "all trivial phis must be removed from block {bb:?}"
+            );
+        }
+        // Pre-seal `BinaryOp` operands were rewritten from `p1` to `param0`.
+        assert!(matches!(
+            module.insts[add_iid.index()].op,
+            Op::BinaryOp {
+                left,
+                right,
+                ..
+            } if left == param0 && right == param0
+        ));
+        // Debug entries referencing `p1_iid` were pruned/adjusted cleanly.
+        let dbg = module.functions[func_id.index()].debug.as_ref().unwrap();
+        assert_eq!(dbg.line_table.len(), 1);
+        assert_eq!(dbg.line_table[0].inst, add_iid);
+        assert!(dbg.column_table.is_empty());
+        assert_eq!(
+            dbg.local_names[0].scope,
+            Some(LocalScope {
+                start: add_iid,
+                end: ret_iid,
+            })
+        );
+
+        let report = abcd_ir::verify_module(&module);
+        assert!(
+            report.is_ok(),
+            "verifier errors after cascading trivial-phi cleanup: {:?}",
+            report.errors
+        );
     }
 }

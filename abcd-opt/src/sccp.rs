@@ -1,61 +1,33 @@
-//! Sparse Conditional Constant Propagation (Wegman-Zadeck 1991; `design/ir.md`,
-//! `design/decisions.md` `N36`–`N42`, `N47`).
+//! Sparse Conditional Constant Propagation (Wegman–Zadeck 1991; `design/ir.md`,
+//! `design/decisions.md` `N23`, `N36`–`N42`, `N47`).
 //!
-//! Lattice: Top → Constant(val) → Bottom.
-//! Dual worklist: CFG edges (reachability) + SSA edges (value changes).
-//! After convergence: replace constants, fold dead branches.
-//!
-//! Representation invariants:
-//!
-//! - CFG edges are kinded (`T5`): the worklist tracks
-//!   `(from, to, kind)` triples and phi entries match on the full
-//!   [`Edge`] — an exceptional in-edge and a normal in-edge from the
-//!   same block are distinct lattice inputs.
-//! - Constants surface in two definition forms: [`Op::LoadConst`]
-//!   instructions (evaluated here) and [`ValueDef::Const`] values
-//!   (resolved on demand — frame-initial values are const-defined,
-//!   not seeded instructions).
-//! - Replacement writes [`Op::LoadConst`] of a freshly pooled [`Const`];
-//!   a folded PHI is moved out of the block's phi prefix (the verifier
-//!   requires phis to lead the block).
+//! Lattice: `Top → Constant(Const) → Bottom`.
+//! Dual worklist: kinded CFG edges `(from, to, EdgeKind)` + SSA value users.
+//! All operator, comparison, unary, and `ToBoolean` evaluations delegate to the
+//! shared ECMA-262 kernel in [`crate::const_eval`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_ir::{
-    BinOp, BlockId, CmpOp, Const, Edge, EdgeKind, FuncId, InstId, Module, Op, Sym, UnOp, ValueDef,
-    ValueId,
+    BlockId, Const, EdgeKind, ExceptionHandlerMap, FuncId, InstId, Module, Op, ValueDef, ValueId,
 };
 
 use crate::FuncPass;
-use crate::{canonicalize_f64_bits, ecma_pow, has_static_ty, to_int32, to_uint32};
+use crate::const_eval::{
+    block_phis, eval_binary_op, eval_compare_op, eval_truthiness, eval_unary_op,
+    fold_cond_branch_to_jump, has_static_ty, is_sccp_lattice_const,
+};
 
-/// Lattice value for SCCP.
+/// Lattice value for SCCP. [`Const::Number`] stores raw IEEE-754 `u64` bits so
+/// `meet()` compares bit-exactly (`meet(+0.0, -0.0) == Bottom`, `R3-H5` / `N37`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LatticeVal {
-    Top,                // Unknown / not yet reached
-    Constant(ConstVal), // Known constant
-    Bottom,             // Overdefined (multiple values possible)
-}
-
-/// Constant value representation. `Number` stores raw IEEE-754 `u64` bits so
-/// lattice `meet()` compares bit-exactly (`meet(+0.0, -0.0) == Bottom`,
-/// `R3-H5` / `N37`), while newly folded arithmetic canonicalizes `NaN` to
-/// [`crate::CANONICAL_NAN_BITS`] (`#60`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ConstVal {
-    Number(u64),
-    Bool(bool),
-    Null,
-    Undefined,
-    String(Sym),
-    BigInt(Sym),
-}
-
-impl ConstVal {
-    #[inline]
-    fn number(n: f64) -> Self {
-        Self::Number(canonicalize_f64_bits(n))
-    }
+    /// Unknown / not yet reached.
+    Top,
+    /// Known scalar constant.
+    Constant(Const),
+    /// Overdefined (multiple runtime values possible).
+    Bottom,
 }
 
 /// The SCCP pass.
@@ -74,27 +46,23 @@ impl FuncPass for Sccp {
         };
         let blocks: Vec<BlockId> = func_data.blocks.clone();
 
-        // N38(ii): catch-handler blocks. Exception dispatch transfers
-        // control from ANY protected instruction to the handler
-        // mid-block, so a handler phi entry keyed by a protected pred
-        // carries that pred's BLOCK-END value, which is not the value
-        // live at the point of exception — folding handler phis is
-        // unsound. They are forced to lattice Bottom in evaluate_phi.
+        // N38(ii): catch-handler blocks. Exception dispatch transfers control
+        // mid-block, so handler phis are forced to lattice Bottom.
         let handler_blocks: HashSet<BlockId> = func_data
             .try_regions
             .iter()
             .flat_map(|region| region.catches.iter().map(|c| c.handler))
             .collect();
-        let exc_handlers = crate::analysis::exception_handlers_by_block(func_data);
+        let Some(exc_map) = ExceptionHandlerMap::build(module, func) else {
+            return false;
+        };
 
-        // Initialize lattice: all values start at Top.
         let mut lattice: HashMap<ValueId, LatticeVal> = HashMap::new();
-
-        // Function params are Bottom (unknown input). `params` is the
-        // authoritative parameter identity. (ExceptionParam values and
-        // const-defined values need no seeding: `get_lattice` resolves
-        // them on demand — Bottom and the scalar constant respectively.)
-        for &val in &func_data.params {
+        for &val in module
+            .func(func)
+            .map(|f| f.params.as_slice())
+            .unwrap_or(&[])
+        {
             lattice.insert(val, LatticeVal::Bottom);
         }
 
@@ -114,61 +82,40 @@ impl FuncPass for Sccp {
             }
         }
 
-        // Worklists.
         let mut cfg_worklist: VecDeque<CfgEdge> = VecDeque::new();
         let mut ssa_worklist: VecDeque<ValueId> = VecDeque::new();
         let mut reachable_edges: HashSet<CfgEdge> = HashSet::new();
         let mut reachable_blocks: HashSet<BlockId> = HashSet::new();
 
-        // Seed: entry block is reachable. Process the entry block's
-        // instructions (phis via evaluate_phi, the rest via
-        // evaluate_inst — same split as newly reached blocks).
+        // Seed entry block accurately: record `Exceptional` handler edges for
+        // `entry`, evaluate its instructions in order, and seed outgoing Normal
+        // edges via `add_cfg_edges` so an already-constant entry `CondBranch`
+        // never marks its dead arm reachable.
         reachable_blocks.insert(entry);
-        if let Some(entry_block) = module.block(entry) {
-            for &inst_id in &entry_block.insts.clone() {
-                evaluate_and_record(
-                    module,
-                    inst_id,
-                    &mut lattice,
-                    &mut ssa_worklist,
-                    &reachable_edges,
-                    &handler_blocks,
-                );
-            }
-        }
-        // Seed CFG edges from entry — AUGMENTED successors (N38(i)):
-        // exception edges included, so catch handlers are reachable.
-        for edge in crate::analysis::augmented_succs_indexed(module, &exc_handlers, entry) {
-            cfg_worklist.push_back((entry, edge.0, edge.1));
-        }
+        visit_block_first_time(
+            module,
+            entry,
+            &exc_map,
+            &mut lattice,
+            &mut ssa_worklist,
+            &mut cfg_worklist,
+            &reachable_edges,
+            &handler_blocks,
+            true,
+        );
 
-        // Main loop.
         loop {
-            let has_cfg = !cfg_worklist.is_empty();
-            let has_ssa = !ssa_worklist.is_empty();
-            if !has_cfg && !has_ssa {
+            if cfg_worklist.is_empty() && ssa_worklist.is_empty() {
                 break;
             }
 
-            // Process CFG edges.
             while let Some((from, to, kind)) = cfg_worklist.pop_front() {
                 if !reachable_edges.insert((from, to, kind)) {
                     continue;
                 }
                 let first_time = reachable_blocks.insert(to);
 
-                // Re-evaluate phis in `to` (new edge may change phi values).
-                let phis: Vec<InstId> = module
-                    .block(to)
-                    .map(|b| {
-                        b.insts
-                            .iter()
-                            .copied()
-                            .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for &phi_id in &phis {
+                for phi_id in block_phis(module, to) {
                     if let Some(new_val) =
                         evaluate_phi(module, phi_id, &lattice, &reachable_edges, &handler_blocks)
                     {
@@ -177,16 +124,49 @@ impl FuncPass for Sccp {
                 }
 
                 if first_time {
-                    // Evaluate all non-phi instructions.
-                    let insts: Vec<InstId> = module
-                        .block(to)
-                        .map(|b| b.insts.clone())
-                        .unwrap_or_default();
-                    for &inst_id in &insts {
-                        let is_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
-                        if is_phi {
-                            continue; // already evaluated above
+                    visit_block_first_time(
+                        module,
+                        to,
+                        &exc_map,
+                        &mut lattice,
+                        &mut ssa_worklist,
+                        &mut cfg_worklist,
+                        &reachable_edges,
+                        &handler_blocks,
+                        false,
+                    );
+                }
+            }
+
+            while let Some(val) = ssa_worklist.pop_front() {
+                let Some(users) = use_list.get(&val) else {
+                    continue;
+                };
+                for &inst_id in users {
+                    let Some(inst_block) = module.inst(inst_id).map(|i| i.block) else {
+                        continue;
+                    };
+                    if !reachable_blocks.contains(&inst_block) {
+                        continue;
+                    }
+                    let is_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
+                    if is_phi {
+                        if let Some(new_val) = evaluate_phi(
+                            module,
+                            inst_id,
+                            &lattice,
+                            &reachable_edges,
+                            &handler_blocks,
+                        ) {
+                            record_result(
+                                module,
+                                inst_id,
+                                new_val,
+                                &mut lattice,
+                                &mut ssa_worklist,
+                            );
                         }
+                    } else {
                         if let Some(new_val) = evaluate_inst(module, inst_id, &lattice) {
                             record_result(
                                 module,
@@ -196,65 +176,13 @@ impl FuncPass for Sccp {
                                 &mut ssa_worklist,
                             );
                         }
-                        // Add CFG edges from terminators.
-                        add_cfg_edges(module, &exc_handlers, inst_id, &lattice, &mut cfg_worklist);
-                    }
-                }
-            }
-
-            // Process SSA edges.
-            while let Some(val) = ssa_worklist.pop_front() {
-                if let Some(users) = use_list.get(&val) {
-                    for &inst_id in users {
-                        let inst_block = module.inst(inst_id).map(|i| i.block);
-                        let Some(inst_block) = inst_block else {
-                            continue;
-                        };
-                        if !reachable_blocks.contains(&inst_block) {
-                            continue;
-                        }
-
-                        let is_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
-                        if is_phi {
-                            if let Some(new_val) = evaluate_phi(
-                                module,
-                                inst_id,
-                                &lattice,
-                                &reachable_edges,
-                                &handler_blocks,
-                            ) {
-                                record_result(
-                                    module,
-                                    inst_id,
-                                    new_val,
-                                    &mut lattice,
-                                    &mut ssa_worklist,
-                                );
-                            }
-                        } else {
-                            if let Some(new_val) = evaluate_inst(module, inst_id, &lattice) {
-                                record_result(
-                                    module,
-                                    inst_id,
-                                    new_val,
-                                    &mut lattice,
-                                    &mut ssa_worklist,
-                                );
-                            }
-                            add_cfg_edges(
-                                module,
-                                &exc_handlers,
-                                inst_id,
-                                &lattice,
-                                &mut cfg_worklist,
-                            );
-                        }
+                        add_cfg_edges(module, &exc_map, inst_id, &lattice, &mut cfg_worklist);
                     }
                 }
             }
         }
 
-        // Apply results: replace constants and fold dead branches.
+        // Apply results: replace constants and fold dead or identical-target branches.
         let mut changed = false;
 
         for &bb in &blocks {
@@ -273,13 +201,11 @@ impl FuncPass for Sccp {
                 };
                 if let Some(LatticeVal::Constant(c)) = lattice.get(&result) {
                     let c = c.clone();
-                    // Skip when the instruction already loads an equal
-                    // constant (bit-exact for numbers — N37).
                     if inst_is_const(module, inst_id, &c) {
                         continue;
                     }
                     let was_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
-                    let cid = module.consts.intern(const_to_const(&c));
+                    let cid = module.consts.intern(c);
                     if let Some(inst) = module.inst_mut(inst_id) {
                         inst.op = Op::LoadConst(cid);
                     }
@@ -321,69 +247,40 @@ impl FuncPass for Sccp {
                 }
             }
 
-            // Fold CondBranch with known condition (`R3-M6`: query `get_lattice`
-            // so `ValueDef::Const` conditions also rewrite `CondBranch -> Branch`).
-            let Some(block) = module.block(bb) else {
+            // Fold CondBranch when `true_dest == false_dest` or `cond` has known
+            // `ToBoolean` truthiness (`R3-M6`, `N23`).
+            let Some(&last) = module.block(bb).and_then(|b| b.insts.last()) else {
                 continue;
             };
-            let Some(&last) = block.insts.last() else {
-                continue;
-            };
-            let Some(inst) = module.inst(last) else {
-                continue;
-            };
-            if let Op::CondBranch {
+            let Some(Op::CondBranch {
                 cond,
                 true_dest,
                 false_dest,
-            } = &inst.op
-            {
-                let cond = *cond;
-                let true_dest = *true_dest;
-                let false_dest = *false_dest;
-                if let LatticeVal::Constant(c) = get_lattice(module, &lattice, cond)
-                    && let Some(is_true) = const_is_truthy(&c)
+            }) = module.inst(last).map(|i| i.op.clone())
+            else {
+                continue;
+            };
+            if true_dest == false_dest {
+                if fold_cond_branch_to_jump(module, bb, last, true_dest, false_dest) {
+                    changed = true;
+                }
+                continue;
+            }
+            let cond_lat = get_lattice(module, &lattice, cond);
+            let known_const = match &cond_lat {
+                LatticeVal::Constant(c) => Some(c),
+                _ => None,
+            };
+            if let Some(is_true) = eval_truthiness(module, cond, known_const) {
+                let target = if is_true { true_dest } else { false_dest };
+                let dead = if is_true { false_dest } else { true_dest };
+                if dead == entry
+                    && !block_phis(module, entry).is_empty()
+                    && module.block(entry).is_some_and(|b| b.preds.len() <= 1)
                 {
-                    let target = if is_true { true_dest } else { false_dest };
-                    let dead = if is_true { false_dest } else { true_dest };
-                    if let Some(inst) = module.inst_mut(last) {
-                        inst.op = Op::Branch { dest: target };
-                    }
-                    // Remove the Normal edge bb→dead from dead's preds AND
-                    // from its phi entries (N23/N27): a stale entry keyed
-                    // by bb survives on the IMPOSSIBLE path, and a later
-                    // merge/dedup can resurrect its value over the value
-                    // from the only live path. When both dests name the
-                    // same block the edge is still live (the branch still
-                    // targets it), so nothing is removed.
-                    if dead != target {
-                        let dead_edge = Edge {
-                            from: bb,
-                            kind: EdgeKind::Normal,
-                        };
-                        if let Some(dead_block) = module.block_mut(dead) {
-                            dead_block.preds.retain(|e| *e != dead_edge);
-                        }
-                        let dead_phis: Vec<InstId> = module
-                            .block(dead)
-                            .map(|b| {
-                                b.insts
-                                    .iter()
-                                    .copied()
-                                    .take_while(|&id| {
-                                        module.inst(id).is_some_and(|i| i.op.is_phi())
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        for phi_id in dead_phis {
-                            if let Some(inst) = module.inst_mut(phi_id)
-                                && let Op::Phi { entries } = &mut inst.op
-                            {
-                                entries.retain(|(edge, _)| *edge != dead_edge);
-                            }
-                        }
-                    }
+                    continue;
+                }
+                if fold_cond_branch_to_jump(module, bb, last, target, dead) {
                     changed = true;
                 }
             }
@@ -393,23 +290,49 @@ impl FuncPass for Sccp {
     }
 }
 
-/// Evaluate `inst_id` (phi or not) and record a lattice change.
-fn evaluate_and_record(
+/// Evaluate a newly reached block's instructions and seed its outgoing
+/// normal and exceptional CFG edges.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Wegman-Zadeck block visit threads module, exception map, lattice, and dual worklists"
+)]
+fn visit_block_first_time(
     module: &Module,
-    inst_id: InstId,
+    bb: BlockId,
+    exc_map: &ExceptionHandlerMap,
     lattice: &mut HashMap<ValueId, LatticeVal>,
     ssa_worklist: &mut VecDeque<ValueId>,
+    cfg_worklist: &mut VecDeque<CfgEdge>,
     reachable_edges: &HashSet<CfgEdge>,
     handler_blocks: &HashSet<BlockId>,
+    eval_leading_phis: bool,
 ) {
-    let is_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
-    let new_val = if is_phi {
-        evaluate_phi(module, inst_id, lattice, reachable_edges, handler_blocks)
-    } else {
-        evaluate_inst(module, inst_id, lattice)
-    };
-    if let Some(new_val) = new_val {
-        record_result(module, inst_id, new_val, lattice, ssa_worklist);
+    // Seed implicit exception edges immediately when `bb` becomes reachable
+    // (`N38(i)`, `N47`) so catch handlers are reached even if `bb` ends in
+    // `Return`/`Unreachable` or lacks a terminator in unverified IR.
+    for &handler in exc_map.handlers_of(bb) {
+        cfg_worklist.push_back((bb, handler, EdgeKind::Exceptional));
+    }
+
+    let insts: Vec<InstId> = module
+        .block(bb)
+        .map(|b| b.insts.clone())
+        .unwrap_or_default();
+    for inst_id in insts {
+        let is_phi = module.inst(inst_id).is_some_and(|i| i.op.is_phi());
+        if is_phi {
+            if eval_leading_phis
+                && let Some(new_val) =
+                    evaluate_phi(module, inst_id, lattice, reachable_edges, handler_blocks)
+            {
+                record_result(module, inst_id, new_val, lattice, ssa_worklist);
+            }
+            continue;
+        }
+        if let Some(new_val) = evaluate_inst(module, inst_id, lattice) {
+            record_result(module, inst_id, new_val, lattice, ssa_worklist);
+        }
+        add_cfg_edges(module, exc_map, inst_id, lattice, cfg_worklist);
     }
 }
 
@@ -433,7 +356,7 @@ fn record_result(
     }
 }
 
-/// Lattice meet: Top ⊓ x = x, x ⊓ x = x, else Bottom.
+/// Lattice meet: `Top ⊓ x = x`, `x ⊓ x = x`, else `Bottom`.
 fn meet(a: &LatticeVal, b: &LatticeVal) -> LatticeVal {
     match (a, b) {
         (LatticeVal::Top, x) | (x, LatticeVal::Top) => x.clone(),
@@ -442,28 +365,19 @@ fn meet(a: &LatticeVal, b: &LatticeVal) -> LatticeVal {
     }
 }
 
-/// Evaluate a non-phi instruction to a lattice value.
+/// Evaluate a non-phi instruction to a lattice value via [`crate::const_eval`].
 fn evaluate_inst(
     module: &Module,
     inst_id: InstId,
     lattice: &HashMap<ValueId, LatticeVal>,
 ) -> Option<LatticeVal> {
     let inst = module.inst(inst_id)?;
-    // If the instruction doesn't produce a result, nothing to evaluate.
     inst.result?;
 
     match &inst.op {
         Op::LoadConst(cid) => match module.consts.get(*cid) {
-            // Scalar and string/bigint constants enter the lattice; literal
-            // buffers, typed integer/float literal tags, and the hole evaluate
-            // to Bottom.
-            Some(Const::Undefined) => Some(LatticeVal::Constant(ConstVal::Undefined)),
-            Some(Const::Null) => Some(LatticeVal::Constant(ConstVal::Null)),
-            Some(Const::Bool(b)) => Some(LatticeVal::Constant(ConstVal::Bool(*b))),
-            Some(Const::Number(bits)) => Some(LatticeVal::Constant(ConstVal::Number(*bits))),
-            Some(Const::String(sym)) => Some(LatticeVal::Constant(ConstVal::String(*sym))),
-            Some(Const::BigInt(sym)) => Some(LatticeVal::Constant(ConstVal::BigInt(*sym))),
-            Some(_) | None => Some(LatticeVal::Bottom),
+            Some(c) if is_sccp_lattice_const(c) => Some(LatticeVal::Constant(c.clone())),
+            _ => Some(LatticeVal::Bottom),
         },
 
         Op::BinaryOp { op, left, right } => {
@@ -474,12 +388,10 @@ fn evaluate_inst(
             let rv = get_lattice(module, lattice, *right);
             match (&lv, &rv) {
                 (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => Some(LatticeVal::Bottom),
-                (LatticeVal::Top, _) | (_, LatticeVal::Top) => None, // not yet determined
-                // Operand order (N36): IR `left` = acc, `right` = vreg,
-                // while the vendored `*2` handlers compute `vreg OP acc`
-                // (e.g. div2 interpreter_assembly.cpp:1095-1096) — evaluate
-                // with (right, left).
-                (LatticeVal::Constant(a), LatticeVal::Constant(b)) => eval_binop_lattice(*op, b, a),
+                (LatticeVal::Top, _) | (_, LatticeVal::Top) => None,
+                (LatticeVal::Constant(lc), LatticeVal::Constant(rc)) => Some(
+                    eval_binary_op(*op, lc, rc).map_or(LatticeVal::Bottom, LatticeVal::Constant),
+                ),
             }
         }
 
@@ -492,11 +404,10 @@ fn evaluate_inst(
             match (&lv, &rv) {
                 (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => Some(LatticeVal::Bottom),
                 (LatticeVal::Top, _) | (_, LatticeVal::Top) => None,
-                // Same operand order as BinaryOp (N36 — vendored
-                // comparisons compute `vreg CMP acc`).
-                (LatticeVal::Constant(a), LatticeVal::Constant(b)) => {
-                    eval_compare_lattice(*op, b, a)
-                }
+                (LatticeVal::Constant(lc), LatticeVal::Constant(rc)) => Some(
+                    eval_compare_op(&module.sym, *op, lc, rc)
+                        .map_or(LatticeVal::Bottom, LatticeVal::Constant),
+                ),
             }
         }
 
@@ -504,11 +415,16 @@ fn evaluate_inst(
             if has_static_ty(module, inst_id) {
                 return Some(LatticeVal::Bottom);
             }
-            let v = get_lattice(module, lattice, *operand);
-            match &v {
-                LatticeVal::Bottom => Some(LatticeVal::Bottom),
+            match get_lattice(module, lattice, *operand) {
                 LatticeVal::Top => None,
-                LatticeVal::Constant(c) => eval_unop_lattice(*op, c),
+                LatticeVal::Constant(c) => Some(
+                    eval_unary_op(module, *op, *operand, Some(&c))
+                        .map_or(LatticeVal::Bottom, LatticeVal::Constant),
+                ),
+                LatticeVal::Bottom => Some(
+                    eval_unary_op(module, *op, *operand, None)
+                        .map_or(LatticeVal::Bottom, LatticeVal::Constant),
+                ),
             }
         }
 
@@ -537,12 +453,7 @@ fn evaluate_inst(
     }
 }
 
-/// Evaluate a phi node considering only reachable incoming edges.
-///
-/// Phis in catch-handler blocks are forced to Bottom (N38(ii)): their
-/// entries carry the protected preds' BLOCK-END values, but exception
-/// dispatch transfers control mid-block, so the value live at the point
-/// of exception is not the block-end value — folding them is unsound.
+/// Evaluate a phi node considering only reachable incoming edges (`N38(ii)`).
 fn evaluate_phi(
     module: &Module,
     phi_id: InstId,
@@ -569,17 +480,11 @@ fn evaluate_phi(
     }
 }
 
-/// Add CFG edges from a terminator instruction based on lattice state,
-/// PLUS the implicit exception edges of any try region protecting the
-/// block (N38(i)): catch handlers are reachable from every protected
-/// block regardless of how the terminator folds. Non-terminator
-/// instructions contribute no edges (the exception edge is added once,
-/// at the block's terminator — enough for reachability, and the
-/// mid-block dispatch unsoundness is covered by the handler-phi guard
-/// in `evaluate_phi`).
+/// Add outgoing CFG edges from a terminator instruction based on lattice state,
+/// plus protecting [`ExceptionHandlerMap`] edges (`N38(i)`, `N47`).
 fn add_cfg_edges(
     module: &Module,
-    exc_handlers: &HashMap<BlockId, Vec<BlockId>>,
+    exc_map: &ExceptionHandlerMap,
     inst_id: InstId,
     lattice: &HashMap<ValueId, LatticeVal>,
     cfg_worklist: &mut VecDeque<CfgEdge>,
@@ -588,63 +493,52 @@ fn add_cfg_edges(
         return;
     };
     let block = inst.block;
-    let mut dests: Vec<CfgEdge> = Vec::new();
     match &inst.op {
         Op::Branch { dest } => {
-            dests.push((block, *dest, EdgeKind::Normal));
+            cfg_worklist.push_back((block, *dest, EdgeKind::Normal));
         }
         Op::CondBranch {
             cond,
             true_dest,
             false_dest,
         } => {
-            match get_lattice(module, lattice, *cond) {
-                LatticeVal::Constant(c) => match const_is_truthy(&c) {
-                    Some(true) => dests.push((block, *true_dest, EdgeKind::Normal)),
-                    Some(false) => dests.push((block, *false_dest, EdgeKind::Normal)),
-                    None => {
-                        dests.push((block, *true_dest, EdgeKind::Normal));
-                        dests.push((block, *false_dest, EdgeKind::Normal));
+            if *true_dest == *false_dest {
+                cfg_worklist.push_back((block, *true_dest, EdgeKind::Normal));
+            } else {
+                let cond_lat = get_lattice(module, lattice, *cond);
+                if matches!(cond_lat, LatticeVal::Top) && module.value(*cond).is_some() {
+                    // Optimistic Wegman-Zadeck: wait until `cond` lowers from `Top`
+                    // on `ssa_worklist` before seeding normal arms.
+                } else {
+                    let known_const = match &cond_lat {
+                        LatticeVal::Constant(c) => Some(c),
+                        _ => None,
+                    };
+                    match eval_truthiness(module, *cond, known_const) {
+                        Some(true) => {
+                            cfg_worklist.push_back((block, *true_dest, EdgeKind::Normal));
+                        }
+                        Some(false) => {
+                            cfg_worklist.push_back((block, *false_dest, EdgeKind::Normal));
+                        }
+                        None => {
+                            cfg_worklist.push_back((block, *true_dest, EdgeKind::Normal));
+                            cfg_worklist.push_back((block, *false_dest, EdgeKind::Normal));
+                        }
                     }
-                },
-                _ => {
-                    // Unknown or Bottom: both edges are possible.
-                    dests.push((block, *true_dest, EdgeKind::Normal));
-                    dests.push((block, *false_dest, EdgeKind::Normal));
                 }
             }
         }
-        // Non-branch terminators (Return/Unreachable): no CFG successors,
-        // but the block may still be try-protected — FALL THROUGH to the
-        // exception-edge append below (N47: an early `return` here skipped
-        // the handler edge, so SCCP never reached the catch handler of a
-        // protected block ending in Return/Unreachable — including the
-        // corpus Throw+Unreachable shape — leaving foldable handler code
-        // untouched).
+        // Return / Unreachable: fall through so exception edges still seed (`N47`).
         _ if inst.op.is_terminator() => {}
-        // Non-terminator: no edges (the exception edge is added once, at
-        // the block's terminator — enough for reachability).
         _ => return,
     }
-    // Exception edges: pre-indexed handlers of the try regions protecting
-    // this block (#29).
-    if let Some(handlers) = exc_handlers.get(&block) {
-        for &handler in handlers {
-            let edge = (block, handler, EdgeKind::Exceptional);
-            if !dests.contains(&edge) {
-                dests.push(edge);
-            }
-        }
-    }
-    for dest in dests {
-        cfg_worklist.push_back(dest);
+    for &handler in exc_map.handlers_of(block) {
+        cfg_worklist.push_back((block, handler, EdgeKind::Exceptional));
     }
 }
 
-/// The lattice value of `val`, resolving definition forms that are known
-/// without evaluation: const-defined values yield their scalar constant
-/// (non-scalars are Bottom), exception parameters are Bottom (the
-/// exception object is unknown).
+/// Lattice lookup resolving `ValueDef::Const` and `ValueDef::ExceptionParam` on demand.
 fn get_lattice(
     module: &Module,
     lattice: &HashMap<ValueId, LatticeVal>,
@@ -658,12 +552,7 @@ fn get_lattice(
     };
     match value.def {
         ValueDef::Const(cid) => match module.consts.get(cid) {
-            Some(Const::Undefined) => LatticeVal::Constant(ConstVal::Undefined),
-            Some(Const::Null) => LatticeVal::Constant(ConstVal::Null),
-            Some(Const::Bool(b)) => LatticeVal::Constant(ConstVal::Bool(*b)),
-            Some(Const::Number(bits)) => LatticeVal::Constant(ConstVal::Number(*bits)),
-            Some(Const::String(sym)) => LatticeVal::Constant(ConstVal::String(*sym)),
-            Some(Const::BigInt(sym)) => LatticeVal::Constant(ConstVal::BigInt(*sym)),
+            Some(c) if is_sccp_lattice_const(c) => LatticeVal::Constant(c.clone()),
             _ => LatticeVal::Bottom,
         },
         ValueDef::ExceptionParam(_) => LatticeVal::Bottom,
@@ -671,179 +560,13 @@ fn get_lattice(
     }
 }
 
-/// Whether `inst_id` already loads a constant equal to `c` (numbers
-/// compared bit-exactly — replacing LiteralNumber(-0.0) with +0.0 would
-/// be an N37 violation).
-fn inst_is_const(module: &Module, inst_id: InstId, c: &ConstVal) -> bool {
+/// Whether `inst_id` already loads a constant bit-identically equal to `c` (`N37`).
+fn inst_is_const(module: &Module, inst_id: InstId, c: &Const) -> bool {
     let Some(inst) = module.inst(inst_id) else {
         return false;
     };
     let Op::LoadConst(cid) = inst.op else {
         return false;
     };
-    match (module.consts.get(cid), c) {
-        (Some(Const::Number(bits)), ConstVal::Number(n_bits)) => *bits == *n_bits,
-        (Some(Const::Bool(x)), ConstVal::Bool(y)) => x == y,
-        (Some(Const::Null), ConstVal::Null) => true,
-        (Some(Const::Undefined), ConstVal::Undefined) => true,
-        (Some(Const::String(x)), ConstVal::String(y)) => x == y,
-        (Some(Const::BigInt(x)), ConstVal::BigInt(y)) => x == y,
-        _ => false,
-    }
-}
-
-fn const_to_const(c: &ConstVal) -> Const {
-    match c {
-        ConstVal::Number(bits) => Const::Number(*bits), // bit-exact (N37)
-        ConstVal::Bool(b) => Const::Bool(*b),
-        ConstVal::Null => Const::Null,
-        ConstVal::Undefined => Const::Undefined,
-        ConstVal::String(sym) => Const::String(*sym),
-        ConstVal::BigInt(sym) => Const::BigInt(*sym),
-    }
-}
-
-fn const_is_truthy(c: &ConstVal) -> Option<bool> {
-    match c {
-        ConstVal::Bool(b) => Some(*b),
-        ConstVal::Number(bits) => {
-            let n = f64::from_bits(*bits);
-            Some(n != 0.0 && !n.is_nan())
-        }
-        ConstVal::Null | ConstVal::Undefined => Some(false),
-        ConstVal::String(_) | ConstVal::BigInt(_) => None,
-    }
-}
-
-fn const_to_number(c: &ConstVal) -> Option<f64> {
-    match c {
-        ConstVal::Number(bits) => Some(f64::from_bits(*bits)),
-        ConstVal::Bool(true) => Some(1.0),
-        ConstVal::Bool(false) => Some(0.0),
-        ConstVal::Null => Some(0.0),
-        ConstVal::Undefined => Some(f64::NAN),
-        ConstVal::String(_) | ConstVal::BigInt(_) => None,
-    }
-}
-
-fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVal> {
-    let (Some(an), Some(bn)) = (const_to_number(a), const_to_number(b)) else {
-        return Some(LatticeVal::Bottom);
-    };
-    // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
-    // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's saturating
-    // `as` casts — matches vendored DoubleToInt (number_helper.cpp:1137).
-    // The shift count is masked `& 0x1f` AFTER the wrap, so -1 → 31.
-    let res = match op {
-        BinOp::Add => an + bn,
-        BinOp::Sub => an - bn,
-        BinOp::Mul => an * bn,
-        BinOp::Div => an / bn,
-        BinOp::Mod => an % bn,
-        BinOp::Exp => ecma_pow(an, bn),
-        BinOp::Shl => (to_int32(an) << (to_uint32(bn) & 0x1f)) as f64,
-        // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift —
-        // (uint32)ToInt32(v) >> shift, so the unsigned reinterpret
-        // goes through i32 (a direct `as u32` saturates negatives).
-        BinOp::Shr => ((to_int32(an) as u32) >> (to_uint32(bn) & 0x1f)) as f64,
-        // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift.
-        BinOp::Ashr => (to_int32(an) >> (to_uint32(bn) & 0x1f)) as f64,
-        BinOp::BitAnd => (to_int32(an) & to_int32(bn)) as f64,
-        BinOp::BitOr => (to_int32(an) | to_int32(bn)) as f64,
-        BinOp::BitXor => (to_int32(an) ^ to_int32(bn)) as f64,
-    };
-    Some(LatticeVal::Constant(ConstVal::number(res)))
-}
-
-/// Evaluate a [`CmpOp`] comparison over constant lattice inputs.
-fn eval_compare_lattice(op: CmpOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVal> {
-    // N38(iii): JS loose equality does NOT ToNumber-coerce nullish
-    // operands — `undefined == undefined` and `null == undefined` are
-    // true, `null == 0` is false. The ToNumber path below maps
-    // Undefined → NaN (so undefined == undefined folded to FALSE,
-    // rewiring es2abc's finally guards) and Null → 0.0 (so null == 0
-    // folded to TRUE). Never fold Eq/NotEq when either operand is a
-    // Null/Undefined constant.
-    if matches!(op, CmpOp::Eq | CmpOp::NotEq)
-        && matches!(
-            (a, b),
-            (ConstVal::Null | ConstVal::Undefined, _) | (_, ConstVal::Null | ConstVal::Undefined)
-        )
-    {
-        return Some(LatticeVal::Bottom);
-    }
-    let (Some(an), Some(bn)) = (const_to_number(a), const_to_number(b)) else {
-        return Some(LatticeVal::Bottom);
-    };
-    match op {
-        CmpOp::Eq => Some(LatticeVal::Constant(ConstVal::Bool(an == bn))),
-        CmpOp::NotEq => Some(LatticeVal::Constant(ConstVal::Bool(an != bn))),
-        CmpOp::Less => Some(LatticeVal::Constant(ConstVal::Bool(an < bn))),
-        CmpOp::LessEq => Some(LatticeVal::Constant(ConstVal::Bool(an <= bn))),
-        CmpOp::Greater => Some(LatticeVal::Constant(ConstVal::Bool(an > bn))),
-        CmpOp::GreaterEq => Some(LatticeVal::Constant(ConstVal::Bool(an >= bn))),
-        // StrictEq/StrictNotEq need type-aware comparison; In/InstanceOf are runtime-only.
-        _ => Some(LatticeVal::Bottom),
-    }
-}
-
-fn eval_unop_lattice(op: UnOp, c: &ConstVal) -> Option<LatticeVal> {
-    match op {
-        UnOp::Minus => {
-            let Some(n) = const_to_number(c) else {
-                return Some(LatticeVal::Bottom);
-            };
-            Some(LatticeVal::Constant(ConstVal::number(-n)))
-        }
-        UnOp::BitNot => {
-            let Some(n) = const_to_number(c) else {
-                return Some(LatticeVal::Bottom);
-            };
-            // ECMA-262 ToInt32 (wrap, NaN/±Inf → 0), not saturating (N42).
-            Some(LatticeVal::Constant(ConstVal::number(!to_int32(n) as f64)))
-        }
-        UnOp::LogicalNot => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
-            LatticeVal::Constant(ConstVal::Bool(!b))
-        })),
-        UnOp::IsTrue => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
-            LatticeVal::Constant(ConstVal::Bool(b))
-        })),
-        UnOp::IsFalse => Some(const_is_truthy(c).map_or(LatticeVal::Bottom, |b| {
-            LatticeVal::Constant(ConstVal::Bool(!b))
-        })),
-        UnOp::ToNumber | UnOp::ToNumeric => {
-            let Some(n) = const_to_number(c) else {
-                return Some(LatticeVal::Bottom);
-            };
-            Some(LatticeVal::Constant(ConstVal::number(n)))
-        }
-        UnOp::ToPropertyKey => match c {
-            ConstVal::String(sym) => Some(LatticeVal::Constant(ConstVal::String(*sym))),
-            _ => Some(LatticeVal::Bottom),
-        },
-        UnOp::Void => Some(LatticeVal::Constant(ConstVal::Undefined)),
-        UnOp::JumpEqz => {
-            let b = match c {
-                ConstVal::Bool(b) => !*b,
-                ConstVal::Number(bits) => f64::from_bits(*bits) == 0.0,
-                ConstVal::Null
-                | ConstVal::Undefined
-                | ConstVal::String(_)
-                | ConstVal::BigInt(_) => false,
-            };
-            Some(LatticeVal::Constant(ConstVal::Bool(b)))
-        }
-        UnOp::JumpNez => {
-            let b = match c {
-                ConstVal::Bool(b) => *b,
-                ConstVal::Number(bits) => f64::from_bits(*bits) != 0.0,
-                ConstVal::Null
-                | ConstVal::Undefined
-                | ConstVal::String(_)
-                | ConstVal::BigInt(_) => false,
-            };
-            Some(LatticeVal::Constant(ConstVal::Bool(b)))
-        }
-        _ => Some(LatticeVal::Bottom),
-    }
+    module.consts.get(cid) == Some(c)
 }

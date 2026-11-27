@@ -1,16 +1,20 @@
 //! Dominators and post-dominators delegated to [`abcd_ir::cfg::DomTree`] and
-//! [`abcd_ir::cfg::IndexedDom`] (`#82` `R4-P4`, `#83` `R4-D5`).
+//! [`abcd_ir::cfg::IndexedDom`] (`#82` `R4-P4`, `#83` `R4-D5`, `#94` `D1`).
 //!
-//! Blocks unreachable from the entry (or, for post-dominance, blocks that
-//! cannot reach any exit) are absent from the RPO slice and dominated only by
-//! themselves (`dominates(dead, dead) == true`).
+//! In [`Dominators`], blocks unreachable from the entry are absent from the
+//! RPO slice and satisfy `dominates(dead, dead) == false`, agreeing
+//! workspace-wide with [`DomTree::dominates`]. In [`PostDominators`], blocks
+//! that cannot reach any exit (e.g. infinite loops) remain reflexively
+//! self-post-dominating (`post_dominates(b, b) == true`) for region-structuring
+//! termination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use abcd_ir::cfg::{DomTree, ExceptionHandlerMap, IndexedDom};
+use abcd_ir::cfg::{
+    DomTree, ExceptionHandlerMap, IndexedDom, augmented_succs, augmented_succs_with_map,
+    block_succs,
+};
 use abcd_ir::{BlockId, FuncId, Module, Op};
-
-use super::succs::{augmented_succs, augmented_succs_with_map, block_succs};
 
 /// Dense wrapper over [`IndexedDom`] supporting single-entry forward graphs
 /// and virtual-super-root multi-exit reversed graphs.
@@ -21,6 +25,8 @@ struct IndexedBlockTree {
     nodes: Vec<BlockId>,
     node_idx: HashMap<BlockId, usize>,
     rpo: Vec<BlockId>,
+    child_offsets: Vec<u32>,
+    child_targets: Vec<BlockId>,
     dom: IndexedDom,
     virtual_root: bool,
 }
@@ -31,6 +37,8 @@ impl IndexedBlockTree {
             nodes: Vec::new(),
             node_idx: HashMap::new(),
             rpo: Vec::new(),
+            child_offsets: Vec::new(),
+            child_targets: Vec::new(),
             dom: IndexedDom::compute(0, &[]),
             virtual_root: false,
         }
@@ -70,11 +78,22 @@ impl IndexedBlockTree {
             }
         }
         let dom = IndexedDom::compute(n, &succs);
-        let rpo = dom.rpo().iter().map(|&idx| nodes[idx as usize]).collect();
+        let rpo: Vec<BlockId> = dom.rpo().iter().map(|&idx| nodes[idx as usize]).collect();
+        let mut child_offsets = Vec::with_capacity(n + 1);
+        let mut child_targets = Vec::with_capacity(rpo.len().saturating_sub(1));
+        child_offsets.push(0);
+        for i in 0..n {
+            for &c in dom.children(i) {
+                child_targets.push(nodes[c as usize]);
+            }
+            child_offsets.push(child_targets.len() as u32);
+        }
         Self {
             nodes,
             node_idx,
             rpo,
+            child_offsets,
+            child_targets,
             dom,
             virtual_root: false,
         }
@@ -124,10 +143,21 @@ impl IndexedBlockTree {
             .skip(1)
             .map(|&idx| nodes[idx as usize])
             .collect();
+        let mut child_offsets = Vec::with_capacity(total + 1);
+        let mut child_targets = Vec::new();
+        child_offsets.push(0);
+        for i in 0..total {
+            for &c in dom.children(i) {
+                child_targets.push(nodes[c as usize]);
+            }
+            child_offsets.push(child_targets.len() as u32);
+        }
         Self {
             nodes,
             node_idx,
             rpo,
+            child_offsets,
+            child_targets,
             dom,
             virtual_root: true,
         }
@@ -149,7 +179,39 @@ impl IndexedBlockTree {
         }
     }
 
-    fn dominates(&self, a: BlockId, b: BlockId) -> bool {
+    fn depth(&self, b: BlockId) -> Option<u32> {
+        let i = *self.node_idx.get(&b)?;
+        let d = self.dom.depth(i)?;
+        if self.virtual_root {
+            d.checked_sub(1)
+        } else {
+            Some(d)
+        }
+    }
+
+    fn dom_children(&self, b: BlockId) -> &[BlockId] {
+        let Some(&i) = self.node_idx.get(&b) else {
+            return &[];
+        };
+        let Some(&start) = self.child_offsets.get(i) else {
+            return &[];
+        };
+        let Some(&end) = self.child_offsets.get(i + 1) else {
+            return &[];
+        };
+        self.child_targets
+            .get(start as usize..end as usize)
+            .unwrap_or(&[])
+    }
+
+    fn dominates_forward(&self, a: BlockId, b: BlockId) -> bool {
+        let (Some(&ai), Some(&bi)) = (self.node_idx.get(&a), self.node_idx.get(&b)) else {
+            return false;
+        };
+        self.dom.dominates(ai, bi)
+    }
+
+    fn post_dominates(&self, a: BlockId, b: BlockId) -> bool {
         if a == b {
             return true;
         }
@@ -159,7 +221,10 @@ impl IndexedBlockTree {
         self.dom.dominates(ai, bi)
     }
 
-    fn chain(&self, b: BlockId) -> Vec<BlockId> {
+    fn chain(&self, b: BlockId, require_reachable: bool) -> Vec<BlockId> {
+        if require_reachable && !self.is_reachable(b) {
+            return Vec::new();
+        }
         let mut out = vec![b];
         let mut cur = b;
         while let Some(next) = self.idom(cur) {
@@ -176,12 +241,9 @@ enum DomBacking {
     Custom(IndexedBlockTree),
 }
 
-/// Immediate-dominator tree of one function.
-///
-/// Construction is generic over the successor relation; use
-/// [`Dominators::normal`] (terminator successors only) or
-/// [`Dominators::augmented`] (try→handler dispatch included) for the two
-/// standard relations, or [`Dominators::over`] for a custom one.
+/// Immediate-dominator tree of one function, backed directly by
+/// [`abcd_ir::cfg::DomTree`] on [`Dominators::normal`] and
+/// [`Dominators::augmented`] (`D1`, `#94`).
 #[derive(Clone, Debug)]
 pub struct Dominators {
     /// The analyzed function.
@@ -191,8 +253,8 @@ pub struct Dominators {
 
 impl Dominators {
     /// Dominators over an explicit entry block and successor relation
-    /// (used by [`super::structure_subgraph`] without touching `Module`).
-    pub(crate) fn from_entry(
+    /// (suitable for subgraph projections without cloning or mutating `Module`).
+    pub fn from_entry(
         func: FuncId,
         entry: Option<BlockId>,
         succ: &dyn Fn(BlockId) -> Vec<BlockId>,
@@ -225,12 +287,33 @@ impl Dominators {
         }
     }
 
+    /// Underlying [`DomTree`] when built via [`Dominators::normal`] or
+    /// [`Dominators::augmented`].
+    #[must_use]
+    pub fn as_dom_tree(&self) -> Option<&DomTree> {
+        match &self.backing {
+            DomBacking::Ir(dt) => dt.as_ref(),
+            DomBacking::Custom(_) => None,
+        }
+    }
+
     /// Reachable blocks in reverse post-order (the entry first).
     pub fn rpo(&self) -> &[BlockId] {
         match &self.backing {
             DomBacking::Ir(Some(dt)) => dt.rpo(),
             DomBacking::Ir(None) => &[],
             DomBacking::Custom(tree) => &tree.rpo,
+        }
+    }
+
+    /// All blocks owned by the tree (`func.blocks` order for [`DomTree`]-backed
+    /// instances; reachable BFS order for [`Dominators::over`]).
+    #[must_use]
+    pub fn blocks(&self) -> &[BlockId] {
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.blocks(),
+            DomBacking::Ir(None) => &[],
+            DomBacking::Custom(tree) => &tree.nodes,
         }
     }
 
@@ -244,7 +327,7 @@ impl Dominators {
     }
 
     /// The immediate dominator of `b`; `None` for the entry and for
-    /// unreachable blocks.
+    /// unreachable or foreign blocks.
     pub fn idom(&self, b: BlockId) -> Option<BlockId> {
         match &self.backing {
             DomBacking::Ir(Some(dt)) => dt.idom(b),
@@ -253,24 +336,53 @@ impl Dominators {
         }
     }
 
-    /// Whether `a` dominates `b`. Every block dominates itself;
-    /// unreachable blocks are dominated by nothing else.
-    pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
-        if a == b {
-            return true;
-        }
+    /// Dominator-tree depth of `b` (`Some(0)` at entry, `None` for unreachable
+    /// or foreign blocks).
+    #[must_use]
+    pub fn depth(&self, b: BlockId) -> Option<u32> {
         match &self.backing {
-            DomBacking::Ir(Some(dt)) => dt.dominates(a, b),
-            DomBacking::Ir(None) => false,
-            DomBacking::Custom(tree) => tree.dominates(a, b),
+            DomBacking::Ir(Some(dt)) => dt.depth(b),
+            DomBacking::Ir(None) => None,
+            DomBacking::Custom(tree) => tree.depth(b),
         }
     }
 
+    /// Immediate dominator-tree children of `b` (`&[]` if leaf, unreachable,
+    /// or foreign).
+    #[must_use]
+    pub fn dom_children(&self, b: BlockId) -> &[BlockId] {
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.dom_children(b),
+            DomBacking::Ir(None) => &[],
+            DomBacking::Custom(tree) => tree.dom_children(b),
+        }
+    }
+
+    /// Whether `a` dominates `b` (`true` when `a == b` and `a` is reachable;
+    /// `false` whenever either `a` or `b` is unreachable, matching
+    /// [`DomTree::dominates`]).
+    pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
+        match &self.backing {
+            DomBacking::Ir(Some(dt)) => dt.dominates(a, b),
+            DomBacking::Ir(None) => false,
+            DomBacking::Custom(tree) => tree.dominates_forward(a, b),
+        }
+    }
+
+    /// Whether `a` strictly dominates `b` (`a != b && self.dominates(a, b)`).
+    #[must_use]
+    pub fn strictly_dominates(&self, a: BlockId, b: BlockId) -> bool {
+        a != b && self.dominates(a, b)
+    }
+
     /// The full dominator chain of `b`, from `b` up to the entry
-    /// (unreachable blocks yield `{b}` alone).
+    /// (unreachable blocks yield an empty vector, matching `dominates(dead, dead) == false`).
     pub fn dominator_chain(&self, b: BlockId) -> Vec<BlockId> {
         match &self.backing {
             DomBacking::Ir(_) => {
+                if !self.is_reachable(b) {
+                    return Vec::new();
+                }
                 let mut out = vec![b];
                 let mut cur = b;
                 while let Some(next) = self.idom(cur) {
@@ -279,7 +391,7 @@ impl Dominators {
                 }
                 out
             }
-            DomBacking::Custom(tree) => tree.chain(b),
+            DomBacking::Custom(tree) => tree.chain(b, true),
         }
     }
 }
@@ -299,8 +411,8 @@ pub struct PostDominators {
 
 impl PostDominators {
     /// Post-dominators over an explicit block slice and successor relation
-    /// (used by [`super::structure_subgraph`] without touching `Module`).
-    pub(crate) fn over_blocks(
+    /// (suitable for subgraph projections without cloning or mutating `Module`).
+    pub fn over_blocks(
         func: FuncId,
         blocks: &[BlockId],
         succ: &dyn Fn(BlockId) -> Vec<BlockId>,
@@ -390,12 +502,12 @@ impl PostDominators {
 
     /// Whether `a` post-dominates `b`.
     pub fn post_dominates(&self, a: BlockId, b: BlockId) -> bool {
-        self.tree.dominates(a, b)
+        self.tree.post_dominates(a, b)
     }
 
     /// The full post-dominator chain of `b`, from `b` down to the exits.
     pub fn post_dominator_chain(&self, b: BlockId) -> Vec<BlockId> {
-        self.tree.chain(b)
+        self.tree.chain(b, false)
     }
 }
 
@@ -443,7 +555,14 @@ mod tests {
         assert_eq!(dom.idom(b), Some(entry));
         assert_eq!(dom.idom(join), Some(entry));
         assert_eq!(dom.idom(exit), Some(join));
+        assert_eq!(dom.depth(entry), Some(0));
+        assert_eq!(dom.depth(join), Some(1));
+        assert_eq!(dom.depth(exit), Some(2));
+        assert_eq!(dom.dom_children(entry), &[a, b, join]);
+        assert_eq!(dom.dom_children(join), &[exit]);
         assert!(dom.dominates(entry, join));
+        assert!(dom.strictly_dominates(entry, join));
+        assert!(!dom.strictly_dominates(entry, entry));
         assert!(!dom.dominates(a, join));
         assert!(dom.dominates(entry, entry));
     }
@@ -506,7 +625,7 @@ mod tests {
     }
 
     /// Exceptional predecessors are NOT Normal edges: a catch handler is
-    /// unreachable over the Normal relation (dominated only by itself),
+    /// unreachable over the Normal relation (`dominates(handler, handler) == false`),
     /// but dominated by the protected block's chain under the augmented
     /// relation.
     #[test]
@@ -528,7 +647,8 @@ mod tests {
         assert!(normal.is_reachable(exit));
         assert!(!normal.is_reachable(handler));
         assert!(!normal.dominates(entry, handler));
-        assert!(normal.dominates(handler, handler));
+        assert!(!normal.dominates(handler, handler));
+        assert_eq!(normal.depth(handler), None);
 
         let aug = Dominators::augmented(&m, f);
         assert!(aug.is_reachable(handler));
@@ -631,9 +751,10 @@ mod tests {
         assert_eq!(post.ipostdom(throw_in_typed), None);
     }
 
-    /// Dead blocks (no path from entry) are dominated by themselves only.
+    /// Dead blocks (no path from entry) satisfy `dominates(dead, dead) == false`,
+    /// agreeing workspace-wide with `abcd_ir::cfg::DomTree`.
     #[test]
-    fn dead_blocks_stand_alone() {
+    fn dead_blocks_agree_with_dom_tree() {
         let mut m = mk_module();
         let f = add_func(&mut m);
         let entry = entry_of(&m, f);
@@ -642,10 +763,15 @@ mod tests {
         emit_void(&mut m, dead, Op::Return { value: None });
 
         let dom = Dominators::normal(&m, f);
-        assert!(!dom.is_reachable(dead));
-        assert!(dom.dominates(dead, dead));
-        assert!(!dom.dominates(entry, dead));
-        assert_eq!(dom.dominator_chain(dead), vec![dead]);
+        let custom = Dominators::over(&m, f, &|b| crate::control::block_succs(&m, b));
+        for d in [&dom, &custom] {
+            assert!(!d.is_reachable(dead));
+            assert!(!d.dominates(dead, dead));
+            assert!(!d.dominates(entry, dead));
+            assert_eq!(d.depth(dead), None);
+            assert!(d.dom_children(dead).is_empty());
+            assert!(d.dominator_chain(dead).is_empty());
+        }
     }
 
     /// A self-loop with no exit reaches no exit: post-dominance degrades

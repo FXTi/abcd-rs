@@ -26,11 +26,11 @@ fn main() -> ExitCode {
             // stderr + 1 (not clap's default 2, which means "tool error"
             // in this binary's contract).
             if e.use_stderr() {
-                eprint!("{e}");
+                abcd_cli::write_stderr_fmt(format_args!("{e}"));
                 return ExitCode::from(1);
             }
             if let Err(io_err) = abcd_cli::write_stdout_fmt(format_args!("{e}")) {
-                eprintln!("error: {io_err}");
+                abcd_cli::write_stderr_fmt_line(format_args!("error: {io_err}"));
                 return ExitCode::from(io_err.exit_code());
             }
             return ExitCode::SUCCESS;
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     match abcd_cli::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            abcd_cli::write_stderr_fmt_line(format_args!("error: {e}"));
             ExitCode::from(e.exit_code())
         }
     }

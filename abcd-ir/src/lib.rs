@@ -2,9 +2,10 @@
 //!
 //! Format-independent Static Single Assignment intermediate representation for
 //! ArkCompiler bytecode programs (`design/ir.md`; design rulings in
-//! `design/decisions.md`): identity tables, module/function arenas, the 88-op
+//! `design/decisions.md`): identity tables, module/function arenas, the 94-op
 //! taxonomy, the effects table, the type lattice, the dual-dialect calling
-//! convention (`D6`), and the structural verifier. Lifting (`abcd-lift`,
+//! convention (`D6`, [`Module::dialect`]), iterative Semi-NCA dominance, and
+//! the structural verifier. Lifting (`abcd-lift`,
 //! container → IR), optimization (`abcd-opt`, IR → IR), and lowering
 //! (`abcd-lower`, IR → container) live in separate crates.
 //!
@@ -78,7 +79,10 @@ pub mod symbol;
 pub mod ty;
 pub mod verify;
 
-pub use cfg::{DomTree, ExceptionHandlerMap, IndexedDom, normal_succs_inline};
+pub use cfg::{
+    DomTree, ExceptionHandlerMap, IndexedDom, augmented_succs, augmented_succs_with_map,
+    block_succs, compute_rpo, compute_rpo_with, inst_succs, normal_succs_inline,
+};
 pub use consts::{Const, ConstPool, LitMethodKind, TypedArrayTag};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use frame::{FrameSlots, this_param_index};

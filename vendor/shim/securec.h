@@ -1,40 +1,68 @@
 /**
  * Shim for Huawei securec library.
- * Provides memcpy_s as a thin wrapper around standard memcpy.
  *
- * On Windows, memcpy_s and errno_t are already in the CRT — skip entirely.
+ * Provides a non-aborting `memcpy_s` wrapper across all platforms:
+ * - Avoids C/C++ UB on `std::memcpy(dest, nullptr, 0)` when `count == 0`.
+ * - On Windows MSVC, avoids CRT `::memcpy_s` invoking the Invalid Parameter
+ *   Handler (`__fastfail`) on null pointers or `count > destMax`, returning
+ *   `EINVAL` / `ERANGE` cleanly so callers can propagate errors.
  */
 
 #ifndef SECUREC_H
 #define SECUREC_H
 
-#ifdef _WIN32
-
-// Windows CRT provides memcpy_s, errno_t, etc. via <cstring>/<cerrno>.
-#include <cstring>
 #include <cerrno>
+#include <cstring>
 
 #ifndef EOK
 #define EOK 0
 #endif
+
+#ifdef _WIN32
+
+inline int abcd_shim_memcpy_s(void *dest, size_t destMax, const void *src, size_t count) noexcept
+{
+    if (dest == nullptr) {
+        return EINVAL;
+    }
+    if (count == 0) {
+        return EOK;
+    }
+    if (src == nullptr) {
+        return EINVAL;
+    }
+    if (count > destMax) {
+        return ERANGE;
+    }
+    std::memcpy(dest, src, count);
+    return EOK;
+}
+
+#ifdef memcpy_s
+#undef memcpy_s
+#endif
+#define memcpy_s abcd_shim_memcpy_s
 
 #else  // !_WIN32
 
-#include <cstring>
-#include <cerrno>
-
-#ifndef EOK
-#define EOK 0
-#endif
-
-// errno_t is not standard C++; available on macOS but not on Linux/GCC.
 #ifndef __STDC_LIB_EXT1__
 typedef int errno_t;
 #endif
 
-inline int memcpy_s(void *dest, size_t destMax, const void *src, size_t count) {
-    if (dest == nullptr || src == nullptr) return EINVAL;
-    if (count > destMax) return ERANGE;
+inline int memcpy_s(void *dest, size_t destMax, const void *src, size_t count) noexcept
+{
+    if (dest == nullptr) {
+        return EINVAL;
+    }
+    if (count == 0) {
+        return EOK;
+    }
+    if (src == nullptr) {
+        return EINVAL;
+    }
+    if (count > destMax) {
+        return ERANGE;
+    }
     std::memcpy(dest, src, count);
     return EOK;
 }

@@ -1,13 +1,9 @@
-//! Regression tests for finding #17 — per-parameter annotations.
+//! Regression tests for finding #17 and Issue #91 — per-parameter annotations.
 //!
-//! Model contract (maintainer ruling, same precedent as the annotation
-//! category fold, review finding #9): decode keeps both buckets
-//! (`ParamAnnotations::{compile_time, runtime}`); encode folds them — the
-//! vendored MethodParamItem keeps a single annotation vector per param and
-//! sealing snapshots it (vendor file_items.cpp:424), so encode stages the
-//! per-param union of both buckets and seals ONCE as compile-time, unless
-//! the compile-time bucket is empty (then the runtime bucket is sealed as
-//! runtime).
+//! Model contract: decode and encode both keep compile-time
+//! (`MethodTag::PARAM_ANNOTATION`) and runtime
+//! (`MethodTag::RUNTIME_PARAM_ANNOTATION`) parameter annotation buckets
+//! strictly isolated without cross-bucket folding or duplication.
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElemDefEx, AnnotationElemValue, AnnotationValue, Builder,
@@ -76,11 +72,13 @@ fn build_compile_and_runtime() -> Vec<u8> {
 
     let ann_a = mk_ann(&mut b, 1111);
     b.method_param_add_annotation(m, p0, ann_a);
-    b.method_seal_param_annotations(m, false);
+    b.method_seal_param_annotations(m, false)
+        .expect("seal compile-time");
 
     let ann_b = mk_ann(&mut b, 2222);
     b.method_param_add_runtime_annotation(m, p1, ann_b);
-    b.method_seal_param_annotations(m, true);
+    b.method_seal_param_annotations(m, true)
+        .expect("seal runtime");
 
     b.finalize().expect("finalize")
 }
@@ -103,44 +101,38 @@ fn build_runtime_only() -> Vec<u8> {
         }],
     );
     b.method_param_add_runtime_annotation(m, p1, ann);
-    b.method_seal_param_annotations(m, true);
+    b.method_seal_param_annotations(m, true)
+        .expect("seal runtime");
 
     b.finalize().expect("finalize")
 }
 
 #[test]
-fn param_annotations_decode_and_fold_roundtrip() {
+fn param_annotations_decode_and_dual_bucket_roundtrip() {
     let file1 = decode(&build_compile_and_runtime()).expect("decode #1");
     let g1 = file1.classes.values().find(|c| !c.is_external).unwrap();
     let pa1 = &g1.methods[0].param_annotations;
 
-    // Decode: both buckets filled, indexed by parameter position.
+    // Decode: both buckets filled independently, indexed by parameter position.
     assert_eq!(pa1.compile_time.len(), 2);
     assert_eq!(u32_values(&pa1.compile_time[0]), vec![1111]);
     assert!(pa1.compile_time[1].is_empty());
     assert_eq!(pa1.runtime.len(), 2);
+    assert!(pa1.runtime[0].is_empty());
     assert_eq!(u32_values(&pa1.runtime[1]), vec![2222]);
 
-    // Encode folds runtime into compile-time (contract at the top of this
-    // file): the re-encoded file has a single compile-time item holding the
-    // per-param union, and no runtime item.
+    // Encode seals both buckets independently without cross-bucket duplication.
     let bytes2 = encode(&file1).expect("encode");
     let file2 = decode(&bytes2).expect("decode #2");
     let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
     let pa2 = &g2.methods[0].param_annotations;
 
-    assert!(pa2.runtime.is_empty(), "runtime bucket folded away");
     assert_eq!(pa2.compile_time.len(), 2);
-    assert!(
-        u32_values(&pa2.compile_time[0]).contains(&1111),
-        "compile_time[0] must keep 1111, got {:?}",
-        u32_values(&pa2.compile_time[0])
-    );
-    assert!(
-        u32_values(&pa2.compile_time[1]).contains(&2222),
-        "compile_time[1] must gain the folded 2222, got {:?}",
-        u32_values(&pa2.compile_time[1])
-    );
+    assert_eq!(u32_values(&pa2.compile_time[0]), vec![1111]);
+    assert!(pa2.compile_time[1].is_empty());
+    assert_eq!(pa2.runtime.len(), 2);
+    assert!(pa2.runtime[0].is_empty());
+    assert_eq!(u32_values(&pa2.runtime[1]), vec![2222]);
 }
 
 #[test]

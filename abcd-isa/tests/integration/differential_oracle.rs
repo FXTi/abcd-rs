@@ -5,10 +5,22 @@ use std::collections::{BTreeSet, HashMap};
 use std::ptr;
 
 use abcd_isa::{
-    Bytecode, BytecodeFlags, DecodeError, EntityId, ExceptionType, Imm, Label, Reg,
-    RelocationError, decode, encode, insn, relocate_entity_id,
+    Bytecode, BytecodeFlags, DecodeError, EntityId, ExceptionType, Imm, Label, MIN_PREFIX_OPCODE,
+    ModernDecodeFault, Reg, RelocationError, Version, decode, encode, insn, relocate_entity_id,
 };
-use abcd_isa_sys::{self as sys, MIN_PREFIX_OPCODE, ModernDecodeFault};
+use abcd_isa_sys as sys;
+
+#[allow(
+    dead_code,
+    unused_parens,
+    clippy::all,
+    clippy::undocumented_unsafe_blocks,
+    clippy::allow_attributes_without_reason,
+    reason = "pre-generated C FFI differential oracle helper emitted by scripts/vendor-gen.py"
+)]
+mod oracle {
+    include!("generated/oracle_decode.rs");
+}
 
 /// Encode `instructions` through the vendored C++ `BytecodeEmitter` FFI oracle.
 fn cpp_oracle_encode(instructions: &[Bytecode]) -> Vec<u8> {
@@ -184,7 +196,7 @@ fn exhaustive_all_u16_opcodes_match_cpp_oracle() {
             assert_eq!(cpp_sz_bytes, cpp_size);
 
             // SAFETY: `buf` has >= `cpp_size` readable bytes and `op` is assigned.
-            let (cpp_bc, cpp_jmp) = unsafe { Bytecode::decode_one(buf.as_ptr(), op) }
+            let (cpp_bc, cpp_jmp) = unsafe { oracle::oracle_decode_one(buf.as_ptr(), op) }
                 .expect("assigned opcode must decode in C++ oracle");
             let (rs_bc, rs_sz, rs_jmp) = Bytecode::decode_modern(&buf[..cpp_size])
                 .expect("assigned opcode must decode in pure Rust");
@@ -646,6 +658,125 @@ fn domino_cascade_forward_and_backward_at_imm8_boundary() {
             assert_eq!((b0_sz, b1_sz, b2_sz), (2, 2, 2));
         } else {
             assert_eq!((b0_sz, b1_sz, b2_sz), (3, 3, 3));
+        }
+    }
+}
+
+/// 5. Terminal widened conditional jump (`R1-6`): when a `> 32 KiB` backward
+///    conditional jump requiring an inverted-branch + `jmp.32` trampoline is
+///    the FINAL instruction in `instructions`, `encode` appends a 1-byte `nop`
+///    landing pad so the inverted skip branch lands on a valid instruction
+///    boundary and `decode` succeeds.
+#[test]
+fn terminal_widened_conditional_jumps_decode_cleanly() {
+    let filler = 40_000usize;
+    for &(mk, expected_inv) in &all_17_jump_builders() {
+        let mut prog = Vec::with_capacity(filler + 2);
+        prog.push(insn::Returnundefined::new()); // index 0: backward target
+        prog.resize(filler + 1, insn::Ldundefined::new());
+        prog.push(mk(Label(0))); // final instruction!
+
+        let (bytes, offsets) = encode(&prog).expect("terminal >40 KiB jump encode must succeed");
+        assert_eq!(offsets.len(), prog.len());
+        let dec = decode(&bytes).expect("terminal >40 KiB jump must decode without OOB target");
+        match expected_inv {
+            None => {
+                assert_eq!(dec.len(), prog.len());
+                assert_eq!(dec.last().unwrap().0.jump_label(), Some(Label(0)));
+            }
+            Some(inv_mnem) => {
+                assert_eq!(dec.len(), prog.len() + 2);
+                let inv_idx = filler + 1;
+                assert_eq!(dec[inv_idx].0.mnemonic(), inv_mnem);
+                assert_eq!(
+                    dec[inv_idx].0.jump_label(),
+                    Some(Label((inv_idx + 2) as u32))
+                );
+                assert_eq!(dec[inv_idx + 1].0, Bytecode::Jmp(Label(0)));
+                assert_eq!(dec[inv_idx + 2].0, Bytecode::Nop);
+            }
+        }
+    }
+}
+
+/// 6. Exhaustive differential parity between pure-Rust `abcd_isa::Version` and
+///    the vendored C++ `file_format_version` FFI queries in `abcd_isa_sys`.
+#[test]
+fn pure_rust_version_matches_cpp_oracle_exhaustively() {
+    // SAFETY: valid 4-byte stack buffers passed to stateless C99 version queries.
+    unsafe {
+        let mut cpp_cur = [0u8; 4];
+        sys::isa_get_version(cpp_cur.as_mut_ptr());
+        assert_eq!(*Version::current().as_bytes(), cpp_cur);
+
+        let mut cpp_min = [0u8; 4];
+        sys::isa_get_min_version(cpp_min.as_mut_ptr());
+        assert_eq!(*Version::min_supported().as_bytes(), cpp_min);
+
+        let count = sys::isa_incompatible_version_count();
+        let rs_incompat = Version::incompatible_versions();
+        assert_eq!(rs_incompat.len(), count);
+        for (i, v) in rs_incompat.iter().enumerate() {
+            let mut cpp_v = [0u8; 4];
+            sys::isa_incompatible_version_at(i, cpp_v.as_mut_ptr());
+            assert_eq!(*v.as_bytes(), cpp_v);
+            assert!(v.is_blocked());
+            assert_eq!(sys::isa_is_version_incompatible(cpp_v.as_ptr()), 1);
+        }
+
+        for api in 0u8..=255 {
+            let mut cpp_out = [0u8; 4];
+            let rc = sys::isa_get_version_by_api(api, cpp_out.as_mut_ptr());
+            let rs_api = Version::for_api(api);
+            if rc == 0 {
+                assert_eq!(rs_api, Some(Version::from(cpp_out)), "api={api}");
+            } else {
+                assert_eq!(rs_api, None, "api={api}");
+            }
+
+            for (sub_str, sub_c) in [
+                ("", c""),
+                ("beta1", c"beta1"),
+                ("beta2", c"beta2"),
+                ("beta3", c"beta3"),
+                ("rc1", c"rc1"),
+            ] {
+                let mut cpp_sub = [0u8; 4];
+                let sub_rc =
+                    sys::isa_get_version_by_api_sub(api, sub_c.as_ptr(), cpp_sub.as_mut_ptr());
+                assert_eq!(sub_rc, 0);
+                assert_eq!(
+                    Version::for_api_sub(api, sub_str),
+                    Some(Version::from(cpp_sub)),
+                    "api={api} sub={sub_str}"
+                );
+            }
+            assert_eq!(Version::for_api_sub(api, "bad\0sub"), None);
+        }
+
+        for probe in [
+            [0, 0, 0, 1],
+            [0, 0, 0, 2],
+            [9, 0, 0, 0],
+            [11, 0, 0, 0],
+            [11, 0, 1, 0],
+            [11, 0, 2, 0],
+            [12, 0, 6, 0],
+            [24, 0, 0, 0],
+            [24, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            let v = Version::from(probe);
+            assert_eq!(
+                v.is_in_supported_range(),
+                sys::isa_is_version_compatible(probe.as_ptr()) != 0,
+                "probe={probe:?}"
+            );
+            assert_eq!(
+                v.is_blocked(),
+                sys::isa_is_version_incompatible(probe.as_ptr()) != 0,
+                "probe={probe:?}"
+            );
         }
     }
 }

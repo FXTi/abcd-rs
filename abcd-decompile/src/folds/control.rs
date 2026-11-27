@@ -123,7 +123,7 @@ pub(in crate::folds) fn arm_has_loop_break(nodes: &[SNode]) -> bool {
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -183,7 +183,7 @@ pub(in crate::folds) fn switch_test(cond: &Expr) -> Option<(Expr, Expr, bool)> {
     }
     match c {
         Expr::Compare {
-            op: abcd_ir::op::CmpOp::StrictEq | abcd_ir::op::CmpOp::Eq,
+            op: abcd_ir::op::CmpOp::StrictEq,
             left,
             right,
         } => {
@@ -790,6 +790,7 @@ fn run_ft_steps(initial: FtStep<'_>) -> bool {
                         steps.push(FtStep::List(body));
                     }
                 }
+                SNode::Block(body) => steps.push(FtStep::List(body)),
                 SNode::Break { .. } | SNode::Continue { .. } => vals.push(false),
                 // Loops, switches, labeled blocks, honesty comments: may
                 // complete (a loop can break out, a comment says nothing).
@@ -875,6 +876,7 @@ fn take_ft_child(
         SNode::Labeled { label, body } => {
             (slot == 0).then(|| (std::mem::take(body), ctx, Some(label.clone())))
         }
+        SNode::Block(body) => (slot == 0).then(|| (std::mem::take(body), ctx, None)),
         SNode::Try {
             body,
             catches,
@@ -904,7 +906,8 @@ fn put_ft_child(n: &mut SNode, slot: usize, child: Vec<SNode>) {
             1 => *otherwise = child,
             _ => {}
         },
-        SNode::While { body, .. }
+        SNode::Block(body)
+        | SNode::While { body, .. }
         | SNode::DoWhile { body, .. }
         | SNode::ForOf { body, .. }
         | SNode::ForIn { body, .. }

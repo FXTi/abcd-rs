@@ -263,10 +263,10 @@ fn yield_star_node_throw_main_correct() {
     );
 }
 
-/// The bail fixture: stdout pins the loud-fallback form (the
-/// unfolded machine yields the raw iter-result objects — today's
-/// honest fallback, not source behavior). This is the shape the fold
-/// deliberately refuses to touch.
+/// The bail fixture: `yield_star_fold` refuses to turn the hand-rolled
+/// iterator-protocol loop into `yield*`, while `generator_machine_fold`
+/// folds the inner `yield r.value` cleanly so the generator reproduces
+/// exact source stdout (`1,2,3`).
 #[test]
 #[ignore = "requires exported corpus"]
 fn yield_star_node_bail_loud_fallback() {
@@ -284,8 +284,8 @@ fn yield_star_node_bail_loud_fallback() {
     eprintln!("NODE-EVIDENCE manual-iterator exit={ok} stdout={stdout:?}");
     assert!(ok, "node run manual-iterator failed: {stderr}");
     assert_eq!(
-        stdout, "[object Object],[object Object],[object Object]\n",
-        "manual-iterator: loud-fallback form changed (investigate!)"
+        stdout, "1,2,3\n",
+        "manual-iterator: behavior mismatch (investigate!)"
     );
 }
 

@@ -126,6 +126,34 @@ pub(crate) fn write_stdout_fmt_line(args: std::fmt::Arguments<'_>) -> Result<(),
     )
 }
 
+/// Write formatted text (without trailing newline) to `writer` (`stderr`),
+/// ignoring `BrokenPipe` and any secondary error while reporting diagnostics.
+pub fn write_stderr_fmt_to<W: std::io::Write>(
+    mut writer: W,
+    args: std::fmt::Arguments<'_>,
+) -> std::io::Result<()> {
+    match writer.write_fmt(args).and_then(|()| writer.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write formatted text (without trailing newline) to locked `stderr`,
+/// treating `BrokenPipe` as clean completion instead of panicking in `eprint!`.
+pub fn write_stderr_fmt(args: std::fmt::Arguments<'_>) {
+    let _ = write_stderr_fmt_to(std::io::stderr().lock(), args);
+}
+
+/// Write formatted text followed by `'\n'` to locked `stderr`, treating
+/// `BrokenPipe` as clean completion instead of panicking in `eprintln!`.
+pub fn write_stderr_fmt_line(args: std::fmt::Arguments<'_>) {
+    let mut err = std::io::stderr().lock();
+    let _ = std::io::Write::write_fmt(&mut err, args)
+        .and_then(|()| std::io::Write::write_all(&mut err, b"\n"))
+        .and_then(|()| std::io::Write::flush(&mut err));
+}
+
 /// Dispatch a parsed command line. Prints results to stdout; diagnostics
 /// are the caller's job (see `main`).
 pub fn run(cli: cli::Cli) -> Result<(), CliError> {
@@ -242,6 +270,12 @@ fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
     }
     if let Some(b) = args.pta_budget {
         cfg.pta_step_budget = Some(b);
+    }
+    if args.pta_budget.is_some() && cfg.alias_rung < 2 {
+        return Err(CliError::User(format!(
+            "--pta-budget requires --alias-rung 2, got effective alias rung {}",
+            cfg.alias_rung
+        )));
     }
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;

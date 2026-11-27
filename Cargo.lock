@@ -84,6 +84,7 @@ name = "abcd-isa"
 version = "0.1.0"
 dependencies = [
  "abcd-isa-sys",
+ "bitflags",
  "thiserror",
 ]
 
@@ -91,7 +92,6 @@ dependencies = [
 name = "abcd-isa-sys"
 version = "0.1.0"
 dependencies = [
- "bitflags",
  "cc",
 ]
 
@@ -109,7 +109,6 @@ dependencies = [
 name = "abcd-lower"
 version = "0.1.0"
 dependencies = [
- "abcd-analysis",
  "abcd-file",
  "abcd-ir",
  "abcd-isa",

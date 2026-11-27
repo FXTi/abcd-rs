@@ -187,101 +187,104 @@ fn sendable_export_1_nested_i32_array_is_decoded() {
     );
 }
 
-/// Render one literal array offset-independently: strings/methods by name,
-/// nested references structurally (cycle-guarded), typed-array payloads by
-/// content read from the owning file's bytes at the raw payload offset (the
-/// N52 representation — ARRAY_* slots keep raw payload offsets).
-fn render_array(
-    file: &abcd_file::File,
-    bytes: &[u8],
-    index: u32,
-    visiting: &mut HashSet<u32>,
-) -> String {
-    if !visiting.insert(index) {
-        return "cycle".to_owned();
+/// Render one literal array offset-independently using an explicit workstack:
+/// strings/methods by name, nested references structurally (cycle-guarded),
+/// and typed-array payloads by owned elements.
+fn render_array(file: &abcd_file::File, _bytes: &[u8], root_index: u32) -> String {
+    enum Step<'a> {
+        EnterArray(u32),
+        ExitArray(u32),
+        Slice(&'a [LiteralValue], usize),
+        Val(&'a LiteralValue),
     }
-    let Some(array) = file.literal_arrays.get(index as usize) else {
-        return format!("oob:{index}");
-    };
-    let rendered: Vec<String> = array
-        .values
-        .iter()
-        .map(|v| render_value(file, bytes, v, visiting))
-        .collect();
-    visiting.remove(&index);
-    format!("[{}]", rendered.join(","))
-}
-
-fn render_value(
-    file: &abcd_file::File,
-    bytes: &[u8],
-    value: &LiteralValue,
-    visiting: &mut HashSet<u32>,
-) -> String {
     use abcd_file::LiteralValue::*;
-    match value {
-        String(sid) | EtsImplements(sid) => {
-            format!("s:{}", file.strings.resolve(*sid).unwrap_or("?"))
-        }
-        Method(midx)
-        | GeneratorMethod(midx)
-        | AsyncGeneratorMethod(midx)
-        | Getter(midx)
-        | Setter(midx) => {
-            let name = file
-                .method_by_idx(*midx)
-                .and_then(|(_, _, m)| file.strings.resolve(m.name))
-                .unwrap_or("?");
-            format!("m:{name}")
-        }
-        LiteralArray(idx) => render_array(file, bytes, idx.0, visiting),
-        ArrayU1(idx) | ArrayU8(idx) | ArrayI8(idx) | ArrayU16(idx) | ArrayI16(idx)
-        | ArrayU32(idx) | ArrayI32(idx) | ArrayU64(idx) | ArrayI64(idx) | ArrayF32(idx)
-        | ArrayF64(idx) | ArrayString(idx) => {
-            // Typed-array payload starts at `array_source_offset + 5`
-            // (`[u32 item_count][u8 tag][u32 elem_count][elems...]`).
-            let Some(arr_off) = file
-                .literal_arrays
-                .get(idx.index())
-                .and_then(|la| la.source_offset)
-            else {
-                return format!("typed:{value:?}@oob");
-            };
-            let off = arr_off as usize + 5;
-            let Some(raw) = bytes.get(off..off + 4) else {
-                return format!("typed:{value:?}@oob");
-            };
-            let count = u32::from_le_bytes(raw.try_into().unwrap());
-            format!("typed:{}:n{count}", tag_name(value))
-        }
-        other => format!("{other:?}"),
-    }
-}
 
-fn tag_name(value: &LiteralValue) -> &'static str {
-    use abcd_file::LiteralValue::*;
-    match value {
-        ArrayU1(_) => "u1",
-        ArrayU8(_) => "u8",
-        ArrayI8(_) => "i8",
-        ArrayU16(_) => "u16",
-        ArrayI16(_) => "i16",
-        ArrayU32(_) => "u32",
-        ArrayI32(_) => "i32",
-        ArrayU64(_) => "u64",
-        ArrayI64(_) => "i64",
-        ArrayF32(_) => "f32",
-        ArrayF64(_) => "f64",
-        ArrayString(_) => "string",
-        _ => unreachable!(),
+    let mut visiting = HashSet::new();
+    let mut out = std::string::String::new();
+    let mut stack = vec![Step::EnterArray(root_index)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::EnterArray(index) => {
+                if !visiting.insert(index) {
+                    out.push_str("cycle");
+                    continue;
+                }
+                let Some(array) = file.literal_arrays.get(index as usize) else {
+                    visiting.remove(&index);
+                    out.push_str(&format!("oob:{index}"));
+                    continue;
+                };
+                out.push('[');
+                stack.push(Step::ExitArray(index));
+                stack.push(Step::Slice(&array.values, 0));
+            }
+            Step::ExitArray(index) => {
+                visiting.remove(&index);
+                out.push(']');
+            }
+            Step::Slice(slice, idx) => {
+                if idx < slice.len() {
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    stack.push(Step::Slice(slice, idx + 1));
+                    stack.push(Step::Val(&slice[idx]));
+                }
+            }
+            Step::Val(value) => match value {
+                String(sid) | EtsImplements(sid) => {
+                    out.push_str(&format!("s:{}", file.strings.resolve(*sid).unwrap_or("?")));
+                }
+                Method(midx)
+                | GeneratorMethod(midx)
+                | AsyncGeneratorMethod(midx)
+                | Getter(midx)
+                | Setter(midx) => {
+                    let name = file
+                        .method_by_idx(*midx)
+                        .and_then(|(_, _, m)| file.strings.resolve(m.name))
+                        .unwrap_or("?");
+                    out.push_str(&format!("m:{name}"));
+                }
+                LiteralArray(idx) => stack.push(Step::EnterArray(idx.0)),
+                ArrayU1(v) => out.push_str(&format!("typed:u1:n{}:{v:?}", v.len())),
+                ArrayU8(v) => out.push_str(&format!("typed:u8:n{}:{v:?}", v.len())),
+                ArrayI8(v) => out.push_str(&format!("typed:i8:n{}:{v:?}", v.len())),
+                ArrayU16(v) => out.push_str(&format!("typed:u16:n{}:{v:?}", v.len())),
+                ArrayI16(v) => out.push_str(&format!("typed:i16:n{}:{v:?}", v.len())),
+                ArrayU32(v) => out.push_str(&format!("typed:u32:n{}:{v:?}", v.len())),
+                ArrayI32(v) => out.push_str(&format!("typed:i32:n{}:{v:?}", v.len())),
+                ArrayU64(v) => out.push_str(&format!("typed:u64:n{}:{v:?}", v.len())),
+                ArrayI64(v) => out.push_str(&format!("typed:i64:n{}:{v:?}", v.len())),
+                ArrayF32(v) => out.push_str(&format!(
+                    "typed:f32:n{}:{:?}",
+                    v.len(),
+                    v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                )),
+                ArrayF64(v) => out.push_str(&format!(
+                    "typed:f64:n{}:{:?}",
+                    v.len(),
+                    v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                )),
+                ArrayString(v) => out.push_str(&format!(
+                    "typed:string:n{}:{:?}",
+                    v.len(),
+                    v.iter()
+                        .map(|&s| file.strings.resolve(s).unwrap_or("?"))
+                        .collect::<Vec<_>>()
+                )),
+                other => out.push_str(&format!("{other:?}")),
+            },
+        }
     }
+    out
 }
 
 /// All literal arrays of a file as a sorted set of structural renderings
 /// (immune to table-order permutations across a rewrite).
 fn literal_snapshot(file: &abcd_file::File, bytes: &[u8]) -> BTreeSet<String> {
     (0..file.literal_arrays.len() as u32)
-        .map(|i| render_array(file, bytes, i, &mut HashSet::new()))
+        .map(|i| render_array(file, bytes, i))
         .collect()
 }
 

@@ -173,6 +173,42 @@ pub fn format_g6(v: f64) -> String {
     s
 }
 
+/// Exact lossless `f32` rendering for `array_f32` literal items (Ryū shortest
+/// decimal for finite values, `-0.0` for negative zero, `inf`/`-inf`, and
+/// `bits:0x...` for NaN bit patterns).
+fn write_exact_f32(v: f32, out: &mut Vec<u8>) {
+    if v.is_nan() {
+        let _ = write!(out, "bits:0x{:08x}", v.to_bits());
+    } else if v.is_infinite() {
+        out.extend_from_slice(if v.is_sign_negative() {
+            b"-inf"
+        } else {
+            b"inf"
+        });
+    } else if v == 0.0 && v.is_sign_negative() {
+        out.extend_from_slice(b"-0.0");
+    } else {
+        let _ = write!(out, "{v}");
+    }
+}
+
+/// Exact lossless `f64` rendering for `array_f64` literal items.
+fn write_exact_f64(v: f64, out: &mut Vec<u8>) {
+    if v.is_nan() {
+        let _ = write!(out, "bits:0x{:016x}", v.to_bits());
+    } else if v.is_infinite() {
+        out.extend_from_slice(if v.is_sign_negative() {
+            b"-inf"
+        } else {
+            b"inf"
+        });
+    } else if v == 0.0 && v.is_sign_negative() {
+        out.extend_from_slice(b"-0.0");
+    } else {
+        let _ = write!(out, "{v}");
+    }
+}
+
 /// `{:.5e}`-style scientific text with the C two-digit signed exponent and
 /// its parsed base-10 exponent.
 fn format_scientific_exp(v: f64, prec: usize) -> (String, i32) {
@@ -1074,10 +1110,130 @@ impl<'f> Emitter<'f> {
             LiteralValue::BuiltinTypeIndex(v) => {
                 let _ = write!(out, "builtin_type:{}", i16::from(*v));
             }
-            // ARRAY_* payloads never occur in dynamic pandasm corpus; render a
-            // deterministic placeholder.
-            other => {
-                let _ = write!(out, "!invalid:literal:{other:?}");
+            LiteralValue::ArrayU1(elems) => {
+                out.extend_from_slice(b"array_u1:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{}", u8::from(x));
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayU8(elems) => {
+                out.extend_from_slice(b"array_u8:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayI8(elems) => {
+                out.extend_from_slice(b"array_i8:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayU16(elems) => {
+                out.extend_from_slice(b"array_u16:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayI16(elems) => {
+                out.extend_from_slice(b"array_i16:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayU32(elems) => {
+                out.extend_from_slice(b"array_u32:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayI32(elems) => {
+                out.extend_from_slice(b"array_i32:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayU64(elems) => {
+                out.extend_from_slice(b"array_u64:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayI64(elems) => {
+                out.extend_from_slice(b"array_i64:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(out, "{x}");
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayF32(elems) => {
+                out.extend_from_slice(b"array_f32:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    write_exact_f32(x, out);
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayF64(elems) => {
+                out.extend_from_slice(b"array_f64:[");
+                for (i, &x) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    write_exact_f64(x, out);
+                }
+                out.push(b']');
+            }
+            LiteralValue::ArrayString(elems) => {
+                out.extend_from_slice(b"array_string:[");
+                for (i, &sid) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b", ");
+                    }
+                    out.push(b'"');
+                    out.extend_from_slice(&self.str_bytes(sid));
+                    out.push(b'"');
+                }
+                out.push(b']');
+            }
+            LiteralValue::Integer8(_) => {
+                // Filtered out by `serialize_literal_array_into`.
             }
         }
     }

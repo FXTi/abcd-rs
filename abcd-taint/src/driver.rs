@@ -34,21 +34,24 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::Rung1AliasOracle;
 use abcd_analysis::dataflow::heap::{DEFAULT_MAX_FIELD_CHAIN, Rung0AliasOracle};
-use abcd_analysis::dataflow::ifds::CallGraphOracle;
-use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
+use abcd_analysis::dataflow::ifds::{
+    CallGraphOracle, IfdsConfig, IfdsProblem, IfdsResult, IfdsSolver,
+};
 use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle};
 use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
-use abcd_analysis::ohos_lifecycle::synthesize_ohos_harness;
+use abcd_analysis::ohos_lifecycle::EntryModel;
 use abcd_ir::{FuncId, InstId, Loc, Module, Op};
 
-use crate::fact::{Fact, TaintFact};
+use crate::fact::{Fact, TaintFact, UNCAUGHT_EXCEPTION_VALUE};
 use crate::gap::GapCallGraph;
 use crate::names::{
     ClassPropStores, call_base_value, callee_name_candidates_indexed, quick_callee_leaf_sym,
+    resolve_namespace_classes,
 };
 use crate::oracle::Oracle;
 use crate::problem::{
-    TaintProblem, peel_ns_index, resolve_global_sources, resolve_module_import_sources,
+    TaintProblem, is_global_object, resolve_global_sources, resolve_module_import_sources,
+    resolve_namespace_import_sources,
 };
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 
@@ -288,7 +291,11 @@ fn compute_pta_roots(
 
     let global_sources = resolve_global_sources(module, config);
     let module_import_sources = resolve_module_import_sources(module, links, config);
-    if !global_sources.is_empty() || !module_import_sources.is_empty() {
+    let namespace_import_sources = resolve_namespace_import_sources(module, links, config);
+    if !global_sources.is_empty()
+        || !module_import_sources.is_empty()
+        || !namespace_import_sources.is_empty()
+    {
         for (fi, f) in module.functions.iter().enumerate() {
             let fid = FuncId::new(fi as u32);
             if is_gen[fi] || f.blocks.is_empty() || Some(fid) == harness_fid {
@@ -305,11 +312,24 @@ fn compute_pta_roots(
                             Op::TryGetGlobal { name, .. } => {
                                 inst.result.is_some() && global_sources.contains(name)
                             }
+                            Op::LoadProp { object, name } => {
+                                inst.result.is_some()
+                                    && global_sources.contains(name)
+                                    && is_global_object(module, *object)
+                            }
                             Op::LoadModuleVar { index, kind } => {
                                 inst.result.is_some()
                                     && !kind.is_local()
                                     && links.inst_class(module, iid).is_some_and(|cid| {
                                         module_import_sources.get(&(cid, *index)).is_some_and(
+                                            |opt| opt.as_ref().is_none_or(|syms| !syms.is_empty()),
+                                        )
+                                    })
+                            }
+                            Op::GetModuleNamespace { index } => {
+                                inst.result.is_some()
+                                    && links.inst_class(module, iid).is_some_and(|cid| {
+                                        namespace_import_sources.get(&(cid, *index)).is_some_and(
                                             |opt| opt.as_ref().is_none_or(|syms| !syms.is_empty()),
                                         )
                                     })
@@ -614,13 +634,14 @@ fn compute_pta_roots(
                             }
                         }
                         Op::LoadProp { object, name } => {
-                            if let Some(req_idx) = peel_ns_index(module, *object)
-                                && let Some(slots) =
-                                    links.resolve_namespace_member(f.class_id, req_idx, *name)
-                            {
-                                for &sr in slots {
-                                    if exported_slots.contains(&sr) {
-                                        push_reader(sr, fid);
+                            for ns_cid in resolve_namespace_classes(module, links, fid, *object) {
+                                if let Some(slots) =
+                                    links.namespace_exports(ns_cid).and_then(|m| m.get(name))
+                                {
+                                    for &sr in slots {
+                                        if exported_slots.contains(&sr) {
+                                            push_reader(sr, fid);
+                                        }
                                     }
                                 }
                             }
@@ -708,13 +729,21 @@ fn compute_pta_roots(
         for &b in &f.blocks {
             let Some(bb) = module.block(b) else { continue };
             for &iid in &bb.insts {
-                if let Some(
-                    Op::StoreGlobal { name, .. }
-                    | Op::StoreGlobalRecord { name, .. }
-                    | Op::TryStoreGlobal { name, .. },
-                ) = module.inst(iid).map(|i| &i.op)
-                {
-                    stored_globals.insert(*name);
+                match module.inst(iid).map(|i| &i.op) {
+                    Some(
+                        Op::StoreGlobal { name, .. }
+                        | Op::StoreGlobalRecord { name, .. }
+                        | Op::TryStoreGlobal { name, .. },
+                    ) => {
+                        stored_globals.insert(*name);
+                    }
+                    Some(
+                        Op::StoreProp { object, name, .. }
+                        | Op::StoreOwnPropName { object, name, .. },
+                    ) if is_global_object(module, *object) => {
+                        stored_globals.insert(*name);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -729,13 +758,36 @@ fn compute_pta_roots(
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else { continue };
                 for &iid in &bb.insts {
-                    if let Some(Op::TryGetGlobal { name, .. }) = module.inst(iid).map(|i| &i.op)
-                        && stored_globals.contains(name)
-                    {
-                        let list = glob_to_readers.entry(*name).or_default();
-                        if list.last() != Some(&fid) {
-                            list.push(fid);
+                    match module.inst(iid).map(|i| &i.op) {
+                        Some(Op::TryGetGlobal { name, .. }) if stored_globals.contains(name) => {
+                            let list = glob_to_readers.entry(*name).or_default();
+                            if list.last() != Some(&fid) {
+                                list.push(fid);
+                            }
                         }
+                        Some(Op::LoadProp { object, name })
+                            if stored_globals.contains(name)
+                                && is_global_object(module, *object) =>
+                        {
+                            let list = glob_to_readers.entry(*name).or_default();
+                            if list.last() != Some(&fid) {
+                                list.push(fid);
+                            }
+                        }
+                        Some(
+                            Op::LoadPropDyn { object, .. }
+                            | Op::LoadPropIdx { object, .. }
+                            | Op::CopyDataProps { src: object, .. }
+                            | Op::CreateObjectWithExcludedKeys { obj: object, .. },
+                        ) if is_global_object(module, *object) => {
+                            for &g in &stored_globals {
+                                let list = glob_to_readers.entry(g).or_default();
+                                if list.last() != Some(&fid) {
+                                    list.push(fid);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -796,15 +848,16 @@ fn compute_pta_roots(
 pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
     let orig_func_len = module.functions.len();
     let orig_inst_len = module.insts.len();
-    let (augmented, harness_fid) = if config.ohos_lifecycle {
-        match synthesize_ohos_harness(module, config.manifest_json.as_deref()) {
-            Some((m, hfid)) => (Some(m), Some(hfid)),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-    let work_mod: &Module = augmented.as_ref().unwrap_or(module);
+    let entry_model = config
+        .ohos_lifecycle
+        .then(|| EntryModel::build(module, config.manifest_json.as_deref()));
+    let harness_fid = entry_model.as_ref().and_then(|em| em.harness_func);
+    let has_augmented = entry_model
+        .as_ref()
+        .is_some_and(|em| em.augmented_module.is_some());
+    let work_mod: &Module = entry_model
+        .as_ref()
+        .map_or(module, |em| em.active_module(module));
 
     let links = ModuleLinkTable::build(work_mod);
     let prop_stores = ClassPropStores::build(work_mod);
@@ -836,6 +889,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
                 step_budget: config
                     .pta_step_budget
                     .unwrap_or(abcd_analysis::dataflow::pta::DEFAULT_STEP_BUDGET),
+                harness_func: harness_fid,
                 ..PtaConfig::default()
             };
             let pta_roots = compute_pta_roots(
@@ -890,6 +944,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         oracle,
         &registry,
         config,
+        harness_fid,
     );
     // Callback-gap layer: the eager scan's callback edges ride the
     // solver's call-graph oracle (the base graph itself is untouched —
@@ -935,8 +990,8 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         let path_index = PathIndex::build(work_mod, &result);
         for hit in &mut report.hits {
             let (mut seed, mut path) =
-                reconstruct_path(work_mod, &gap_graph, &result, &path_index, hit);
-            if augmented.is_some() {
+                reconstruct_path(work_mod, &problem, &gap_graph, &result, &path_index, hit);
+            if has_augmented {
                 path.retain(|step| step.inst.index() < orig_inst_len);
                 if path.is_empty()
                     && let Some(inst) = module.inst(hit.call)
@@ -1120,6 +1175,8 @@ struct PathIndex {
     handler_entry_exc: HashMap<InstId, abcd_ir::ValueId>,
     /// function → exit instructions (Return/Throw).
     exits_of: HashMap<FuncId, Vec<InstId>>,
+    /// function → unprotected call sites (`!has_catch_all`) that may propagate uncaught exceptions.
+    uncaught_calls_of: HashMap<FuncId, Vec<InstId>>,
     /// return site → call instructions it is a return site of.
     calls_at_return_site: HashMap<InstId, Vec<InstId>>,
 }
@@ -1166,6 +1223,7 @@ impl PathIndex {
         // Pre-index exceptional handler entry instructions per protected block
         // for reached functions only.
         let mut block_exc_handlers: Vec<Vec<InstId>> = vec![Vec::new(); module.blocks.len()];
+        let mut block_has_catch_all: Vec<bool> = vec![false; module.blocks.len()];
         let mut handler_entry_exc: HashMap<InstId, abcd_ir::ValueId> = HashMap::new();
         for (fi, f) in module.functions.iter().enumerate() {
             if !reached_funcs[fi] {
@@ -1174,7 +1232,11 @@ impl PathIndex {
             let func = FuncId::new(fi as u32);
             for region in &f.try_regions {
                 let mut catch_entries = Vec::new();
+                let mut region_catch_all = false;
                 for catch in &region.catches {
+                    if catch.type_class.is_none() {
+                        region_catch_all = true;
+                    }
                     if let Some(&first) =
                         module.block(catch.handler).and_then(|bb| bb.insts.first())
                     {
@@ -1184,12 +1246,17 @@ impl PathIndex {
                         }
                     }
                 }
-                if catch_entries.is_empty() {
+                if catch_entries.is_empty() && !region_catch_all {
                     continue;
                 }
                 for &prot_b in &region.protected {
                     if block_to_func.get(prot_b.index()).copied().flatten() != Some(func) {
                         continue;
+                    }
+                    if region_catch_all
+                        && let Some(ca) = block_has_catch_all.get_mut(prot_b.index())
+                    {
+                        *ca = true;
                     }
                     let slot = &mut block_exc_handlers[prot_b.index()];
                     for &first in &catch_entries {
@@ -1203,6 +1270,7 @@ impl PathIndex {
 
         let mut func_of_sp = HashMap::new();
         let mut exits_of: HashMap<FuncId, Vec<InstId>> = HashMap::new();
+        let mut uncaught_calls_of: HashMap<FuncId, Vec<InstId>> = HashMap::new();
         let mut calls_at_return_site: HashMap<InstId, Vec<InstId>> = HashMap::new();
         let mut rs_buf: Vec<InstId> = Vec::new();
         for (fi, f) in module.functions.iter().enumerate() {
@@ -1218,6 +1286,7 @@ impl PathIndex {
                 continue;
             }
             let mut exits = Vec::new();
+            let mut uncaught_calls = Vec::new();
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else { continue };
                 for (pos, &iid) in bb.insts.iter().enumerate() {
@@ -1228,6 +1297,13 @@ impl PathIndex {
                         exits.push(iid);
                     }
                     if matches!(inst.op, Op::Call { .. }) {
+                        if !block_has_catch_all
+                            .get(inst.block.index())
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            uncaught_calls.push(iid);
+                        }
                         rs_buf.clear();
                         if inst.block == b {
                             if pos + 1 < bb.insts.len() {
@@ -1274,6 +1350,9 @@ impl PathIndex {
                 }
             }
             exits_of.insert(func, exits);
+            if !uncaught_calls.is_empty() {
+                uncaught_calls_of.insert(func, uncaught_calls);
+            }
         }
         PathIndex {
             block_to_func,
@@ -1283,6 +1362,7 @@ impl PathIndex {
             func_of_sp,
             handler_entry_exc,
             exits_of,
+            uncaught_calls_of,
             calls_at_return_site,
         }
     }
@@ -1331,6 +1411,7 @@ impl PathIndex {
 ///    indices).
 fn reconstruct_path(
     module: &Module,
+    problem: &TaintProblem<'_>,
     callgraph: &impl CallGraphOracle,
     result: &IfdsResult<Fact>,
     index: &PathIndex,
@@ -1380,6 +1461,7 @@ fn reconstruct_path(
     let mut visited: HashSet<usize> = HashSet::new();
     let mut parent: HashMap<usize, usize> = HashMap::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut replay_buf: Vec<Fact> = Vec::new();
     queue.push_back(start_edge);
     visited.insert(start_edge);
     let mut seed_edge = None;
@@ -1415,106 +1497,174 @@ fn reconstruct_path(
                 }));
             }
         } else {
-            // Return-site disambiguation: if this edge's fact is on the
-            // call's RESULT value (or catch handler ExceptionParam, or a heap
-            // fact produced by the callee), the taint arrived through the
-            // callee (return flow), so the path detours via the callee exit —
-            // not the intraprocedural bypass.
-            let mut via_exit: Option<Vec<usize>> = None;
-            if let Some(calls) = index.calls_at_return_site.get(&n) {
-                let dst_local = fact_local_base(dst_id);
-                let handler_exc = index.handler_entry_exc.get(&n).copied();
-                'calls: for c in calls {
-                    let result_val = module.inst(*c).and_then(|i| i.result);
-                    let is_handler_exc = dst_local.is_some() && dst_local == handler_exc;
-                    let on_result =
-                        (dst_local == result_val && result_val.is_some()) || is_handler_exc;
-                    let is_heap_return = dst_local.is_none()
-                        && Some(dst_id) != zero_id
-                        && !index
-                            .edges_at(*c)
-                            .any(|pi| edges[pi].0 == src_id && edges[pi].2 == dst_id);
-                    if !on_result && !is_heap_return {
-                        continue;
-                    }
-                    let mut exit_preds: Vec<usize> = Vec::new();
-                    for callee in callgraph.callees_of_call_at(*c) {
-                        if let Some(exits) = index.exits_of.get(callee) {
-                            for exit in exits {
-                                let Some(exit_inst) = module.inst(*exit) else {
+            let dst_fact = result.fact_by_id(dst_id);
+            let dst_local = fact_local_base(dst_id);
+
+            // Uncaught-exit disambiguation at a throwing `Op::Call` site (`!has_catch_all`):
+            // replay `call_uncaught_exit_flow` across callee `Return`/`Throw` exits and
+            // nested uncaught `Op::Call` sites so multi-frame exception paths reconstruct
+            // every callee frame back to the originating `Throw`.
+            let mut via_uncaught_call = false;
+            if matches!(module.inst(n).map(|i| &i.op), Some(Op::Call { .. }))
+                && Some(dst_id) != zero_id
+            {
+                let is_uncaught_sentinel = dst_local == Some(UNCAUGHT_EXCEPTION_VALUE);
+                let is_uncaught_state = !is_uncaught_sentinel
+                    && dst_local.is_none()
+                    && !inst_preds(module, index, n).into_iter().any(|p| {
+                        index
+                            .edges_at(p)
+                            .any(|pi| edges[pi].0 == src_id && edges[pi].2 == dst_id)
+                    });
+                if (is_uncaught_sentinel || is_uncaught_state)
+                    && let Some(dst_f) = dst_fact
+                {
+                    let mut uncaught_preds: Vec<usize> = Vec::new();
+                    for &callee in callgraph.callees_of_call_at(n) {
+                        let exit_iter = index
+                            .exits_of
+                            .get(&callee)
+                            .into_iter()
+                            .flatten()
+                            .chain(index.uncaught_calls_of.get(&callee).into_iter().flatten());
+                        for &callee_exit in exit_iter {
+                            for pi in index.edges_at(callee_exit) {
+                                let Some(src_f) = result.fact_by_id(edges[pi].2) else {
                                     continue;
                                 };
-                                if is_heap_return {
-                                    if is_handler_exc && !matches!(exit_inst.op, Op::Throw { .. }) {
-                                        continue;
-                                    }
-                                    exit_preds.extend(
-                                        index.edges_at(*exit).filter(|&pi| edges[pi].2 == dst_id),
-                                    );
-                                } else {
-                                    let exit_val = match (&exit_inst.op, is_handler_exc) {
-                                        (Op::Throw { value }, true) => Some(*value),
-                                        (Op::Return { value }, false) => *value,
-                                        _ => None,
-                                    };
-                                    if exit_val.is_some() {
-                                        exit_preds.extend(index.edges_at(*exit).filter(|&pi| {
-                                            fact_local_base(edges[pi].2) == exit_val
-                                        }));
-                                    }
+                                replay_buf.clear();
+                                problem.call_uncaught_exit_flow(
+                                    module,
+                                    n,
+                                    callee,
+                                    callee_exit,
+                                    src_f,
+                                    &mut replay_buf,
+                                );
+                                if replay_buf.contains(dst_f) {
+                                    uncaught_preds.push(pi);
                                 }
                             }
                         }
                     }
-                    if !exit_preds.is_empty() {
-                        via_exit = Some(exit_preds);
-                        break 'calls;
+                    if !uncaught_preds.is_empty() {
+                        preds.extend(uncaught_preds);
+                        via_uncaught_call = true;
                     }
                 }
             }
-            if let Some(exit_preds) = via_exit {
-                preds.extend(exit_preds);
-            } else {
-                let mut zero_preds: Vec<usize> = Vec::new();
-                for p in inst_preds(module, index, n) {
-                    // Prefer the exact-fact (pass-through) predecessor;
-                    // widen only at transforming instructions, preferring
-                    // non-zero incoming taint before the Zero-minting fallback.
-                    let mut any_exact = false;
-                    for pi in index.edges_at(p) {
-                        if edges[pi].0 == src_id && edges[pi].2 == dst_id {
-                            preds.push(pi);
-                            any_exact = true;
-                        }
-                    }
-                    if !any_exact {
-                        for pi in index.edges_at(p) {
-                            if edges[pi].0 == src_id {
-                                if Some(edges[pi].2) != zero_id {
-                                    preds.push(pi);
-                                } else {
-                                    zero_preds.push(pi);
-                                }
-                            }
-                        }
-                    }
-                }
+
+            if !via_uncaught_call {
+                // Return-site disambiguation: if this edge's fact is on the
+                // call's RESULT value (or catch handler ExceptionParam, or a heap
+                // fact produced by the callee), the taint arrived through the
+                // callee (return flow), so the path detours via the callee exit —
+                // not the intraprocedural bypass.
+                let mut via_exit: Option<Vec<usize>> = None;
                 if let Some(calls) = index.calls_at_return_site.get(&n) {
-                    for c in calls {
-                        // The call edge with the same anchor (bypass).
-                        for pi in index.edges_at(*c) {
-                            if edges[pi].0 == src_id {
-                                if Some(edges[pi].2) != zero_id {
-                                    preds.push(pi);
+                    let handler_exc = index.handler_entry_exc.get(&n).copied();
+                    'calls: for c in calls {
+                        let result_val = module.inst(*c).and_then(|i| i.result);
+                        let is_handler_exc = dst_local.is_some() && dst_local == handler_exc;
+                        let on_result =
+                            (dst_local == result_val && result_val.is_some()) || is_handler_exc;
+                        let is_heap_return = dst_local.is_none()
+                            && Some(dst_id) != zero_id
+                            && !index
+                                .edges_at(*c)
+                                .any(|pi| edges[pi].0 == src_id && edges[pi].2 == dst_id);
+                        if !on_result && !is_heap_return {
+                            continue;
+                        }
+                        let mut exit_preds: Vec<usize> = Vec::new();
+                        if let Some(dst_f) = dst_fact {
+                            for &callee in callgraph.callees_of_call_at(*c) {
+                                let uncaught_slice: &[InstId] = if is_handler_exc {
+                                    index
+                                        .uncaught_calls_of
+                                        .get(&callee)
+                                        .map_or(&[], Vec::as_slice)
                                 } else {
-                                    zero_preds.push(pi);
+                                    &[]
+                                };
+                                let exit_iter = index
+                                    .exits_of
+                                    .get(&callee)
+                                    .map_or(&[][..], Vec::as_slice)
+                                    .iter()
+                                    .chain(uncaught_slice.iter());
+                                for &exit in exit_iter {
+                                    for pi in index.edges_at(exit) {
+                                        let Some(src_f) = result.fact_by_id(edges[pi].2) else {
+                                            continue;
+                                        };
+                                        replay_buf.clear();
+                                        problem.return_flow(
+                                            module,
+                                            Some(*c),
+                                            callee,
+                                            exit,
+                                            Some(n),
+                                            src_f,
+                                            &mut replay_buf,
+                                        );
+                                        if replay_buf.contains(dst_f) {
+                                            exit_preds.push(pi);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !exit_preds.is_empty() {
+                            via_exit = Some(exit_preds);
+                            break 'calls;
+                        }
+                    }
+                }
+                if let Some(exit_preds) = via_exit {
+                    preds.extend(exit_preds);
+                } else {
+                    let mut zero_preds: Vec<usize> = Vec::new();
+                    for p in inst_preds(module, index, n) {
+                        // Prefer the exact-fact (pass-through) predecessor;
+                        // widen only at transforming instructions, preferring
+                        // non-zero incoming taint before the Zero-minting fallback.
+                        let mut any_exact = false;
+                        for pi in index.edges_at(p) {
+                            if edges[pi].0 == src_id && edges[pi].2 == dst_id {
+                                preds.push(pi);
+                                any_exact = true;
+                            }
+                        }
+                        if !any_exact {
+                            for pi in index.edges_at(p) {
+                                if edges[pi].0 == src_id {
+                                    if Some(edges[pi].2) != zero_id {
+                                        preds.push(pi);
+                                    } else {
+                                        zero_preds.push(pi);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if preds.is_empty() {
-                    preds.extend(zero_preds);
+                    if let Some(calls) = index.calls_at_return_site.get(&n) {
+                        for c in calls {
+                            // The call edge with the same anchor (bypass).
+                            for pi in index.edges_at(*c) {
+                                if edges[pi].0 == src_id {
+                                    if Some(edges[pi].2) != zero_id {
+                                        preds.push(pi);
+                                    } else {
+                                        zero_preds.push(pi);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if preds.is_empty() {
+                        preds.extend(zero_preds);
+                    }
                 }
             }
         }

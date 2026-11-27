@@ -438,16 +438,31 @@ fn class_lazy_getters_reject_truncated_tag_value() {
                 let mut hits = 0usize;
                 let ctx = &mut hits as *mut usize as *mut c_void;
                 match trap {
-                    0x03 => abc_class_enumerate_runtime_annotations(ca, Some(count_cb), ctx),
-                    0x05 => abc_class_enumerate_runtime_type_annotations(ca, Some(count_cb), ctx),
-                    0x06 => abc_class_enumerate_type_annotations(ca, Some(count_cb), ctx),
+                    0x03 => {
+                        assert_eq!(
+                            abc_class_enumerate_runtime_annotations(ca, Some(count_cb), ctx),
+                            -1
+                        );
+                    }
+                    0x05 => {
+                        assert_eq!(
+                            abc_class_enumerate_runtime_type_annotations(ca, Some(count_cb), ctx),
+                            -1
+                        );
+                    }
+                    0x06 => {
+                        assert_eq!(
+                            abc_class_enumerate_type_annotations(ca, Some(count_cb), ctx),
+                            -1
+                        );
+                    }
                     0x07 => assert_eq!(abc_class_source_file_off(ca), u32::MAX),
                     _ => {
-                        abc_class_enumerate_annotations(ca, Some(count_cb), ctx);
+                        assert_eq!(abc_class_enumerate_annotations(ca, Some(count_cb), ctx), -1);
                         let mut members: Vec<u32> = Vec::new();
                         let mctx = &mut members as *mut Vec<u32> as *mut c_void;
-                        abc_class_enumerate_methods(ca, Some(collect_u32), mctx);
-                        abc_class_enumerate_fields(ca, Some(collect_u32), mctx);
+                        assert_eq!(abc_class_enumerate_methods(ca, Some(collect_u32), mctx), -1);
+                        assert_eq!(abc_class_enumerate_fields(ca, Some(collect_u32), mctx), -1);
                         assert!(members.is_empty(), "member walks hit the same trap");
                     }
                 }
@@ -1875,10 +1890,11 @@ fn builder_annotation_attach_guards() {
         let count_class_anns = |a: *mut AbcClassAccessor, kind: u8| {
             let mut n = 0usize;
             let ctx = &mut n as *mut usize as *mut c_void;
-            match kind {
+            let rc = match kind {
                 0 => abc_class_enumerate_annotations(a, Some(count_ann), ctx),
                 _ => abc_class_enumerate_runtime_annotations(a, Some(count_ann), ctx),
-            }
+            };
+            assert_eq!(rc, 0);
             n
         };
         let ca = abc_class_open(f, class_off);

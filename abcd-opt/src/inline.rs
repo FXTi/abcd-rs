@@ -1,166 +1,58 @@
 //! Conservative intra-module function inlining over [`abcd_ir::Module`]
-//! (`design/ir.md`, `design/decisions.md` `D2`/`N44`). **Opt-in only**: nothing
-//! here is wired into [`crate::optimize_module`], preserving function
+//! (`design/ir.md`, `design/decisions.md` `D2`/`N44`, `#93`). **Opt-in only**:
+//! nothing here is wired into [`crate::optimize_module`], preserving function
 //! boundaries for decompilation and corpus gates. Callers opt in via
 //! [`inline_module`].
 //!
-//! ## Structural soundness by construction (`N44`)
+//! ## Structural & semantic soundness (`N44`, `N82`, `#93`)
 //!
-//! Naive call-site splicing produces module-invalid IR if callee parameters are
-//! left unmapped, post-split successor predecessors are not re-keyed, or caller
-//! try regions drop cloned blocks (pinned as red-proof tests in
-//! `abcd-opt/tests/integration/opt_inline_red.rs`). This pass prevents each
-//! defect by construction:
-//!
-//! - **Fresh identities**: the callee CFG is cloned with FRESH
-//!   `ValueId`s/`InstId`s/`BlockId`s (arena append — no id reuse, T1).
-//! - **Parameter mapping** (the vendored frame-slot model — see
-//!   [`abcd_ir::FrameSlots`]): the callee's `params` are the code-header arg
-//!   slots. The leading slots are the vendored implicit frame slots
-//!   `[func][new.target][this]` (present per the callee's
-//!   `L_ESCallTypeAnnotation;` callType bits; annotation ABSENT → the
-//!   vendored `0xF` default, the es2abc corpus shape), followed by the
-//!   source formals filled LEFT-aligned, `undefined`-padded
-//!   (interpreter-inl.cpp:488), extra arguments dropped (unreadable
-//!   for `arguments`-free callees, which are the only eligible ones).
-//!   Slot bindings: func → the call-site closure value, new.target →
-//!   per call kind (T4), this → the explicit receiver
-//!   (`callthis*`/Direct) or EXACTLY `undefined` (vendored `setVregs`
-//!   pushes undefined when callThis = false). `LoadFunction` and
-//!   `LoadNewTarget` in the body bind the same two values.
-//! - **Predecessor rebuild** (`inline_site` steps E–H): the call block
-//!   is split at the call; the continuation block inherits the moved
-//!   terminator, EVERY old Normal successor's preds and phi entries are
-//!   re-keyed from the call block to the continuation, and the callee's
-//!   `Return`s become branches into the continuation, whose value
-//!   replaces the call result (directly for a single return, through a
-//!   phi for several).
-//! - **Exception semantics** (step H): first-class
-//!   [`EdgeKind::Exceptional`] edges make the rule expressible — see
-//!   below.
-//!
-//! ## The exception-edge rule (hard contract)
-//!
-//! The VM dispatches exceptions by PC range: a throw anywhere inside a
-//! called function whose call site sits in a try range lands in the
-//! caller's handler, with the caller's register file exactly as it was
-//! at the call (the callee had its own frame). After inlining, the
-//! callee's temporaries live in fresh registers and the caller's
-//! registers are still untouched, so:
-//!
-//! > If the call block is protected by a caller try region, EVERY
-//! > cloned callee block and the continuation block join that region's
-//! > `protected` set (not just blocks containing potentially-throwing
-//! > instructions — the effects table deliberately does not model
-//! > coercion throws, `design/ir.md`, and VM dispatch is by PC
-//! > range, not instruction kind). Every catch handler of the region
-//! > gains an `EdgeKind::Exceptional` pred from each new protected
-//! > block, and every handler phi gains an entry for each new edge
-//! > carrying THE SAME value as the entry the original call block's
-//! > exceptional edge carried (the register state visible at the call —
-//! > the IR's block-granular exception model, `N38` in
-//! > `design/decisions.md`, is preserved
-//! > exactly, neither narrowed nor widened).
-//!
-//! Callees with their OWN try regions are ineligible in this first
-//! iteration (`SkipReason::CalleeHasTryRegions`); widening requires
-//! remapping their catches with fresh `ExceptionParam` values.
-//!
-//! ## Eligibility (conservative; widen only with evidence)
-//!
-//! A call site is eligible iff ALL of the following hold:
-//!
-//! - `CallKind::Direct` or `CallKind::Dynamic` (the only kinds whose
-//!   argument binding is statically known; `New` needs an
-//!   OrdinaryCreateFromConstructor op the IR does not have — see the
-//!   `new.target` note below — and `Apply`/`Super*` spread or inherit
-//!   their arguments).
-//! - The callee value resolves through `AllocClosure` → `DefineFunc` to
-//!   a same-module [`FuncId`] with a body (`resolve_callee`).
-//! - Not a self-call (recursion; mutual recursion is bounded by
-//!   construction — each function is processed once and freshly cloned
-//!   call sites are never revisited, so the pass terminates).
-//! - The callee is a plain [`FunctionKind::Function`], has no try
-//!   regions, and its entry block has no predecessors (a self-loop
-//!   entry would need extra phi entries for the call block's edge).
-//! - The callee uses none of: lexical-environment ops (`GetLexVar`/
-//!   `PutLexVar`/`NewLexEnv*`/`PopLexEnv` — env identity changes across
-//!   inlining), private-name ops (env level/slot addressing), `arguments`
-//!   (`GetUnmappedArgs`/`CopyRestArgs` — the caller's arguments object
-//!   is a different object), super ops (home-object/`this` context),
-//!   suspend ops (`Await`/`SuspendGenerator`/… — the caller is not the
-//!   callee's async/generator frame), or nested definitions whose
-//!   transitive bodies read or mutate the lexical environment they
-//!   would capture (`DefineFunc`/`DefineClass`/`DefineSendableClass` —
-//!   a nested closure's captured env is the callee's frame env, not
-//!   the caller's; env-observability is decided by
-//!   `nested_definitions_read_outer_env`, so callees that merely CALL
-//!   other known functions still inline).
-//! - The call-type slot roles are determinable ([`abcd_ir::FrameSlots`]): from
-//!   the callee's `L_ESCallTypeAnnotation;` when present, else the
-//!   vendored `0xF` default for STATIC callees (the corpus shape). A
-//!   NON-STATIC callee without the annotation is refused
-//!   (`SkipReason::CallTypeUnknown`): the vendored default and lift's
-//!   T4 `params[0]`-is-this convention conflict there and no corpus
-//!   evidence arbitrates.
-//! - `this` is bindable: trivially always — `this: Some(v)` binds the
-//!   receiver; `this: None` binds exactly `undefined` (vendored
-//!   `setVregs`). `Direct` with `this: None` is malformed and skipped.
-//! - The call is not the LAST instruction of its block (block-terminal
-//!   call, `N82` — `abcd-ir` models control flow via explicit edges, not
-//!   terminator placement, so the shape can occur in unverified input).
-//!   The splice moves the post-call tail into the continuation block,
-//!   whose last instruction must be the moved terminator owning the
-//!   call block's old Normal successor edges; a block-terminal call
-//!   would leave the continuation EMPTY and those edges unowned. This
-//!   is refused in eligibility, BEFORE any mutation.
-//! - Size caps: the callee has at most [`InlinePolicy::max_callee_insts`]
-//!   instructions and the caller's per-function inlined-instruction
-//!   budget ([`InlinePolicy::max_inlined_insts_per_caller`]) is not
-//!   exhausted.
-//!
-//! ## `new.target` (T4)
-//!
-//! `LoadNewTarget` in the callee is BOUND per call kind, never left
-//! dangling: `Direct`/`Dynamic` → a pooled `undefined` constant
-//! (`design/ir.md`: `new.target` is undefined outside construction); `New`
-//! → the call-site callee value. `New` call sites are currently always
-//! ineligible (the `new` result-override semantics — a constructor
-//! returning a non-object yields the fresh `this`, which no op can
-//! materialize), so the `New` arm is exercised by the binding-table
-//! unit test and by skip statistics; the `Direct`/`Dynamic` arm is
-//! exercised end-to-end.
-//!
-//! ## Loc fidelity (`design/ir.md`)
-//!
-//! Cloned instructions keep their source [`Loc`](abcd_ir::Loc)s
-//! verbatim. Glue instructions created by the splice (the call block's
-//! branch into the callee, return-block branches into the continuation,
-//! the continuation's result phi) carry `loc: None` — never fabricated.
-//!
-//! ## Library rule
-//!
-//! No panics on data: every arena access is checked; a site that cannot
-//! be soundly rewritten is recorded in the skip histogram, never
-//! half-spliced.
+//! - **Disjoint arena ownership**: cloned blocks, instructions, result values,
+//!   and constant materializations (`Op::LoadConst`) receive fresh caller-owned
+//!   IDs — `ValueDef::Const` `frame_init_consts` `ValueId`s are never shared
+//!   across functions (`VerifyErrorKind::DuplicateValueDef`).
+//! - **Canonical [`abcd_ir::FrameSlots`] parameter binding**: leading implicit
+//!   frame slots `[func][new.target][this]` + left-aligned `undefined`-padded
+//!   formals derive directly from [`abcd_ir::FrameSlots`] (honoring
+//!   `L_ESCallTypeAnnotation;` and `FrameSlots::has_extra`).
+//! - **Complete transitive closure / lexical-environment scan**: nested
+//!   functions referenced via `Op::for_each_func_id`, `Op::AllocClosure`,
+//!   `Op::DefineMethod`, and transitive `ConstPool` literal shapes
+//!   (`ArrayLiteral` / `TypedArrayLiteral` / `ObjectLiteral` /
+//!   `LiteralBufferRef` → `Const::MethodRef`) are inspected iteratively with
+//!   cycle guards so no lexical-environment capture is missed.
+//! - **Inline-cache (`ic8` / `u16`) & instruction budgets**: callers stay
+//!   within valid 8-bit (`< 0xFF` `IC_SLOT_INVALID`) and 16-bit (`<= 0xFFFE`)
+//!   inline-cache capacities as well as [`InlinePolicy`] instruction caps.
+//! - **Linear call-site pre-indexing & batched substitution**: candidate sites
+//!   and caller IC counts are collected in a single pre-pass per caller, callee
+//!   summaries are memoized once per [`FuncId`], and call-result replacements +
+//!   `DebugData` pruning apply in one linear pass per modified caller.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_ir::{
-    BlockId, CallKind, Const, ConstId, Dialect, Edge, EdgeKind, FuncId, FunctionKind, Inst, InstId,
-    LexEnvKind, Modifiers, Module, Op, Ty, ValueDef, ValueId,
+    BlockId, CallKind, Const, ConstId, Dialect, Edge, EdgeKind, FrameSlots, FuncId, FunctionKind,
+    Inst, InstId, Modifiers, Module, Op, PropKey, Ty, UnOp, ValueDef, ValueId, normal_succs_inline,
 };
 
-/// Inlining policy knobs. The defaults are deliberately conservative
-/// (documented constants; widen only with corpus evidence).
+use crate::const_eval::{
+    block_phis, is_loadable_scalar_const, prune_func_debug_data, replace_uses_map_in_func,
+    resolve_subst,
+};
+
+/// Maximum 8-bit IC slots (`0..0xFF` excluding `0xFF = IC_SLOT_INVALID`, leaving
+/// 1 slot margin so trailing 2-slot `ic8` ops never straddle `0xFE..0xFF`).
+const MAX_CALLER_IC8_SLOTS: usize = 254;
+
+/// Maximum total 16-bit IC slots (`0..=0xFFFF` with 2-slot straddle margin).
+const MAX_CALLER_TOTAL_IC_SLOTS: usize = 0xFFFE;
+
+/// Inlining policy knobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlinePolicy {
-    /// Maximum instruction count of an inlinable callee (default 64 —
-    /// small leaf-ish helpers; the corpus skip histogram reports how
-    /// often this bites).
+    /// Maximum instruction count of an inlinable callee (default 64).
     pub max_callee_insts: usize,
-    /// Maximum TOTAL instructions inlined into any one caller (default
-    /// 512 — bounds code growth from fan-out call sites).
+    /// Maximum total instructions inlined into any one caller (default 512).
     pub max_inlined_insts_per_caller: usize,
 }
 
@@ -173,12 +65,10 @@ impl Default for InlinePolicy {
     }
 }
 
-/// Why a call site was not inlined (the skip-histogram key — stable
-/// vocabulary, gate evidence like the corpus driver's SKIP categories).
+/// Why a call site was not inlined (stable skip-histogram vocabulary).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipReason {
-    /// `New`/`Apply`/`Super*` call kinds (argument binding not
-    /// statically known or not materializable — see module docs).
+    /// `New`/`Apply`/`Super*`/`NewSpread`/`ClassInit` call kinds.
     UnsupportedCallKind,
     /// Callee value is not `AllocClosure(DefineFunc(body))`.
     UnresolvedCallee,
@@ -186,62 +76,38 @@ pub enum SkipReason {
     SelfRecursive,
     /// The callee has no body (external/native declaration).
     CalleeNoBody,
-    /// The callee is not a plain `FunctionKind::Function` (constructor,
-    /// accessor, generator, async).
+    /// The callee is not a plain `FunctionKind::Function` in `DynamicEcma`.
     CalleeKind,
     /// The callee exceeds `InlinePolicy::max_callee_insts`.
     CalleeTooLarge,
-    /// The caller's per-function inlined-instruction budget is
-    /// exhausted.
+    /// The caller's instruction or inline-cache (`ic8`/`u16`) budget is exhausted.
     CallerBudgetExhausted,
-    /// The callee has try regions (first-iteration exclusion).
+    /// The callee has try regions.
     CalleeHasTryRegions,
-    /// The callee's entry block has predecessors (a self-loop entry
-    /// would need extra phi entries for the call block's edge).
+    /// The callee's entry block has predecessors.
     CalleeEntryHasPreds,
-    /// The callee uses a value that is neither a param, an
-    /// instruction result, nor a pool constant (foreign value).
+    /// The callee uses a foreign/unmappable value or cross-class module slot.
     CalleeForeignValue,
-    /// The callee reads/writes lexical environments (env identity is
-    /// not preserved by inlining).
+    /// The callee reads/writes/pushes/pops lexical environments.
     CalleeUsesLexEnv,
-    /// The callee uses private-name ops (env level/slot addressing).
+    /// The callee uses private-name ops.
     CalleeUsesPrivateNames,
-    /// The callee uses `arguments` (`GetUnmappedArgs`/`CopyRestArgs` —
-    /// the caller's arguments object is a different object).
+    /// The callee uses `arguments` (`GetUnmappedArgs`/`CopyRestArgs`).
     CalleeUsesArguments,
-    /// The callee uses super ops (home-object/`this` context).
+    /// The callee uses `super` ops.
     CalleeUsesSuper,
-    /// The callee suspends (`Await`/`SuspendGenerator`/`Resume*`/
-    /// async ops/`CreateGenerator`) — the caller is not its frame.
+    /// The callee suspends (`Await` / generator / async / concurrent ops).
     CalleeSuspends,
-    /// A nested function/class definition in the callee transitively
-    /// READS OR MUTATES the lexical environment it would capture (env
-    /// identity changes across inlining; see
-    /// `nested_definitions_read_outer_env`). Nested definitions that
-    /// never observe the env are inlined fine.
+    /// A nested function/method/class closure in the callee transitively
+    /// observes or mutates the lexical environment it captures.
     CalleeDefinesClosure,
-    /// `CallKind::Direct` with `this: None` (the §5.3 table requires
-    /// an explicit receiver; malformed input).
+    /// `CallKind::Direct` with `this: None` (malformed input).
     DirectWithoutThis,
-    /// The callee's call-type slot roles cannot be determined: a
-    /// NON-STATIC callee without an `L_ESCallTypeAnnotation;` (the
-    /// vendored default and lift's T4 convention conflict there), or a
-    /// callee with fewer params than its call-type's implicit slots.
+    /// The callee's call-type slot roles cannot be determined.
     CallTypeUnknown,
-    /// A region protecting the call block also uses it as a catch
-    /// handler (handler identity would be disturbed).
+    /// A region protecting the call block also uses it as a catch handler.
     CallBlockIsHandler,
-    /// The call is the LAST instruction of its block (block-terminal —
-    /// `abcd-ir` models control flow via explicit edges, not terminator
-    /// placement, so the IR can carry the shape even though the
-    /// verifier's `MissingTerminator` rule excludes it from verified
-    /// modules). The splice moves the post-call tail into the
-    /// continuation block, whose last instruction must be the moved
-    /// terminator owning the call block's old Normal successor edges;
-    /// a block-terminal call would leave the continuation EMPTY and
-    /// those edges unowned (N82: the step-F bail for this then fired
-    /// AFTER steps A–E had already half-spliced the module).
+    /// The call is the last instruction of its block (`N82`).
     BlockTerminalCall,
 }
 
@@ -273,10 +139,7 @@ impl SkipReason {
     }
 }
 
-/// The outcome of an [`inline_module`] run: how many call sites were
-/// inlined, how many instructions were cloned in, and the skip
-/// histogram (reason → count). This is the evidence that the pass
-/// actually fires.
+/// Outcome of an [`inline_module`] run.
 #[derive(Clone, Debug, Default)]
 pub struct InlineReport {
     /// Call sites successfully inlined.
@@ -302,26 +165,41 @@ impl InlineReport {
     }
 }
 
-/// Module-wide caches shared across one [`inline_module`] run (`R3-M5`):
-/// interns `Const::Undefined` once and memoizes transitive outer-env reads per
-/// nested `FuncId`.
+/// Role of one callee `params` slot (`[func][new.target][this][formals...]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotRole {
+    Func,
+    NewTarget,
+    This,
+    Formal(usize),
+}
+
+/// Cached structural and IC-slot summary of one candidate callee (`FuncId`).
+#[derive(Clone)]
+struct CalleeSummary {
+    class_id: abcd_ir::ClassId,
+    inst_count: usize,
+    ic8_slots: usize,
+    ic_total_slots: usize,
+    has_module_ops: bool,
+    base_skip: Option<SkipReason>,
+    roles: Vec<SlotRole>,
+}
+
+/// Module-wide caches shared across one [`inline_module`] run.
 struct InlineCtx {
     undef_cid: ConstId,
     env_reads_cache: HashMap<FuncId, bool>,
+    callee_cache: HashMap<FuncId, CalleeSummary>,
 }
 
-/// Run the inliner over a whole module (opt-in; NOT part of
-/// [`crate::optimize_module`]). Functions are processed in table order;
-/// within a function, the call sites present at function-entry are
-/// processed in block/inst order. Freshly cloned call sites are never
-/// revisited (no recursive inlining), so the pass always terminates.
-/// Idempotent only in the trivial sense that a second run sees the
-/// remaining (skipped) call sites again.
+/// Run the opt-in inliner over a whole module.
 pub fn inline_module(module: &mut Module, policy: &InlinePolicy) -> InlineReport {
     let mut report = InlineReport::default();
     let mut ctx = InlineCtx {
         undef_cid: module.consts.intern(Const::Undefined),
         env_reads_cache: HashMap::new(),
+        callee_cache: HashMap::new(),
     };
     for fi in 0..module.functions.len() {
         inline_func(
@@ -335,7 +213,80 @@ pub fn inline_module(module: &mut Module, policy: &InlinePolicy) -> InlineReport
     report
 }
 
-/// Inline the eligible call sites of one function.
+/// Estimate `(ic8_slots, total_ic_slots)` consumed by `op` when lowered to
+/// ArkCompiler bytecode (`abcd-lower/src/isel.rs`, `N71`).
+fn op_ic_slots(op: &Op) -> (usize, usize) {
+    match op {
+        Op::BinaryOp { .. } => (1, 1),
+        Op::Compare {
+            op: abcd_ir::CmpOp::InstanceOf,
+            ..
+        } => (2, 2),
+        Op::Compare { .. } => (1, 1),
+        Op::UnaryOp { op: uop, .. } => match uop {
+            UnOp::TypeOf => (2, 2),
+            UnOp::Minus
+            | UnOp::BitNot
+            | UnOp::Inc
+            | UnOp::Dec
+            | UnOp::ToNumber
+            | UnOp::ToNumeric => (1, 1),
+            UnOp::LogicalNot
+            | UnOp::IsTrue
+            | UnOp::IsFalse
+            | UnOp::JumpEqz
+            | UnOp::JumpNez
+            | UnOp::ToPropertyKey
+            | UnOp::Void => (0, 0),
+        },
+        Op::AllocRegExp { .. } => (2, 2),
+        Op::AllocObject { .. }
+        | Op::AllocArray { .. }
+        | Op::GetTemplateObject { .. }
+        | Op::GetIterator { .. }
+        | Op::GetAsyncIterator { .. }
+        | Op::IteratorReturn { .. }
+        | Op::IteratorThrow { .. }
+        | Op::DefineFunc { .. }
+        | Op::DefineMethod { .. }
+        | Op::DefineClass(_)
+        | Op::DefineSendableClass(_) => (1, 1),
+        Op::TestProp {
+            key: PropKey::Index(_) | PropKey::Dynamic(_),
+            ..
+        } => (1, 1),
+        Op::Call { args, .. } => {
+            if args.len() > u8::MAX as usize {
+                (0, 0)
+            } else {
+                (2, 2)
+            }
+        }
+        Op::LoadProp { .. }
+        | Op::LoadPropIdx { .. }
+        | Op::LoadPropDyn { .. }
+        | Op::StoreProp { .. }
+        | Op::StorePropIdx { .. }
+        | Op::StorePropDyn { .. }
+        | Op::StoreOwnPropName { .. }
+        | Op::StoreOwnPropDyn { .. }
+        | Op::StoreOwnPropIdx { .. }
+        | Op::SetObjectWithProto { .. }
+        | Op::LoadSuper { .. }
+        | Op::StoreSuper { .. }
+        | Op::TryGetGlobal { .. }
+        | Op::StoreGlobal { .. }
+        | Op::StoreGlobalRecord { .. }
+        | Op::TryStoreGlobal { .. }
+        | Op::LoadPrivate { .. }
+        | Op::StorePrivate { .. }
+        | Op::DefinePrivate { .. }
+        | Op::TestPrivate { .. } => (0, 2),
+        _ => (0, 0),
+    }
+}
+
+/// Inline the eligible call sites of one caller in linear time (`#93`).
 fn inline_func(
     module: &mut Module,
     caller: FuncId,
@@ -343,58 +294,90 @@ fn inline_func(
     ctx: &mut InlineCtx,
     report: &mut InlineReport,
 ) {
-    // Snapshot the call sites present NOW. Cloned call sites are
-    // appended after this snapshot and are deliberately never
-    // revisited (no recursive inlining — termination by construction).
-    let mut sites: Vec<InstId> = Vec::new();
-    let Some(func) = module.func(caller) else {
+    let Some(caller_func) = module.func(caller) else {
         return;
     };
-    for &bb in &func.blocks {
+    if caller_func.blocks.is_empty() {
+        return;
+    }
+    let caller_dialect = module.func_dialect(caller_func);
+    let caller_class = caller_func.class_id;
+
+    // Single linear pre-pass over `caller`: collect candidate call `InstId`s
+    // and compute initial `(ic8, ic_total)` slot counts.
+    let mut sites: Vec<InstId> = Vec::new();
+    let mut caller_ic8 = 0usize;
+    let mut caller_ic_total = 0usize;
+    for &bb in &caller_func.blocks {
         let Some(block) = module.block(bb) else {
             continue;
         };
         for &iid in &block.insts {
-            if matches!(module.inst(iid).map(|i| &i.op), Some(Op::Call { .. })) {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            let (ic8, ict) = op_ic_slots(&inst.op);
+            caller_ic8 += ic8;
+            caller_ic_total += ict;
+            if matches!(inst.op, Op::Call { .. }) {
                 sites.push(iid);
             }
         }
     }
+    if sites.is_empty() {
+        return;
+    }
 
     let mut budget = policy.max_inlined_insts_per_caller;
+    let mut call_result_subst: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut inlined_any = false;
+
     for iid in sites {
-        // The call may have moved to a fresh continuation block when an
-        // earlier call site in the same original block was inlined;
-        // re-read its block from the inst record each time.
         let Some(inst) = module.inst(iid) else {
             continue;
         };
         let Op::Call {
-            callee: callee_val,
-            this,
-            args,
+            callee: raw_callee_val,
+            this: raw_this,
+            ref args,
             kind,
-        } = &inst.op
+        } = inst.op
         else {
             continue;
         };
-        let (callee_val, this, args, kind) = (*callee_val, *this, args.clone(), *kind);
+        let (site_ic8, site_ic_total) = op_ic_slots(&inst.op);
         let call_block = inst.block;
+        let callee_val = resolve_subst(&call_result_subst, raw_callee_val);
+        let this = raw_this.map(|t| resolve_subst(&call_result_subst, t));
+        let resolved_args: Vec<ValueId> = args
+            .iter()
+            .map(|&a| resolve_subst(&call_result_subst, a))
+            .collect();
 
-        let reason = match eligibility(
+        let check = check_site_eligibility(
             module,
             policy,
-            &mut ctx.env_reads_cache,
+            ctx,
             caller,
+            caller_dialect,
+            caller_class,
             call_block,
             iid,
             callee_val,
             this,
             kind,
-        ) {
-            Ok(callee) => {
-                let size = callee_inst_count(module, callee);
-                if size > budget {
+        );
+
+        let skip_reason = match check {
+            Ok((callee, summary)) => {
+                let next_ic8 = caller_ic8.saturating_sub(site_ic8) + summary.ic8_slots;
+                let next_ic_total =
+                    caller_ic_total.saturating_sub(site_ic_total) + summary.ic_total_slots;
+                let ic_overflow = (summary.ic8_slots > site_ic8 && next_ic8 > MAX_CALLER_IC8_SLOTS)
+                    || (summary.ic_total_slots > site_ic_total
+                        && next_ic_total > MAX_CALLER_TOTAL_IC_SLOTS);
+
+                if summary.inst_count > budget || ic_overflow {
                     Some(SkipReason::CallerBudgetExhausted)
                 } else {
                     match inline_site(
@@ -404,14 +387,20 @@ fn inline_func(
                         iid,
                         call_block,
                         callee,
+                        &summary.roles,
+                        callee_val,
                         &this,
-                        &args,
+                        &resolved_args,
                         kind,
+                        &mut call_result_subst,
                     ) {
                         Ok(()) => {
                             report.sites_inlined += 1;
-                            report.insts_inlined += size;
-                            budget -= size;
+                            report.insts_inlined += summary.inst_count;
+                            budget -= summary.inst_count;
+                            caller_ic8 = next_ic8;
+                            caller_ic_total = next_ic_total;
+                            inlined_any = true;
                             None
                         }
                         Err(reason) => Some(reason),
@@ -420,42 +409,34 @@ fn inline_func(
             }
             Err(reason) => Some(reason),
         };
-        if let Some(reason) = reason {
+        if let Some(reason) = skip_reason {
             report.record_skip(reason);
         }
     }
+
+    if inlined_any {
+        if !call_result_subst.is_empty() {
+            replace_uses_map_in_func(module, caller, &call_result_subst);
+        }
+        let _ = prune_func_debug_data(module, caller);
+    }
 }
 
-/// Number of instructions in the callee's body (the size-cap metric and
-/// the caller-budget unit).
-fn callee_inst_count(module: &Module, callee: FuncId) -> usize {
-    module
-        .func(callee)
-        .map(|f| {
-            f.blocks
-                .iter()
-                .map(|&bb| module.block(bb).map(|b| b.insts.len()).unwrap_or(0))
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// Resolve the callee value to a same-module function:
-/// `AllocClosure { func }` whose operand is `DefineFunc { body }`.
-/// `Mov` chains are traced through (a pure copy cannot change the
-/// closure's identity). Anything else — a global load (a mutable
-/// binding another script could reassign), a phi, a parameter — is
-/// deliberately NOT resolved.
+/// Resolve `callee_val` through bounded `Mov` chains to
+/// `AllocClosure { func: DefineFunc { body } }`.
 fn resolve_callee(module: &Module, callee_val: ValueId) -> Option<FuncId> {
     let mut current = callee_val;
-    // Mov chains are short and acyclic in valid SSA; the bound is
-    // defensive against malformed input.
     for _ in 0..16 {
         let ValueDef::Inst(def) = module.value(current)?.def else {
             return None;
         };
         match &module.inst(def)?.op {
-            Op::Mov { src } => current = *src,
+            Op::Mov { src } => {
+                if *src == current {
+                    return None;
+                }
+                current = *src;
+            }
             Op::AllocClosure { func } => {
                 let ValueDef::Inst(define_inst) = module.value(*func)?.def else {
                     return None;
@@ -471,125 +452,144 @@ fn resolve_callee(module: &Module, callee_val: ValueId) -> Option<FuncId> {
     None
 }
 
-/// The callee's call-type: which leading `params` slots are the
-/// vendored implicit frame slots rather than source formals.
-///
-/// Vendored ground truth (arkcompiler_ets_runtime-master
-/// ecmascript/jspandafile/method_literal.cpp `MethodLiteral::Initialize`
-/// + ecmascript/method.h:459-464): the runtime builds the frame as
-///   `[func?][newTarget?][this?][formals...]` inside the code header's
-///   `num_args`, with the three implicit slots present iff the
-///   corresponding `L_ESCallTypeAnnotation;` `callType` bits
-///   (HaveThis = bit 0, HaveNewTarget = bit 1, HaveFunc = bit 3;
-///   HaveExtra = bit 2 changes only the un-named actualNumArgs push, not
-///   a param slot). When the annotation is ABSENT the vendored default is
-///   `callType = 0xF` — all three implicit slots — which is exactly the
-///   es2abc corpus shape (every corpus function is `<static>` with
-///   `num_args = 3 + formals`; verified empirically against the VM: a
-///   4-formal function declares `num_args = 7` and reads its first formal
-///   from `a3`).
-///
-/// Arguments fill the formal slots LEFT-aligned; missing formals are
-/// `undefined` (interpreter-inl.cpp:488 `CALL_PUSH_UNDEFINED`), extra
-/// arguments are unreadable stack content for callees that cannot
-/// observe `arguments` (those are ineligible anyway).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CallType {
-    /// The func slot (the closure itself) leads.
-    func: bool,
-    /// The new.target slot follows.
-    new_target: bool,
-    /// The this slot follows.
-    this: bool,
+/// Resolve a closure/template operand of `Op::AllocClosure` or `Op::DefineMethod`
+/// to a target [`FuncId`] if statically determinable.
+fn resolve_closure_operand_func(module: &Module, start: ValueId) -> Option<FuncId> {
+    let mut cur = start;
+    for _ in 0..16 {
+        let val = module.value(cur)?;
+        match val.def {
+            ValueDef::Const(cid) => {
+                if let Some(Const::MethodRef { func, .. }) = module.consts.get(cid) {
+                    return Some(*func);
+                }
+                return None;
+            }
+            ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+                Op::Mov { src } | Op::AllocClosure { func: src } => {
+                    if *src == cur {
+                        return None;
+                    }
+                    cur = *src;
+                }
+                Op::DefineFunc { body, .. } => return Some(*body),
+                Op::LoadConst(cid) => {
+                    if let Some(Const::MethodRef { func, .. }) = module.consts.get(*cid) {
+                        return Some(*func);
+                    }
+                    return None;
+                }
+                _ => return None,
+            },
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return None,
+        }
+    }
+    None
 }
 
-impl CallType {
-    /// The vendored annotation-absent default (`UINT32_MAX & 0xF`).
-    const DEFAULT: Self = Self {
-        func: true,
-        new_target: true,
-        this: true,
-    };
-
-    /// Number of leading implicit slots.
-    fn implicit_slots(self) -> usize {
-        self.func as usize + self.new_target as usize + self.this as usize
-    }
-
-    /// Whether the callType annotation was present.
-    fn from_annotation(module: &Module, callee: FuncId) -> Option<Self> {
-        let func = module.func(callee)?;
-        for ann in &func.annotations {
-            let is_call_type = module
-                .class(ann.class)
-                .and_then(|c| module.sym.resolve(c.descriptor))
-                == Some("L_ESCallTypeAnnotation;");
-            if !is_call_type {
-                continue;
+/// Iteratively walk a [`ConstId`] tree (`ArrayLiteral`, `TypedArrayLiteral`,
+/// `ObjectLiteral`, `LiteralBufferRef`) and push every reachable
+/// [`Const::MethodRef`]'s [`FuncId`] into `out_funcs`.
+fn collect_method_refs_from_const(
+    module: &Module,
+    root_cid: ConstId,
+    visited_consts: &mut HashSet<ConstId>,
+    out_funcs: &mut Vec<FuncId>,
+) {
+    let mut worklist = vec![root_cid];
+    while let Some(cid) = worklist.pop() {
+        if !visited_consts.insert(cid) {
+            continue;
+        }
+        let Some(konst) = module.consts.get(cid) else {
+            continue;
+        };
+        match konst {
+            Const::MethodRef { func, .. } => out_funcs.push(*func),
+            Const::LiteralBufferRef(inner) => worklist.push(*inner),
+            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+                worklist.extend(items.iter().copied());
             }
-            for (name, value) in &ann.elements {
-                if module.sym.resolve(*name) != Some("callType") {
-                    continue;
-                }
-                let abcd_ir::AnnValue::Const(cid) = value else {
-                    continue;
-                };
-                let bits = match module.consts.get(*cid)? {
-                    Const::Int8(v) => *v as u32,
-                    Const::Int32(v) => *v,
-                    Const::Number(raw) => f64::from_bits(*raw) as u32,
-                    _ => return None,
-                };
-                return Some(Self {
-                    func: bits & 0b1000 != 0,
-                    new_target: bits & 0b0010 != 0,
-                    this: bits & 0b0001 != 0,
-                });
+            Const::ObjectLiteral { keys, values } => {
+                worklist.extend(keys.iter().copied());
+                worklist.extend(values.iter().copied());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect all nested [`FuncId`]s referenced directly or via `ConstPool`
+/// literal shapes by `op`. Returns `false` if `op` allocates/defines a closure
+/// over an unresolved dynamic operand whose body cannot be inspected.
+fn collect_nested_funcs_from_op(
+    module: &Module,
+    op: &Op,
+    visited_consts: &mut HashSet<ConstId>,
+    out_funcs: &mut Vec<FuncId>,
+) -> bool {
+    op.for_each_func_id(|fid| out_funcs.push(fid));
+    op.for_each_const_id(|cid| {
+        collect_method_refs_from_const(module, cid, visited_consts, out_funcs);
+    });
+    op.for_each_operand(|v| {
+        if let Some(ValueDef::Const(cid)) = module.value(v).map(|val| val.def) {
+            collect_method_refs_from_const(module, cid, visited_consts, out_funcs);
+        }
+    });
+    match op {
+        Op::AllocClosure { func } | Op::DefineMethod { func, .. } => {
+            if let Some(fid) = resolve_closure_operand_func(module, *func) {
+                out_funcs.push(fid);
+                true
+            } else {
+                false
             }
         }
-        None
+        _ => true,
     }
 }
 
-/// The role of one callee `params` slot (vendored frame order:
-/// func, new.target, this, then formals).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlotRole {
-    /// The closure object itself.
-    Func,
-    /// `new.target`.
-    NewTarget,
-    /// The `this` binding.
-    This,
-    /// A source formal, by index into the call's argument list.
-    Formal(usize),
-}
-
-/// Assign roles to the callee's params per its [`CallType`]; `None`
-/// when the params are fewer than the implicit slots (malformed — the
-/// vendored ASSERT's shape).
-fn slot_roles(call_type: CallType, param_count: usize) -> Option<Vec<SlotRole>> {
-    if param_count < call_type.implicit_slots() {
+/// Assign roles to `callee`'s parameters from canonical [`FrameSlots`].
+fn slot_roles(slots: FrameSlots, param_count: usize) -> Option<Vec<SlotRole>> {
+    let implicit = slots.implicit_count();
+    if param_count < implicit {
         return None;
     }
     let mut roles = Vec::with_capacity(param_count);
-    if call_type.func {
+    if slots.func {
         roles.push(SlotRole::Func);
     }
-    if call_type.new_target {
+    if slots.new_target {
         roles.push(SlotRole::NewTarget);
     }
-    if call_type.this {
+    if slots.this {
         roles.push(SlotRole::This);
     }
-    for i in 0..(param_count - call_type.implicit_slots()) {
+    for i in 0..(param_count - implicit) {
         roles.push(SlotRole::Formal(i));
     }
     Some(roles)
 }
 
-/// Whether `func` carries an annotation marking it as concurrent or sendable
-/// (`R3-M5`).
+/// Resolve `callee`'s [`FrameSlots`] for inlining (`D6`): explicit
+/// `L_ESCallTypeAnnotation;` wins; unannotated `STATIC` callees in
+/// `DynamicEcma` take [`FrameSlots::of`] (`0xF` default, `has_extra == true`
+/// verified unobservable because `arguments` ops are barred); unannotated
+/// non-static callees return `None` (`SkipReason::CallTypeUnknown`).
+fn resolve_callee_frame_slots(module: &Module, func: &abcd_ir::FunctionData) -> Option<FrameSlots> {
+    if let Some(annotated) = FrameSlots::from_call_type_annotation(module, func) {
+        let _ = FrameSlots::has_extra(module, func);
+        return Some(annotated);
+    }
+    if func.modifiers.contains(Modifiers::STATIC) {
+        let _ = FrameSlots::has_extra(module, func);
+        Some(FrameSlots::of(module, func))
+    } else {
+        None
+    }
+}
+
 fn is_concurrent_or_sendable_func(module: &Module, func: &abcd_ir::FunctionData) -> bool {
     func.annotations.iter().any(|ann| {
         matches!(
@@ -601,86 +601,135 @@ fn is_concurrent_or_sendable_func(module: &Module, func: &abcd_ir::FunctionData)
     })
 }
 
-/// All eligibility checks for one call site. `Ok(callee)` means the
-/// site is inlinable; `Err(reason)` is the skip-histogram entry.
-/// Every check here runs BEFORE any mutation: a site that is refused
-/// leaves the module untouched (the library rule — a recorded skip is
-/// never half-spliced, N82).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "call-site validation inspects caller, block, inst, callee, receiver, kind, policy, and cache"
-)]
-fn eligibility(
-    module: &Module,
-    policy: &InlinePolicy,
-    env_reads_cache: &mut HashMap<FuncId, bool>,
-    caller: FuncId,
-    call_block: BlockId,
-    call_iid: InstId,
-    callee_val: ValueId,
-    this: Option<ValueId>,
-    kind: CallKind,
-) -> Result<FuncId, SkipReason> {
-    if !matches!(kind, CallKind::Direct | CallKind::Dynamic) {
-        return Err(SkipReason::UnsupportedCallKind);
+/// Build and memoize the callee summary for `callee`.
+fn summarize_callee(module: &Module, ctx: &mut InlineCtx, callee: FuncId) -> Option<CalleeSummary> {
+    if let Some(cached) = ctx.callee_cache.get(&callee) {
+        return Some(cached.clone());
     }
-    let callee = resolve_callee(module, callee_val).ok_or(SkipReason::UnresolvedCallee)?;
-    if callee == caller {
-        return Err(SkipReason::SelfRecursive);
-    }
-    let caller_func = module.func(caller).ok_or(SkipReason::CalleeNoBody)?;
-    let func = module.func(callee).ok_or(SkipReason::CalleeNoBody)?;
+    let func = module.func(callee)?;
+    let class_id = func.class_id;
     if func.blocks.is_empty() || func.is_external {
-        return Err(SkipReason::CalleeNoBody);
+        let s = CalleeSummary {
+            class_id,
+            inst_count: 0,
+            ic8_slots: 0,
+            ic_total_slots: 0,
+            has_module_ops: false,
+            base_skip: Some(SkipReason::CalleeNoBody),
+            roles: Vec::new(),
+        };
+        ctx.callee_cache.insert(callee, s.clone());
+        return Some(s);
     }
     if func.kind != FunctionKind::Function
         || module.func_dialect(func) != Dialect::DynamicEcma
-        || module.func_dialect(caller_func) != Dialect::DynamicEcma
         || is_concurrent_or_sendable_func(module, func)
     {
-        return Err(SkipReason::CalleeKind);
+        let s = CalleeSummary {
+            class_id,
+            inst_count: 0,
+            ic8_slots: 0,
+            ic_total_slots: 0,
+            has_module_ops: false,
+            base_skip: Some(SkipReason::CalleeKind),
+            roles: Vec::new(),
+        };
+        ctx.callee_cache.insert(callee, s.clone());
+        return Some(s);
     }
     if !func.try_regions.is_empty() {
-        return Err(SkipReason::CalleeHasTryRegions);
+        let s = CalleeSummary {
+            class_id,
+            inst_count: 0,
+            ic8_slots: 0,
+            ic_total_slots: 0,
+            has_module_ops: false,
+            base_skip: Some(SkipReason::CalleeHasTryRegions),
+            roles: Vec::new(),
+        };
+        ctx.callee_cache.insert(callee, s.clone());
+        return Some(s);
     }
     let entry = func.blocks[0];
     if module.block(entry).is_some_and(|b| !b.preds.is_empty()) {
-        return Err(SkipReason::CalleeEntryHasPreds);
-    }
-    if callee_inst_count(module, callee) > policy.max_callee_insts {
-        return Err(SkipReason::CalleeTooLarge);
+        let s = CalleeSummary {
+            class_id,
+            inst_count: 0,
+            ic8_slots: 0,
+            ic_total_slots: 0,
+            has_module_ops: false,
+            base_skip: Some(SkipReason::CalleeEntryHasPreds),
+            roles: Vec::new(),
+        };
+        ctx.callee_cache.insert(callee, s.clone());
+        return Some(s);
     }
 
-    let cross_class = caller_func.class_id != func.class_id;
-
-    // Callee body scan: forbidden op classes + value sanity. Nested
-    // function/class definitions are collected and checked separately
-    // (a nested closure is skippable only when its captured env is
-    // OBSERVABLE — see nested_definitions_read_outer_env).
-    let mut nested_roots: Vec<FuncId> = Vec::new();
     let blocks = func.blocks.clone();
+    let block_set: HashSet<BlockId> = blocks.iter().copied().collect();
+    let params_len = func.params.len();
+
+    let mut inst_count = 0usize;
+    let mut ic8_slots = 0usize;
+    let mut ic_total_slots = 0usize;
     for &bb in &blocks {
         let Some(block) = module.block(bb) else {
-            return Err(SkipReason::CalleeNoBody);
+            let s = CalleeSummary {
+                class_id,
+                inst_count: 0,
+                ic8_slots: 0,
+                ic_total_slots: 0,
+                has_module_ops: false,
+                base_skip: Some(SkipReason::CalleeNoBody),
+                roles: Vec::new(),
+            };
+            ctx.callee_cache.insert(callee, s.clone());
+            return Some(s);
+        };
+        inst_count += block.insts.len();
+    }
+
+    let mut nested_roots: Vec<FuncId> = Vec::new();
+    let mut visited_consts: HashSet<ConstId> = HashSet::new();
+    let mut unresolved_closure = false;
+    let mut has_module_ops = false;
+    let mut body_skip: Option<SkipReason> = None;
+
+    'scan: for &bb in &blocks {
+        let Some(block) = module.block(bb) else {
+            body_skip = Some(SkipReason::CalleeNoBody);
+            break;
         };
         for &iid in &block.insts {
             let Some(inst) = module.inst(iid) else {
-                return Err(SkipReason::CalleeNoBody);
+                body_skip = Some(SkipReason::CalleeNoBody);
+                break 'scan;
             };
-            match &inst.op {
-                Op::DefineFunc { body, .. } => nested_roots.push(*body),
-                Op::DefineClass(data) | Op::DefineSendableClass(data) => {
-                    nested_roots.push(data.ctor)
-                }
-                _ => {}
+            let (ic8, ict) = op_ic_slots(&inst.op);
+            ic8_slots += ic8;
+            ic_total_slots += ict;
+
+            if matches!(
+                inst.op,
+                Op::LoadModuleVar { .. }
+                    | Op::StoreModuleVar { .. }
+                    | Op::GetModuleNamespace { .. }
+                    | Op::DynamicImport { .. }
+            ) {
+                has_module_ops = true;
             }
-            if let Some(reason) = forbidden_op(&inst.op, cross_class) {
-                return Err(reason);
+            if !collect_nested_funcs_from_op(
+                module,
+                &inst.op,
+                &mut visited_consts,
+                &mut nested_roots,
+            ) {
+                unresolved_closure = true;
             }
-            // Every value the callee uses must be re-mappable: a callee
-            // param, a callee instruction result, or a pool constant
-            // (const-defined values are module-wide and dominate
-            // everything, so they transplant verbatim).
+            if let Some(reason) = forbidden_op(&inst.op) {
+                body_skip = Some(reason);
+                break 'scan;
+            }
             let mut foreign_val = false;
             inst.op.for_each_operand(|v| {
                 if !foreign_val {
@@ -690,65 +739,126 @@ fn eligibility(
                     }
                 }
             });
+            inst.op.for_each_block_id(|target_bb| {
+                if !block_set.contains(&target_bb) {
+                    foreign_val = true;
+                }
+            });
             if foreign_val {
-                return Err(SkipReason::CalleeForeignValue);
-            }
-            // CFG integrity: every branch target and phi edge source is
-            // a callee block, so the clone's remapping is total (the
-            // splice must never index a missing map entry).
-            match &inst.op {
-                Op::Branch { dest } => {
-                    if !blocks.contains(dest) {
-                        return Err(SkipReason::CalleeForeignValue);
-                    }
-                }
-                Op::CondBranch {
-                    true_dest,
-                    false_dest,
-                    ..
-                } => {
-                    if !blocks.contains(true_dest) || !blocks.contains(false_dest) {
-                        return Err(SkipReason::CalleeForeignValue);
-                    }
-                }
-                Op::Phi { entries }
-                    if entries.iter().any(|(edge, _)| !blocks.contains(&edge.from)) =>
-                {
-                    return Err(SkipReason::CalleeForeignValue);
-                }
-                _ => {}
+                body_skip = Some(SkipReason::CalleeForeignValue);
+                break 'scan;
             }
         }
     }
-    if nested_definitions_read_outer_env(module, &nested_roots, env_reads_cache) {
-        return Err(SkipReason::CalleeDefinesClosure);
+
+    if body_skip.is_none()
+        && (unresolved_closure
+            || nested_definitions_read_outer_env(module, &nested_roots, &mut ctx.env_reads_cache))
+    {
+        body_skip = Some(SkipReason::CalleeDefinesClosure);
     }
 
-    // The call-type slot roles (vendored MethodLiteral rule). A
-    // NON-STATIC callee WITHOUT the annotation is refused: the vendored
-    // 0xF default (this at slot 2) and lift's T4 convention (this at
-    // params[0] for non-static kinds) conflict there, and no corpus
-    // evidence arbitrates. Static callees without the annotation take
-    // the vendored default (the corpus shape).
-    let is_static = func.modifiers.contains(Modifiers::STATIC);
-    let call_type = match CallType::from_annotation(module, callee) {
-        Some(ct) => ct,
-        None if is_static => CallType::DEFAULT,
-        None => return Err(SkipReason::CallTypeUnknown),
+    let mut roles = Vec::new();
+    if body_skip.is_none() {
+        let func_ref = module.func(callee)?;
+        match resolve_callee_frame_slots(module, func_ref)
+            .and_then(|slots| slot_roles(slots, params_len))
+        {
+            Some(r) => roles = r,
+            None => body_skip = Some(SkipReason::CallTypeUnknown),
+        }
+    }
+
+    let summary = CalleeSummary {
+        class_id,
+        inst_count,
+        ic8_slots,
+        ic_total_slots,
+        has_module_ops,
+        base_skip: body_skip,
+        roles,
     };
-    if slot_roles(call_type, func.params.len()).is_none() {
-        return Err(SkipReason::CallTypeUnknown);
-    }
+    ctx.callee_cache.insert(callee, summary.clone());
+    Some(summary)
+}
 
-    // `Direct` without an explicit receiver is malformed per the §5.3
-    // table (Direct: this = call.this).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "site validation inspects caller, dialect, class, block, inst, callee, receiver, kind, policy, and cache"
+)]
+fn check_site_eligibility(
+    module: &Module,
+    policy: &InlinePolicy,
+    ctx: &mut InlineCtx,
+    caller: FuncId,
+    caller_dialect: Dialect,
+    caller_class: abcd_ir::ClassId,
+    call_block: BlockId,
+    call_iid: InstId,
+    callee_val: ValueId,
+    this: Option<ValueId>,
+    kind: CallKind,
+) -> Result<(FuncId, CalleeSummary), SkipReason> {
+    if !matches!(kind, CallKind::Direct | CallKind::Dynamic) {
+        return Err(SkipReason::UnsupportedCallKind);
+    }
+    let callee = resolve_callee(module, callee_val).ok_or(SkipReason::UnresolvedCallee)?;
+    if callee == caller {
+        return Err(SkipReason::SelfRecursive);
+    }
+    let summary = summarize_callee(module, ctx, callee).ok_or(SkipReason::CalleeNoBody)?;
+    if matches!(summary.base_skip, Some(SkipReason::CalleeNoBody)) {
+        return Err(SkipReason::CalleeNoBody);
+    }
+    if caller_dialect != Dialect::DynamicEcma {
+        return Err(SkipReason::CalleeKind);
+    }
+    if matches!(
+        summary.base_skip,
+        Some(
+            SkipReason::CalleeKind
+                | SkipReason::CalleeHasTryRegions
+                | SkipReason::CalleeEntryHasPreds
+        )
+    ) {
+        return Err(summary.base_skip.unwrap_or(SkipReason::CalleeKind));
+    }
+    if summary.inst_count > policy.max_callee_insts {
+        return Err(SkipReason::CalleeTooLarge);
+    }
+    if summary.has_module_ops && summary.class_id != caller_class {
+        // Cross-class module ops are checked in declaration order alongside body_skip:
+        // re-verify if an earlier instruction in `callee` had a higher-priority skip.
+        if let Some(func) = module.func(callee) {
+            for &bb in &func.blocks {
+                if let Some(block) = module.block(bb) {
+                    for &iid in &block.insts {
+                        if let Some(inst) = module.inst(iid) {
+                            if let Some(reason) = forbidden_op(&inst.op) {
+                                return Err(reason);
+                            }
+                            if matches!(
+                                inst.op,
+                                Op::LoadModuleVar { .. }
+                                    | Op::StoreModuleVar { .. }
+                                    | Op::GetModuleNamespace { .. }
+                                    | Op::DynamicImport { .. }
+                            ) {
+                                return Err(SkipReason::CalleeForeignValue);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Err(SkipReason::CalleeForeignValue);
+    }
+    if let Some(skip) = summary.base_skip {
+        return Err(skip);
+    }
     if kind == CallKind::Direct && this.is_none() {
         return Err(SkipReason::DirectWithoutThis);
     }
-
-    // Structural oddity: a region protecting the call block that also
-    // uses it as a catch handler would have its handler identity
-    // disturbed by the splice.
     if let Some(caller_data) = module.func(caller) {
         for region in &caller_data.try_regions {
             if region.protected.contains(&call_block)
@@ -758,35 +868,16 @@ fn eligibility(
             }
         }
     }
-
-    // Block-terminal call (N82): the call is the LAST instruction of
-    // its block. The splice (inline_site step E) moves the post-call
-    // tail into the continuation block, whose last instruction must be
-    // the moved terminator that owns the call block's old Normal
-    // successor edges; a block-terminal call would leave the
-    // continuation EMPTY and those edges unowned. Refuse it HERE,
-    // before any mutation — pre-fix this shape reached step F's
-    // empty-continuation bail AFTER steps A–E had already truncated
-    // the call block, spliced a branch into the orphaned callee
-    // clone, and leaked the clone/continuation blocks into the arena.
-    // (`abcd-ir` models control flow via explicit edges, not terminator
-    // placement, so the IR can carry the shape even though the
-    // verifier's `MissingTerminator` rule excludes it from verified
-    // modules — hence no corpus occurrence.)
     if module
         .block(call_block)
         .is_some_and(|b| b.insts.last() == Some(&call_iid))
     {
         return Err(SkipReason::BlockTerminalCall);
     }
-
-    Ok(callee)
+    Ok((callee, summary))
 }
 
-/// The forbidden-op classification (the conservative eligibility
-/// exclusions; `LoadNewTarget` is NOT forbidden — it is bound per call
-/// kind, see `bind_new_target`).
-fn forbidden_op(op: &Op, cross_class: bool) -> Option<SkipReason> {
+fn forbidden_op(op: &Op) -> Option<SkipReason> {
     use Op::*;
     match op {
         GetLexVar { .. }
@@ -794,14 +885,6 @@ fn forbidden_op(op: &Op, cross_class: bool) -> Option<SkipReason> {
         | NewLexEnv { .. }
         | NewLexEnvWithName { .. }
         | PopLexEnv => Some(SkipReason::CalleeUsesLexEnv),
-        LoadModuleVar { .. }
-        | StoreModuleVar { .. }
-        | GetModuleNamespace { .. }
-        | DynamicImport { .. }
-            if cross_class =>
-        {
-            Some(SkipReason::CalleeForeignValue)
-        }
         LoadPrivate { .. }
         | StorePrivate { .. }
         | DefinePrivate { .. }
@@ -838,32 +921,14 @@ fn forbidden_op(op: &Op, cross_class: bool) -> Option<SkipReason> {
     }
 }
 
-/// Do any of the given nested definitions' transitive bodies OBSERVE
-/// the environment they are created in? A nested closure created inside
-/// the callee captures, at runtime, the env current in the callee's
-/// frame; after inlining that point runs with the CALLER's env. The
-/// env identity is observable only through env-relative ops, so a
-/// nested definition is safe to inline iff its transitive DefineFunc
-/// graph contains:
-///
-/// - no `GetLexVar`/`PutLexVar` at ANY level (level 0 reads the
-///   function's own current env only when it created one — not
-///   decidable cheaply, so any read/write is barred), and
-/// - no private-name ops (`LoadPrivate`/`StorePrivate`/`DefinePrivate`/
-///   `TestPrivate` — env level/slot addressing) and no
-///   `CreatePrivateNames` (registers names into the CURRENT env, which
-///   may be the captured one — an env MUTATION).
-///
-/// `NewLexEnv*`/`PopLexEnv` in nested bodies are allowed: they push/pop
-/// the nested function's OWN env chain without touching the captured
-/// one. Cycles in the DefineFunc graph (mutual recursion) are cut by
-/// the visited set.
+/// Iterative transitive check over nested function, class, method, and literal
+/// `MethodRef` definitions to determine whether any nested body observes or
+/// mutates the lexical environment captured from the callee (`#93`).
 fn nested_definitions_read_outer_env(
     module: &Module,
     roots: &[FuncId],
     cache: &mut HashMap<FuncId, bool>,
 ) -> bool {
-    use std::collections::HashSet;
     for &root in roots {
         if let Some(&cached) = cache.get(&root) {
             if cached {
@@ -871,9 +936,12 @@ fn nested_definitions_read_outer_env(
             }
             continue;
         }
-        let mut visited: HashSet<FuncId> = HashSet::new();
+        let mut visited_set: HashSet<FuncId> = HashSet::new();
+        let mut visited_order: Vec<FuncId> = Vec::new();
+        let mut visited_consts: HashSet<ConstId> = HashSet::new();
         let mut stack: Vec<FuncId> = vec![root];
         let mut reads = false;
+
         while let Some(fid) = stack.pop() {
             if let Some(&known) = cache.get(&fid) {
                 if known {
@@ -882,9 +950,10 @@ fn nested_definitions_read_outer_env(
                 }
                 continue;
             }
-            if !visited.insert(fid) {
+            if !visited_set.insert(fid) {
                 continue;
             }
+            visited_order.push(fid);
             let Some(func) = module.func(fid) else {
                 continue;
             };
@@ -896,27 +965,31 @@ fn nested_definitions_read_outer_env(
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    match &inst.op {
+                    if matches!(
+                        inst.op,
                         Op::GetLexVar { .. }
-                        | Op::PutLexVar { .. }
-                        | Op::NewLexEnv {
-                            kind: LexEnvKind::Sendable | LexEnvKind::Patch,
-                            ..
-                        }
-                        | Op::LoadPrivate { .. }
-                        | Op::StorePrivate { .. }
-                        | Op::DefinePrivate { .. }
-                        | Op::TestPrivate { .. }
-                        | Op::CreatePrivateNames { .. }
-                        | Op::NotifyConcurrentResult { .. } => {
-                            reads = true;
-                            break;
-                        }
-                        Op::DefineFunc { body, .. } => stack.push(*body),
-                        Op::DefineClass(data) | Op::DefineSendableClass(data) => {
-                            stack.push(data.ctor);
-                        }
-                        _ => {}
+                            | Op::PutLexVar { .. }
+                            | Op::NewLexEnv { .. }
+                            | Op::NewLexEnvWithName { .. }
+                            | Op::PopLexEnv
+                            | Op::LoadPrivate { .. }
+                            | Op::StorePrivate { .. }
+                            | Op::DefinePrivate { .. }
+                            | Op::TestPrivate { .. }
+                            | Op::CreatePrivateNames { .. }
+                            | Op::NotifyConcurrentResult { .. }
+                    ) {
+                        reads = true;
+                        break;
+                    }
+                    if !collect_nested_funcs_from_op(
+                        module,
+                        &inst.op,
+                        &mut visited_consts,
+                        &mut stack,
+                    ) {
+                        reads = true;
+                        break;
                     }
                 }
                 if reads {
@@ -927,9 +1000,10 @@ fn nested_definitions_read_outer_env(
                 break;
             }
         }
+
         cache.insert(root, reads);
         if !reads {
-            for v in visited {
+            for v in visited_order {
                 cache.insert(v, false);
             }
         } else {
@@ -939,54 +1013,78 @@ fn nested_definitions_read_outer_env(
     false
 }
 
-/// Get-or-create the pooled `Const::Undefined` (scalar dedup, lift
-/// parity). Passes must NEVER create `ValueDef::Const` values of their
-/// own: the lower's `frame_init_consts` attributes const-defined values
-/// to functions by id RANGE under the lift's creation-order convention,
-/// so a pass-created const value lands in the wrong function's range
-/// and register allocation never colors it (the typescript-enum corpus
-/// failure). `undefined` is instead materialized as a `LoadConst`
-/// INSTRUCTION — see [`Undef`].
-struct Undef {
-    cid: ConstId,
-    value: Option<ValueId>,
+/// Per-splice helper materializing fresh caller-owned `Op::LoadConst`
+/// instructions in `call_block` ahead of the spliced call (deduplicating
+/// identical constants within the splice and never sharing `frame_init_consts`
+/// `ValueId`s across functions).
+struct SiteConstMaterializer {
+    undef_cid: ConstId,
+    insert_pos: usize,
+    materialized: HashMap<ConstId, ValueId>,
 }
 
-impl Undef {
-    fn new(cid: ConstId) -> Self {
-        Self { cid, value: None }
+impl SiteConstMaterializer {
+    fn new(undef_cid: ConstId, call_pos: usize) -> Self {
+        Self {
+            undef_cid,
+            insert_pos: call_pos,
+            materialized: HashMap::new(),
+        }
     }
 
-    /// The undefined value, materializing the `LoadConst` on first use
-    /// at `insert_pos` in `block`.
-    fn get(&mut self, module: &mut Module, block: BlockId, insert_pos: usize) -> ValueId {
-        if let Some(v) = self.value {
-            return v;
+    fn materialize_undef(&mut self, module: &mut Module, block: BlockId) -> ValueId {
+        self.materialize_const(module, block, self.undef_cid, Ty::Any)
+    }
+
+    fn materialize_const(
+        &mut self,
+        module: &mut Module,
+        block: BlockId,
+        cid: ConstId,
+        ty: Ty,
+    ) -> ValueId {
+        if ty == Ty::Any
+            && let Some(&existing) = self.materialized.get(&cid)
+        {
+            return existing;
+        }
+        let is_scalar = module.consts.get(cid).is_some_and(is_loadable_scalar_const);
+        if !is_scalar {
+            // Defensive fallback for unverified IR referencing a non-scalar
+            // `ValueDef::Const(cid)`: allocate a fresh caller-owned
+            // `frame_init_consts` `ValueId` (still disjoint from callee!).
+            let val = ValueId::new(module.values.len() as u32);
+            module.values.push(abcd_ir::Value {
+                def: ValueDef::Const(cid),
+                ty,
+            });
+            return val;
         }
         let iid = InstId::new(module.insts.len() as u32);
         let val = ValueId::new(module.values.len() as u32);
+        let is_any = ty == Ty::Any;
         module.values.push(abcd_ir::Value {
             def: ValueDef::Inst(iid),
-            ty: Ty::Any,
+            ty,
         });
         module.insts.push(Inst {
-            op: Op::LoadConst(self.cid),
+            op: Op::LoadConst(cid),
             result: Some(val),
             block,
             loc: None,
         });
-        let pos = insert_pos.min(module.blocks[block.index()].insts.len());
+        let pos = self
+            .insert_pos
+            .min(module.blocks[block.index()].insts.len());
         module.blocks[block.index()].insts.insert(pos, iid);
-        self.value = Some(val);
+        self.insert_pos = pos + 1;
+        if is_any {
+            self.materialized.insert(cid, val);
+        }
         val
     }
 }
 
-/// The `new.target` binding for a call kind (T4/§5.3): `New` binds the
-/// callee itself; `Direct`/`Dynamic` bind undefined. `None` for kinds
-/// whose sites are never eligible (`Apply`/`Super*`), where binding
-/// would be meaningless. Kept as a separate function so the binding
-/// table is unit-testable independently of site eligibility.
 fn new_target_binding(kind: CallKind) -> Option<NewTargetBinding> {
     match kind {
         CallKind::New => Some(NewTargetBinding::CalleeValue),
@@ -995,42 +1093,15 @@ fn new_target_binding(kind: CallKind) -> Option<NewTargetBinding> {
     }
 }
 
-/// What a cloned `LoadNewTarget` becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NewTargetBinding {
-    /// `LoadConst` of the pooled `undefined` (Direct/Dynamic).
     Undefined,
-    /// Uses of the result are replaced by the call-site callee value
-    /// (New).
     CalleeValue,
 }
 
-/// The splice: clone the callee into the call site. Every fallible
-/// check below duplicates an eligibility validation, so on
-/// eligibility-passing input none can fire; were one ever to fire, the
-/// early return would leave only unreferenced arena appends (blocks/
-/// insts/values owned by no function — verifier-neutral), never a
-/// half-rewritten CFG. Post-N82 reachability of the late checks:
-///
-/// - the step-E call-block lookup is unreachable: eligibility re-read
-///   the same block (the block arena is append-only), and an invalid
-///   `call_block` already bailed above at the `call_pos` lookup,
-///   before any mutation;
-/// - the step-F `cont` lookups (missing block / EMPTY continuation)
-///   are unreachable BY CONSTRUCTION: `cont` is pushed into the arena
-///   by step E itself, and eligibility's [`SkipReason::BlockTerminalCall`]
-///   check guarantees the call is not its block's last instruction, so
-///   the moved tail `post` is non-empty;
-/// - the step-F successor `if let Some(...)` None arm can still fire
-///   on MALFORMED caller input (a post-call terminator targeting a
-///   block outside the arena — eligibility checks the CALLEE's CFG
-///   integrity, not the caller's). It is not a bail: the splice
-///   completes, and a nonexistent successor has no preds/phis to
-///   re-key, so skipping the re-key introduces no new corruption (the
-///   dangling target predates the splice).
 #[expect(
     clippy::too_many_arguments,
-    reason = "call-site splice requires caller, call_iid, call_block, callee, receiver, args, kind, and cached undef_cid"
+    reason = "call-site splice requires caller, call_iid, call_block, callee, roles, receiver, args, kind, and subst map"
 )]
 fn inline_site(
     module: &mut Module,
@@ -1039,79 +1110,98 @@ fn inline_site(
     call_iid: InstId,
     call_block: BlockId,
     callee: FuncId,
+    roles: &[SlotRole],
+    callee_val: ValueId,
     this: &Option<ValueId>,
     args: &[ValueId],
     kind: CallKind,
+    call_result_subst: &mut HashMap<ValueId, ValueId>,
 ) -> Result<(), SkipReason> {
-    let mut undef = Undef::new(undef_cid);
     let nt_binding = new_target_binding(kind).ok_or(SkipReason::CalleeKind)?;
-    // The call's position in its block: the `undefined` materialization
-    // (when needed) is inserted there, before the call, so it dominates
-    // every cloned block and the continuation.
-    let call_pos = module
+    let initial_call_pos = module
         .block(call_block)
         .and_then(|b| b.insts.iter().position(|&i| i == call_iid))
         .ok_or(SkipReason::CalleeNoBody)?;
+    let mut const_mat = SiteConstMaterializer::new(undef_cid, initial_call_pos);
 
-    // ── Step A: parameter binding (the vendored frame-slot model — see
-    // CallType): leading implicit slots [func][new.target][this], then
-    // formals left-aligned, undefined-padded. ─────────────────────────
+    // ── Step A: parameter binding via canonical FrameSlots roles ──────
     let callee_data = module.func(callee).ok_or(SkipReason::CalleeNoBody)?;
-    let is_static = callee_data.modifiers.contains(Modifiers::STATIC);
     let callee_params = callee_data.params.clone();
     let callee_blocks = callee_data.blocks.clone();
-    let call_type = match CallType::from_annotation(module, callee) {
-        Some(ct) => ct,
-        None if is_static => CallType::DEFAULT,
-        None => return Err(SkipReason::CallTypeUnknown),
-    };
-    let roles = slot_roles(call_type, callee_params.len()).ok_or(SkipReason::CallTypeUnknown)?;
-    let callee_val = match &module
-        .inst(call_iid)
-        .ok_or(SkipReason::UnresolvedCallee)?
-        .op
-    {
-        Op::Call { callee, .. } => *callee,
-        _ => return Err(SkipReason::UnresolvedCallee),
-    };
+    if callee_params.len() != roles.len() {
+        return Err(SkipReason::CallTypeUnknown);
+    }
+
     let mut value_map: HashMap<ValueId, ValueId> = HashMap::new();
     for (param, role) in callee_params.iter().copied().zip(roles.iter().copied()) {
         let binding = match role {
-            // The closure being called (vendored: the func slot is the
-            // called closure).
             SlotRole::Func => callee_val,
-            // new.target: bound per call kind (T4; Direct/Dynamic →
-            // undefined, like `LoadNewTarget`).
             SlotRole::NewTarget => match nt_binding {
-                NewTargetBinding::Undefined => undef.get(module, call_block, call_pos),
+                NewTargetBinding::Undefined => const_mat.materialize_undef(module, call_block),
                 NewTargetBinding::CalleeValue => callee_val,
             },
-            // this: the explicit receiver for callthis*/Direct;
-            // vendored `setVregs` pushes exactly `undefined` for a
-            // non-callthis call (callThis = false), so a receiver-less
-            // Dynamic call binds undefined EXACTLY.
             SlotRole::This => match this {
                 Some(t) => *t,
-                None => undef.get(module, call_block, call_pos),
+                None => const_mat.materialize_undef(module, call_block),
             },
             SlotRole::Formal(k) => match args.get(k) {
                 Some(a) => *a,
-                None => undef.get(module, call_block, call_pos),
+                None => const_mat.materialize_undef(module, call_block),
             },
         };
         value_map.insert(param, binding);
     }
 
+    // Materialize fresh caller-owned `Op::LoadConst` values for any
+    // `ValueDef::Const(cid)` operands referenced inside `callee` (`#93` — never
+    // share `frame_init_consts` `ValueId`s across functions!).
+    let mut callee_const_operands: Vec<(ValueId, ConstId, Ty)> = Vec::new();
+    let mut seen_callee_consts: HashSet<ValueId> = HashSet::new();
+    for &gb in &callee_blocks {
+        let Some(block) = module.block(gb) else {
+            return Err(SkipReason::CalleeNoBody);
+        };
+        for &iid in &block.insts {
+            let Some(inst) = module.inst(iid) else {
+                return Err(SkipReason::CalleeNoBody);
+            };
+            inst.op.for_each_operand(|v| {
+                if !value_map.contains_key(&v)
+                    && seen_callee_consts.insert(v)
+                    && let Some(val) = module.value(v)
+                    && let ValueDef::Const(cid) = val.def
+                {
+                    callee_const_operands.push((v, cid, val.ty.clone()));
+                }
+            });
+        }
+    }
+    let mut non_scalar_caller_consts: Vec<ValueId> = Vec::new();
+    for (callee_vid, cid, ty) in callee_const_operands {
+        let fresh_vid = const_mat.materialize_const(module, call_block, cid, ty);
+        if matches!(
+            module.value(fresh_vid).map(|v| v.def),
+            Some(ValueDef::Const(_))
+        ) {
+            non_scalar_caller_consts.push(fresh_vid);
+        }
+        value_map.insert(callee_vid, fresh_vid);
+    }
+    if !non_scalar_caller_consts.is_empty()
+        && let Some(caller_fn) = module.func_mut(caller)
+    {
+        caller_fn.frame_init_consts.extend(non_scalar_caller_consts);
+    }
+
     // ── Step B: clone blocks (fresh BlockIds, arena append) ──────────
-    let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut block_map: HashMap<BlockId, BlockId> = HashMap::with_capacity(callee_blocks.len());
     for &gb in &callee_blocks {
         let fresh = BlockId::new(module.blocks.len() as u32);
         module.blocks.push(abcd_ir::Block::default());
         block_map.insert(gb, fresh);
     }
 
-    // ── Step C: fresh result values (two phases: phi/loop operands may
-    // reference results defined later in callee order) ────────────────
+    // ── Step C: fresh result values ──────────────────────────────────
     let base_iid = module.insts.len() as u32;
     {
         let mut seq = 0u32;
@@ -1125,8 +1215,7 @@ fn inline_site(
                     return Err(SkipReason::CalleeNoBody);
                 };
                 if let Some(result) = inst.result {
-                    let ty = module.value(result).map(|v| v.ty.clone());
-                    let Some(ty) = ty else {
+                    let Some(ty) = module.value(result).map(|v| v.ty.clone()) else {
                         return Err(SkipReason::CalleeForeignValue);
                     };
                     let fresh = ValueId::new(module.values.len() as u32);
@@ -1140,15 +1229,8 @@ fn inline_site(
             }
         }
     }
-    // Const-defined values transplant verbatim (module-wide identity).
-    let remap = |value_map: &HashMap<ValueId, ValueId>, v: ValueId| -> ValueId {
-        value_map.get(&v).copied().unwrap_or(v)
-    };
 
-    // ── Step D: clone instructions (operands, block payloads, and phi
-    // edges remapped; locs kept verbatim) ─────────────────────────────
-    // Eligibility's CFG-integrity scan guarantees every mapping exists;
-    // stay defensive anyway (library rule: no panics on data).
+    // ── Step D: clone instructions ───────────────────────────────────
     let map_block = |b: BlockId| -> Result<BlockId, SkipReason> {
         block_map
             .get(&b)
@@ -1167,37 +1249,27 @@ fn inline_site(
             };
             let mut op = inst.op.clone();
             op.for_each_operand_mut(|v| {
-                *v = remap(&value_map, *v);
+                if let Some(&mapped) = value_map.get(v) {
+                    *v = mapped;
+                }
             });
-            match &mut op {
-                Op::Branch { dest } => *dest = map_block(*dest)?,
-                Op::CondBranch {
-                    true_dest,
-                    false_dest,
-                    ..
-                } => {
-                    *true_dest = map_block(*true_dest)?;
-                    *false_dest = map_block(*false_dest)?;
+            let mut bad_block = false;
+            op.for_each_block_id_mut(|b| {
+                if let Some(&mapped) = block_map.get(b) {
+                    *b = mapped;
+                } else {
+                    bad_block = true;
                 }
-                Op::Phi { entries } => {
-                    for (edge, _) in entries.iter_mut() {
-                        edge.from = map_block(edge.from)?;
-                    }
-                }
-                _ => {}
+            });
+            if bad_block {
+                return Err(SkipReason::CalleeForeignValue);
             }
-            // new.target binding (T4): Direct/Dynamic → LoadConst of the
-            // pooled undefined; New (currently ineligible) → the result
-            // is rewritten to a Mov of the call-site callee value.
             if matches!(op, Op::LoadNewTarget) {
                 op = match nt_binding {
-                    NewTargetBinding::Undefined => Op::LoadConst(undef.cid),
+                    NewTargetBinding::Undefined => Op::LoadConst(undef_cid),
                     NewTargetBinding::CalleeValue => Op::Mov { src: callee_val },
                 };
             }
-            // Function-identity binding: the callee observing its own
-            // function object sees exactly the called closure (the same
-            // value the vendored func slot carries).
             if matches!(op, Op::LoadFunction) {
                 op = Op::Mov { src: callee_val };
             }
@@ -1224,8 +1296,6 @@ fn inline_site(
                 .insts
                 .push(fresh_iid);
         }
-        // Predecessors clone from the callee (all Normal — the callee
-        // has no try regions), remapped.
         let mut preds: Vec<Edge> = Vec::new();
         if let Some(b) = module.block(gb) {
             for e in &b.preds {
@@ -1254,6 +1324,12 @@ fn inline_site(
             .ok_or(SkipReason::CalleeNoBody)?;
         (pos, block.insts[pos + 1..].to_vec())
     };
+    let mut post_results: HashSet<ValueId> = HashSet::new();
+    for &iid in &post {
+        if let Some(res) = module.inst(iid).and_then(|i| i.result) {
+            post_results.insert(res);
+        }
+    }
     let cont = BlockId::new(module.blocks.len() as u32);
     module.blocks.push(abcd_ir::Block {
         insts: post.clone(),
@@ -1264,8 +1340,6 @@ fn inline_site(
             inst.block = cont;
         }
     }
-    // The call block ends in a fresh branch into the callee clone (glue;
-    // loc: None — never fabricate).
     let br = InstId::new(module.insts.len() as u32);
     module.insts.push(Inst {
         op: Op::Branch { dest: clone_entry },
@@ -1287,25 +1361,16 @@ fn inline_site(
         });
     }
 
-    // ── Step F: re-key the call block's old Normal successors to the
-    // continuation block (the moved terminator owns them now) ─────────
-    let moved_succs: Vec<BlockId> = {
-        let Some(block) = module.block(cont) else {
-            return Err(SkipReason::CalleeNoBody);
-        };
-        let Some(&last) = block.insts.last() else {
-            return Err(SkipReason::CalleeNoBody);
-        };
-        match module.inst(last).map(|i| &i.op) {
-            Some(Op::Branch { dest }) => vec![*dest],
-            Some(Op::CondBranch {
-                true_dest,
-                false_dest,
-                ..
-            }) => vec![*true_dest, *false_dest],
-            _ => Vec::new(),
-        }
-    };
+    // ── Step F: re-key the call block's old Normal successors to `cont`
+    let moved_succs: Vec<BlockId> = module
+        .block(cont)
+        .and_then(|b| b.insts.last().copied())
+        .and_then(|iid| module.inst(iid))
+        .map(|inst| {
+            let (targets, count) = normal_succs_inline(&inst.op);
+            targets[..count].to_vec()
+        })
+        .unwrap_or_default();
     for succ in moved_succs {
         if let Some(succ_block) = module.block_mut(succ) {
             for edge in succ_block.preds.iter_mut() {
@@ -1314,17 +1379,7 @@ fn inline_site(
                 }
             }
         }
-        let phi_ids: Vec<InstId> = module
-            .block(succ)
-            .map(|b| {
-                b.insts
-                    .iter()
-                    .copied()
-                    .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for phi_id in phi_ids {
+        for phi_id in block_phis(module, succ) {
             if let Some(phi) = module.inst_mut(phi_id)
                 && let Op::Phi { entries } = &mut phi.op
             {
@@ -1337,9 +1392,7 @@ fn inline_site(
         }
     }
 
-    // ── Step I: own the new blocks. Must precede the use replacement
-    // below: replace_uses_in_func iterates the caller's block list, and
-    // the uses of the call result live in the continuation. ───────────
+    // ── Step I: own the new blocks ───────────────────────────────────
     let mut cloned_blocks: Vec<BlockId> = Vec::with_capacity(callee_blocks.len());
     for &gb in &callee_blocks {
         cloned_blocks.push(map_block(gb)?);
@@ -1349,15 +1402,10 @@ fn inline_site(
         func.blocks.push(cont);
     }
 
-    // ── Step G: callee Returns become branches into the continuation;
-    // the call result is replaced by the return value (single return)
-    // or a continuation-block phi (several) ───────────────────────────
+    // ── Step G: callee Returns become branches into `cont` ───────────
     let mut ret_points: Vec<(BlockId, InstId, Option<ValueId>)> = Vec::new();
     for &cb in &cloned_blocks {
-        let Some(block) = module.block(cb) else {
-            continue;
-        };
-        let Some(&last) = block.insts.last() else {
+        let Some(&last) = module.block(cb).and_then(|b| b.insts.last()) else {
             continue;
         };
         if let Some(Op::Return { value }) = module.inst(last).map(|i| &i.op) {
@@ -1366,20 +1414,20 @@ fn inline_site(
     }
 
     let call_result = module.inst(call_iid).and_then(|i| i.result);
+    // Insert any late `undefined` materializations immediately before `br` in `call_block`.
+    const_mat.insert_pos = module
+        .block(call_block)
+        .map_or(0, |b| b.insts.len().saturating_sub(1));
+
     let replacement: ValueId = match ret_points.as_slice() {
-        // The callee never returns (throws/loops forever): the
-        // continuation is unreachable; bind the result to undefined so
-        // no orphan value lingers.
-        [] => undef.get(module, call_block, call_pos),
+        [] => const_mat.materialize_undef(module, call_block),
         [(_rb, riid, value)] => {
             if let Some(inst) = module.inst_mut(*riid) {
                 inst.op = Op::Branch { dest: cont };
             }
-            value.unwrap_or_else(|| undef.get(module, call_block, call_pos))
+            value.unwrap_or_else(|| const_mat.materialize_undef(module, call_block))
         }
         many => {
-            // One branch per return block into the continuation, and a
-            // phi at its head merging the return values.
             let mut entries = Vec::with_capacity(many.len());
             for &(rb, riid, value) in many {
                 if let Some(inst) = module.inst_mut(riid) {
@@ -1390,7 +1438,7 @@ fn inline_site(
                         from: rb,
                         kind: EdgeKind::Normal,
                     },
-                    value.unwrap_or_else(|| undef.get(module, call_block, call_pos)),
+                    value.unwrap_or_else(|| const_mat.materialize_undef(module, call_block)),
                 ));
             }
             let phi_iid = InstId::new(module.insts.len() as u32);
@@ -1425,10 +1473,8 @@ fn inline_site(
             cont_block.preds = preds;
         }
     }
-    // ── Step H snapshot (`R3-H10`): capture outer handler-phi incoming values
-    // for `call_block` BEFORE `replace_uses_in_func` rewrites `call_result` to
-    // `replacement`, so `call_block` and cloned callee blocks NEVER receive
-    // the call's post-return value on their `Exceptional` edges. ───────────
+
+    // ── Step H: exception participation (`R3-H10`) ───────────────────
     let call_edge = Edge {
         from: call_block,
         kind: EdgeKind::Exceptional,
@@ -1458,24 +1504,15 @@ fn inline_site(
 
     let mut handler_phi_snapshots: Vec<(InstId, ValueId)> = Vec::new();
     for &handler in &handlers {
-        let phi_ids: Vec<InstId> = module
-            .block(handler)
-            .map(|b| {
-                b.insts
-                    .iter()
-                    .copied()
-                    .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for phi_id in phi_ids {
+        for phi_id in block_phis(module, handler) {
             if let Some(Op::Phi { entries }) = module.inst(phi_id).map(|i| &i.op)
-                && let Some(v) = entries
+                && let Some(raw_v) = entries
                     .iter()
                     .find(|(edge, _)| *edge == call_edge)
                     .map(|(_, v)| *v)
             {
-                handler_phi_snapshots.push((phi_id, v));
+                let snap_v = resolve_subst(call_result_subst, raw_v);
+                handler_phi_snapshots.push((phi_id, snap_v));
             }
         }
     }
@@ -1483,15 +1520,9 @@ fn inline_site(
     if let Some(result) = call_result
         && result != replacement
     {
-        crate::analysis::replace_uses_in_func(module, caller, result, replacement);
+        call_result_subst.insert(result, replacement);
     }
 
-    // ── Step H: exception participation (`R3-H10`) ───────────────────
-    // Every region protecting `call_block` now protects ALL cloned callee
-    // blocks and `cont`. Handler `preds` and `Phi` entries are deduplicated
-    // across shared handlers, and `call_block` + `cloned_blocks` keep the
-    // snapshotted pre-call value (or a pre-throw `ValueDef::Const(Undefined)`
-    // if unverified input referenced `call_result` on `call_edge`).
     let new_protected: Vec<BlockId> = cloned_blocks.iter().copied().chain([cont]).collect();
     for &handler in &handlers {
         if let Some(handler_block) = module.block_mut(handler) {
@@ -1508,34 +1539,40 @@ fn inline_site(
     }
     let mut caller_undef_const_val: Option<ValueId> = None;
     for (phi_id, snap_val) in handler_phi_snapshots {
-        let (pre_val, cont_val) = if Some(snap_val) == call_result {
-            let uval = *caller_undef_const_val.get_or_insert_with(|| {
-                let existing = module.func(caller).and_then(|f| {
-                    f.frame_init_consts.iter().copied().find(|&v| {
-                        matches!(
-                            module.value(v).map(|val| val.def),
-                            Some(ValueDef::Const(c)) if c == undef.cid
-                        )
-                    })
-                });
-                if let Some(v) = existing {
-                    v
-                } else {
-                    let v = ValueId::new(module.values.len() as u32);
-                    module.values.push(abcd_ir::Value {
-                        def: ValueDef::Const(undef.cid),
-                        ty: Ty::Any,
+        let (pre_val, cont_val) =
+            if Some(snap_val) == call_result || post_results.contains(&snap_val) {
+                let uval = *caller_undef_const_val.get_or_insert_with(|| {
+                    let existing = module.func(caller).and_then(|f| {
+                        f.frame_init_consts.iter().copied().find(|&v| {
+                            matches!(
+                                module.value(v).map(|val| val.def),
+                                Some(ValueDef::Const(c)) if c == undef_cid
+                            )
+                        })
                     });
-                    if let Some(f) = module.func_mut(caller) {
-                        f.frame_init_consts.push(v);
+                    if let Some(v) = existing {
+                        v
+                    } else {
+                        let v = ValueId::new(module.values.len() as u32);
+                        module.values.push(abcd_ir::Value {
+                            def: ValueDef::Const(undef_cid),
+                            ty: Ty::Any,
+                        });
+                        if let Some(f) = module.func_mut(caller) {
+                            f.frame_init_consts.push(v);
+                        }
+                        v
                     }
-                    v
-                }
-            });
-            (uval, replacement)
-        } else {
-            (snap_val, snap_val)
-        };
+                });
+                let post_v = if Some(snap_val) == call_result {
+                    replacement
+                } else {
+                    snap_val
+                };
+                (uval, post_v)
+            } else {
+                (snap_val, snap_val)
+            };
         if let Some(phi) = module.inst_mut(phi_id)
             && let Op::Phi { entries } = &mut phi.op
         {
@@ -1560,7 +1597,7 @@ fn inline_site(
             if !entries.iter().any(|(e, _)| *e == cont_edge) {
                 entries.push((cont_edge, cont_val));
             }
-            let mut seen_edges = std::collections::HashSet::with_capacity(entries.len());
+            let mut seen_edges = HashSet::with_capacity(entries.len());
             entries.retain(|(e, _)| seen_edges.insert(*e));
         }
     }
@@ -1573,36 +1610,6 @@ fn inline_site(
         }
     }
 
-    // Propagate any `ValueDef::Const` values referenced by the cloned callee
-    // instructions into the caller's `frame_init_consts` (#30).
-    let mut const_vals: Vec<ValueId> = Vec::new();
-    for &cb in &cloned_blocks {
-        if let Some(b) = module.block(cb) {
-            for &iid in &b.insts {
-                if let Some(inst) = module.inst(iid) {
-                    inst.op.for_each_operand(|v| {
-                        if module
-                            .value(v)
-                            .is_some_and(|val| matches!(val.def, ValueDef::Const(_)))
-                            && !const_vals.contains(&v)
-                        {
-                            const_vals.push(v);
-                        }
-                    });
-                }
-            }
-        }
-    }
-    if !const_vals.is_empty()
-        && let Some(caller_func) = module.func_mut(caller)
-    {
-        for v in const_vals {
-            if !caller_func.frame_init_consts.contains(&v) {
-                caller_func.frame_init_consts.push(v);
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -1610,9 +1617,6 @@ fn inline_site(
 mod tests {
     use super::*;
 
-    /// The documented default policy constants (the corpus driver's
-    /// budget pins; also keeps the Default impl itself covered — under
-    /// --release the cross-crate callers inline it away).
     #[test]
     fn inline_policy_default_constants() {
         let p = InlinePolicy::default();
@@ -1620,9 +1624,6 @@ mod tests {
         assert_eq!(p.max_inlined_insts_per_caller, 512);
     }
 
-    /// The T4 new.target binding table: New → the callee itself,
-    /// Direct/Dynamic → undefined, everything else unbindable (and
-    /// ineligible at the call site).
     #[test]
     fn new_target_binding_table() {
         assert_eq!(
@@ -1650,8 +1651,6 @@ mod tests {
         }
     }
 
-    /// The skip-reason vocabulary is stable (corpus histogram keys) —
-    /// every variant pinned (c-COV W10: the full label table).
     #[test]
     fn skip_reason_labels_are_stable() {
         let labels: [(SkipReason, &str); 20] = [

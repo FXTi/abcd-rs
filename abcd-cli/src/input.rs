@@ -135,16 +135,20 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
     let mut out = Vec::with_capacity(modules.len());
     let mut used_keys: BTreeSet<String> = BTreeSet::new();
     for m in modules {
+        let summary = m.manifest_summary();
         let abc = m.data.as_slice().to_vec();
         let module_json = m.module_json.as_ref().map(|d| d.as_slice().to_vec());
-        let base = resolve_module_name(module_json.as_deref(), &m.container_path, source_name);
-        // Validate the base module name first so an unsafe container-supplied
-        // name is never masked by collision suffixing.
-        if safe_module_name(&base).is_none() {
-            return Err(CliError::Tool(format!(
-                "{source_name}: module name {base:?} is not a safe output path component"
-            )));
-        }
+        let raw_base = resolve_module_name(
+            summary.as_ref().and_then(|s| s.module_name.as_deref()),
+            module_json.as_deref(),
+            &m.container_path,
+            source_name,
+        );
+        // Sanitize container-supplied names deterministically rather than
+        // aborting read-only subcommands (`info`, `analyze`, `taint`, `dis`,
+        // `decompile`) when a container carries quirky `module.json` strings,
+        // while guaranteeing `is_safe_path_segment` for writer commands.
+        let base = sanitize_module_name(&raw_base);
         // A per-ability hap (ets/<Ability>/<Name>.abc …) or a container with
         // case-only name variants (`Entry` + `entry`) yields modules whose
         // output filenames collide on case-insensitive filesystems (APFS/NTFS).
@@ -152,26 +156,18 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
         // original case in `m.name`: first occurrence keeps `base`, collisions
         // get `<base>__<entry-stem>`, then `__N` on repeat.
         let name = if used_keys.contains(&base.to_ascii_lowercase()) {
-            let stem = file_stem(&m.entry_name);
-            let mut candidate = format!("{base}__{stem}");
+            let stem = sanitize_module_name(&file_stem(&m.entry_name));
+            let mut candidate = sanitize_module_name(&format!("{base}__{stem}"));
             let mut n = 2;
             while used_keys.contains(&candidate.to_ascii_lowercase()) {
-                candidate = format!("{base}__{stem}{n}");
+                candidate = sanitize_module_name(&format!("{base}__{stem}{n}"));
                 n += 1;
             }
             candidate
         } else {
             base
         };
-        // Module names end up in OUTPUT PATHS (`extract`, `decompile --all`),
-        // and they come from container content — an attacker-controlled
-        // module.json `name` or entry stem must not escape the output directory
-        // or hit a reserved Windows device name.
-        let name = safe_module_name(&name).ok_or_else(|| {
-            CliError::Tool(format!(
-                "{source_name}: module name {name:?} is not a safe output path component"
-            ))
-        })?;
+        debug_assert!(is_safe_path_segment(&name));
         used_keys.insert(name.to_ascii_lowercase());
         let mut provenance = source_name.to_string();
         for hop in &m.container_path {
@@ -190,14 +186,21 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
     Ok(out)
 }
 
-/// Module name resolution order: `module.json`'s `name` field, then the
+/// Module name resolution order: Stage `module.name` or FA
+/// `module.distro.moduleName` via [`abcd_hap::ManifestSummary`], then the
 /// innermost container entry stem (`entry.hap` → `entry`), then the source
 /// file stem.
 fn resolve_module_name(
+    summary_name: Option<&str>,
     module_json: Option<&[u8]>,
     container_path: &[String],
     source_name: &str,
 ) -> String {
+    if let Some(name) = summary_name
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
     if let Some(json) = module_json
         && let Some(name) = module_json_name(json)
     {
@@ -209,16 +212,14 @@ fn resolve_module_name(
     file_stem(source_name)
 }
 
-/// Pull the module name out of a Stage-model `module.json`
-/// (`module.name`) or an FA-model `config.json` (same layout). Anything
-/// unparseable falls back to the caller's derivation.
+/// Pull the module name out of a Stage-model `module.json` (`module.name`) or
+/// an FA-model `config.json` (`module.distro.moduleName`) via `abcd-hap`'s
+/// zero-recursion manifest parser. Anything unparseable falls back to the
+/// caller's derivation.
 fn module_json_name(json: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
-    let name = value.get("module")?.get("name")?.as_str()?;
-    if name.is_empty() {
-        return None;
-    }
-    Some(name.to_string())
+    abcd_hap::parse_manifest_summary(json)?
+        .module_name
+        .filter(|s| !s.is_empty())
 }
 
 /// Stem of the final path component (`dir/entry.hap` → `entry`).
@@ -278,8 +279,39 @@ pub fn is_safe_path_segment(seg: &str) -> bool {
 }
 
 /// A module name is safe iff it is a single, inert portable path component.
+#[cfg(test)]
 fn safe_module_name(name: &str) -> Option<String> {
     is_safe_path_segment(name).then(|| name.to_string())
+}
+
+/// Deterministically sanitize an arbitrary container-supplied module name into
+/// a valid single path segment satisfying [`is_safe_path_segment`].
+pub fn sanitize_module_name(raw: &str) -> String {
+    if is_safe_path_segment(raw) {
+        return raw.to_string();
+    }
+    let mut cleaned = String::with_capacity(raw.len().max(7));
+    for c in raw.chars() {
+        if c <= '\x1f'
+            || c == '\x7f'
+            || c.is_control()
+            || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        {
+            cleaned.push('_');
+        } else {
+            cleaned.push(c);
+        }
+    }
+    let trimmed = cleaned.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return "_module".to_string();
+    }
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    if is_windows_reserved_device(stem) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Apply the module-selection rule (never silently pick from several).

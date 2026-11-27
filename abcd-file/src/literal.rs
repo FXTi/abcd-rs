@@ -139,53 +139,40 @@ pub enum LiteralValue {
     EtsImplements(crate::StringId),
     /// Null sentinel value.
     NullValue(u8),
-    /// Typed `bool[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayU1(LiteralArrayIdx),
-    /// Typed `u8[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayU8(LiteralArrayIdx),
-    /// Typed `i8[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayI8(LiteralArrayIdx),
-    /// Typed `u16[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayU16(LiteralArrayIdx),
-    /// Typed `i16[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayI16(LiteralArrayIdx),
-    /// Typed `u32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayU32(LiteralArrayIdx),
-    /// Typed `i32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayI32(LiteralArrayIdx),
-    /// Typed `u64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayU64(LiteralArrayIdx),
-    /// Typed `i64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayI64(LiteralArrayIdx),
-    /// Typed `f32[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayF32(LiteralArrayIdx),
-    /// Typed `f64[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayF64(LiteralArrayIdx),
-    /// Typed `string[]` literal-array entry indexed in [`File::literal_arrays`](crate::File::literal_arrays).
-    ArrayString(LiteralArrayIdx),
+    /// Typed `bool[]` literal-array payload (`ARRAY_U1`).
+    ArrayU1(Vec<bool>),
+    /// Typed `u8[]` literal-array payload (`ARRAY_U8`).
+    ArrayU8(Vec<u8>),
+    /// Typed `i8[]` literal-array payload (`ARRAY_I8`).
+    ArrayI8(Vec<i8>),
+    /// Typed `u16[]` literal-array payload (`ARRAY_U16`).
+    ArrayU16(Vec<u16>),
+    /// Typed `i16[]` literal-array payload (`ARRAY_I16`).
+    ArrayI16(Vec<i16>),
+    /// Typed `u32[]` literal-array payload (`ARRAY_U32`).
+    ArrayU32(Vec<u32>),
+    /// Typed `i32[]` literal-array payload (`ARRAY_I32`).
+    ArrayI32(Vec<i32>),
+    /// Typed `u64[]` literal-array payload (`ARRAY_U64`).
+    ArrayU64(Vec<u64>),
+    /// Typed `i64[]` literal-array payload (`ARRAY_I64`).
+    ArrayI64(Vec<i64>),
+    /// Typed `f32[]` literal-array payload (`ARRAY_F32`).
+    ArrayF32(Vec<f32>),
+    /// Typed `f64[]` literal-array payload (`ARRAY_F64`).
+    ArrayF64(Vec<f64>),
+    /// Typed `string[]` literal-array payload (`ARRAY_STRING`).
+    ArrayString(Vec<crate::StringId>),
 }
 
 impl LiteralValue {
-    /// If this item carries a [`LiteralArrayIdx`] (`LiteralArray`,
-    /// `LiteralBufferIndex`, or `ArrayU1..ArrayString`), return it.
+    /// If this item carries a [`LiteralArrayIdx`] (`LiteralArray` or
+    /// `LiteralBufferIndex`), return it.
     #[inline]
     #[must_use]
     pub const fn literal_array_idx(&self) -> Option<LiteralArrayIdx> {
         match self {
-            Self::LiteralArray(idx)
-            | Self::LiteralBufferIndex(idx)
-            | Self::ArrayU1(idx)
-            | Self::ArrayU8(idx)
-            | Self::ArrayI8(idx)
-            | Self::ArrayU16(idx)
-            | Self::ArrayI16(idx)
-            | Self::ArrayU32(idx)
-            | Self::ArrayI32(idx)
-            | Self::ArrayU64(idx)
-            | Self::ArrayI64(idx)
-            | Self::ArrayF32(idx)
-            | Self::ArrayF64(idx)
-            | Self::ArrayString(idx) => Some(*idx),
+            Self::LiteralArray(idx) | Self::LiteralBufferIndex(idx) => Some(*idx),
             _ => None,
         }
     }
@@ -246,6 +233,49 @@ fn intern_literal_string(
     } else {
         crate::file::intern_string(ctx.file, off, strings).ok_or(Error::InvalidString(off))
     }
+}
+
+/// Read and bounds-check a typed literal array (`ARRAY_U1`..`ARRAY_STRING`) at
+/// `payload_off` (`[u32 elem_count][elem_count * elem_size]`).
+pub(crate) fn read_typed_literal_array_raw(
+    file: *const sys::AbcFileHandle,
+    payload_off: u32,
+    elem_size: u32,
+) -> Result<Vec<u64>, Error> {
+    // SAFETY: `file` is a valid live `AbcFileHandle`; null buffer queries and bounds-checks length.
+    let len = unsafe {
+        sys::abc_literal_read_typed_array(file, payload_off, elem_size, std::ptr::null_mut(), 0)
+    };
+    if len < 0 {
+        return Err(Error::Malformed {
+            field: "literal typed array",
+            context: format!("invalid or truncated typed literal array at offset {payload_off:#x}"),
+        });
+    }
+    let count = len as u32;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut raw = Vec::new();
+    raw.try_reserve_exact(count as usize)
+        .map_err(|_| Error::Malformed {
+            field: "literal typed array",
+            context: format!(
+                "allocation failed for typed literal array at offset {payload_off:#x}"
+            ),
+        })?;
+    raw.resize(count as usize, 0u64);
+    // SAFETY: `file` is valid and `raw` holds `count` writable `u64` elements.
+    let read_n = unsafe {
+        sys::abc_literal_read_typed_array(file, payload_off, elem_size, raw.as_mut_ptr(), count)
+    };
+    if read_n != len {
+        return Err(Error::Malformed {
+            field: "literal typed array",
+            context: format!("truncated typed literal array at offset {payload_off:#x}"),
+        });
+    }
+    Ok(raw)
 }
 
 /// Callback for collecting literal values from the C API.
@@ -354,51 +384,145 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
         }
         LiteralTag::ArrayU1 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayU1(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayU1(raw.into_iter().map(|x| x != 0).collect())
         }
         LiteralTag::ArrayU8 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayU8(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayU8(raw.into_iter().map(|x| x as u8).collect())
         }
         LiteralTag::ArrayI8 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayI8(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayI8(raw.into_iter().map(|x| x as i8).collect())
         }
         LiteralTag::ArrayU16 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayU16(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 2) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayU16(raw.into_iter().map(|x| x as u16).collect())
         }
         LiteralTag::ArrayI16 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayI16(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 2) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayI16(raw.into_iter().map(|x| x as i16).collect())
         }
         LiteralTag::ArrayU32 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayU32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayU32(raw.into_iter().map(|x| x as u32).collect())
         }
         LiteralTag::ArrayI32 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayI32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayI32(raw.into_iter().map(|x| x as i32).collect())
         }
         LiteralTag::ArrayU64 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayU64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayU64(raw)
         }
         LiteralTag::ArrayI64 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayI64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayI64(raw.into_iter().map(|x| x as i64).collect())
         }
         LiteralTag::ArrayF32 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayF32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayF32(raw.into_iter().map(|x| f32::from_bits(x as u32)).collect())
         }
         LiteralTag::ArrayF64 => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayF64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            LiteralValue::ArrayF64(raw.into_iter().map(f64::from_bits).collect())
         }
         LiteralTag::ArrayString => {
             // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            LiteralValue::ArrayString(LiteralArrayIdx(unsafe { v.data.u32_val }))
+            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
+                Ok(r) => r,
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            };
+            let mut out = Vec::with_capacity(raw.len());
+            for x in raw {
+                match intern_literal_string(ctx, x as u32) {
+                    Ok(sid) => out.push(sid),
+                    Err(err) => {
+                        ctx.error = Some(err);
+                        return;
+                    }
+                }
+            }
+            LiteralValue::ArrayString(out)
         }
         // TagValue (= INTEGER_8): a legal one-byte integer literal in
         // real 12.x files (audit finding #A1).

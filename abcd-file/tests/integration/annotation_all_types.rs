@@ -34,98 +34,133 @@ fn method_name_by_idx(file: &abcd_file::File, idx: abcd_file::MethodIdx) -> Stri
         .to_string()
 }
 
-/// Canonical text form of a literal value: StringIds are resolved through
-/// the pool and method handles through the method table, because both are
-/// pool/table-local across decodes.
-/// Typed-array (`ArrayXxx`) values compare by discriminant only.
-fn canon_literal(file: &abcd_file::File, v: &LiteralValue) -> String {
-    let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
-    match v {
-        LiteralValue::String(sid) => format!("String({})", r(*sid)),
-        LiteralValue::EtsImplements(sid) => format!("EtsImplements({})", r(*sid)),
-        LiteralValue::Method(idx) => format!("Method({})", method_name_by_idx(file, *idx)),
-        LiteralValue::GeneratorMethod(idx) => {
-            format!("GeneratorMethod({})", method_name_by_idx(file, *idx))
-        }
-        LiteralValue::AsyncGeneratorMethod(idx) => {
-            format!("AsyncGeneratorMethod({})", method_name_by_idx(file, *idx))
-        }
-        LiteralValue::Getter(idx) => format!("Getter({})", method_name_by_idx(file, *idx)),
-        LiteralValue::Setter(idx) => format!("Setter({})", method_name_by_idx(file, *idx)),
-        LiteralValue::LiteralArray(idx) => {
-            let values = &file.literal_arrays[idx.index()].values;
-            format!("LiteralArray[{}]", canon_literals(file, values))
-        }
-        LiteralValue::ArrayU1(_) => "ArrayU1".into(),
-        LiteralValue::ArrayU8(_) => "ArrayU8".into(),
-        LiteralValue::ArrayI8(_) => "ArrayI8".into(),
-        LiteralValue::ArrayU16(_) => "ArrayU16".into(),
-        LiteralValue::ArrayI16(_) => "ArrayI16".into(),
-        LiteralValue::ArrayU32(_) => "ArrayU32".into(),
-        LiteralValue::ArrayI32(_) => "ArrayI32".into(),
-        LiteralValue::ArrayU64(_) => "ArrayU64".into(),
-        LiteralValue::ArrayI64(_) => "ArrayI64".into(),
-        LiteralValue::ArrayF32(_) => "ArrayF32".into(),
-        LiteralValue::ArrayF64(_) => "ArrayF64".into(),
-        LiteralValue::ArrayString(_) => "ArrayString".into(),
-        other => format!("{other:?}"),
+/// Canonical text form of a literal value slice using an explicit workstack.
+fn canon_literals(file: &abcd_file::File, root_values: &[LiteralValue]) -> String {
+    enum Step<'a> {
+        Text(String),
+        Slice(&'a [LiteralValue], usize),
+        Val(&'a LiteralValue),
     }
-}
-
-fn canon_literals(file: &abcd_file::File, values: &[LiteralValue]) -> String {
-    values
-        .iter()
-        .map(|v| canon_literal(file, v))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Canonical text form of an annotation element value (see
-/// [`canon_literal`]). Method/Enum/MethodHandle references compare by
-/// resolved name; nested annotations/arrays recurse.
-fn canon_value(file: &abcd_file::File, v: &AnnotationValue) -> String {
     let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
-    match v {
-        AnnotationValue::String(sid) => format!("String({})", r(*sid)),
-        AnnotationValue::Record(sid) => format!("Record({})", r(*sid)),
-        AnnotationValue::Method { name, .. } => format!("Method({})", r(*name)),
-        AnnotationValue::Enum { name, .. } => format!("Enum({})", r(*name)),
-        AnnotationValue::Annotation(inner) => format!(
-            "Annotation({})[{}]",
-            r(inner.class_descriptor),
-            canon_elements(file, &inner.elements)
-        ),
-        AnnotationValue::MethodHandle(mh) => {
-            format!("MethodHandle({}, {})", mh.handle_type as u8, r(mh.entity))
+    let mut out = String::new();
+    let mut stack = vec![Step::Slice(root_values, 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Text(s) => out.push_str(&s),
+            Step::Slice(slice, idx) => {
+                if idx < slice.len() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    stack.push(Step::Slice(slice, idx + 1));
+                    stack.push(Step::Val(&slice[idx]));
+                }
+            }
+            Step::Val(v) => match v {
+                LiteralValue::String(sid) => out.push_str(&format!("String({})", r(*sid))),
+                LiteralValue::EtsImplements(sid) => {
+                    out.push_str(&format!("EtsImplements({})", r(*sid)));
+                }
+                LiteralValue::Method(idx) => {
+                    out.push_str(&format!("Method({})", method_name_by_idx(file, *idx)));
+                }
+                LiteralValue::GeneratorMethod(idx) => out.push_str(&format!(
+                    "GeneratorMethod({})",
+                    method_name_by_idx(file, *idx)
+                )),
+                LiteralValue::AsyncGeneratorMethod(idx) => out.push_str(&format!(
+                    "AsyncGeneratorMethod({})",
+                    method_name_by_idx(file, *idx)
+                )),
+                LiteralValue::Getter(idx) => {
+                    out.push_str(&format!("Getter({})", method_name_by_idx(file, *idx)));
+                }
+                LiteralValue::Setter(idx) => {
+                    out.push_str(&format!("Setter({})", method_name_by_idx(file, *idx)));
+                }
+                LiteralValue::LiteralArray(idx) => {
+                    let values = &file.literal_arrays[idx.index()].values;
+                    out.push_str("LiteralArray[");
+                    stack.push(Step::Text("]".to_owned()));
+                    stack.push(Step::Slice(values, 0));
+                }
+                LiteralValue::ArrayString(sids) => out.push_str(&format!(
+                    "ArrayString({:?})",
+                    sids.iter().map(|&s| r(s)).collect::<Vec<_>>()
+                )),
+                other => out.push_str(&format!("{other:?}")),
+            },
         }
-        AnnotationValue::LiteralArray(values) => {
-            format!("LiteralArray[{}]", canon_literals(file, values))
-        }
-        AnnotationValue::Array { tag, values } => format!(
-            "Array({})[{}]",
-            *tag as char,
-            values
-                .iter()
-                .map(|v| canon_value(file, v))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        other => format!("{other:?}"),
     }
+    out
 }
 
-fn canon_elements(file: &abcd_file::File, elems: &[AnnotationElem]) -> String {
-    elems
-        .iter()
-        .map(|e| {
-            format!(
-                "{}={}",
-                file.strings.resolve(e.name).unwrap_or("<dangling>"),
-                canon_value(file, &e.value)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+/// Canonical text form of an annotation element slice using an explicit workstack.
+fn canon_elements(file: &abcd_file::File, root_elems: &[AnnotationElem]) -> String {
+    enum Step<'a> {
+        Text(String),
+        Elems(&'a [AnnotationElem], usize),
+        Vals(&'a [AnnotationValue], usize),
+        Val(&'a AnnotationValue),
+    }
+    let r = |sid: abcd_file::StringId| file.strings.resolve(sid).unwrap_or("<dangling>");
+    let mut out = String::new();
+    let mut stack = vec![Step::Elems(root_elems, 0)];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Text(s) => out.push_str(&s),
+            Step::Elems(elems, idx) => {
+                if idx < elems.len() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(r(elems[idx].name));
+                    out.push('=');
+                    stack.push(Step::Elems(elems, idx + 1));
+                    stack.push(Step::Val(&elems[idx].value));
+                }
+            }
+            Step::Vals(vals, idx) => {
+                if idx < vals.len() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    stack.push(Step::Vals(vals, idx + 1));
+                    stack.push(Step::Val(&vals[idx]));
+                }
+            }
+            Step::Val(v) => match v {
+                AnnotationValue::String(sid) => out.push_str(&format!("String({})", r(*sid))),
+                AnnotationValue::Record(sid) => out.push_str(&format!("Record({})", r(*sid))),
+                AnnotationValue::Method { name, .. } => {
+                    out.push_str(&format!("Method({})", r(*name)));
+                }
+                AnnotationValue::Enum { name, .. } => out.push_str(&format!("Enum({})", r(*name))),
+                AnnotationValue::Annotation(inner) => {
+                    out.push_str(&format!("Annotation({})[", r(inner.class_descriptor)));
+                    stack.push(Step::Text("]".to_owned()));
+                    stack.push(Step::Elems(&inner.elements, 0));
+                }
+                AnnotationValue::MethodHandle(mh) => {
+                    out.push_str(&format!(
+                        "MethodHandle({}, {})",
+                        mh.handle_type as u8,
+                        r(mh.entity)
+                    ));
+                }
+                AnnotationValue::LiteralArray(values) => {
+                    out.push_str(&format!("LiteralArray[{}]", canon_literals(file, values)));
+                }
+                AnnotationValue::Array { tag, values } => {
+                    out.push_str(&format!("Array({})[", *tag as char));
+                    stack.push(Step::Text("]".to_owned()));
+                    stack.push(Step::Vals(values, 0));
+                }
+                other => out.push_str(&format!("{other:?}")),
+            },
+        }
+    }
+    out
 }
 
 /// Encode the model and re-decode, returning the canonical form of the
@@ -1041,18 +1076,18 @@ fn annotation_embedded_literal_array_all_kinds_encode_roundtrip() {
         LiteralValue::NullValue(0),
     ];
     let typed_arrays = [
-        LiteralValue::ArrayU1(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI8(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU16(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI16(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayU64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayI64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayF32(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayF64(abcd_file::LiteralArrayIdx(0)),
-        LiteralValue::ArrayString(abcd_file::LiteralArrayIdx(0)),
+        LiteralValue::ArrayU1(vec![true, false]),
+        LiteralValue::ArrayU8(vec![1, 2]),
+        LiteralValue::ArrayI8(vec![-1, 2]),
+        LiteralValue::ArrayU16(vec![300, 400]),
+        LiteralValue::ArrayI16(vec![-300, 400]),
+        LiteralValue::ArrayU32(vec![100_000]),
+        LiteralValue::ArrayI32(vec![-100_000]),
+        LiteralValue::ArrayU64(vec![1 << 40]),
+        LiteralValue::ArrayI64(vec![-(1 << 40)]),
+        LiteralValue::ArrayF32(vec![1.25]),
+        LiteralValue::ArrayF64(vec![-2.75]),
+        LiteralValue::ArrayString(vec![str_sid]),
     ];
 
     let mut elements = vec![

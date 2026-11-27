@@ -23,8 +23,6 @@ pub(crate) enum LitWrap {
     /// [`Const::LiteralBufferRef`] wrapping a pooled [`Const::ArrayLiteral`]
     /// (`LiteralTag::LITERALBUFFERINDEX`).
     BufferRef,
-    /// [`Const::TypedArrayLiteral`] (`LiteralTag::ARRAY_*`).
-    TypedArray(TypedArrayTag),
 }
 
 /// Resolve an [`EntityId`] through the owning method's typed [`EntityRef`]
@@ -302,8 +300,8 @@ fn const_for_literal_array_with_wrap(
 }
 
 /// Pool and memoize a finished literal-array frame under its [`LitWrap`] shape,
-/// keeping plain `ArrayLiteral` entries distinct from `LiteralBufferRef` and
-/// `TypedArrayLiteral` wrappers (`#57` `R3-H9`).
+/// keeping plain `ArrayLiteral` entries distinct from `LiteralBufferRef`
+/// wrappers (`#57` `R3-H9`).
 fn finish_literal_frame(
     lf: &mut Lifter,
     table_idx: u32,
@@ -318,7 +316,6 @@ fn finish_literal_frame(
                 .insert((table_idx, LitWrap::PlainArray), arr_cid);
             lf.const_shape(Const::LiteralBufferRef(arr_cid))
         }
-        LitWrap::TypedArray(tag) => lf.const_shape(Const::TypedArrayLiteral { tag, items: consts }),
     };
     lf.lit_cache.insert((table_idx, wrap), cid);
     cid
@@ -443,53 +440,128 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
             child_idx: idx.0,
             wrap: LitWrap::BufferRef,
         },
-        LiteralValue::ArrayU1(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::U1),
-        },
-        LiteralValue::ArrayU8(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::U8),
-        },
-        LiteralValue::ArrayI8(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::I8),
-        },
-        LiteralValue::ArrayU16(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::U16),
-        },
-        LiteralValue::ArrayI16(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::I16),
-        },
-        LiteralValue::ArrayU32(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::U32),
-        },
-        LiteralValue::ArrayI32(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::I32),
-        },
-        LiteralValue::ArrayU64(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::U64),
-        },
-        LiteralValue::ArrayI64(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::I64),
-        },
-        LiteralValue::ArrayF32(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::F32),
-        },
-        LiteralValue::ArrayF64(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::F64),
-        },
-        LiteralValue::ArrayString(idx) => LitStep::Nested {
-            child_idx: idx.0,
-            wrap: LitWrap::TypedArray(TypedArrayTag::String),
-        },
+        LiteralValue::ArrayU1(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Bool(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::U1,
+                items,
+            })
+        }
+        LiteralValue::ArrayU8(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int8(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::U8,
+                items,
+            })
+        }
+        LiteralValue::ArrayI8(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int8(x as u8)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::I8,
+                items,
+            })
+        }
+        LiteralValue::ArrayU16(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int32(u32::from(x))))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::U16,
+                items,
+            })
+        }
+        LiteralValue::ArrayI16(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int32(i32::from(x) as u32)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::I16,
+                items,
+            })
+        }
+        LiteralValue::ArrayU32(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int32(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::U32,
+                items,
+            })
+        }
+        LiteralValue::ArrayI32(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int32(x as u32)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::I32,
+                items,
+            })
+        }
+        LiteralValue::ArrayU64(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::UInt64(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::U64,
+                items,
+            })
+        }
+        LiteralValue::ArrayI64(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::Int64(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::I64,
+                items,
+            })
+        }
+        LiteralValue::ArrayF32(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::float32(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::F32,
+                items,
+            })
+        }
+        LiteralValue::ArrayF64(elems) => {
+            let items = elems
+                .iter()
+                .map(|&x| lf.module.consts.intern(Const::number(x)))
+                .collect();
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::F64,
+                items,
+            })
+        }
+        LiteralValue::ArrayString(sids) => {
+            let mut items = Vec::with_capacity(sids.len());
+            for &sid in sids {
+                let sym = lf
+                    .sym_of_file_sid(sid)
+                    .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
+                items.push(lf.module.consts.intern(Const::String(sym)));
+            }
+            LitStep::Ready(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::String,
+                items,
+            })
+        }
     })
 }

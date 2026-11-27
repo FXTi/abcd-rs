@@ -5,7 +5,7 @@
 //! reached through first-class `EdgeKind::Exceptional` edges sourced from
 //! the function's `TryRegion`s. `remove_unreachable_blocks` and
 //! `rebuild_predecessors` must use the AUGMENTED successor relation
-//! (`abcd_opt::analysis::augmented_succs`) — a terminator-only BFS
+//! (`abcd_ir::augmented_succs`) — a terminator-only BFS
 //! deletes every catch handler and silently drops the exceptional
 //! control-flow path.
 
@@ -71,19 +71,19 @@ fn build_try_module() -> (Module, FuncId, BlockId, BlockId, BlockId) {
 fn augmented_succs_adds_handler_edges_only_to_protected_blocks() {
     let (module, func, entry, handler, dead) = build_try_module();
 
-    let entry_succs = abcd_opt::analysis::augmented_succs(&module, func, entry);
+    let entry_succs = abcd_ir::augmented_succs(&module, func, entry);
     assert_eq!(
         entry_succs,
-        vec![(handler, EdgeKind::Exceptional)],
+        vec![handler],
         "the protected entry block (terminator: Return, no terminator successors) \
          must see the catch handler as a successor"
     );
     assert!(
-        abcd_opt::analysis::augmented_succs(&module, func, handler).is_empty(),
+        abcd_ir::augmented_succs(&module, func, handler).is_empty(),
         "the handler itself is not protected: terminator successors only (none)"
     );
     assert!(
-        abcd_opt::analysis::augmented_succs(&module, func, dead).is_empty(),
+        abcd_ir::augmented_succs(&module, func, dead).is_empty(),
         "the dead block is not protected: terminator successors only (none)"
     );
 }

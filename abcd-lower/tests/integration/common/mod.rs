@@ -37,6 +37,7 @@ impl<'m> V2Builder<'m> {
         module
             .functions
             .push(FunctionData::new(ClassId::new(0), sym, kind));
+        module.classes[0].methods.push(func);
         let entry = BlockId::new(module.blocks.len() as u32);
         module.blocks.push(Block::default());
         module.functions[func.index()].blocks.push(entry);
@@ -242,8 +243,8 @@ pub enum Halt {
     /// `ThrowConstassignment` (record-and-stop): `name` is the register's
     /// contents (the variable name string VALUE).
     ThrowConstAssignment { name: i64 },
-    /// `ThrowUndefinedifhole` (record-and-stop): `name` the first
-    /// register's contents, `value` the second's.
+    /// `ThrowUndefinedifhole` (record-and-stop): `value` the first
+    /// register's contents (`v1`), `name` the second's (`v2`).
     ThrowUndefinedIfHole { name: i64, value: i64 },
     /// `ThrowUndefinedifholewithname` (record-and-stop): `value` is the
     /// accumulator (the checked value).
@@ -569,7 +570,7 @@ impl Machine {
                         name: self.reg(name_r.0),
                     };
                 }
-                Bytecode::ThrowUndefinedifhole(name_r, val_r) => {
+                Bytecode::ThrowUndefinedifhole(val_r, name_r) => {
                     return Halt::ThrowUndefinedIfHole {
                         name: self.reg(name_r.0),
                         value: self.reg(val_r.0),

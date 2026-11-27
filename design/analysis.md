@@ -14,15 +14,14 @@ This document specifies the format-independent static analysis library (`abcd-an
 
 ## 2. `abcd-analysis` Infrastructure
 
-### 2.1 Control-Flow, Dominators & Region Structuring (`src/control/`)
-- **CFG Relations**: Provides both Normal-only (`block_succs`) and exception-augmented (`augmented_succs` / `augmented_succs_with_map` backed by `abcd_ir::cfg::ExceptionHandlerMap`) successor queries, deterministic iterative RPO (`compute_rpo`), and cross-block `SuspendGenerator → ResumeGenerator` `await` pairing (`awaited_values_for_resume`, `build_await_resume_map`).
-- **Dominators & Post-Dominators (`dom.rs`)**: Delegates forward normal-CFG dominance to `abcd_ir::cfg::{DomTree, IndexedDom}` (`O(B)` Cooper–Harvey–Kennedy + Euler `tin`/`tout` intervals for `O(1)` queries, with lazy `BitSet` materialization) and models catch-protected `Return` / uncaught `Throw` exit blocks in `PostDominators::augmented`.
-- **Pattern-Independent Region Trees (`regions.rs`)**: Reduces arbitrary reducible and irreducible CFGs into hierarchical `Seq` / `If` / `Loop` / `Switch` region trees for `abcd-decompile` (panic-free `RegionTree::get` / `node`, multi-arm `>= 3` merge reduction, and single-pass `TryRegion` projection).
+### 2.1 Control-Flow & Dominators (`src/control/`)
+- **CFG Relations**: Re-exports canonical Normal-only (`block_succs`) and exception-augmented (`augmented_succs` / `augmented_succs_with_map` backed by `abcd_ir::cfg::ExceptionHandlerMap`) successor queries and deterministic iterative RPO (`compute_rpo`) from `abcd_ir::cfg`, plus cross-block `SuspendGenerator → ResumeGenerator` `await` pairing (`awaited_values_for_resume`, `build_await_resume_map`).
+- **Dominators & Post-Dominators (`dom.rs`)**: Delegates forward normal-CFG dominance to `abcd_ir::cfg::{DomTree, IndexedDom}` (`O((V + E) log V)` Georgiadis Semi-NCA + Euler `tin`/`tout` intervals for `O(1)` queries, with lazy `BitSet` materialization) and models catch-protected `Return` / uncaught `Throw` exit blocks in `PostDominators::augmented`.
 
 ### 2.2 Dataflow & IFDS Tabulation (`src/dataflow/`)
 - **Def-Use Chains (`usedef.rs`)**: Edge-aware per-function SSA `UseDefChains` built over `Op::for_each_operand` without per-instruction `Vec` allocations.
 - **IFDS Solver (`ifds.rs`)**: Reps–Horwitz–Sagiv interprocedural tabulation engine with Naeem–Lhoták–Rodriguez practical extensions:
-  - Sparse `TOP`-as-absent path-edge jump table, `incoming` / `endSummary` tables with second-arriver replay, selective zero-fact call gating (`IfdsProblem::propagate_zero_to_callee`), unbalanced-return following (`follow_returns_past_seeds`), first-class `ExceptionHandlerMap` + `Op::effects_in(module)` exceptional edges, and iterative multi-frame uncaught-exception propagation (`IfdsProblem::call_uncaught_exit_flow`, distinguishing catch-all-protected `Throw`s from uncaught exits).
+  - Sparse `TOP`-as-absent path-edge jump table, separated normal vs. uncaught-exception summary/path edge sets, zero-copy `FactId(u32)` identity passthrough (`FlowSink::pass_through`), `incoming` / `endSummary` tables with second-arriver replay, selective zero-fact call gating (`IfdsProblem::propagate_zero_to_callee`), unbalanced-return following (`follow_returns_past_seeds`), first-class `ExceptionHandlerMap` + `Op::effects_in(module)` exceptional edges, and iterative multi-frame uncaught-exception propagation (`IfdsProblem::call_uncaught_exit_flow`, distinguishing catch-all-protected `Throw`s from uncaught exits).
   - Parameterized over client `IfdsProblem` (fact domain + `normal_flow`, `call_flow`, `return_flow`, `call_to_return_flow`, `call_uncaught_exit_flow`) and `CallGraphOracle`.
 
 ### 2.3 The Alias & Pointer-Analysis Ladder
@@ -37,7 +36,7 @@ This document specifies the format-independent static analysis library (`abcd-an
 ### 2.4 Call Graph, Cross-Module Linker & OHOS Lifecycle (`callgraph`, `module_link`, `ohos_lifecycle`)
 - **`CallGraph`**: Resolves `Direct`, closure/method/class `Dynamic`/`New`/`Apply`/`Super*`, `ClassHierarchyIndex` OOP virtual/singleton/field dispatches, and cross-record ES imports, refined by Rung 1 `points_to` or superseded by Rung 2's co-evolved graph; unresolved sites remain explicit `CallTargets::UnknownCallees`.
 - **`ModuleLinkTable` & `merge_ir_modules`**: Links ES `ImportDecl` / `ExportDecl::{Local, Indirect, Star}` (cycle-guarded, ECMA-262 `default` non-forwarding on `export *`), commercial OHMUrl (`@bundle:`, `@package:`, 4/5-segment & bare-`&` `@normalized:`), dot-encoded record descriptors, relative paths, `jsonFileContent` JSON modules, and topological `func_main_0` order across `--merge-abc` records and multi-`.abc` `.hap`/`.hsp` containers.
-- **`ohos_lifecycle`**: Discovers Stage/FA `UIAbility`, `AbilityStage`, `*ExtensionAbility`, and ArkUI `ViewPU`/`View` components (honoring `module.json`/`config.json` `srcEntry` hints and prototype-overflow methods) and synthesizes deterministic `__abcd_ohos_harness__` entrypoints with per-component `this`, `this.context`, and `__ohos_want__` bindings.
+- **`ohos_lifecycle`**: Discovers Stage/FA `UIAbility`, `AbilityStage`, `*ExtensionAbility`, and ArkUI `ViewPU`/`View` components (honoring `module.json`/`config.json` `srcEntry` hints and prototype-overflow methods) and synthesizes deterministic steady-state `while (*)` lifecycle dispatch harnesses (returned via explicit `FuncId` handles) with per-component `this`, `this.context`, and `__ohos_want__` bindings.
 
 ---
 

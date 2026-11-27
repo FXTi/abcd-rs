@@ -11,9 +11,9 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
   - Full `.abc` `decode` & `encode` across modern formats (`9.0.0.0`–`24.0.0.0`, including `20+ MB` commercial `--merge-abc` bundles) plus legacy `0.0.0.2` decoding.
   - Byte-identical `.pa` disassembler (`abcd dis`, `5,517/5,517` vs. upstream `ark_disasm`) and semantic `.pa` assembler (`abcd asm`).
 - **Format-Independent `94`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
-  - Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), chordal MCS register allocation, `acc`-as-cache instruction selection, and per-method `u16` entity compaction.
+  - Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), Hack–Grund–Goos dominance-tree SSA coloring + Boissinot CSSA coalescing, `acc`-as-cache instruction selection, and per-method `u16` entity compaction.
 - **Interprocedural Static & Taint Analysis (`abcd-analysis`, `abcd-taint`)**:
-  - Iterative Cooper–Harvey–Kennedy dominators, pattern-independent region trees, IFDS tabulation solver, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with on-the-fly call-graph co-evolution, cross-module ES linking, Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
+  - Iterative Semi-NCA dominators, IFDS tabulation solver with zero-copy identity passthrough, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with on-the-fly call-graph co-evolution, cross-module ES linking, Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
 - **JS / TS & ArkUI Decompiler (`abcd-decompile`)**:
   - Three-stage expression, control-flow, and state-machine (`function*`, `async`, `async*`, `yield*`, `for await..of`) recovery (`1,149/1,149` corpus dream gate, `2,676/2,685` `test262` dream gate), `--split-modules` multi-file bundle recovery, and `--arkui` `@Component struct` reconstruction.
 
@@ -23,18 +23,18 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
 
 | Crate | Description |
 | :--- | :--- |
-| [`abcd-isa-sys`](abcd-isa-sys/README.md) | Vendored C++17 `BytecodeEmitter` & version FFI bridge + pre-generated ISA tables |
-| [`abcd-isa`](abcd-isa/README.md) | Safe `Bytecode` enum, modern & legacy `0.0.0.2` decoders, encoder, and entity relocation |
-| [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded, span-clamped C99 FFI bridge over vendored `libpandafile` |
+| [`abcd-isa-sys`](abcd-isa-sys/README.md) | Vendored C++17 `BytecodeInst` / `BytecodeEmitter` C99 differential-oracle FFI bridge |
+| [`abcd-isa`](abcd-isa/README.md) | Pure-Rust `Bytecode` enum, modern & legacy `0.0.0.2` decoders, Fenwick encoder, relocation, and `Version` |
+| [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded, span-checked C99 FFI bridge over vendored `libpandafile` |
 | [`abcd-file`](abcd-file/README.md) | `.abc` `decode` / `encode`, lossless MUTF-8 `StringPool`, and `pandasm` `.pa` text layer |
-| [`abcd-hap`](abcd-hap/README.md) | Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` container reader |
-| [`abcd-ir`](abcd-ir/README.md) | Format-independent `94`-op SSA IR, `Effects`, `Ty`, `frame::FrameSlots`, and verifier |
+| [`abcd-hap`](abcd-hap/README.md) | Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` container & manifest reader |
+| [`abcd-ir`](abcd-ir/README.md) | Format-independent `94`-op SSA IR, Semi-NCA `DomTree`, `Effects`, `Ty`, `FrameSlots`, and verifier |
 | [`abcd-lift`](abcd-lift/README.md) | `abcd_file::File` → `abcd_ir::Module` lifter |
 | [`abcd-opt`](abcd-opt/README.md) | SSA optimization passes (`Peephole`, `SCCP`, `ADCE`, `CopyProp`, `inline`) |
-| [`abcd-lower`](abcd-lower/README.md) | `abcd_ir::Module` → `abcd_file::File` register allocator & bytecode lowerer |
-| [`abcd-analysis`](abcd-analysis/README.md) | Dominators, region trees, IFDS solver, Rung `0`–`2` alias/PTA, call graph, and OHOS linker |
+| [`abcd-lower`](abcd-lower/README.md) | `abcd_ir::Module` → `abcd_file::File` dominance-tree CSSA register allocator & bytecode lowerer |
+| [`abcd-analysis`](abcd-analysis/README.md) | IFDS solver, Rung `0`–`2` alias/PTA, call graph, class hierarchy, and OHOS module/lifecycle linker |
 | [`abcd-taint`](abcd-taint/README.md) | Access-path IFDS taint analyzer, callback-gap summaries, and OpenHarmony (`ohos`) preset |
-| [`abcd-decompile`](abcd-decompile/README.md) | Bytecode → JS/TS decompiler with `--split-modules` and `--arkui` modes |
+| [`abcd-decompile`](abcd-decompile/README.md) | Bytecode → JS/TS decompiler (Ramsey labeled-block structuring, `--split-modules`, `--arkui`) |
 | [`abcd-cli`](abcd-cli/README.md) | Unified `abcd` command-line binary |
 
 ---

@@ -161,6 +161,20 @@ fn lossy(bytes: &[u8]) -> String {
 // The string oracle (raw contents may contain quotes/commas/newlines)
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn step_oracle_hash(h: u64, b: u8) -> u64 {
+    h.wrapping_mul(0x0100_0000_01b3)
+        .wrapping_add(u64::from(b).wrapping_add(1))
+}
+
+fn compute_oracle_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0u64;
+    for &b in bytes {
+        h = step_oracle_hash(h, b);
+    }
+    h
+}
+
 /// Candidate string contents used to delimit raw-printed strings. Seeded
 /// from the STRING section (exhaustive for instruction string operands)
 /// and extended with every literal-array string as it is parsed. `multi`
@@ -168,7 +182,9 @@ fn lossy(bytes: &[u8]) -> String {
 #[derive(Default)]
 struct Oracle {
     set: HashSet<Vec<u8>>,
+    len_hashes: HashSet<(usize, u64)>,
     multi: BTreeSet<Box<[u8]>>,
+    max_multi_len: usize,
 }
 
 impl Oracle {
@@ -176,23 +192,141 @@ impl Oracle {
         if !self.set.insert(content.to_vec()) {
             return;
         }
+        self.len_hashes
+            .insert((content.len(), compute_oracle_hash(content)));
         if content.contains(&b'"') || content.contains(&b'\n') {
+            self.max_multi_len = self.max_multi_len.max(content.len());
             self.multi.insert(content.into());
         }
     }
 
-    fn contains(&self, content: &[u8]) -> bool {
-        self.set.contains(content)
+    #[inline]
+    fn contains_hashed(&self, content: &[u8], hash: u64) -> bool {
+        self.len_hashes.contains(&(content.len(), hash)) && self.set.contains(content)
     }
 
-    /// Does any quote/newline-bearing oracle string start with `prefix`?
-    fn has_string_prefix(&self, prefix: &[u8]) -> bool {
+    fn first_multi_with_prefix(&self, prefix: &[u8]) -> Option<&[u8]> {
+        if self.multi.is_empty() || prefix.len() > self.max_multi_len {
+            return None;
+        }
         use std::ops::Bound;
         self.multi
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .next()
-            .is_some_and(|s| s.starts_with(prefix))
+            .and_then(|s| s.starts_with(prefix).then_some(s.as_ref()))
     }
+
+    /// Does any quote/newline-bearing oracle string start with `prefix`?
+    fn has_string_prefix(&self, prefix: &[u8]) -> bool {
+        self.first_multi_with_prefix(prefix).is_some()
+    }
+}
+
+#[inline]
+fn is_quote_followed_by_separator(buf: &[u8], quote_pos: usize, allow_newline_ws: bool) -> bool {
+    let mut k = quote_pos + 1;
+    while k < buf.len()
+        && (matches!(buf[k], b' ' | b'\t' | b'\r') || (allow_newline_ws && buf[k] == b'\n'))
+    {
+        k += 1;
+    }
+    k == buf.len() || matches!(buf[k], b',' | b']' | b'}')
+}
+
+/// Scan forward from an opening quote at `open` in `O(matched_len)` time using
+/// rolling hashes and incremental `oracle.multi` prefix pruning.
+///
+/// Returns `(best_oracle_close, first_same_line_quote, tail_is_multi_prefix)`.
+fn scan_quote_forward(
+    buf: &[u8],
+    open: usize,
+    oracle: &Oracle,
+    allow_newline_ws_after_close: bool,
+) -> (Option<usize>, Option<usize>, bool) {
+    let start = open + 1;
+    let mut cur_hash = 0u64;
+    let mut seen_newline = false;
+    let mut first_same_line_quote = None;
+    let mut best_oracle_close = None;
+    let mut witness: Option<&[u8]> = None;
+    let mut witness_checked = 0usize;
+    let mut prefix_dead = oracle.multi.is_empty();
+
+    let mut pos = start;
+    while pos < buf.len() {
+        let b = buf[pos];
+        if b == b'"' {
+            if !seen_newline && first_same_line_quote.is_none() {
+                first_same_line_quote = Some(pos);
+            }
+            if is_quote_followed_by_separator(buf, pos, allow_newline_ws_after_close)
+                && oracle.contains_hashed(&buf[start..pos], cur_hash)
+            {
+                best_oracle_close = Some(pos);
+            }
+            cur_hash = step_oracle_hash(cur_hash, b);
+            let prefix_len = pos + 1 - start;
+            if prefix_dead || prefix_len > oracle.max_multi_len {
+                prefix_dead = true;
+                break;
+            }
+            let still_matches = match witness {
+                Some(w)
+                    if w.len() >= prefix_len
+                        && w[witness_checked..prefix_len] == buf[start + witness_checked..=pos] =>
+                {
+                    witness_checked = prefix_len;
+                    true
+                }
+                _ => match oracle.first_multi_with_prefix(&buf[start..=pos]) {
+                    Some(w) => {
+                        witness = Some(w);
+                        witness_checked = prefix_len;
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if !still_matches {
+                prefix_dead = true;
+                break;
+            }
+        } else {
+            if b == b'\n' {
+                seen_newline = true;
+            }
+            cur_hash = step_oracle_hash(cur_hash, b);
+            let prefix_len = pos + 1 - start;
+            if !prefix_dead && prefix_len > oracle.max_multi_len {
+                prefix_dead = true;
+                if best_oracle_close.is_some() || first_same_line_quote.is_some() || seen_newline {
+                    break;
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    let full_len = buf.len() - start;
+    let tail_is_multi_prefix = if prefix_dead || full_len > oracle.max_multi_len {
+        false
+    } else {
+        match witness {
+            Some(w)
+                if w.len() >= full_len
+                    && w[witness_checked..full_len] == buf[start + witness_checked..] =>
+            {
+                true
+            }
+            _ => oracle.has_string_prefix(&buf[start..]),
+        }
+    };
+
+    (
+        best_oracle_close,
+        first_same_line_quote,
+        tail_is_multi_prefix,
+    )
 }
 
 /// Split a pandasm operand list at top-level commas, respecting
@@ -221,54 +355,26 @@ fn split_operands_ext(
     while i < rest.len() {
         let b = rest[i];
         if b == b'"' {
-            if defer_oracle_prefix
-                && prefix_open.is_none()
-                && oracle.has_string_prefix(&rest[i + 1..])
-            {
+            let (oracle_close, first_quote, tail_is_prefix) =
+                scan_quote_forward(rest, i, oracle, !defer_oracle_prefix);
+            if defer_oracle_prefix && prefix_open.is_none() && tail_is_prefix {
                 prefix_open = Some(i);
             }
-            // Oracle close: latest `"` whose content is an oracle entry,
-            // followed by a separator or the end of the text.
-            let mut close = None;
-            for j in (i + 1..rest.len()).rev() {
-                if rest[j] != b'"' {
-                    continue;
-                }
-                if !oracle.contains(&rest[i + 1..j]) {
-                    continue;
-                }
-                let mut k = j + 1;
-                while k < rest.len()
-                    && (matches!(rest[k], b' ' | b'\t' | b'\r')
-                        || (!defer_oracle_prefix && rest[k] == b'\n'))
-                {
-                    k += 1;
-                }
-                if k == rest.len() || matches!(rest[k], b',' | b']' | b'}') {
-                    close = Some(j);
-                    break;
-                }
-            }
-            let close = match close {
+            let close = match oracle_close {
                 Some(c) => c,
                 None => {
                     // Defer same-line quote pairing while the opened string
                     // is a prefix of a quote/newline-bearing oracle entry so
                     // embedded `"` characters on line 1 never split early.
-                    if defer_oracle_prefix && oracle.has_string_prefix(&rest[i + 1..]) {
+                    if defer_oracle_prefix && tail_is_prefix {
                         return Err(prefix_open.unwrap_or(i));
                     }
                     // Fallback for hand-written single-line strings absent
                     // from the STRING oracle: next quote on the same line.
-                    match rest[i + 1..].iter().position(|&b| b == b'"') {
-                        Some(off) if !rest[i + 1..i + 1 + off].contains(&b'\n') => {
-                            let cand = i + 1 + off;
+                    match first_quote {
+                        Some(cand) => {
                             if defer_oracle_prefix {
-                                let mut k = cand + 1;
-                                while k < rest.len() && matches!(rest[k], b' ' | b'\t' | b'\r') {
-                                    k += 1;
-                                }
-                                if k == rest.len() || matches!(rest[k], b',' | b']' | b'}') {
+                                if is_quote_followed_by_separator(rest, cand, false) {
                                     cand
                                 } else {
                                     return Err(prefix_open.unwrap_or(i));
@@ -277,7 +383,7 @@ fn split_operands_ext(
                                 cand
                             }
                         }
-                        _ => return Err(prefix_open.unwrap_or(i)),
+                        None => return Err(prefix_open.unwrap_or(i)),
                     }
                 }
             };
@@ -405,6 +511,18 @@ enum PaItem {
     LitOffset(u32),
     LitBufferIndex(u32),
     BuiltinType(u8),
+    ArrayU1(Vec<bool>),
+    ArrayU8(Vec<u8>),
+    ArrayI8(Vec<i8>),
+    ArrayU16(Vec<u16>),
+    ArrayI16(Vec<i16>),
+    ArrayU32(Vec<u32>),
+    ArrayI32(Vec<i32>),
+    ArrayU64(Vec<u64>),
+    ArrayI64(Vec<i64>),
+    ArrayF32(Vec<f32>),
+    ArrayF64(Vec<f64>),
+    ArrayString(Vec<Vec<u8>>),
 }
 
 /// One LITERALS section entry.
@@ -571,8 +689,8 @@ struct Parser {
     lit_by_text: HashMap<Vec<u8>, (Vec<u32>, usize)>,
     /// Key offset → position in `regular`.
     lit_by_offset: HashMap<u32, usize>,
-    /// Module blob offset → parsed module data.
-    modules: HashMap<u32, PaModule>,
+    /// Module blob offset → parsed module data (`BTreeMap` for `N20` deterministic fallback order).
+    modules: BTreeMap<u32, PaModule>,
     /// Offsets named by `lit_offset:` items (nested references are exact —
     /// they pin WHICH same-content array a parent nests).
     nested_targets: HashSet<u32>,
@@ -593,7 +711,7 @@ impl Parser {
             regular: Vec::new(),
             lit_by_text: HashMap::new(),
             lit_by_offset: HashMap::new(),
-            modules: HashMap::new(),
+            modules: BTreeMap::new(),
             nested_targets: HashSet::new(),
             key_index_to_offset: Vec::new(),
             records: Vec::new(),
@@ -680,11 +798,12 @@ impl Parser {
                 return err(base + i, "malformed LITERALS entry key");
             };
             // Accumulate the value across physical lines until the
-            // oracle-aware scanner finds the closing `]}`.
+            // incremental oracle-aware scanner finds the closing `]}`.
             let mut acc = line[value_start..].to_vec();
+            let mut scanner = LiteralCompleteScanner::default();
             let mut j = i + 1;
             let value = loop {
-                if value_is_complete(&acc, &self.oracle) {
+                if scanner.is_complete(&acc, &self.oracle) {
                     break acc;
                 }
                 // Module arrays can run to hundreds of records; the only
@@ -719,13 +838,14 @@ impl Parser {
                     // Newly-seen literal strings join the oracle for the
                     // rest of the section (and for instruction parsing);
                     // lit_offset targets pin their exact offsets.
-                    let strings: Vec<Vec<u8>> = items
-                        .iter()
-                        .filter_map(|item| match item {
-                            PaItem::Str(s) | PaItem::EtsImplements(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                        .collect();
+                    let mut strings: Vec<Vec<u8>> = Vec::new();
+                    for item in items {
+                        match item {
+                            PaItem::Str(s) | PaItem::EtsImplements(s) => strings.push(s.clone()),
+                            PaItem::ArrayString(arr) => strings.extend(arr.iter().cloned()),
+                            _ => {}
+                        }
+                    }
                     for s in strings {
                         self.oracle.add(&s);
                     }
@@ -840,6 +960,9 @@ impl Parser {
             }
             b"lit_index" => PaItem::LitBufferIndex(int(value)? as u32),
             b"builtin_type" => PaItem::BuiltinType(int(value)? as i16 as u8),
+            b"array_u1" | b"array_u8" | b"array_i8" | b"array_u16" | b"array_i16"
+            | b"array_u32" | b"array_i32" | b"array_u64" | b"array_i64" | b"array_f32"
+            | b"array_f64" | b"array_string" => self.parse_typed_literal_array(tag, value, line)?,
             other => {
                 return err(
                     line,
@@ -847,6 +970,181 @@ impl Parser {
                 );
             }
         })
+    }
+
+    fn parse_typed_literal_array(
+        &self,
+        tag: &[u8],
+        value: &[u8],
+        line: usize,
+    ) -> Result<PaItem, ParseError> {
+        let Some(inner) = value.strip_prefix(b"[").and_then(|s| s.strip_suffix(b"]")) else {
+            return err(line, "typed literal array value must be bracketed `[...]`");
+        };
+        let (tokens, _, _) = split_operands(inner, &self.oracle).ok_or_else(|| ParseError {
+            line,
+            message: "unterminated string in typed literal array".to_owned(),
+        })?;
+        fn parse_ascii(raw: &[u8], line: usize) -> Result<&str, ParseError> {
+            std::str::from_utf8(raw).map_err(|_| ParseError {
+                line,
+                message: "typed literal array element is not ASCII".to_owned(),
+            })
+        }
+        match tag {
+            b"array_u1" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    let v = s.parse::<i64>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_u1 element `{s}` does not parse"),
+                    })?;
+                    out.push(v != 0);
+                }
+                Ok(PaItem::ArrayU1(out))
+            }
+            b"array_u8" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<u8>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_u8 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayU8(out))
+            }
+            b"array_i8" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<i8>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_i8 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayI8(out))
+            }
+            b"array_u16" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<u16>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_u16 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayU16(out))
+            }
+            b"array_i16" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<i16>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_i16 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayI16(out))
+            }
+            b"array_u32" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<u32>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_u32 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayU32(out))
+            }
+            b"array_i32" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<i32>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_i32 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayI32(out))
+            }
+            b"array_u64" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<u64>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_u64 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayU64(out))
+            }
+            b"array_i64" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    out.push(s.parse::<i64>().map_err(|_| ParseError {
+                        line,
+                        message: format!("array_i64 element `{s}` does not parse"),
+                    })?);
+                }
+                Ok(PaItem::ArrayI64(out))
+            }
+            b"array_f32" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    let v = if let Some(hex) = s.strip_prefix("bits:0x") {
+                        let bits = u32::from_str_radix(hex, 16).map_err(|_| ParseError {
+                            line,
+                            message: format!("array_f32 bits `{s}` does not parse"),
+                        })?;
+                        f32::from_bits(bits)
+                    } else {
+                        s.parse::<f32>().map_err(|_| ParseError {
+                            line,
+                            message: format!("array_f32 element `{s}` does not parse"),
+                        })?
+                    };
+                    out.push(v);
+                }
+                Ok(PaItem::ArrayF32(out))
+            }
+            b"array_f64" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    let s = parse_ascii(t, line)?;
+                    let v = if let Some(hex) = s.strip_prefix("bits:0x") {
+                        let bits = u64::from_str_radix(hex, 16).map_err(|_| ParseError {
+                            line,
+                            message: format!("array_f64 bits `{s}` does not parse"),
+                        })?;
+                        f64::from_bits(bits)
+                    } else {
+                        s.parse::<f64>().map_err(|_| ParseError {
+                            line,
+                            message: format!("array_f64 element `{s}` does not parse"),
+                        })?
+                    };
+                    out.push(v);
+                }
+                Ok(PaItem::ArrayF64(out))
+            }
+            b"array_string" => {
+                let mut out = Vec::with_capacity(tokens.len());
+                for t in &tokens {
+                    if t.len() >= 2 && t[0] == b'"' && t[t.len() - 1] == b'"' {
+                        out.push(t[1..t.len() - 1].to_vec());
+                    } else {
+                        return err(line, "array_string element is not quoted");
+                    }
+                }
+                Ok(PaItem::ArrayString(out))
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Parse a module-array value block (`{ N [\n\tMODULE_REQUEST_ARRAY…`).
@@ -905,6 +1203,7 @@ impl Parser {
         let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
         let mut i = 0usize;
         let mut pending_lang = SourceLang::EcmaScript;
+        let mut seen_descriptors: HashSet<Vec<u8>> = HashSet::new();
         while i < lines.len() {
             let line = lines[i];
             if trim(line).is_empty() {
@@ -919,10 +1218,17 @@ impl Parser {
                 i += 1;
                 continue;
             }
+            let record_line = base + i;
             let Some(rest) = line.strip_prefix(b".record ") else {
-                return err(base + i, "expected `.record` or `.language`");
+                return err(record_line, "expected `.record` or `.language`");
             };
             if let Some(name) = rest.strip_suffix(b" <external>") {
+                if !seen_descriptors.insert(record_descriptor(name)) {
+                    return err(
+                        record_line,
+                        format!("duplicate .record `{}`", String::from_utf8_lossy(name)),
+                    );
+                }
                 self.records.push(PaRecord {
                     name: name.to_vec(),
                     lang: pending_lang,
@@ -933,8 +1239,14 @@ impl Parser {
                 continue;
             }
             let Some(name) = rest.strip_suffix(b" {") else {
-                return err(base + i, "malformed `.record` header");
+                return err(record_line, "malformed `.record` header");
             };
+            if !seen_descriptors.insert(record_descriptor(name)) {
+                return err(
+                    record_line,
+                    format!("duplicate .record `{}`", String::from_utf8_lossy(name)),
+                );
+            }
             let mut fields = Vec::new();
             i += 1;
             while i < lines.len() && lines[i] != b"}" {
@@ -1240,27 +1552,114 @@ impl Parser {
         let mut acc = first_line.to_vec();
         let mut best: Option<BestCandidate> = None;
         let mut j = i + 1;
-        loop {
-            let should_extend = match insn_ops_parse_ext(&acc, &self.oracle, true) {
-                Ok((mnemonic, tokens, string_bytes, probe_open)) => {
-                    let better = match &best {
-                        None => true,
-                        Some((_, _, _, prev)) => string_bytes > *prev,
-                    };
-                    if better {
-                        best = Some((j, mnemonic, tokens, string_bytes));
-                    }
-                    probe_open.is_some_and(|o| self.oracle.has_string_prefix(&acc[o + 1..]))
-                }
-                Err(open) => self.oracle.has_string_prefix(&acc[open + 1..]),
-            };
-            if !should_extend || j >= lines.len() {
-                break;
+
+        let active_open = match insn_ops_parse_ext(&acc, &self.oracle, true) {
+            Ok((mnemonic, tokens, string_bytes, probe_open)) => {
+                best = Some((j, mnemonic, tokens, string_bytes));
+                probe_open.filter(|&o| self.oracle.has_string_prefix(&acc[o + 1..]))
             }
-            acc.push(b'\n');
-            acc.extend_from_slice(lines[j]);
-            j += 1;
+            Err(open) => self
+                .oracle
+                .has_string_prefix(&acc[open + 1..])
+                .then_some(open),
+        };
+
+        if let Some(mut open_idx) = active_open
+            && let Some(mut witness) = self.oracle.first_multi_with_prefix(&acc[open_idx + 1..])
+        {
+            let mut cur_hash = compute_oracle_hash(&acc[open_idx + 1..]);
+            let mut witness_checked = acc.len() - (open_idx + 1);
+
+            while j < lines.len() {
+                let prev_len = acc.len();
+                acc.push(b'\n');
+                acc.extend_from_slice(lines[j]);
+                j += 1;
+
+                let mut line_had_oracle_close = false;
+                for pos in prev_len..acc.len() {
+                    let b = acc[pos];
+                    if b == b'"'
+                        && is_quote_followed_by_separator(&acc, pos, false)
+                        && self
+                            .oracle
+                            .contains_hashed(&acc[open_idx + 1..pos], cur_hash)
+                    {
+                        line_had_oracle_close = true;
+                    }
+                    cur_hash = step_oracle_hash(cur_hash, b);
+                }
+
+                let full_len = acc.len() - (open_idx + 1);
+                let mut still_prefix = if full_len > self.oracle.max_multi_len {
+                    false
+                } else if witness.len() >= full_len
+                    && witness[witness_checked..full_len] == acc[open_idx + 1 + witness_checked..]
+                {
+                    witness_checked = full_len;
+                    true
+                } else if let Some(new_w) =
+                    self.oracle.first_multi_with_prefix(&acc[open_idx + 1..])
+                {
+                    witness = new_w;
+                    witness_checked = full_len;
+                    true
+                } else {
+                    false
+                };
+
+                if line_had_oracle_close {
+                    match insn_ops_parse_ext(&acc, &self.oracle, true) {
+                        Ok((mnemonic, tokens, string_bytes, probe_open)) => {
+                            let better = match &best {
+                                None => true,
+                                Some((_, _, _, prev)) => string_bytes > *prev,
+                            };
+                            if better {
+                                best = Some((j, mnemonic, tokens, string_bytes));
+                            }
+                            match probe_open {
+                                Some(po) if po == open_idx => {}
+                                Some(po) => {
+                                    if let Some(w2) =
+                                        self.oracle.first_multi_with_prefix(&acc[po + 1..])
+                                    {
+                                        open_idx = po;
+                                        cur_hash = compute_oracle_hash(&acc[open_idx + 1..]);
+                                        witness = w2;
+                                        witness_checked = acc.len() - (open_idx + 1);
+                                        still_prefix = true;
+                                    } else {
+                                        still_prefix = false;
+                                    }
+                                }
+                                None => still_prefix = false,
+                            }
+                        }
+                        Err(new_open) => {
+                            if new_open != open_idx {
+                                if let Some(w2) =
+                                    self.oracle.first_multi_with_prefix(&acc[new_open + 1..])
+                                {
+                                    open_idx = new_open;
+                                    cur_hash = compute_oracle_hash(&acc[open_idx + 1..]);
+                                    witness = w2;
+                                    witness_checked = acc.len() - (open_idx + 1);
+                                    still_prefix = true;
+                                } else {
+                                    still_prefix = false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !still_prefix {
+                    break;
+                }
+            }
         }
+
         if best.is_none()
             && let Ok((mnemonic, tokens, string_bytes, _)) =
                 insn_ops_parse_ext(first_line, &self.oracle, false)
@@ -1334,8 +1733,9 @@ impl Parser {
         }
 
         // Fields (classification mirrors decode_field_at: phase by name,
-        // module/scope blobs by record descriptor).
-        let mut class_fields: HashMap<StringId, Vec<Field>> = HashMap::new();
+        // module/scope blobs by record descriptor). `BTreeMap` preserves
+        // deterministic `N20` iteration order when collecting scope/phase offsets.
+        let mut class_fields: BTreeMap<StringId, Vec<Field>> = BTreeMap::new();
         for (rec, &desc_sid) in records.iter().zip(&record_classes) {
             let mut fields = Vec::new();
             for pf in &rec.fields {
@@ -1405,7 +1805,7 @@ impl Parser {
 
         // Bodies (temporary method shell offsets and literal source offsets in
         // `MethodBody::entities` are rewritten to dense indices below).
-        let mut methods_by_owner: HashMap<StringId, Vec<Method>> = HashMap::new();
+        let mut methods_by_owner: BTreeMap<StringId, Vec<Method>> = BTreeMap::new();
         for (idx, fun) in functions.iter().enumerate() {
             let shell = MethodShell {
                 owner: b.method_shells[idx].owner,
@@ -1855,6 +2255,24 @@ impl Parser {
                 }
                 PaItem::LitBufferIndex(v) => LiteralValue::LiteralBufferIndex(LiteralArrayIdx(*v)),
                 PaItem::BuiltinType(v) => LiteralValue::BuiltinTypeIndex(*v),
+                PaItem::ArrayU1(v) => LiteralValue::ArrayU1(v.clone()),
+                PaItem::ArrayU8(v) => LiteralValue::ArrayU8(v.clone()),
+                PaItem::ArrayI8(v) => LiteralValue::ArrayI8(v.clone()),
+                PaItem::ArrayU16(v) => LiteralValue::ArrayU16(v.clone()),
+                PaItem::ArrayI16(v) => LiteralValue::ArrayI16(v.clone()),
+                PaItem::ArrayU32(v) => LiteralValue::ArrayU32(v.clone()),
+                PaItem::ArrayI32(v) => LiteralValue::ArrayI32(v.clone()),
+                PaItem::ArrayU64(v) => LiteralValue::ArrayU64(v.clone()),
+                PaItem::ArrayI64(v) => LiteralValue::ArrayI64(v.clone()),
+                PaItem::ArrayF32(v) => LiteralValue::ArrayF32(v.clone()),
+                PaItem::ArrayF64(v) => LiteralValue::ArrayF64(v.clone()),
+                PaItem::ArrayString(v) => {
+                    let mut sids = Vec::with_capacity(v.len());
+                    for raw in v {
+                        sids.push(self.intern(raw)?);
+                    }
+                    LiteralValue::ArrayString(sids)
+                }
             };
             out.push(v);
         }
@@ -1987,6 +2405,9 @@ impl Parser {
             insn_count,
             entities: HashMap::new(),
             next_raw: HashMap::new(),
+            string_slots: HashMap::new(),
+            method_slots: HashMap::new(),
+            literal_slots: HashMap::new(),
         };
         let mut bytecodes = Vec::with_capacity(fun.insns.len());
 
@@ -2102,16 +2523,23 @@ impl Parser {
                     .string_offsets
                     .get(content)
                     .and_then(|offsets| offsets.first().copied());
-                let raw = state.next_raw.entry(EntityKind::StringId).or_insert(0);
-                let id = *raw;
-                *raw += 1;
-                state.entities.insert(
-                    (EntityKind::StringId, id),
-                    EntityRef::String {
-                        id: sid,
-                        source_offset,
-                    },
-                );
+                let id = match state.string_slots.get(&(sid, source_offset)).copied() {
+                    Some(existing) => existing,
+                    None => {
+                        let raw = state.next_raw.entry(EntityKind::StringId).or_insert(0);
+                        let id = *raw;
+                        *raw += 1;
+                        state.string_slots.insert((sid, source_offset), id);
+                        state.entities.insert(
+                            (EntityKind::StringId, id),
+                            EntityRef::String {
+                                id: sid,
+                                source_offset,
+                            },
+                        );
+                        id
+                    }
+                };
                 Ok(RawOperand::E(id))
             }
             (OpKind::Method, PaOp::MethodSig(sig)) => {
@@ -2126,15 +2554,22 @@ impl Parser {
                             String::from_utf8_lossy(sig)
                         ),
                     })?;
-                let raw = state.next_raw.entry(EntityKind::MethodId).or_insert(0);
-                let id = *raw;
-                *raw += 1;
-                // Temporarily store the synthetic method offset; rewritten to
-                // the post-sort dense `MethodIdx` in `build()`.
-                state.entities.insert(
-                    (EntityKind::MethodId, id),
-                    EntityRef::Method(MethodIdx(offset)),
-                );
+                let id = match state.method_slots.get(&offset).copied() {
+                    Some(existing) => existing,
+                    None => {
+                        let raw = state.next_raw.entry(EntityKind::MethodId).or_insert(0);
+                        let id = *raw;
+                        *raw += 1;
+                        state.method_slots.insert(offset, id);
+                        // Temporarily store the synthetic method offset; rewritten to
+                        // the post-sort dense `MethodIdx` in `build()`.
+                        state.entities.insert(
+                            (EntityKind::MethodId, id),
+                            EntityRef::Method(MethodIdx(offset)),
+                        );
+                        id
+                    }
+                };
                 Ok(RawOperand::E(id))
             }
             (OpKind::LiteralArr, PaOp::Literal(text)) => {
@@ -2169,18 +2604,25 @@ impl Parser {
                         off
                     }
                 };
-                let raw = state
-                    .next_raw
-                    .entry(EntityKind::LiteralarrayId)
-                    .or_insert(0);
-                let id = *raw;
-                *raw += 1;
-                // Temporarily store the literal source offset; rewritten to
-                // `offset_to_lit_idx[&offset]` in `build()`.
-                state.entities.insert(
-                    (EntityKind::LiteralarrayId, id),
-                    EntityRef::LiteralArray(LiteralArrayIdx(offset)),
-                );
+                let id = match state.literal_slots.get(&offset).copied() {
+                    Some(existing) => existing,
+                    None => {
+                        let raw = state
+                            .next_raw
+                            .entry(EntityKind::LiteralarrayId)
+                            .or_insert(0);
+                        let id = *raw;
+                        *raw += 1;
+                        state.literal_slots.insert(offset, id);
+                        // Temporarily store the literal source offset; rewritten to
+                        // `offset_to_lit_idx[&offset]` in `build()`.
+                        state.entities.insert(
+                            (EntityKind::LiteralarrayId, id),
+                            EntityRef::LiteralArray(LiteralArrayIdx(offset)),
+                        );
+                        id
+                    }
+                };
                 Ok(RawOperand::E(id))
             }
             _ => Err(mismatch()),
@@ -2295,6 +2737,9 @@ struct BodyBuildState<'a> {
     insn_count: u32,
     entities: HashMap<(EntityKind, u32), EntityRef>,
     next_raw: HashMap<EntityKind, u32>,
+    string_slots: HashMap<(StringId, Option<u32>), u32>,
+    method_slots: HashMap<u32, u32>,
+    literal_slots: HashMap<u32, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,63 +2971,114 @@ pub(crate) fn parse_literal_key(line: &[u8]) -> Option<(u32, u32, usize)> {
     Some((index, offset, value_start))
 }
 
-/// Is the accumulated literal-array value text complete? Scans with the
-/// oracle for raw strings; complete when the braces/brackets balance and
-/// the text ends with `]}` (or when the value is empty).
-fn value_is_complete(acc: &[u8], oracle: &Oracle) -> bool {
-    if trim(acc).is_empty() {
-        return true; // the empty array prints as nothing
-    }
-    let mut depth = 0i32;
-    let mut i = 0usize;
-    while i < acc.len() {
-        let b = acc[i];
-        if b == b'"' {
-            // Oracle close followed by a separator, else defer while an
-            // oracle prefix is active, else the next quote in `acc`.
-            let mut close = None;
-            for j in (i + 1..acc.len()).rev() {
-                if acc[j] != b'"' {
+#[derive(Default)]
+struct LiteralCompleteScanner {
+    pos: usize,
+    depth: i32,
+    open_quote: Option<LiteralQuoteState>,
+}
+
+struct LiteralQuoteState {
+    open: usize,
+    cur_hash: u64,
+    seen_newline: bool,
+    first_same_line_quote: Option<usize>,
+    best_oracle_close: Option<usize>,
+}
+
+impl LiteralCompleteScanner {
+    /// Incrementally scan `acc` for balanced braces/brackets ending with `]}`,
+    /// keeping `O(N)` total work across multi-line module and string arrays.
+    fn is_complete(&mut self, acc: &[u8], oracle: &Oracle) -> bool {
+        if self.pos == 0 && self.open_quote.is_none() && trim(acc).is_empty() {
+            return true; // the empty array prints as nothing
+        }
+        loop {
+            if let Some(mut qs) = self.open_quote.take() {
+                let mut closed_at = None;
+                while self.pos < acc.len() {
+                    let b = acc[self.pos];
+                    if b == b'"' {
+                        let mut k = self.pos + 1;
+                        while k < acc.len() && acc[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k == acc.len() {
+                            // Trailing quote at current buffer end: cannot end with `]}`
+                            // yet; wait for the next line to reveal whether a separator
+                            // or string continuation follows.
+                            self.open_quote = Some(qs);
+                            return false;
+                        }
+                        if qs.first_same_line_quote.is_none() {
+                            qs.first_same_line_quote = Some(self.pos);
+                        }
+                        if matches!(acc[k], b',' | b']' | b'}')
+                            && oracle.contains_hashed(&acc[qs.open + 1..self.pos], qs.cur_hash)
+                        {
+                            qs.best_oracle_close = Some(self.pos);
+                        }
+                        qs.cur_hash = step_oracle_hash(qs.cur_hash, b);
+                        if !oracle.has_string_prefix(&acc[qs.open + 1..=self.pos]) {
+                            if let Some(c) = qs.best_oracle_close.or(qs.first_same_line_quote) {
+                                closed_at = Some(c);
+                                break;
+                            }
+                            self.pos += 1;
+                            self.open_quote = Some(qs);
+                            return false;
+                        }
+                    } else {
+                        if b == b'\n' {
+                            qs.seen_newline = true;
+                        }
+                        qs.cur_hash = step_oracle_hash(qs.cur_hash, b);
+                    }
+                    self.pos += 1;
+                }
+                if let Some(c) = closed_at {
+                    self.pos = c + 1;
                     continue;
                 }
-                if !oracle.contains(&acc[i + 1..j]) {
+                if oracle.has_string_prefix(&acc[qs.open + 1..]) {
+                    self.open_quote = Some(qs);
+                    return false;
+                }
+                if let Some(c) = qs.best_oracle_close.or(qs.first_same_line_quote) {
+                    self.pos = c + 1;
                     continue;
                 }
-                let mut k = j + 1;
-                while k < acc.len() && acc[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                if k == acc.len() || matches!(acc[k], b',' | b']' | b'}') {
-                    close = Some(j);
-                    break;
-                }
-            }
-            if close.is_some() && oracle.has_string_prefix(&acc[i + 1..]) {
+                self.open_quote = Some(qs);
                 return false;
             }
-            let close = match close {
-                Some(c) => c,
-                None => {
-                    if oracle.has_string_prefix(&acc[i + 1..]) {
-                        return false;
-                    }
-                    match acc[i + 1..].iter().position(|&b| b == b'"') {
-                        Some(off) => i + 1 + off,
-                        None => return false,
-                    }
+
+            let mut entered_quote = false;
+            while self.pos < acc.len() {
+                let b = acc[self.pos];
+                if b == b'"' {
+                    self.open_quote = Some(LiteralQuoteState {
+                        open: self.pos,
+                        cur_hash: 0,
+                        seen_newline: false,
+                        first_same_line_quote: None,
+                        best_oracle_close: None,
+                    });
+                    self.pos += 1;
+                    entered_quote = true;
+                    break;
                 }
-            };
-            i = close + 1;
-            continue;
+                match b {
+                    b'{' | b'[' => self.depth += 1,
+                    b'}' | b']' => self.depth -= 1,
+                    _ => {}
+                }
+                self.pos += 1;
+            }
+            if !entered_quote {
+                return self.depth == 0 && acc.ends_with(b"]}");
+            }
         }
-        match b {
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
     }
-    depth == 0 && acc.ends_with(b"]}")
 }
 
 /// Try to split the mnemonic and operand list of one accumulated instruction

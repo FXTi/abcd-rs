@@ -35,8 +35,8 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 3. **Type Lattice (`src/ty.rs`) & Frame-Slot Calling Convention (`src/frame.rs`)**:
    - `Ty` bridges dynamic ECMAScript (`Ty::Any`, `DynPrim`) and statically typed ArkTS (`StaticTy` primitives, `Reference(ClassId)`, `Ty::Union(Box<[Ty]>)` with iterative `O(1)`-stack `Clone`/`Drop`/`Eq`/`Hash`/`Debug`).
    - `abcd_ir::frame` defines parameter slot layout (`ADR-05`): dynamic ECMAScript functions prepend `[func][new.target][this]` (`H = 3` default, or the subset encoded in `L_ESCallTypeAnnotation;`), while static ArkTS methods (`SourceLang::ArkTs` / static ABI) carry `H = 0` implicit JS slots.
-4. **Shared Linear-Memory Dominator Infrastructure & Verifier (`src/cfg.rs`, `src/verify.rs`, `ADR-04`, `ADR-17`)**:
-   - `abcd_ir::cfg::DomTree` computes iterative Reverse Post-Order (RPO) + **Cooper–Harvey–Kennedy** `idom: Vec<u32>` (`O(B)` memory) + iterative Euler `(tin, tout)` intervals (`O(1)` dominance queries) over both Normal and Exception-Augmented CFGs, alongside dense `ExceptionHandlerMap` and inline `normal_succs_inline`.
+4. **Shared Linear-Memory Dominator Infrastructure & Verifier (`src/cfg.rs`, `src/verify.rs`, `ADR-04`, `ADR-17`, `ADR-22`)**:
+   - `abcd_ir::cfg::DomTree` computes iterative Reverse Post-Order (RPO) + **Georgiadis–Tarjan–Werneck Semi-NCA** `idom: Vec<u32>` (`O((V + E) log V)` worst-case time, `O(B)` memory) + iterative Euler `(tin, tout)` intervals (`O(1)` dominance & depth queries) over both Normal and Exception-Augmented CFGs, alongside dense `ExceptionHandlerMap` and inline `block_succs` / `inst_succs` / `normal_succs_inline`.
    - `verify_module` checks arena/symbol/entity bounds, iterative 3-color `ConstPool` acyclicity (`ConstCycle`), `Inst.result` ↔ `Op::has_result()` agreement, disjoint cross-function ownership, `CallKind` arity invariants, `TryRegion` ↔ `EdgeKind::Exceptional` symmetry, and **`O(1)` pre-throw / post-normal-exit augmented SSA dominance** (`R2-D1`, `ADR-04`).
 
 ---
@@ -67,9 +67,9 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 `abcd-lower` supports both in-place container rewriting (`rewrite_file`) and standalone synthesis (`lower_module`):
 
 1. **Fusion Pre-Pass (`src/fusion.rs`)**: Suppresses single-use expansion intermediates (`DefineFunc`→`AllocClosure`, adjacent constant index loads, global-load defaults) before register coloring.
-2. **Chordal Register Allocation & Out-of-SSA (`src/regalloc.rs`, `src/copy_resolve.rs`)**:
-   - Ranks function-local `ValueId`s densely (`0..V`) and computes backward liveness over `[u64]` bitsets with `ExceptionHandlerMap` and pre-grouped phi incoming lists (`ADR-19`).
-   - Runs Maximum Cardinality Search (MCS) + greedy coloring, reserving low scratch registers (`v0..v255`) for `lda`/`sta` and a contiguous low-register window for `*range` calls (`ADR-03`).
+2. **Dominance-Tree SSA Coloring & CSSA Out-of-SSA (`src/regalloc.rs`, `src/copy_resolve.rs`, `ADR-22`)**:
+   - Isolates `Phi` webs and entry parameters into Conventional SSA (Boissinot et al., *CGO* 2009) and computes backward liveness over `[u64]` bitsets with `ExceptionHandlerMap` (`ValueDef::ExceptionParam` included in handler kills).
+   - Colors live ranges in iterative `DomTree` preorder (Hack–Grund–Goos, *CC* 2006) with zero materialized $O(V^2)$ interference graph, biased coalescing, low scratch registers (`v0..v255`) for `lda`/`sta`, and a contiguous low-register window for `*range` calls (`ADR-03`).
    - Schedules parallel phi copies with cycle-breaking temporaries on Normal edges (splitting critical edges via trampolines) while enforcing **zero copies on exception edges** (`N21`).
 3. **Instruction Selection, Layout, Debug Replay & Compaction (`src/isel.rs`, `src/layout.rs`, `src/method_body.rs`)**:
    - Emits narrow and `wide.*` instructions using `AccContent` caching, unfused `cmp + jnez`/`jeqz` branches (`ADR-07`), and fallthrough `jmp` elision to the immediately-following RPO block (`ADR-19`).

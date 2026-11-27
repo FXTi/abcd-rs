@@ -217,48 +217,54 @@ pub fn fold(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
     fold_tagged_templates(nodes);
 }
 
-/// Visit every `SNode::Stmts` leaf run in pre-order using an explicit heap stack.
+/// Visit every `SNode::Stmts` leaf run in exact left-to-right DFS pre-order
+/// (matching `scope_fold` Pass 1 and `Emitter`) using an explicit heap stack.
 pub(in crate::folds) fn walk_stmts_runs_mut(
     nodes: &mut [SNode],
     mut f: impl FnMut(&mut Vec<Leaf>),
 ) {
     let mut stack: Vec<&mut [SNode]> = vec![nodes];
     while let Some(slice) = stack.pop() {
-        for n in slice.iter_mut() {
-            match n {
-                SNode::Stmts(leaves) => f(leaves),
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    stack.push(otherwise);
-                    stack.push(then);
-                }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => stack.push(body),
-                SNode::Try {
-                    body,
-                    catches,
-                    finally,
-                    ..
-                } => {
-                    if let Some(fin) = finally {
-                        stack.push(fin);
-                    }
-                    for c in catches.iter_mut().rev() {
-                        stack.push(&mut c.body);
-                    }
-                    stack.push(body);
-                }
-                SNode::Switch { cases, .. } => {
-                    for c in cases.iter_mut().rev() {
-                        stack.push(&mut c.body);
-                    }
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        let Some((first, rest)) = slice.split_first_mut() else {
+            continue;
+        };
+        if !rest.is_empty() {
+            stack.push(rest);
+        }
+        match first {
+            SNode::Stmts(leaves) => f(leaves),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                stack.push(otherwise);
+                stack.push(then);
             }
+            SNode::Block(body)
+            | SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => stack.push(body),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                if let Some(fin) = finally {
+                    stack.push(fin);
+                }
+                for c in catches.iter_mut().rev() {
+                    stack.push(&mut c.body);
+                }
+                stack.push(body);
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases.iter_mut().rev() {
+                    stack.push(&mut c.body);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
 }
@@ -320,7 +326,8 @@ pub(in crate::folds) fn fold_snode_vecs_postorder(
                             tasks.push(PostTask::EnterSeq(o));
                             tasks.push(PostTask::EnterSeq(t));
                         }
-                        SNode::While { body, .. }
+                        SNode::Block(body)
+                        | SNode::While { body, .. }
                         | SNode::DoWhile { body, .. }
                         | SNode::Labeled { body, .. }
                         | SNode::ForOf { body, .. }
@@ -388,7 +395,8 @@ pub(in crate::folds) fn fold_snode_vecs_postorder(
                             *then = it.next().unwrap_or_default();
                             *otherwise = it.next().unwrap_or_default();
                         }
-                        SNode::While { body, .. }
+                        SNode::Block(body)
+                        | SNode::While { body, .. }
                         | SNode::DoWhile { body, .. }
                         | SNode::Labeled { body, .. }
                         | SNode::ForOf { body, .. }
@@ -887,7 +895,8 @@ pub(in crate::folds) fn walk_leaves(nodes: &[SNode], f: &mut impl FnMut(&Leaf)) 
                 stack.push(otherwise);
                 stack.push(then);
             }
-            SNode::While { body, .. }
+            SNode::Block(body)
+            | SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
@@ -953,7 +962,7 @@ pub(in crate::folds) fn nodes_use_temp(nodes: &[SNode], id: ValueId) -> bool {
                     }
                     stack.push(body);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::ForOf { iter, body, .. } => {
                     if expr_uses_value(iter, id) {
                         return true;
@@ -1050,7 +1059,7 @@ pub(in crate::folds) fn count_temp_uses(nodes: &[SNode], uses: &mut BTreeMap<Val
                     count_expr(obj, uses);
                     nstack.push(body);
                 }
-                SNode::Labeled { body, .. } => nstack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => nstack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -1094,7 +1103,7 @@ pub(in crate::folds) fn sweep_dead_decls(nodes: &mut [SNode], dead: &BTreeSet<Va
 }
 
 /// The expressions a leaf carries (for temp-use walks).
-pub(in crate::folds) fn leaf_exprs(l: &Leaf) -> Vec<&Expr> {
+pub(crate) fn leaf_exprs(l: &Leaf) -> Vec<&Expr> {
     match l {
         Leaf::Raw(s) => match s {
             Stmt::Declare { value, .. } | Stmt::PhiAssign { value, .. } => vec![value],

@@ -56,3 +56,9 @@
 
 #undef CHECK_NOT_NULL
 #define CHECK_NOT_NULL(ptr) CHECK((ptr) != nullptr)
+
+// Pre-empt upstream `libpandabase/utils/span.h` (`LIBPANDABASE_UTILS_SPAN_H`)
+// with our release-checked `vendor/shim/utils/span.h` so every `Span::SubSpan`
+// and `Span::operator[]` across vendored `libpandafile` throws under `NDEBUG`
+// instead of reading out-of-bounds or wrapping unsigned subtraction.
+#include <utils/span.h>

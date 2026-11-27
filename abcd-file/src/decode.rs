@@ -174,7 +174,12 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         };
         entity_map.insert(class_id, desc_sid);
 
-        let method_offs = collect_offsets_void(cr, sys::abc_class_enumerate_methods);
+        let method_offs = collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_methods,
+            "class_methods",
+            class_off,
+        )?;
         for &off in &method_offs {
             // SAFETY: `f` is live.
             let mr = unsafe { sys::abc_method_open(f, off) };
@@ -191,7 +196,12 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             }
         }
 
-        let field_offs = collect_offsets_void(cr, sys::abc_class_enumerate_fields);
+        let field_offs = collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_fields,
+            "class_fields",
+            class_off,
+        )?;
         for &off in &field_offs {
             // SAFETY: `f` is live.
             let fr = unsafe { sys::abc_field_open(f, off) };
@@ -303,6 +313,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         for off in staged.field_offs {
             fields.push(decode_field_at(
                 f,
+                file_bytes,
                 off,
                 &entity_map,
                 &mut strings,
@@ -318,6 +329,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         let annotations = decode_class_annotations(
             f,
             cr,
+            staged.class_off,
             &entity_map,
             &mut strings,
             &mut str_cache,
@@ -1208,7 +1220,12 @@ fn inspect_summary_with_handle(
             // SAFETY: `cr` is valid.
             initial_entities.insert(unsafe { sys::abc_class_get_class_id(cr) });
         }
-        for off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+        for off in collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_methods,
+            "class_methods",
+            class_off,
+        )? {
             // SAFETY: `f` is live.
             let mr = unsafe { sys::abc_method_open(f, off) };
             if mr.is_null() {
@@ -1224,7 +1241,12 @@ fn inspect_summary_with_handle(
                 initial_entities.insert(unsafe { sys::abc_method_get_method_id(mr) });
             }
         }
-        for off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+        for off in collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_fields,
+            "class_fields",
+            class_off,
+        )? {
             // SAFETY: `f` is live.
             let fr = unsafe { sys::abc_field_open(f, off) };
             if fr.is_null() {
@@ -1322,7 +1344,12 @@ fn inspect_summary_with_handle(
             ..ClassSummary::default()
         };
 
-        for method_off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+        for method_off in collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_methods,
+            "class_methods",
+            class_off,
+        )? {
             inspect_method_at(
                 f,
                 data,
@@ -1343,9 +1370,15 @@ fn inspect_summary_with_handle(
             )?;
         }
 
-        for field_off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+        for field_off in collect_offsets_void(
+            cr,
+            sys::abc_class_enumerate_fields,
+            "class_fields",
+            class_off,
+        )? {
             inspect_field_at(
                 f,
+                file_bytes,
                 field_off,
                 desc_sym,
                 is_mod_rec_cls,
@@ -1367,7 +1400,7 @@ fn inspect_summary_with_handle(
             sys::abc_class_enumerate_type_annotations,
             sys::abc_class_enumerate_runtime_type_annotations,
         ] {
-            for ann_off in collect_offsets_int(cr, enumerate) {
+            for ann_off in collect_offsets_int(cr, enumerate, "class_annotations", class_off)? {
                 inspect_annotation_at(
                     f,
                     ann_off,
@@ -1523,10 +1556,11 @@ fn inspect_method_at(
 
     // SAFETY: `mr` is valid.
     let code_off = unsafe { sys::abc_method_code_off(mr) };
+    let mut code_size = 0u32;
     if code_off != ABSENT {
         cls_summary.methods_with_body += 1;
         if dialect != Dialect::Static {
-            cls_summary.instructions_decoded += inspect_code_at(
+            let (insns, csize) = inspect_code_at(
                 f,
                 raw_data,
                 method_off,
@@ -1538,6 +1572,8 @@ fn inspect_method_at(
                 strings,
                 referenced_literal_offsets,
             )?;
+            cls_summary.instructions_decoded += insns;
+            code_size = csize;
         }
     }
 
@@ -1563,7 +1599,7 @@ fn inspect_method_at(
         sys::abc_method_enumerate_type_annotations,
         sys::abc_method_enumerate_runtime_type_annotations,
     ] {
-        for ann_off in collect_offsets_int(mr, enumerate) {
+        for ann_off in collect_offsets_int(mr, enumerate, "method_annotations", method_off)? {
             inspect_annotation_at(
                 f,
                 ann_off,
@@ -1586,6 +1622,7 @@ fn inspect_method_at(
             class_id,
             class_source_file_off,
             mr,
+            code_size,
             debug_off,
             &mut sink,
         )?;
@@ -1620,7 +1657,7 @@ fn inspect_code_at(
     extra_entities: &mut CompactU32Set,
     strings: &mut SummaryStrings<'_>,
     referenced_literal_offsets: &mut CompactU32Set,
-) -> Result<usize, Error> {
+) -> Result<(usize, u32), Error> {
     let legacy = dialect == Dialect::DynamicLegacy;
     // SAFETY: `f` is a live `AbcFileHandle`.
     let cr = unsafe { sys::abc_code_open(f, code_off) };
@@ -1831,7 +1868,7 @@ fn inspect_code_at(
         }
     }
 
-    Ok(insn_count)
+    Ok((insn_count, raw_insns.len() as u32))
 }
 
 fn validate_try_block_spans(
@@ -1846,6 +1883,7 @@ fn validate_try_block_spans(
         method_off: u32,
         code_byte_len: u32,
         decoded: &'a [(abcd_isa::Bytecode, u32)],
+        seen_tries: u32,
         err: Option<Error>,
     }
     #[inline]
@@ -1961,21 +1999,33 @@ fn validate_try_block_spans(
                 return 0;
             }
         }
+        ctx.seen_tries = ctx.seen_tries.saturating_add(1);
         0
     }
+    // SAFETY: `cr` is valid.
+    let expected_tries = unsafe { sys::abc_code_tries_size(cr) };
     let mut ctx = SpanCheckCtx {
         f,
         method_off,
         code_byte_len,
         decoded,
+        seen_tries: 0,
         err: None,
     };
     // SAFETY: `cr` and `ctx` are live for the synchronous enumeration call.
-    unsafe {
-        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>());
-    }
+    let rc = unsafe {
+        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>())
+    };
     if let Some(err) = ctx.err {
         return Err(err);
+    }
+    if rc < 0 || ctx.seen_tries != expected_tries {
+        return Err(Error::Malformed {
+            field: "try_block",
+            context: format!(
+                "method at offset {method_off:#x}: truncated or malformed try/catch table"
+            ),
+        });
     }
     Ok(())
 }
@@ -2025,14 +2075,30 @@ fn inspect_proto_types(
     let raw_ret = TypeId::try_from(unsafe { sys::abc_proto_get_return_type(pr) })?;
     check_type(raw_ret, "return type")?;
 
-    // SAFETY: `pr` is valid.
-    let num_args = unsafe { sys::abc_proto_num_args(pr) };
-    for i in 0..num_args {
-        // SAFETY: `pr` is valid and `i < num_args`.
-        let raw = TypeId::try_from(unsafe { sys::abc_proto_get_arg_type(pr, i) })?;
-        check_type(raw, &format!("arg {i}"))?;
+    unsafe extern "C" fn push_proto_type(raw: u8, ctx: *mut c_void) {
+        // SAFETY: `ctx` points to the caller's live `Vec<u8>`.
+        unsafe { &mut *ctx.cast::<Vec<u8>>() }.push(raw);
     }
-    Ok(num_args as usize)
+    let mut enum_raw: Vec<u8> = Vec::new();
+    // SAFETY: `pr` and `enum_raw` are live for the synchronous enumeration call.
+    let rc = unsafe {
+        sys::abc_proto_enumerate_types(
+            pr,
+            Some(push_proto_type),
+            (&raw mut enum_raw).cast::<c_void>(),
+        )
+    };
+    if rc < 0 || enum_raw.is_empty() {
+        return Err(Error::Malformed {
+            field: "proto",
+            context: format!("proto at offset {proto_off:#x}: truncated or malformed shorty"),
+        });
+    }
+    for (idx, &raw_byte) in enum_raw[1..].iter().enumerate() {
+        let raw = TypeId::try_from(raw_byte)?;
+        check_type(raw, &format!("arg {idx}"))?;
+    }
+    Ok(enum_raw.len() - 1)
 }
 
 fn inspect_param_annotations(
@@ -2110,6 +2176,7 @@ fn inspect_param_annotations(
 )]
 fn inspect_field_at(
     f: *const sys::AbcFileHandle,
+    file_bytes: &[u8],
     field_off: u32,
     class_desc_sym: SymId,
     is_mod_rec_cls: bool,
@@ -2198,12 +2265,23 @@ fn inspect_field_at(
                 // SAFETY: `fr` is valid and `&mut v` is writable.
                 unsafe { sys::abc_field_get_value_f64(fr, &mut v) };
             }
-            TypeId::Void | TypeId::Reference | TypeId::U32 => {}
+            TypeId::Reference => {
+                let mut v = 0i32;
+                // SAFETY: `fr` is valid and `&mut v` is writable.
+                if unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0 {
+                    let offset = v as u32;
+                    if offset == 0 || !strings.intern_offset_lossy(f, offset) {
+                        return Err(Error::InvalidString(offset));
+                    }
+                }
+            }
+            TypeId::Void | TypeId::U32 => {}
         }
         None
     };
 
     if let Some(off) = u32_val {
+        let is_ext = is_external(f, field_id);
         let field_name = strings.resolve_utf8(name_sym);
         if field_name == Some(TYPE_SUMMARY_OFFSET_FIELD) {
             let offset = off as u32;
@@ -2249,9 +2327,15 @@ fn inspect_field_at(
                     "{class_desc} field at {field_off:#x}: negative blob offset {off}"
                 ))
             })?;
-            inspect_module_data_at(f, offset, strings).map_err(|e| {
-                Error::ModuleData(format!("{class_desc} field at {field_off:#x}: {e}"))
-            })?;
+            match inspect_module_data_at(f, offset, strings) {
+                Ok(()) => {}
+                Err(e @ Error::Malformed { .. }) => return Err(e),
+                Err(e) => {
+                    return Err(Error::ModuleData(format!(
+                        "{class_desc} field at {field_off:#x}: {e}"
+                    )));
+                }
+            }
             module_data_offsets.insert(offset);
         } else if is_scope_rec_cls || field_name == Some(SCOPE_NAMES_FIELD) {
             let class_desc = strings
@@ -2264,7 +2348,9 @@ fn inspect_field_at(
                 ))
             })?;
             scope_names_offsets.insert(offset);
-        } else if field_name == Some(JSON_FILE_CONTENT_FIELD) {
+        } else if field_name == Some(JSON_FILE_CONTENT_FIELD)
+            || field_first_tag(file_bytes, field_off, is_ext) == Some(0x02)
+        {
             let offset = off as u32;
             if offset == 0 || !strings.intern_offset_lossy(f, offset) {
                 return Err(Error::InvalidString(offset));
@@ -2278,7 +2364,7 @@ fn inspect_field_at(
         sys::abc_field_enumerate_type_annotations,
         sys::abc_field_enumerate_runtime_type_annotations,
     ] {
-        for ann_off in collect_offsets_int(fr, enumerate) {
+        for ann_off in collect_offsets_int(fr, enumerate, "field_annotations", field_off)? {
             inspect_annotation_at(
                 f,
                 ann_off,
@@ -2354,8 +2440,14 @@ fn inspect_module_data_at(
     }
     let mut raw: Vec<RawRec> = Vec::new();
     // SAFETY: `mr` and `raw` are live for the synchronous enumeration call.
-    unsafe {
-        sys::abc_module_enumerate_records(mr, Some(collect_rec), (&raw mut raw).cast::<c_void>());
+    let rc = unsafe {
+        sys::abc_module_enumerate_records(mr, Some(collect_rec), (&raw mut raw).cast::<c_void>())
+    };
+    if rc < 0 {
+        return Err(Error::Malformed {
+            field: "module_data",
+            context: format!("truncated or malformed module record blob at {offset:#x}"),
+        });
     }
     for rec in raw {
         match rec.tag {
@@ -2525,8 +2617,16 @@ fn inspect_annotation_at(
                 | AVT::U32
                 | AVT::F32
                 | AVT::Void
-                | AVT::StringNullptr
-                | AVT::Unknown => {}
+                | AVT::StringNullptr => {}
+                AVT::Unknown => {
+                    return Err(Error::Malformed {
+                        field: "annotation element tag",
+                        context: format!(
+                            "annotation at offset {off:#x}, element {idx}: unknown tag {:#x}",
+                            out.tag
+                        ),
+                    });
+                }
                 AVT::I64 => {
                     let mut v = 0i64;
                     // SAFETY: `ar` is valid and `&mut v` is writable.
@@ -2804,6 +2904,62 @@ unsafe extern "C" fn summary_literal_val_cb(val: *const sys::AbcLiteralVal, ctx:
         crate::literal::LiteralTag::LiteralArray => {
             // SAFETY: `LITERALARRAY` populates `u32_val`.
             ctx.nested.push(unsafe { v.data.u32_val });
+        }
+        crate::literal::LiteralTag::ArrayU1
+        | crate::literal::LiteralTag::ArrayU8
+        | crate::literal::LiteralTag::ArrayI8 => {
+            // SAFETY: `ARRAY_*` tags populate `u32_val` payload offset.
+            let payload_off = unsafe { v.data.u32_val };
+            if let Err(err) = crate::literal::read_typed_literal_array_raw(ctx.file, payload_off, 1)
+            {
+                ctx.error = Some(err);
+            }
+        }
+        crate::literal::LiteralTag::ArrayU16 | crate::literal::LiteralTag::ArrayI16 => {
+            // SAFETY: `ARRAY_*` tags populate `u32_val` payload offset.
+            let payload_off = unsafe { v.data.u32_val };
+            if let Err(err) = crate::literal::read_typed_literal_array_raw(ctx.file, payload_off, 2)
+            {
+                ctx.error = Some(err);
+            }
+        }
+        crate::literal::LiteralTag::ArrayU32
+        | crate::literal::LiteralTag::ArrayI32
+        | crate::literal::LiteralTag::ArrayF32 => {
+            // SAFETY: `ARRAY_*` tags populate `u32_val` payload offset.
+            let payload_off = unsafe { v.data.u32_val };
+            if let Err(err) = crate::literal::read_typed_literal_array_raw(ctx.file, payload_off, 4)
+            {
+                ctx.error = Some(err);
+            }
+        }
+        crate::literal::LiteralTag::ArrayU64
+        | crate::literal::LiteralTag::ArrayI64
+        | crate::literal::LiteralTag::ArrayF64 => {
+            // SAFETY: `ARRAY_*` tags populate `u32_val` payload offset.
+            let payload_off = unsafe { v.data.u32_val };
+            if let Err(err) = crate::literal::read_typed_literal_array_raw(ctx.file, payload_off, 8)
+            {
+                ctx.error = Some(err);
+            }
+        }
+        crate::literal::LiteralTag::ArrayString => {
+            // SAFETY: `ARRAY_STRING` populates `u32_val` payload offset.
+            let payload_off = unsafe { v.data.u32_val };
+            match crate::literal::read_typed_literal_array_raw(ctx.file, payload_off, 4) {
+                Ok(raw) => {
+                    for x in raw {
+                        let off = x as u32;
+                        if !ctx.strings.intern_offset_lossy(ctx.file, off) {
+                            ctx.error = Some(Error::InvalidString(off));
+                            return;
+                        }
+                    }
+                }
+                Err(err) => {
+                    ctx.error = Some(err);
+                }
+            }
         }
         _ => {}
     }
@@ -3099,16 +3255,16 @@ fn decode_method_at(
     // SAFETY: `mr` is valid.
     let source_lang = decode_source_lang(unsafe { sys::abc_method_get_source_lang(mr) })?;
 
-    let (body, byte_offsets) = {
+    let (body, byte_offsets, code_byte_len) = {
         // SAFETY: `mr` is valid.
         let code_off = unsafe { sys::abc_method_code_off(mr) };
         if code_off == ABSENT {
-            (None, Vec::new())
+            (None, Vec::new(), 0)
         } else {
-            let (b, bo) = decode_code_at(
+            let (b, bo, csize) = decode_code_at(
                 f, method_off, code_off, dialect, entity_map, strings, str_cache,
             )?;
-            (Some(b), bo)
+            (Some(b), bo, csize)
         }
     };
 
@@ -3132,7 +3288,12 @@ fn decode_method_at(
     let annotations = Annotations {
         compile_time: decode_annotation_list(
             f,
-            &collect_offsets_int(mr, sys::abc_method_enumerate_annotations),
+            &collect_offsets_int(
+                mr,
+                sys::abc_method_enumerate_annotations,
+                "method_annotations",
+                method_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3140,7 +3301,12 @@ fn decode_method_at(
         )?,
         runtime: decode_annotation_list(
             f,
-            &collect_offsets_int(mr, sys::abc_method_enumerate_runtime_annotations),
+            &collect_offsets_int(
+                mr,
+                sys::abc_method_enumerate_runtime_annotations,
+                "method_annotations",
+                method_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3148,7 +3314,12 @@ fn decode_method_at(
         )?,
         compile_time_type: decode_annotation_list(
             f,
-            &collect_offsets_int(mr, sys::abc_method_enumerate_type_annotations),
+            &collect_offsets_int(
+                mr,
+                sys::abc_method_enumerate_type_annotations,
+                "method_annotations",
+                method_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3156,7 +3327,12 @@ fn decode_method_at(
         )?,
         runtime_type: decode_annotation_list(
             f,
-            &collect_offsets_int(mr, sys::abc_method_enumerate_runtime_type_annotations),
+            &collect_offsets_int(
+                mr,
+                sys::abc_method_enumerate_runtime_type_annotations,
+                "method_annotations",
+                method_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3178,6 +3354,7 @@ fn decode_method_at(
             class_id,
             class_source_file_off,
             mr,
+            code_byte_len,
             debug_off,
             &mut sink,
         )?;
@@ -3411,12 +3588,14 @@ fn decode_module_data_at(
     }
     let mut raw: Vec<RawRecord> = Vec::new();
     // SAFETY: `mr` and `raw` are live for the synchronous enumeration call.
-    unsafe {
-        sys::abc_module_enumerate_records(
-            mr,
-            Some(collect_record),
-            (&raw mut raw).cast::<c_void>(),
-        );
+    let rc = unsafe {
+        sys::abc_module_enumerate_records(mr, Some(collect_record), (&raw mut raw).cast::<c_void>())
+    };
+    if rc < 0 {
+        return Err(Error::Malformed {
+            field: "module_data",
+            context: format!("truncated or malformed module record blob at {offset:#x}"),
+        });
     }
 
     let mut records = Vec::with_capacity(raw.len());
@@ -3488,12 +3667,24 @@ fn decode_module_request_phase_at(
     })
 }
 
+#[inline]
+fn field_first_tag(file_bytes: &[u8], field_off: u32, is_ext: bool) -> Option<u8> {
+    if is_ext {
+        return None;
+    }
+    let start = usize::try_from(field_off).ok()?.checked_add(8)?;
+    let mut sp = file_bytes.get(start..)?;
+    crate::file::read_uleb128_slice(&mut sp)?;
+    sp.first().copied()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "field decoder threads distinct discovery-offset sets, string cache, and annotation cycle set directly"
 )]
 fn decode_field_at(
     f: *const sys::AbcFileHandle,
+    file_bytes: &[u8],
     field_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
@@ -3594,9 +3785,26 @@ fn decode_field_at(
                 None
             }
         }
-        TypeId::Void | TypeId::Reference => None,
+        TypeId::Void => None,
+        TypeId::Reference => {
+            let mut v = 0i32;
+            // SAFETY: `fr` is valid and `&mut v` is writable.
+            if unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0 {
+                let offset = v as u32;
+                if offset == 0 {
+                    return Err(Error::InvalidString(0));
+                }
+                let sid = str_cache
+                    .intern_lossy(offset, strings)
+                    .ok_or(Error::InvalidString(offset))?;
+                Some(FieldValue::String(sid))
+            } else {
+                None
+            }
+        }
     };
 
+    let is_ext = is_external(f, field_id);
     let initial_value = match (class_descriptor, type_id, initial_value) {
         (_, TypeId::U32, Some(FieldValue::I32(off)))
             if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) =>
@@ -3650,9 +3858,15 @@ fn decode_field_at(
                     "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
                 ))
             })?;
-            let data = decode_module_data_at(f, offset, strings, str_cache).map_err(|e| {
-                Error::ModuleData(format!("{class_descriptor} field at {field_off:#x}: {e}"))
-            })?;
+            let data = match decode_module_data_at(f, offset, strings, str_cache) {
+                Ok(d) => d,
+                Err(e @ Error::Malformed { .. }) => return Err(e),
+                Err(e) => {
+                    return Err(Error::ModuleData(format!(
+                        "{class_descriptor} field at {field_off:#x}: {e}"
+                    )));
+                }
+            };
             module_data_offsets.insert(offset);
             Some(FieldValue::ModuleData(data))
         }
@@ -3686,13 +3900,30 @@ fn decode_field_at(
                 content,
             })
         }
+        (_, TypeId::U32, Some(FieldValue::I32(off)))
+            if field_first_tag(file_bytes, field_off, is_ext) == Some(0x02) =>
+        {
+            let offset = off as u32;
+            if offset == 0 {
+                return Err(Error::InvalidString(0));
+            }
+            let sid = str_cache
+                .intern_lossy(offset, strings)
+                .ok_or(Error::InvalidString(offset))?;
+            Some(FieldValue::String(sid))
+        }
         (_, _, value) => value,
     };
 
     let annotations = Annotations {
         compile_time: decode_annotation_list(
             f,
-            &collect_offsets_int(fr, sys::abc_field_enumerate_annotations),
+            &collect_offsets_int(
+                fr,
+                sys::abc_field_enumerate_annotations,
+                "field_annotations",
+                field_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3700,7 +3931,12 @@ fn decode_field_at(
         )?,
         runtime: decode_annotation_list(
             f,
-            &collect_offsets_int(fr, sys::abc_field_enumerate_runtime_annotations),
+            &collect_offsets_int(
+                fr,
+                sys::abc_field_enumerate_runtime_annotations,
+                "field_annotations",
+                field_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3708,7 +3944,12 @@ fn decode_field_at(
         )?,
         compile_time_type: decode_annotation_list(
             f,
-            &collect_offsets_int(fr, sys::abc_field_enumerate_type_annotations),
+            &collect_offsets_int(
+                fr,
+                sys::abc_field_enumerate_type_annotations,
+                "field_annotations",
+                field_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3716,7 +3957,12 @@ fn decode_field_at(
         )?,
         runtime_type: decode_annotation_list(
             f,
-            &collect_offsets_int(fr, sys::abc_field_enumerate_runtime_type_annotations),
+            &collect_offsets_int(
+                fr,
+                sys::abc_field_enumerate_runtime_type_annotations,
+                "field_annotations",
+                field_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3731,7 +3977,7 @@ fn decode_field_at(
         offset: field_off,
         field_type,
         access_flags,
-        is_external: is_external(f, field_id),
+        is_external: is_ext,
         initial_value,
         annotations,
     })
@@ -3768,7 +4014,7 @@ fn decode_code_at(
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
     str_cache: &mut StringItemCache<'_>,
-) -> Result<(MethodBody, Vec<u32>), Error> {
+) -> Result<(MethodBody, Vec<u32>, u32), Error> {
     // SAFETY: `f` is a live `AbcFileHandle`.
     let cr = unsafe { sys::abc_code_open(f, code_off) };
     if cr.is_null() {
@@ -3895,6 +4141,7 @@ fn decode_code_at(
             ic_size: None,
         },
         byte_offsets,
+        code_byte_len,
     ))
 }
 
@@ -3945,12 +4192,30 @@ fn decode_proto_types(
     let raw_ret = TypeId::try_from(unsafe { sys::abc_proto_get_return_type(pr) })?;
     let return_type = resolve(raw_ret, "return type")?;
 
-    // SAFETY: `pr` is valid.
-    let num_args = unsafe { sys::abc_proto_num_args(pr) };
-    let arg_types = (0..num_args)
-        .map(|i| {
-            // SAFETY: `pr` is valid and `i < num_args`.
-            let raw = TypeId::try_from(unsafe { sys::abc_proto_get_arg_type(pr, i) })?;
+    unsafe extern "C" fn push_proto_type(raw: u8, ctx: *mut c_void) {
+        // SAFETY: `ctx` points to the caller's live `Vec<u8>`.
+        unsafe { &mut *ctx.cast::<Vec<u8>>() }.push(raw);
+    }
+    let mut enum_raw: Vec<u8> = Vec::new();
+    // SAFETY: `pr` and `enum_raw` are live for the synchronous enumeration call.
+    let rc = unsafe {
+        sys::abc_proto_enumerate_types(
+            pr,
+            Some(push_proto_type),
+            (&raw mut enum_raw).cast::<c_void>(),
+        )
+    };
+    if rc < 0 || enum_raw.is_empty() {
+        return Err(Error::Malformed {
+            field: "proto",
+            context: format!("proto at offset {proto_off:#x}: truncated or malformed shorty"),
+        });
+    }
+    let arg_types = enum_raw[1..]
+        .iter()
+        .enumerate()
+        .map(|(i, &raw_byte)| {
+            let raw = TypeId::try_from(raw_byte)?;
             resolve(raw, &format!("arg {i}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3963,6 +4228,7 @@ fn decode_proto_types(
 fn decode_class_annotations(
     f: *const sys::AbcFileHandle,
     cr: *mut sys::AbcClassAccessor,
+    class_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
     str_cache: &mut StringItemCache<'_>,
@@ -3971,7 +4237,12 @@ fn decode_class_annotations(
     Ok(Annotations {
         compile_time: decode_annotation_list(
             f,
-            &collect_offsets_int(cr, sys::abc_class_enumerate_annotations),
+            &collect_offsets_int(
+                cr,
+                sys::abc_class_enumerate_annotations,
+                "class_annotations",
+                class_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3979,7 +4250,12 @@ fn decode_class_annotations(
         )?,
         runtime: decode_annotation_list(
             f,
-            &collect_offsets_int(cr, sys::abc_class_enumerate_runtime_annotations),
+            &collect_offsets_int(
+                cr,
+                sys::abc_class_enumerate_runtime_annotations,
+                "class_annotations",
+                class_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3987,7 +4263,12 @@ fn decode_class_annotations(
         )?,
         compile_time_type: decode_annotation_list(
             f,
-            &collect_offsets_int(cr, sys::abc_class_enumerate_type_annotations),
+            &collect_offsets_int(
+                cr,
+                sys::abc_class_enumerate_type_annotations,
+                "class_annotations",
+                class_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -3995,7 +4276,12 @@ fn decode_class_annotations(
         )?,
         runtime_type: decode_annotation_list(
             f,
-            &collect_offsets_int(cr, sys::abc_class_enumerate_runtime_type_annotations),
+            &collect_offsets_int(
+                cr,
+                sys::abc_class_enumerate_runtime_type_annotations,
+                "class_annotations",
+                class_off,
+            )?,
             entity_map,
             strings,
             str_cache,
@@ -4385,7 +4671,15 @@ fn decode_annotation_at(
                         values,
                     }
                 }
-                AVT::Unknown => AnnotationValue::U32(out.value),
+                AVT::Unknown => {
+                    return Err(Error::Malformed {
+                        field: "annotation element tag",
+                        context: format!(
+                            "annotation at offset {off:#x}, element {idx}: unknown tag {:#x}",
+                            out.tag
+                        ),
+                    });
+                }
             };
             frame.elements.push(AnnotationElem { name, value });
         }
@@ -4593,19 +4887,12 @@ fn decode_annotation_array_elements(
                 }
             }
             AVT::ArrayAnnotation => {
-                let Some(cache) = str_cache.as_deref_mut() else {
-                    return Err(Error::InvalidOffset(raw as u32));
-                };
-                let mut sub_visiting = HashSet::new();
-                let nested = decode_annotation_at(
-                    f,
-                    raw as u32,
-                    entity_map,
-                    strings,
-                    cache,
-                    &mut sub_visiting,
-                )?;
-                AnnotationValue::Annotation(Box::new(nested))
+                return Err(Error::Malformed {
+                    field: "annotation array element tag",
+                    context: format!(
+                        "annotation array at offset {entity_offset:#x}: nested ArrayAnnotation must be decoded iteratively"
+                    ),
+                });
             }
             AVT::LiteralArray => {
                 AnnotationValue::LiteralArray(decode_literal_array_at(f, raw as u32, strings)?)
@@ -4804,26 +5091,6 @@ fn collect_annotation_nested_literal_offsets(
                         LiteralValue::LiteralBufferIndex(idx) if is_valid_lit_array(idx.0) => {
                             out.insert(idx.0);
                         }
-                        LiteralValue::ArrayU1(idx)
-                        | LiteralValue::ArrayU8(idx)
-                        | LiteralValue::ArrayI8(idx)
-                        | LiteralValue::ArrayU16(idx)
-                        | LiteralValue::ArrayI16(idx)
-                        | LiteralValue::ArrayU32(idx)
-                        | LiteralValue::ArrayI32(idx)
-                        | LiteralValue::ArrayU64(idx)
-                        | LiteralValue::ArrayI64(idx)
-                        | LiteralValue::ArrayF32(idx)
-                        | LiteralValue::ArrayF64(idx)
-                        | LiteralValue::ArrayString(idx) => {
-                            if is_valid_lit_array(idx.0) {
-                                out.insert(idx.0);
-                            } else if let Some(parent_off) = idx.0.checked_sub(5)
-                                && is_valid_lit_array(parent_off)
-                            {
-                                out.insert(parent_off);
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -4845,7 +5112,6 @@ fn collect_annotation_nested_literal_offsets(
 
 fn rewrite_literal_item_refs(
     v: &mut LiteralValue,
-    owning_table_idx: Option<u32>,
     offset_to_index: &HashMap<u32, u32>,
     array_count: usize,
     header_offsets: &[u32],
@@ -4867,35 +5133,12 @@ fn rewrite_literal_item_refs(
             }
         }
         LiteralValue::LiteralBufferIndex(idx) => {
-            if let Some(&table_idx) = offset_to_index.get(&idx.0) {
-                idx.0 = table_idx;
-            } else if let Some(&hdr_off) = header_offsets.get(idx.0 as usize)
+            if let Some(&hdr_off) = header_offsets.get(idx.0 as usize)
                 && let Some(&table_idx) = offset_to_index.get(&hdr_off)
             {
                 idx.0 = table_idx;
-            }
-        }
-        LiteralValue::ArrayU1(idx)
-        | LiteralValue::ArrayU8(idx)
-        | LiteralValue::ArrayI8(idx)
-        | LiteralValue::ArrayU16(idx)
-        | LiteralValue::ArrayI16(idx)
-        | LiteralValue::ArrayU32(idx)
-        | LiteralValue::ArrayI32(idx)
-        | LiteralValue::ArrayU64(idx)
-        | LiteralValue::ArrayI64(idx)
-        | LiteralValue::ArrayF32(idx)
-        | LiteralValue::ArrayF64(idx)
-        | LiteralValue::ArrayString(idx) => {
-            if let Some(&table_idx) = offset_to_index
-                .get(&idx.0)
-                .or_else(|| idx.0.checked_sub(5).and_then(|o| offset_to_index.get(&o)))
-            {
+            } else if let Some(&table_idx) = offset_to_index.get(&idx.0) {
                 idx.0 = table_idx;
-            } else if let Some(own) = owning_table_idx {
-                idx.0 = own;
-            } else if (idx.0 as usize) < array_count {
-                idx.0 = ABSENT;
             }
         }
         _ => {}
@@ -4968,7 +5211,6 @@ fn rewrite_annotation_refs(
                 for item in values {
                     rewrite_literal_item_refs(
                         item,
-                        None,
                         offset_to_index,
                         literal_array_count,
                         header_offsets,
@@ -5132,11 +5374,10 @@ fn decode_literal_arrays<'a>(
     }
 
     let array_count = arrays.len();
-    for (arr_idx, arr) in arrays.iter_mut().enumerate() {
+    for arr in &mut arrays {
         for v in &mut arr.values {
             rewrite_literal_item_refs(
                 v,
-                Some(arr_idx as u32),
                 &offset_to_index,
                 array_count,
                 &header_offsets,
@@ -5173,15 +5414,17 @@ fn read_class_descriptor_cached(
 // FFI helper: collect offsets via callbacks
 // ---------------------------------------------------------------------------
 
-/// Collect u32 offsets from a void-returning enumerate callback.
+/// Collect u32 offsets from a checked int-returning enumerate callback (`0` = ok, `< 0` = malformed).
 fn collect_offsets_void<T>(
     raw: *mut T,
     enumerate: unsafe extern "C" fn(
         *mut T,
         Option<unsafe extern "C" fn(u32, *mut c_void)>,
         *mut c_void,
-    ),
-) -> Vec<u32> {
+    ) -> std::os::raw::c_int,
+    field: &'static str,
+    owner_off: u32,
+) -> Result<Vec<u32>, Error> {
     let mut result = Vec::new();
     unsafe extern "C" fn cb(offset: u32, ctx: *mut c_void) {
         // SAFETY: `ctx` points to the caller's live `Vec<u32>`.
@@ -5189,19 +5432,27 @@ fn collect_offsets_void<T>(
         vec.push(offset);
     }
     // SAFETY: `raw` and `result` are live for the synchronous enumeration call.
-    unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
-    result
+    let rc = unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
+    if rc < 0 {
+        return Err(Error::Malformed {
+            field,
+            context: format!("{field} enumeration failed at offset {owner_off:#x}"),
+        });
+    }
+    Ok(result)
 }
 
-/// Collect u32 offsets from an int-returning enumerate callback.
+/// Collect u32 offsets from a checked int-returning annotation enumerate callback (`0` = ok, `< 0` = malformed).
 fn collect_offsets_int<T>(
     raw: *mut T,
     enumerate: unsafe extern "C" fn(
         *mut T,
         Option<unsafe extern "C" fn(u32, *mut c_void) -> i32>,
         *mut c_void,
-    ),
-) -> Vec<u32> {
+    ) -> std::os::raw::c_int,
+    field: &'static str,
+    owner_off: u32,
+) -> Result<Vec<u32>, Error> {
     let mut result = Vec::new();
     unsafe extern "C" fn cb(offset: u32, ctx: *mut c_void) -> i32 {
         // SAFETY: `ctx` points to the caller's live `Vec<u32>`.
@@ -5210,8 +5461,14 @@ fn collect_offsets_int<T>(
         0
     }
     // SAFETY: `raw` and `result` are live for the synchronous enumeration call.
-    unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
-    result
+    let rc = unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
+    if rc < 0 {
+        return Err(Error::Malformed {
+            field,
+            context: format!("{field} enumeration failed at offset {owner_off:#x}"),
+        });
+    }
+    Ok(result)
 }
 
 struct RawCatchBlock {
@@ -5293,12 +5550,22 @@ fn collect_try_blocks(
         });
         0
     }
+    // SAFETY: `cr` is valid.
+    let expected_tries = unsafe { sys::abc_code_tries_size(cr) };
     // SAFETY: `cr` and `ctx` are live for the synchronous enumeration call.
-    unsafe {
-        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>());
-    }
+    let rc = unsafe {
+        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>())
+    };
     if let Some(err) = ctx.err {
         return Err(err);
+    }
+    if rc < 0 || ctx.blocks.len() != expected_tries as usize {
+        return Err(Error::Malformed {
+            field: "try_block",
+            context: format!(
+                "method at offset {method_off:#x}: truncated or malformed try/catch table"
+            ),
+        });
     }
     Ok(ctx.blocks)
 }

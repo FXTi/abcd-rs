@@ -36,6 +36,8 @@ use crate::legalize::sanitize;
 /// and `Namespace` (`GetModuleNamespace`) slot indices per owning [`ClassId`].
 #[derive(Clone, Debug, Default)]
 pub struct RecordModuleEnv {
+    /// Disambiguated legalized local identifier per `esm.imports[i]` entry.
+    pub import_locals: Vec<String>,
     /// `ldexternalmodulevar idx` → `idx`-th `ImportDecl::Regular.local_name`.
     pub external_slots: BTreeMap<u32, String>,
     /// `ldlocalmodulevar idx` / `stmodulevar idx` → resolved local binding name.
@@ -274,6 +276,10 @@ pub struct EnvFrame {
 pub struct NameScopes {
     /// `(inst, resolved raw name)` for every lexvar/private-name op.
     resolved: BTreeMap<InstId, String>,
+    /// `PutLexVar` instructions whose target frame was pushed inside this
+    /// function (`level < stack.len() - seed_len`) rather than inherited from
+    /// an outer closure.
+    own_lex: HashSet<InstId>,
     /// Child function → the env chain captured at its definition site
     /// (first site in augmented-RPO wins — deterministic). Populated only
     /// when `record_defines` is enabled, sharing a single [`Arc`] across
@@ -285,6 +291,12 @@ impl NameScopes {
     /// The resolved raw name of a lexvar/private-name instruction.
     pub fn name_of(&self, inst: InstId) -> Option<&str> {
         self.resolved.get(&inst).map(String::as_str)
+    }
+
+    /// Whether `inst` (`PutLexVar`) writes to an environment frame pushed
+    /// inside this function (`true`) vs inherited from an enclosing closure.
+    pub fn is_own_lex(&self, inst: InstId) -> bool {
+        self.own_lex.contains(&inst)
     }
 
     /// Whether any resolved raw name in this scope table sanitizes to the
@@ -356,6 +368,7 @@ impl NameScopes {
         let seed_len = seed.len();
         let mut scopes = NameScopes {
             resolved: BTreeMap::new(),
+            own_lex: HashSet::new(),
             defines: BTreeMap::new(),
         };
         let Some(func) = module.func(func_id) else {
@@ -591,6 +604,16 @@ fn step_inst(
         | Op::PutLexVar {
             level, slot, kind, ..
         } => {
+            if matches!(
+                op,
+                Op::PutLexVar {
+                    kind: abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable,
+                    ..
+                }
+            ) && (*level as usize) < stack.len().saturating_sub(seed_len)
+            {
+                scopes.own_lex.insert(iid);
+            }
             let name = match kind {
                 abcd_ir::LexEnvKind::Patch => format!("v999999_{slot}"),
                 abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => {
@@ -604,11 +627,12 @@ fn step_inst(
         | Op::StorePrivate { level, slot, .. }
         | Op::DefinePrivate { level, slot, .. }
         | Op::TestPrivate { level, slot, .. } => {
-            // Private names keep the pre-seeding semantics: resolve
-            // against the function's OWN frames only.
-            let own = &stack[seed_len.min(stack.len())..];
-            let name =
-                resolve_priv(own, *level, *slot).unwrap_or_else(|| format!("p{}_{}", level, slot));
+            // Walk the FULL seeded lexical stack so nested methods and closures
+            // inside a class resolve `#private` fields from the enclosing class
+            // frame identically to the class body, falling back to absolute env
+            // index `p{abs}_{slot}` (`R5-4`).
+            let name = resolve_priv(stack, *level, *slot)
+                .unwrap_or_else(|| priv_fallback(stack.len(), *level, *slot));
             scopes.resolved.insert(iid, name);
         }
         _ => {}
@@ -629,6 +653,13 @@ fn lex_fallback(stack_len: usize, level: u16, slot: u16) -> String {
     match stack_len.checked_sub(1 + level as usize) {
         Some(abs) => format!("v{abs}_{slot}"),
         None => format!("v{level}_{slot}"),
+    }
+}
+
+fn priv_fallback(stack_len: usize, level: u16, slot: u16) -> String {
+    match stack_len.checked_sub(1 + level as usize) {
+        Some(abs) => format!("p{abs}_{slot}"),
+        None => format!("p{level}_{slot}"),
     }
 }
 
@@ -949,48 +980,26 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
 
         let mut env = RecordModuleEnv::default();
         let mut taken = BTreeSet::new();
+        let mut module_top_bindings: HashSet<String> = HashSet::new();
 
-        if let Some(esm) = esm {
-            let mut ext_idx = 0u32;
-            for imp in &esm.imports {
-                match imp {
-                    ImportDecl::Regular { local_name, .. } => {
-                        let local = sanitize(&sym_str(module, *local_name));
-                        taken.insert(local.clone());
-                        env.external_slots.insert(ext_idx, local);
-                        ext_idx += 1;
-                    }
-                    ImportDecl::Namespace {
-                        local_name,
-                        module_request,
-                    } => {
-                        let local = sanitize(&sym_str(module, *local_name));
-                        taken.insert(local.clone());
-                        let mut matched_req = false;
-                        for (ridx, req) in esm.module_requests.iter().enumerate() {
-                            if req.specifier == *module_request {
-                                env.namespace_slots.insert(ridx as u32, local.clone());
-                                matched_req = true;
-                            }
-                        }
-                        // Synthetic IR modules that populate `imports` without
-                        // `module_requests` still bind slot 0 when unambiguous.
-                        if !matched_req && esm.module_requests.is_empty() {
-                            env.namespace_slots.entry(0).or_insert(local);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Collect local-slot candidates: per-class methods for multi-record
-        // modules, or whole-module instructions when single-file standalone ESM.
+        // Collect local-slot candidates and top-level/hoisted bindings first so
+        // `import` local bindings can be disambiguated (`foo$1`) when they
+        // collide with hoisted `var`/`let`/`function`/`class` bindings (`R5-6c`).
         let mut candidates: BTreeMap<u32, Option<String>> = BTreeMap::new();
-        let mut inspect_op = |op: &Op| match op {
+        let mut inspect_op = |op: &Op, is_main_fn: bool| match op {
             Op::StoreGlobal { name, .. }
             | Op::StoreGlobalRecord { name, .. }
             | Op::TryStoreGlobal { name, .. } => {
-                taken.insert(sanitize(&sym_str(module, *name)));
+                let s = sanitize(&sym_str(module, *name));
+                taken.insert(s.clone());
+                module_top_bindings.insert(s);
+            }
+            Op::NewLexEnvWithName { scope_names, .. } if is_main_fn => {
+                if let Some(names) = string_array(module, *scope_names) {
+                    for n in names {
+                        module_top_bindings.insert(sanitize(&n));
+                    }
+                }
             }
             Op::ThrowUndefinedIfHoleWithName { name, value } => {
                 if let Some(slot) = load_local_module_slot(module, *value) {
@@ -1011,24 +1020,82 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
             }
             _ => {}
         };
-        if !any_class_has_esm && standalone_esm.is_some() {
-            for inst in &module.insts {
-                inspect_op(&inst.op);
-            }
+        let iter_methods: Vec<FuncId> = if !any_class_has_esm && standalone_esm.is_some() {
+            (0..module.functions.len())
+                .map(|i| FuncId::new(i as u32))
+                .collect()
         } else {
-            for &fid in &cls.methods {
-                let Some(fd) = module.func(fid) else {
+            cls.methods.clone()
+        };
+        let mut inner_defined_fns: HashSet<FuncId> = HashSet::new();
+        for &fid in &iter_methods {
+            let Some(fd) = module.func(fid) else {
+                continue;
+            };
+            let is_main_fn = sym_str(module, fd.name) == "func_main_0";
+            for &bid in &fd.blocks {
+                let Some(block) = module.block(bid) else {
                     continue;
                 };
-                for &bid in &fd.blocks {
-                    let Some(block) = module.block(bid) else {
+                for &iid in &block.insts {
+                    let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    for &iid in &block.insts {
-                        let Some(inst) = module.inst(iid) else {
-                            continue;
-                        };
-                        inspect_op(&inst.op);
+                    for child in defined_children(module, &inst.op) {
+                        inner_defined_fns.insert(child);
+                    }
+                    inspect_op(&inst.op, is_main_fn);
+                }
+            }
+        }
+        for &fid in &iter_methods {
+            if inner_defined_fns.contains(&fid) {
+                continue;
+            }
+            if let Some(fd) = module.func(fid) {
+                let fname = sym_str(module, fd.name);
+                if fname != "func_main_0" {
+                    module_top_bindings.insert(sanitize(&demangle_internal_name(fname)));
+                }
+            }
+        }
+        for cand in candidates.values().flatten() {
+            module_top_bindings.insert(sanitize(cand));
+        }
+
+        if let Some(esm) = esm {
+            let mut imp_legal = crate::legalize::Legalizer::new();
+            let mut ext_idx = 0u32;
+            for imp in &esm.imports {
+                match imp {
+                    ImportDecl::Regular { local_name, .. } => {
+                        let raw = sym_str(module, *local_name);
+                        let local = imp_legal.mint_avoiding(&raw, &module_top_bindings);
+                        taken.insert(local.clone());
+                        env.import_locals.push(local.clone());
+                        env.external_slots.insert(ext_idx, local);
+                        ext_idx += 1;
+                    }
+                    ImportDecl::Namespace {
+                        local_name,
+                        module_request,
+                    } => {
+                        let raw = sym_str(module, *local_name);
+                        let local = imp_legal.mint_avoiding(&raw, &module_top_bindings);
+                        taken.insert(local.clone());
+                        env.import_locals.push(local.clone());
+                        let mut matched_req = false;
+                        for (ridx, req) in esm.module_requests.iter().enumerate() {
+                            if req.specifier == *module_request {
+                                env.namespace_slots.insert(ridx as u32, local.clone());
+                                matched_req = true;
+                            }
+                        }
+                        // Synthetic IR modules that populate `imports` without
+                        // `module_requests` still bind slot 0 when unambiguous.
+                        if !matched_req && esm.module_requests.is_empty() {
+                            env.namespace_slots.entry(0).or_insert(local);
+                        }
                     }
                 }
             }

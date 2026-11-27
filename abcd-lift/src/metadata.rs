@@ -164,9 +164,10 @@ pub fn external_params(lf: &mut Lifter, method: &Method) -> Vec<ValueId> {
     params
 }
 
-/// Lift a class and its fields/methods into the module, returning its
-/// (reserved) class-table index.
-pub fn lift_class<'f>(
+/// Lift a class header (`ClassData`, including `fields`, `annotations`,
+/// `es_module`, `scope_names`, and reserved `methods` list) into its reserved
+/// class-table slot **before** lifting any method body (`D3`).
+pub fn lift_class_header<'f>(
     lf: &mut Lifter<'f>,
     class_key: abcd_file::StringId,
     class: &'f Class,
@@ -213,25 +214,17 @@ pub fn lift_class<'f>(
     }
     let annotations = lift_annotations(lf, &class.annotations);
 
-    // Seed `scope_names` on the reserved class slot before lifting methods so
-    // `finish_debug` can attach it to `DebugData.scope_names` on `--merge-abc`
-    // classes (where the field is named `"scopeNames"` on the record class
-    // rather than keyed by `source_file` on `_ESScopeNamesRecord`).
-    lf.module.classes[class_id.index()].scope_names = class_scope_names;
-
-    let mut method_ids = Vec::with_capacity(class.methods.len());
-    for (mi, method) in class.methods.iter().enumerate() {
-        let func_id = abcd_ir::FuncId::new(func_base + mi as u32);
-        crate::lift_method(lf, class_id, method, func_id)?;
-        method_ids.push(func_id);
-    }
+    let method_ids: Vec<abcd_ir::FuncId> = (0..class.methods.len())
+        .map(|mi| abcd_ir::FuncId::new(func_base + mi as u32))
+        .collect();
 
     let es_module = match class_module_data {
         Some(md) => Some(build_es_module(lf, md, class_module_phase)?),
         None => None,
     };
 
-    // Assign into the reserved slot (pass 1 pre-filled a shell).
+    // Publish complete `ClassData` into the reserved slot before any method
+    // body is lifted (`D3`).
     lf.module.classes[class_id.index()] = ClassData {
         descriptor,
         name,
@@ -307,10 +300,11 @@ fn lift_field<'f>(
             }
             None
         }
-        Some(abcd_file::FieldValue::JsonFileContent { content, .. }) => {
+        Some(abcd_file::FieldValue::String(sid))
+        | Some(abcd_file::FieldValue::JsonFileContent { content: sid, .. }) => {
             let sym = lf
-                .sym_of_file_sid(*content)
-                .ok_or(LiftError::UnresolvedEntity(content.index() as u32))?;
+                .sym_of_file_sid(*sid)
+                .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
             Some(lf.const_scalar(Const::String(sym)))
         }
         None => None,

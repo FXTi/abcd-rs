@@ -563,6 +563,7 @@ fn inline_rejects_cross_class_module_vars_and_stage1_forbidden_ops() {
         let mut fdata = FunctionData::new(cid, sym, FunctionKind::Function);
         fdata.modifiers = Modifiers::STATIC;
         module.functions.push(fdata);
+        module.classes[cid.index()].methods.push(fid);
         let entry = BlockId::new(module.blocks.len() as u32);
         module.blocks.push(abcd_ir::Block::default());
         module.functions[fid.index()].blocks.push(entry);

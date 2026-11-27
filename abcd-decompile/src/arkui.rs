@@ -90,8 +90,7 @@ enum ArkField {
 }
 
 /// Reconstructed declarative UI node inside `build()` or `@Builder`.
-#[derive(Clone, Debug)]
-enum UiNode {
+pub(crate) enum UiNode {
     Component {
         name: String,
         args: String,
@@ -116,6 +115,334 @@ enum UiNode {
         key_gen: Option<String>,
     },
     RawStmt(String),
+}
+
+impl Clone for UiNode {
+    fn clone(&self) -> Self {
+        enum Step<'a> {
+            Eval(&'a UiNode),
+            FinishComp {
+                name: String,
+                args: String,
+                attrs: Vec<(String, String)>,
+                len: usize,
+            },
+            FinishIf {
+                cond: String,
+                then_len: usize,
+                else_len: usize,
+            },
+            FinishForEach {
+                is_lazy: bool,
+                arr: String,
+                item_param: String,
+                idx_param: Option<String>,
+                key_gen: Option<String>,
+                len: usize,
+            },
+        }
+        match self {
+            UiNode::CustomChild { name, props } => {
+                return UiNode::CustomChild {
+                    name: name.clone(),
+                    props: props.clone(),
+                };
+            }
+            UiNode::RawStmt(s) => return UiNode::RawStmt(s.clone()),
+            _ => {}
+        }
+        let mut steps = vec![Step::Eval(self)];
+        let mut vals: Vec<UiNode> = Vec::new();
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Eval(node) => match node {
+                    UiNode::CustomChild { name, props } => vals.push(UiNode::CustomChild {
+                        name: name.clone(),
+                        props: props.clone(),
+                    }),
+                    UiNode::RawStmt(s) => vals.push(UiNode::RawStmt(s.clone())),
+                    UiNode::Component {
+                        name,
+                        args,
+                        attrs,
+                        children,
+                    } => {
+                        steps.push(Step::FinishComp {
+                            name: name.clone(),
+                            args: args.clone(),
+                            attrs: attrs.clone(),
+                            len: children.len(),
+                        });
+                        for c in children.iter().rev() {
+                            steps.push(Step::Eval(c));
+                        }
+                    }
+                    UiNode::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        steps.push(Step::FinishIf {
+                            cond: cond.clone(),
+                            then_len: then_body.len(),
+                            else_len: else_body.len(),
+                        });
+                        for c in else_body.iter().rev() {
+                            steps.push(Step::Eval(c));
+                        }
+                        for c in then_body.iter().rev() {
+                            steps.push(Step::Eval(c));
+                        }
+                    }
+                    UiNode::ForEach {
+                        is_lazy,
+                        arr,
+                        item_param,
+                        idx_param,
+                        body,
+                        key_gen,
+                    } => {
+                        steps.push(Step::FinishForEach {
+                            is_lazy: *is_lazy,
+                            arr: arr.clone(),
+                            item_param: item_param.clone(),
+                            idx_param: idx_param.clone(),
+                            key_gen: key_gen.clone(),
+                            len: body.len(),
+                        });
+                        for c in body.iter().rev() {
+                            steps.push(Step::Eval(c));
+                        }
+                    }
+                },
+                Step::FinishComp {
+                    name,
+                    args,
+                    attrs,
+                    len,
+                } => {
+                    let children = vals.split_off(vals.len() - len);
+                    vals.push(UiNode::Component {
+                        name,
+                        args,
+                        attrs,
+                        children,
+                    });
+                }
+                Step::FinishIf {
+                    cond,
+                    then_len,
+                    else_len,
+                } => {
+                    let else_body = vals.split_off(vals.len() - else_len);
+                    let then_body = vals.split_off(vals.len() - then_len);
+                    vals.push(UiNode::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    });
+                }
+                Step::FinishForEach {
+                    is_lazy,
+                    arr,
+                    item_param,
+                    idx_param,
+                    key_gen,
+                    len,
+                } => {
+                    let body = vals.split_off(vals.len() - len);
+                    vals.push(UiNode::ForEach {
+                        is_lazy,
+                        arr,
+                        item_param,
+                        idx_param,
+                        body,
+                        key_gen,
+                    });
+                }
+            }
+        }
+        vals.pop().unwrap_or_else(|| UiNode::RawStmt(String::new()))
+    }
+}
+
+impl PartialEq for UiNode {
+    fn eq(&self, other: &Self) -> bool {
+        let mut stack = vec![(self, other)];
+        while let Some((a, b)) = stack.pop() {
+            match (a, b) {
+                (
+                    UiNode::Component {
+                        name: n1,
+                        args: a1,
+                        attrs: at1,
+                        children: c1,
+                    },
+                    UiNode::Component {
+                        name: n2,
+                        args: a2,
+                        attrs: at2,
+                        children: c2,
+                    },
+                ) => {
+                    if n1 != n2 || a1 != a2 || at1 != at2 || c1.len() != c2.len() {
+                        return false;
+                    }
+                    stack.extend(c1.iter().zip(c2.iter()));
+                }
+                (
+                    UiNode::CustomChild {
+                        name: n1,
+                        props: p1,
+                    },
+                    UiNode::CustomChild {
+                        name: n2,
+                        props: p2,
+                    },
+                ) => {
+                    if n1 != n2 || p1 != p2 {
+                        return false;
+                    }
+                }
+                (
+                    UiNode::If {
+                        cond: c1,
+                        then_body: t1,
+                        else_body: e1,
+                    },
+                    UiNode::If {
+                        cond: c2,
+                        then_body: t2,
+                        else_body: e2,
+                    },
+                ) => {
+                    if c1 != c2 || t1.len() != t2.len() || e1.len() != e2.len() {
+                        return false;
+                    }
+                    stack.extend(e1.iter().zip(e2.iter()));
+                    stack.extend(t1.iter().zip(t2.iter()));
+                }
+                (
+                    UiNode::ForEach {
+                        is_lazy: l1,
+                        arr: ar1,
+                        item_param: ip1,
+                        idx_param: ix1,
+                        body: b1,
+                        key_gen: k1,
+                    },
+                    UiNode::ForEach {
+                        is_lazy: l2,
+                        arr: ar2,
+                        item_param: ip2,
+                        idx_param: ix2,
+                        body: b2,
+                        key_gen: k2,
+                    },
+                ) => {
+                    if l1 != l2
+                        || ar1 != ar2
+                        || ip1 != ip2
+                        || ix1 != ix2
+                        || k1 != k2
+                        || b1.len() != b2.len()
+                    {
+                        return false;
+                    }
+                    stack.extend(b1.iter().zip(b2.iter()));
+                }
+                (UiNode::RawStmt(s1), UiNode::RawStmt(s2)) => {
+                    if s1 != s2 {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for UiNode {}
+
+impl std::fmt::Debug for UiNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        enum Task<'a> {
+            Node(&'a UiNode),
+            Nodes(&'a [UiNode]),
+            Raw(&'static str),
+            Owned(String),
+        }
+        fn push_list<'a>(tasks: &mut Vec<Task<'a>>, slice: &'a [UiNode]) {
+            tasks.push(Task::Raw("]"));
+            if !slice.is_empty() {
+                tasks.push(Task::Nodes(slice));
+            }
+            tasks.push(Task::Raw("["));
+        }
+        let mut tasks = vec![Task::Node(self)];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Raw(s) => f.write_str(s)?,
+                Task::Owned(s) => f.write_str(&s)?,
+                Task::Nodes(slice) => {
+                    if let Some((first, rest)) = slice.split_first() {
+                        if !rest.is_empty() {
+                            tasks.push(Task::Nodes(rest));
+                            tasks.push(Task::Raw(", "));
+                        }
+                        tasks.push(Task::Node(first));
+                    }
+                }
+                Task::Node(node) => match node {
+                    UiNode::CustomChild { name, props } => {
+                        write!(f, "CustomChild {{ name: {name:?}, props: {props:?} }}")?;
+                    }
+                    UiNode::RawStmt(s) => write!(f, "RawStmt({s:?})")?,
+                    UiNode::Component {
+                        name,
+                        args,
+                        attrs,
+                        children,
+                    } => {
+                        write!(
+                            f,
+                            "Component {{ name: {name:?}, args: {args:?}, attrs: {attrs:?}, children: "
+                        )?;
+                        tasks.push(Task::Raw(" }"));
+                        push_list(&mut tasks, children);
+                    }
+                    UiNode::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    } => {
+                        write!(f, "If {{ cond: {cond:?}, then_body: ")?;
+                        tasks.push(Task::Raw(" }"));
+                        push_list(&mut tasks, else_body);
+                        tasks.push(Task::Raw(", else_body: "));
+                        push_list(&mut tasks, then_body);
+                    }
+                    UiNode::ForEach {
+                        is_lazy,
+                        arr,
+                        item_param,
+                        idx_param,
+                        body,
+                        key_gen,
+                    } => {
+                        write!(
+                            f,
+                            "ForEach {{ is_lazy: {is_lazy:?}, arr: {arr:?}, item_param: {item_param:?}, idx_param: {idx_param:?}, body: "
+                        )?;
+                        tasks.push(Task::Owned(format!(", key_gen: {key_gen:?} }}")));
+                        push_list(&mut tasks, body);
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for UiNode {
@@ -203,6 +530,7 @@ struct MainArkUiPlan {
     proto_to_class: BTreeMap<String, String>,
     extra_methods: BTreeMap<String, Vec<(String, FuncId)>>,
     dead_temps: BTreeSet<String>,
+    live_idents: BTreeSet<String>,
     polyfill_phis: BTreeSet<String>,
     entry_targets: BTreeSet<String>,
 }
@@ -359,6 +687,190 @@ fn scan_main_body(nodes: &[SNode], env: &BTreeMap<String, Expr>, plan: &mut Main
             }
         }
     }
+
+    // Pass 3: collect identifier/temp references across all SURVIVING statements
+    // and control-flow headers of `func_main_0` so live `const t = undefined;`
+    // or pure-setup declarations are never stripped while still referenced.
+    collect_surviving_main_uses(nodes, env, plan);
+}
+
+fn collect_expr_raw_idents(root: &Expr, out: &mut BTreeSet<String>) {
+    let mut stack = vec![root];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Ident(s) | Expr::Temp { name: s, .. } => {
+                out.insert(s.clone());
+            }
+            _ => {}
+        }
+        stack.extend(crate::folds::expr_children(cur));
+    }
+}
+
+fn collect_surviving_main_uses(
+    nodes: &[SNode],
+    env: &BTreeMap<String, Expr>,
+    plan: &mut MainArkUiPlan,
+) {
+    let mut candidate_deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut nstack: Vec<(&[SNode], bool)> = vec![(nodes, true)];
+    while let Some((slice, at_root)) = nstack.pop() {
+        for n in slice {
+            match n {
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    if at_root && is_finalize_construction_polyfill(cond, then, otherwise, env) {
+                        continue;
+                    }
+                    collect_expr_raw_idents(cond, &mut plan.live_idents);
+                    nstack.push((otherwise, false));
+                    nstack.push((then, false));
+                }
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        let Leaf::Raw(s) = l else {
+                            for e in crate::folds::leaf_exprs(l) {
+                                collect_expr_raw_idents(e, &mut plan.live_idents);
+                            }
+                            continue;
+                        };
+                        if at_root {
+                            match s {
+                                Stmt::Declare {
+                                    value: Expr::Class { heritage, .. },
+                                    ..
+                                } if is_view_heritage(heritage.as_deref(), env) => {
+                                    continue;
+                                }
+                                Stmt::Declare { name, value, .. }
+                                    if plan.proto_to_class.contains_key(name)
+                                        || plan.dead_temps.contains(name)
+                                        || is_pure_arkui_main_setup(value, env) =>
+                                {
+                                    let mut deps = BTreeSet::new();
+                                    collect_expr_raw_idents(value, &mut deps);
+                                    candidate_deps.insert(name.clone(), deps);
+                                    continue;
+                                }
+                                Stmt::PhiDecl { name, .. } if plan.polyfill_phis.contains(name) => {
+                                    continue;
+                                }
+                                Stmt::DefineMethod { object, func, .. }
+                                | Stmt::StoreProp {
+                                    object,
+                                    value: func,
+                                    ..
+                                } if raw_ident_of(object)
+                                    .is_some_and(|p| plan.proto_to_class.contains_key(&p))
+                                    && matches!(resolve_expr(func, env), Expr::Closure { .. }) =>
+                                {
+                                    continue;
+                                }
+                                Stmt::StoreDyn {
+                                    object, key, value, ..
+                                } if raw_ident_of(object)
+                                    .is_some_and(|p| plan.proto_to_class.contains_key(&p))
+                                    && string_lit(Some(key), env)
+                                        .is_some_and(|k| k.starts_with("#~@"))
+                                    && matches!(resolve_expr(value, env), Expr::Closure { .. }) =>
+                                {
+                                    continue;
+                                }
+                                Stmt::Expr(Expr::DefineGetterSetter { obj, .. })
+                                    if raw_ident_of(obj)
+                                        .is_some_and(|p| plan.proto_to_class.contains_key(&p)) =>
+                                {
+                                    continue;
+                                }
+                                Stmt::ModuleStore { value, .. }
+                                    if raw_ident_of(value)
+                                        .is_some_and(|v| plan.view_classes.contains(&v)) =>
+                                {
+                                    continue;
+                                }
+                                Stmt::LexStore { value, .. }
+                                    if is_class_alias_store(value, env)
+                                        || raw_ident_of(value)
+                                            .is_some_and(|v| plan.view_classes.contains(&v)) =>
+                                {
+                                    continue;
+                                }
+                                Stmt::Expr(e)
+                                    if is_prototype_touch(e)
+                                        || extract_entry_registration(e, env).is_some() =>
+                                {
+                                    continue;
+                                }
+                                Stmt::Return(None) | Stmt::Elided { .. } => continue,
+                                _ => {}
+                            }
+                        }
+                        for e in crate::emit::stmt_exprs(s) {
+                            collect_expr_raw_idents(e, &mut plan.live_idents);
+                        }
+                    }
+                }
+                SNode::Block(body) | SNode::Labeled { body, .. } => nstack.push((body, false)),
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        collect_expr_raw_idents(c, &mut plan.live_idents);
+                    }
+                    nstack.push((body, false));
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    collect_expr_raw_idents(cond, &mut plan.live_idents);
+                    nstack.push((body, false));
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    collect_expr_raw_idents(iter, &mut plan.live_idents);
+                    nstack.push((body, false));
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    collect_expr_raw_idents(obj, &mut plan.live_idents);
+                    nstack.push((body, false));
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(fin) = finally {
+                        nstack.push((fin, false));
+                    }
+                    for c in catches.iter().rev() {
+                        nstack.push((&c.body, false));
+                    }
+                    nstack.push((body, false));
+                }
+                SNode::Switch { disc, cases } => {
+                    collect_expr_raw_idents(disc, &mut plan.live_idents);
+                    for c in cases.iter().rev() {
+                        for t in &c.tests {
+                            collect_expr_raw_idents(t, &mut plan.live_idents);
+                        }
+                        nstack.push((&c.body, false));
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+
+    // Transitively mark pure-setup candidates referenced by live candidates.
+    let mut work: Vec<String> = plan.live_idents.iter().cloned().collect();
+    while let Some(live) = work.pop() {
+        if let Some(deps) = candidate_deps.get(&live) {
+            for dep in deps {
+                if plan.live_idents.insert(dep.clone()) {
+                    work.push(dep.clone());
+                }
+            }
+        }
+    }
 }
 
 fn collect_phi_targets(nodes: &[SNode], out: &mut BTreeSet<String>) {
@@ -437,9 +949,10 @@ fn emit_arkui_main_node(
                         );
                     }
                     Stmt::Declare { name, value, .. }
-                        if plan.proto_to_class.contains_key(name)
-                            || plan.dead_temps.contains(name)
-                            || is_pure_arkui_main_setup(value, env) => {}
+                        if !plan.live_idents.contains(name)
+                            && (plan.proto_to_class.contains_key(name)
+                                || plan.dead_temps.contains(name)
+                                || is_pure_arkui_main_setup(value, env)) => {}
                     Stmt::PhiDecl { name, .. } if plan.polyfill_phis.contains(name) => {}
                     Stmt::DefineMethod { object, func, .. }
                     | Stmt::StoreProp {
@@ -489,39 +1002,182 @@ fn emit_arkui_main_node(
     }
 }
 
-/// Attempt to emit a `Class` as an `@Component struct` when `opts.arkui`
-/// is enabled and `heritage` resolves to `ViewPU` or `View`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "ArkUI component hook mirrors emit_class across class IR facets"
-)]
-pub(crate) fn try_emit_arkui_component(
-    em: &mut Emitter<'_>,
-    pad: &str,
-    indent: usize,
-    name: &str,
-    ctor: FuncId,
-    heritage: Option<&Expr>,
-    members: ConstId,
-    member_attrs: &[MemberAttrs],
-    out: &mut String,
-) -> bool {
-    let empty_env = BTreeMap::new();
-    if !is_view_heritage(heritage, &empty_env) && !heritage_mentions_view(heritage) {
-        return false;
+/// Iteratively precompute nested `@Component struct` renderings for all
+/// `ViewPU` / `View` classes reachable from `root_func` in post-order so
+/// [`Emitter::step_start_class`] can splice them without calling back into
+/// `crate::arkui` (zero mutual call-graph cycles).
+pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncId) {
+    struct ClassCand {
+        name: String,
+        ctor: FuncId,
+        members: ConstId,
+        member_attrs: Vec<MemberAttrs>,
     }
-    emit_arkui_struct(
-        em,
-        pad,
-        indent,
-        name,
-        ctor,
-        members,
-        member_attrs,
-        &[],
-        false,
-        out,
-    )
+
+    let mut visited_funcs: BTreeSet<FuncId> = BTreeSet::new();
+    let mut fstack: Vec<(FuncId, bool)> = vec![(root_func, true)];
+    let mut candidates: Vec<ClassCand> = Vec::new();
+    let empty_env = BTreeMap::new();
+
+    while let Some((fid, is_top)) = fstack.pop() {
+        if !visited_funcs.insert(fid) || em.module.func(fid).is_none() {
+            continue;
+        }
+        let body = em.peek_prepared(fid, is_top).body.clone();
+        let mut nstack: Vec<&[SNode]> = vec![body.as_slice()];
+        while let Some(slice) = nstack.pop() {
+            for n in slice {
+                match n {
+                    SNode::Stmts(leaves) => {
+                        for l in leaves {
+                            if let Leaf::Raw(Stmt::Declare {
+                                name,
+                                value:
+                                    Expr::Class {
+                                        ctor,
+                                        heritage,
+                                        members,
+                                        member_attrs,
+                                        sendable: false,
+                                        ..
+                                    },
+                                ..
+                            }) = l
+                                && (is_view_heritage(heritage.as_deref(), &empty_env)
+                                    || heritage_mentions_view(heritage.as_deref()))
+                            {
+                                candidates.push(ClassCand {
+                                    name: name.clone(),
+                                    ctor: *ctor,
+                                    members: *members,
+                                    member_attrs: member_attrs.clone(),
+                                });
+                            }
+                            for e in crate::folds::leaf_exprs(l) {
+                                collect_inline_funcs_from_expr(em.module, e, &mut fstack);
+                            }
+                        }
+                    }
+                    SNode::Block(b) | SNode::Labeled { body: b, .. } => nstack.push(b),
+                    SNode::If {
+                        cond,
+                        then,
+                        otherwise,
+                    } => {
+                        collect_inline_funcs_from_expr(em.module, cond, &mut fstack);
+                        nstack.push(otherwise);
+                        nstack.push(then);
+                    }
+                    SNode::While { cond, body: b, .. } => {
+                        if let Some(c) = cond {
+                            collect_inline_funcs_from_expr(em.module, c, &mut fstack);
+                        }
+                        nstack.push(b);
+                    }
+                    SNode::DoWhile { body: b, cond, .. } => {
+                        collect_inline_funcs_from_expr(em.module, cond, &mut fstack);
+                        nstack.push(b);
+                    }
+                    SNode::ForOf { iter, body: b, .. } => {
+                        collect_inline_funcs_from_expr(em.module, iter, &mut fstack);
+                        nstack.push(b);
+                    }
+                    SNode::ForIn { obj, body: b, .. } => {
+                        collect_inline_funcs_from_expr(em.module, obj, &mut fstack);
+                        nstack.push(b);
+                    }
+                    SNode::Try {
+                        body: b,
+                        catches,
+                        finally,
+                        ..
+                    } => {
+                        if let Some(fin) = finally {
+                            nstack.push(fin);
+                        }
+                        for c in catches.iter().rev() {
+                            nstack.push(&c.body);
+                        }
+                        nstack.push(b);
+                    }
+                    SNode::Switch { disc, cases } => {
+                        collect_inline_funcs_from_expr(em.module, disc, &mut fstack);
+                        for c in cases.iter().rev() {
+                            for t in &c.tests {
+                                collect_inline_funcs_from_expr(em.module, t, &mut fstack);
+                            }
+                            nstack.push(&c.body);
+                        }
+                    }
+                    SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+                }
+            }
+        }
+    }
+
+    // Render inner components before outer components so nested `@Component`
+    // classes inside methods find their precomputed output in `em.arkui_components`.
+    for cand in candidates.into_iter().rev() {
+        let key = (cand.ctor, cand.name.clone());
+        if em.arkui_components.contains_key(&key) {
+            continue;
+        }
+        let saved_stats = std::mem::take(&mut em.stats);
+        let saved_fn_fb = em.current_fn_has_fallback;
+        let saved_kind = em.current_kind;
+        let saved_depth = em.class_depth;
+        let saved_hoisted = std::mem::take(&mut em.hoisted);
+
+        let mut rendered = String::new();
+        let ok = emit_arkui_struct(
+            em,
+            "",
+            0,
+            &cand.name,
+            cand.ctor,
+            cand.members,
+            &cand.member_attrs,
+            &[],
+            false,
+            &mut rendered,
+        );
+
+        let delta_stats = std::mem::replace(&mut em.stats, saved_stats);
+        let had_fb = em.current_fn_has_fallback;
+        em.current_fn_has_fallback = saved_fn_fb;
+        em.current_kind = saved_kind;
+        em.class_depth = saved_depth;
+        em.hoisted = saved_hoisted;
+
+        if ok {
+            em.arkui_components
+                .insert(key, (rendered, delta_stats, had_fb));
+        }
+    }
+}
+
+fn collect_inline_funcs_from_expr(
+    module: &abcd_ir::Module,
+    root: &Expr,
+    out: &mut Vec<(FuncId, bool)>,
+) {
+    let mut estack = vec![root];
+    let mut mrefs = BTreeSet::new();
+    while let Some(cur) = estack.pop() {
+        match cur {
+            Expr::Closure { body, .. } => out.push((*body, false)),
+            Expr::Class { ctor, members, .. } => {
+                out.push((*ctor, false));
+                mrefs.clear();
+                crate::emit::collect_method_refs(module, *members, &mut mrefs);
+                for &m in &mrefs {
+                    out.push((m, false));
+                }
+            }
+            _ => {}
+        }
+        estack.extend(crate::folds::expr_children(cur));
+    }
 }
 
 #[allow(
@@ -794,6 +1450,9 @@ fn collect_const_bindings(nodes: &[SNode]) -> BTreeMap<String, Expr> {
                         _ => {}
                     }
                 }
+            }
+            SNode::Block(body) | SNode::Labeled { body, .. } => {
+                stack.push(body.iter());
             }
             SNode::If {
                 then, otherwise, ..
@@ -1208,6 +1867,9 @@ fn walk_ctor_stmts(nodes: &[SNode], f: &mut impl FnMut(&Stmt)) {
                         f(s);
                     }
                 }
+            }
+            SNode::Block(body) | SNode::Labeled { body, .. } => {
+                stack.push(body.iter());
             }
             SNode::If {
                 then, otherwise, ..

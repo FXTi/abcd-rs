@@ -216,6 +216,7 @@ fn dump_stmt(out: &mut String, s: &Stmt) {
             slot,
             name,
             value,
+            ..
         } => {
             let _ = writeln!(
                 out,

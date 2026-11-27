@@ -295,7 +295,7 @@ fn lift_failure_is_a_tool_error() {
     assert_eq!(err.exit_code(), 2, "lift failure is a tool error");
     let msg = err.to_string();
     assert!(msg.contains("failed to lift"), "{msg}");
-    assert!(msg.contains("ldthisbyname"), "{msg}");
+    assert!(msg.contains("jeqnull"), "{msg}");
 }
 
 // ---- seed-fact rendering (Fact::Taint arm) ----
@@ -355,13 +355,16 @@ fn function_params_seed_renders_a_taint_fact_seed() {
 
 // ---- field-chain rendering (FieldKey arms) ----
 
-/// Property reads off the tainted TAINT global carry a field chain to the
-/// sink: the fact renders `local vN.x` / `local vN[*]` / `local vN[dyn]`.
+/// Property stores onto an unknown-provenance parameter (`obj.<key> = TAINT`)
+/// carry a non-empty field chain to `print(obj)`: the fact renders
+/// `local vN.x` / `local vN[*]` / `local vN[dyn]`. Conversely, chained
+/// property reads off a whole-object source (`TAINT.a.b`, `R4-4a`) propagate
+/// whole-value taint (`local vN`).
 mod field_chain {
     use super::*;
 
-    fn run_chain(
-        load: Bytecode,
+    fn run_store_chain(
+        store: Bytecode,
         wire: impl FnOnce(&mut Builder, abcd_file::MethodHandle, &[u32]),
     ) -> String {
         let mut b = Builder::new();
@@ -369,24 +372,24 @@ mod field_chain {
         let cls = b.add_global_class();
         let proto = b.create_proto(Type::Void, &[]);
         let placeholder = EntityId(u16::MAX as u32);
+        // `num_vregs = 2, num_args = 4`: `Reg(5)` is formal parameter 0 (`obj`).
         let (code, offsets) = abcd_isa::encode(&[
-            Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 0: acc = TAINT
-            Bytecode::Sta(Reg(0)),                            // 1: v0 = tainted
-            Bytecode::Lda(Reg(0)),                            // 2: acc = obj
-            load,                                             // 3: acc = obj.<key>
-            Bytecode::Sta(Reg(1)),                            // 4: v1 = result
-            Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 5: acc = print
-            Bytecode::Callarg1(Imm(0), Reg(1)),               // 6: print(v1)
-            Bytecode::Returnundefined,                        // 7
+            Bytecode::Ldai(Imm(0)),                           // 0: key = 0
+            Bytecode::Sta(Reg(0)),                            // 1: v0 = dynamic key
+            Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 2: acc = TAINT
+            store,                                            // 3: obj.<key> = acc
+            Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 4: acc = print
+            Bytecode::Callarg1(Imm(0), Reg(5)),               // 5: print(obj)
+            Bytecode::Returnundefined,                        // 6
         ])
         .unwrap();
-        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 4, 0);
+        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 2, 4);
         let taint = b.add_string("TAINT");
-        b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(taint))
+        b.relocate_code_id(m, offsets[2], 0, CodeEntity::String(taint))
             .unwrap();
         wire(&mut b, m, &offsets);
         let print = b.add_string("print");
-        b.relocate_code_id(m, offsets[5], 0, CodeEntity::String(print))
+        b.relocate_code_id(m, offsets[4], 0, CodeEntity::String(print))
             .unwrap();
         b.deduplicate();
         let abc = b.finalize().expect("field-chain fixture must finalize");
@@ -398,8 +401,8 @@ mod field_chain {
     #[test]
     fn named_field_chain_renders_the_key() {
         let placeholder = EntityId(u16::MAX as u32);
-        let fact = run_chain(
-            Bytecode::Ldobjbyname(Imm(0), placeholder),
+        let fact = run_store_chain(
+            Bytecode::Stobjbyname(Imm(0), placeholder, Reg(5)),
             |b, m, offsets| {
                 let x = b.add_string("x");
                 b.relocate_code_id(m, offsets[3], 0, CodeEntity::String(x))
@@ -412,14 +415,44 @@ mod field_chain {
 
     #[test]
     fn index_load_renders_the_any_index_chain() {
-        let fact = run_chain(Bytecode::Ldobjbyindex(Imm(0), Imm(7)), |_, _, _| {});
+        let fact = run_store_chain(Bytecode::Stobjbyindex(Imm(0), Reg(5), Imm(7)), |_, _, _| {});
         assert!(fact.ends_with("[*]"), "fact: {fact}");
     }
 
     #[test]
     fn dynamic_load_renders_the_any_dynamic_chain() {
-        let fact = run_chain(Bytecode::Ldobjbyvalue(Imm(0), Reg(0)), |_, _, _| {});
+        let fact = run_store_chain(Bytecode::Stobjbyvalue(Imm(0), Reg(5), Reg(0)), |_, _, _| {});
         assert!(fact.ends_with("[dyn]"), "fact: {fact}");
+    }
+
+    #[test]
+    fn two_step_property_read_on_whole_object_source_reaches_sink() {
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let placeholder = EntityId(u16::MAX as u32);
+        let (code, offsets) = abcd_isa::encode(&[
+            Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 0: acc = TAINT
+            Bytecode::Ldobjbyname(Imm(0), placeholder),       // 1: acc = acc.a
+            Bytecode::Ldobjbyname(Imm(1), placeholder),       // 2: acc = acc.b
+            Bytecode::Sta(Reg(0)),                            // 3: v0 = TAINT.a.b
+            Bytecode::Tryldglobalbyname(Imm(2), placeholder), // 4: acc = print
+            Bytecode::Callarg1(Imm(3), Reg(0)),               // 5: print(v0)
+            Bytecode::Returnundefined,                        // 6
+        ])
+        .unwrap();
+        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 4, 3);
+        for (insn, s) in [(0, "TAINT"), (1, "a"), (2, "b"), (4, "print")] {
+            let sid = b.add_string(s);
+            b.relocate_code_id(m, offsets[insn], 0, CodeEntity::String(sid))
+                .unwrap();
+        }
+        b.deduplicate();
+        let abc = b.finalize().unwrap();
+        let report = run(&abc, TAINT_TO_PRINT);
+        assert_eq!(report.hits.len(), 1, "{report:?}");
+        assert!(report.hits[0].fact.starts_with("local v"));
     }
 }
 

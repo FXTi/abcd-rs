@@ -27,11 +27,14 @@ fn main() {
     // - file_reader.cpp: legacy-tree drift (calls undeclared MethodParamItem::AddRuntimeAnnotation).
     // - file.cpp / pgo.cpp: pull in runtime ifstream/PGO machinery unused by the bridge.
     // - method_handle_data_accessor.cpp: unused by the bridge.
-    const EXCLUDED: [&str; 4] = [
+    // - bytecode_emitter.cpp: unused by `file_bridge` and compiled by `abcd-isa-sys`
+    //   (excluding it here avoids duplicate strong C++ symbols when linking tests).
+    const EXCLUDED: [&str; 5] = [
         "file_reader.cpp",
         "file.cpp",
         "pgo.cpp",
         "method_handle_data_accessor.cpp",
+        "bytecode_emitter.cpp",
     ];
 
     let mut cpp_files: Vec<PathBuf> = Vec::new();
@@ -101,4 +104,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/generated/");
     println!("cargo:rerun-if-changed={vendor_root}/");
     println!("cargo:rerun-if-changed={vendor_shim}/utils/logger.h");
+    println!("cargo:rerun-if-changed={vendor_shim}/utils/span.h");
+    println!("cargo:rerun-if-changed={vendor_shim}/libpandabase/utils/span.h");
+    println!("cargo:rerun-if-changed={vendor_shim}/securec.h");
 }

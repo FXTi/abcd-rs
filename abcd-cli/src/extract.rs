@@ -71,11 +71,12 @@ fn plan_and_write(
         });
     }
 
-    // Preflight: no output path may exist unless --force.
+    // Preflight: no output path (regular file, directory, or symlink —
+    // including dangling symlinks) may exist unless --force.
     if !force {
         for p in &planned {
             for path in std::iter::once(&p.abc_path).chain(p.json_path.iter()) {
-                if path.exists() {
+                if std::fs::symlink_metadata(path).is_ok() {
                     return Err(CliError::User(format!(
                         "{} already exists (pass --force to overwrite)",
                         path.display()
@@ -92,15 +93,41 @@ fn plan_and_write(
         ))
     })?;
     for (m, p) in modules.iter().zip(&planned) {
-        std::fs::write(&p.abc_path, &m.abc)
-            .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", p.abc_path.display())))?;
+        write_extracted_file(&p.abc_path, &m.abc, force)?;
         if let (Some(json), Some(json_path)) = (&m.module_json, &p.json_path) {
-            std::fs::write(json_path, json).map_err(|e| {
-                CliError::Tool(format!("cannot write {}: {e}", json_path.display()))
-            })?;
+            write_extracted_file(json_path, json, force)?;
         }
     }
     Ok(planned)
+}
+
+/// Write `bytes` to `path`, using atomic `create_new(true)` (`O_EXCL`) when
+/// `!force` so neither TOCTOU races nor dangling symlinks can overwrite
+/// existing files.
+fn write_extracted_file(path: &Path, bytes: &[u8], force: bool) -> Result<(), CliError> {
+    use std::io::Write;
+
+    if force {
+        return std::fs::write(path, bytes)
+            .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::User(format!(
+                    "{} already exists (pass --force to overwrite)",
+                    path.display()
+                ))
+            } else {
+                CliError::Tool(format!("cannot write {}: {e}", path.display()))
+            }
+        })?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))
 }
 
 /// Human-readable summary of an extract run (goes to stdout).

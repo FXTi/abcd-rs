@@ -544,7 +544,7 @@ fn g05_entry_gate_bail_keeps_fallbacks() {
     let text = decompiled(&m);
     expect(
         &text,
-        "function* seq() {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  const v1 = /*CreateGenerator plumbing*/ this;\n  yield undefined;\n  const v4 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n  const v5 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v1;\n  switch (v5) {\n  case 0.0: {\n      return v1;\n    }\n  case 1.0: {\n      throw v4;\n      /* unreachable */\n    }\n  default: {\n      return 4.0;\n    }\n  }\n}\n",
+        "function* seq() {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  const v1 = /*CreateGenerator plumbing*/ this;\n  yield undefined;\n  const v4 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n  const v5 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v1;\n  if (!(0.0 == v5)) {\n    if (!(1.0 == v5)) {\n      return 4.0;\n    } else {\n      throw v4;\n      /* unreachable */\n    }\n  } else {\n    return v1;\n  }\n}\n",
     );
 }
 

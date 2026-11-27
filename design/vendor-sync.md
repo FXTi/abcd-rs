@@ -9,11 +9,13 @@
 | Path | Contents & Ownership |
 | :--- | :--- |
 | `vendor/UPSTREAM.toml` | Pinned upstream repository URL, release tag/commit (`OpenHarmony-v7.0-Release`), and per-file SHA-256 manifest |
-| `vendor/arkcompiler_runtime_core/` | Read-only upstream C++/YAML/ERB snapshot (`336` files, `~1.84 MB`); **never hand-edit** |
-| `vendor/shim/` | Minimal cross-platform C++ shims (`platform_compat.h`, `utils/logger.h` silent sink + `FATAL` exception throw) |
+| `vendor/arkcompiler_runtime_core/` | Read-only upstream C++/YAML/ERB snapshot (`281` files); **never hand-edit** |
+| `vendor/shim/` | Minimal cross-platform C++ shims (`platform_compat.h`, `utils/logger.h` silent sink + `FATAL` exception throw, `utils/span.h` release-checked `Span<T>`, `securec.h` hardened `memcpy_s`) |
 | `vendor/generated/` | Pre-generated upstream C++ ISA/version headers + `file_bridge_enum_checks.h` (`109` C++17 `static_assert`s) |
-| `abcd-isa-sys/src/generated/`, `abcd-isa/src/generated/`, `abcd-file-sys/src/generated/` | Pre-generated Rust ISA tables, FFI `extern "C"` signatures, and enum/flag bindings |
-| `scripts/vendor-gen.py` | Offline maintenance tool (`sync`, `codegen`, `verify`) |
+| `abcd-isa-sys/bridge/generated/`, `abcd-isa-sys/src/generated/` | Pre-generated C++ emitter dispatch/validity tables and raw C99 `isa_*` FFI declarations |
+| `abcd-isa/src/generated/`, `abcd-isa/tests/integration/generated/` | Pre-generated pure-Rust `Bytecode` model (`bytecode.rs`), `0.0.0.2` translator (`legacy_table.rs`), `.abc` version table (`version_table.rs`), and C++ differential oracle decoder (`oracle_decode.rs`) |
+| `abcd-file-sys/src/generated/`, `abcd-file/src/pandasm/generated/` | Pre-generated C99 `abc_*` FFI declarations, upstream enum/flag constants, and `pandasm` mnemonic constructor table (`insn_ctor.rs`) |
+| `scripts/vendor-gen.py` | Zero-recursion offline maintenance tool (`sync`, `codegen`, `verify`) |
 
 ---
 

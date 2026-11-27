@@ -85,41 +85,16 @@ pub enum Dialect {
     StaticArkTS,
 }
 
-/// The source language a class was authored in (semantic, not a format
-/// tag).
+/// The source language a class was authored in (semantic authoring provenance,
+/// decoupled from container execution [`Dialect`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceLang {
     /// ECMAScript (JavaScript).
     EcmaScript,
     /// TypeScript.
     TypeScript,
-    /// ArkTS (`static_core` / `ets2panda`).
+    /// ArkTS (`static_core` / `ets2panda` or dynamic ArkTS).
     ArkTS,
-}
-
-impl SourceLang {
-    /// Execution and calling-convention [`Dialect`] for this source language (`D6`).
-    #[must_use]
-    pub const fn dialect(self) -> Dialect {
-        match self {
-            Self::EcmaScript | Self::TypeScript => Dialect::DynamicEcma,
-            Self::ArkTS => Dialect::StaticArkTS,
-        }
-    }
-
-    /// `true` when this source language uses [`Dialect::DynamicEcma`]
-    /// (`[func][new.target][this]` leading frame slots).
-    #[must_use]
-    pub const fn is_dynamic(self) -> bool {
-        matches!(self.dialect(), Dialect::DynamicEcma)
-    }
-
-    /// `true` when this source language uses [`Dialect::StaticArkTS`]
-    /// (`H = 0` hidden closure/`new.target` slots).
-    #[must_use]
-    pub const fn is_static(self) -> bool {
-        matches!(self.dialect(), Dialect::StaticArkTS)
-    }
 }
 
 /// Semantic function kind (replaces format-layer `FunctionKind`
@@ -161,7 +136,7 @@ pub struct Signature {
 
 /// An annotation element value. Elements reference only IR-owned
 /// identities (`design/ir.md`): constants, classes, fields, names.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AnnValue {
     /// A constant from the module's [`ConstPool`].
     Const(ConstId),
@@ -176,7 +151,7 @@ pub enum AnnValue {
 /// A single annotation. Retention-bucket classification in legacy containers
 /// folds into one ordered list per attach site at lift; container-specific
 /// emission is a lowering concern (`FormatProfile`), not IR content.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Annotation {
     /// The annotation type.
     pub class: ClassId,
@@ -333,6 +308,9 @@ pub enum ExportDecl {
 /// a [`ValueId`] usable as a taint-analysis key across pass pipelines.
 #[derive(Clone, Debug, Default)]
 pub struct Module {
+    /// Container execution and calling-convention dialect (`D6`, defaults to
+    /// [`Dialect::DynamicEcma`]).
+    pub dialect: Dialect,
     /// Names as identity (T9).
     pub sym: SymbolTable,
     /// Typed constants, incl. array/object literal shapes.
@@ -359,9 +337,19 @@ pub struct Module {
 }
 
 impl Module {
-    /// An empty module.
+    /// An empty [`Dialect::DynamicEcma`] module.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty module configured with an explicit container [`Dialect`].
+    #[must_use]
+    pub fn with_dialect(dialect: Dialect) -> Self {
+        Self {
+            dialect,
+            ..Self::default()
+        }
     }
 
     /// Look up a function; `None` for out-of-range ids.
@@ -404,34 +392,47 @@ impl Module {
         self.classes.get(id.index())
     }
 
-    /// Execution and calling-convention [`Dialect`] of `func`, derived from
-    /// its owning [`ClassData::source_lang`] (`D6`). Defaults to
-    /// [`Dialect::DynamicEcma`] when `func.class_id` is absent (e.g. bare
-    /// synthetic test modules).
+    /// Execution and calling-convention [`Dialect`] of `func`, determined by
+    /// [`Module::dialect`] (`D6`, decoupled from per-class authoring
+    /// [`SourceLang`]).
     #[must_use]
-    pub fn func_dialect(&self, func: &FunctionData) -> Dialect {
-        self.class(func.class_id)
-            .map_or(Dialect::DynamicEcma, |c| c.source_lang.dialect())
+    pub const fn func_dialect(&self, _func: &FunctionData) -> Dialect {
+        self.dialect
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
-    fn source_lang_dialect_classification() {
-        assert_eq!(SourceLang::EcmaScript.dialect(), Dialect::DynamicEcma);
-        assert!(SourceLang::EcmaScript.is_dynamic());
-        assert!(!SourceLang::EcmaScript.is_static());
-
-        assert_eq!(SourceLang::TypeScript.dialect(), Dialect::DynamicEcma);
-        assert!(SourceLang::TypeScript.is_dynamic());
-        assert!(!SourceLang::TypeScript.is_static());
-
-        assert_eq!(SourceLang::ArkTS.dialect(), Dialect::StaticArkTS);
-        assert!(!SourceLang::ArkTS.is_dynamic());
-        assert!(SourceLang::ArkTS.is_static());
+    fn module_dialect_is_decoupled_from_source_lang_and_annotations_hash() {
         assert_eq!(Dialect::default(), Dialect::DynamicEcma);
+        let mut dyn_mod = Module::new();
+        assert_eq!(dyn_mod.dialect, Dialect::DynamicEcma);
+        let desc = dyn_mod.sym.intern("LDynArkTS;");
+        let mut cls = ClassData::new(desc, desc);
+        cls.source_lang = SourceLang::ArkTS; // Dynamic es2abc ArkTS 1.0/1.1 class!
+        dyn_mod.classes.push(cls);
+        let fd = FunctionData::new(ClassId::new(0), desc, FunctionKind::Function);
+        assert_eq!(
+            dyn_mod.func_dialect(&fd),
+            Dialect::DynamicEcma,
+            "dynamic container with SourceLang::ArkTS must keep DynamicEcma ABI"
+        );
+
+        let static_mod = Module::with_dialect(Dialect::StaticArkTS);
+        assert_eq!(static_mod.dialect, Dialect::StaticArkTS);
+        assert_eq!(static_mod.func_dialect(&fd), Dialect::StaticArkTS);
+
+        let ann = Annotation {
+            class: ClassId::new(0),
+            elements: vec![(desc, AnnValue::Field(ClassId::new(0), FieldId::new(1)))],
+        };
+        let mut set = HashSet::new();
+        assert!(set.insert(ann.clone()));
+        assert!(!set.insert(ann));
     }
 }

@@ -1,7 +1,10 @@
+use std::fmt;
+
 use abcd_file_sys as sys;
 
+use crate::model::Annotation;
+
 /// Annotation element with resolved name.
-#[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationElem {
     pub name: crate::StringId,
     pub value: AnnotationValue,
@@ -69,13 +72,16 @@ pub struct ResolvedMethodHandle {
 /// All variants are fully resolved at decode time:
 /// - String, Record, Method, Enum → interned [`StringId`](crate::StringId)
 ///   (plus dense [`MethodIdx`](crate::MethodIdx) / [`FieldIdx`](crate::FieldIdx) handles)
-/// - Annotation → recursively resolved nested [`Annotation`](crate::Annotation)
+/// - Annotation → iteratively resolved nested [`Annotation`](crate::Annotation)
 /// - MethodHandle → resolved [`ResolvedMethodHandle`]
 /// - LiteralArray → resolved [`LiteralValue`](crate::LiteralValue) items
 ///   (nested [`LiteralArrayIdx`](crate::LiteralArrayIdx) and
 ///   [`MethodIdx`](crate::MethodIdx) items are rewritten to table indices)
 /// - Array → element count preserved with original tag
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Drop`, `Clone`, `PartialEq`, and `Debug` are implemented iteratively over
+/// explicit heap workstacks so arbitrarily deep annotation trees never overflow
+/// the call stack.
 pub enum AnnotationValue {
     Bool(bool),
     I8(i8),
@@ -124,6 +130,546 @@ pub enum AnnotationValue {
         tag: u8,
         values: Vec<AnnotationValue>,
     },
+}
+
+#[inline]
+const fn has_nested_annotation_children(v: &AnnotationValue) -> bool {
+    matches!(
+        v,
+        AnnotationValue::Annotation(_) | AnnotationValue::Array { .. }
+    )
+}
+
+impl Drop for AnnotationValue {
+    fn drop(&mut self) {
+        let needs_drain = match self {
+            Self::Annotation(ann) => ann
+                .elements
+                .iter()
+                .any(|e| has_nested_annotation_children(&e.value)),
+            Self::Array { values, .. } => values.iter().any(has_nested_annotation_children),
+            _ => false,
+        };
+        if !needs_drain {
+            return;
+        }
+        let mut stack: Vec<AnnotationValue> = Vec::new();
+        match self {
+            Self::Annotation(ann) => {
+                for elem in std::mem::take(&mut ann.elements) {
+                    if has_nested_annotation_children(&elem.value) {
+                        stack.push(elem.value);
+                    }
+                }
+            }
+            Self::Array { values, .. } => {
+                for v in std::mem::take(values) {
+                    if has_nested_annotation_children(&v) {
+                        stack.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+        while let Some(mut node) = stack.pop() {
+            match &mut node {
+                Self::Annotation(ann) => {
+                    for elem in std::mem::take(&mut ann.elements) {
+                        if has_nested_annotation_children(&elem.value) {
+                            stack.push(elem.value);
+                        }
+                    }
+                }
+                Self::Array { values, .. } => {
+                    for v in std::mem::take(values) {
+                        if has_nested_annotation_children(&v) {
+                            stack.push(v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn try_clone_leaf_annotation_value(v: &AnnotationValue) -> Option<AnnotationValue> {
+    Some(match v {
+        AnnotationValue::Bool(x) => AnnotationValue::Bool(*x),
+        AnnotationValue::I8(x) => AnnotationValue::I8(*x),
+        AnnotationValue::U8(x) => AnnotationValue::U8(*x),
+        AnnotationValue::I16(x) => AnnotationValue::I16(*x),
+        AnnotationValue::U16(x) => AnnotationValue::U16(*x),
+        AnnotationValue::I32(x) => AnnotationValue::I32(*x),
+        AnnotationValue::U32(x) => AnnotationValue::U32(*x),
+        AnnotationValue::I64(x) => AnnotationValue::I64(*x),
+        AnnotationValue::U64(x) => AnnotationValue::U64(*x),
+        AnnotationValue::F32(x) => AnnotationValue::F32(*x),
+        AnnotationValue::F64(x) => AnnotationValue::F64(*x),
+        AnnotationValue::String(x) => AnnotationValue::String(*x),
+        AnnotationValue::Record(x) => AnnotationValue::Record(*x),
+        AnnotationValue::Method {
+            name,
+            method,
+            offset,
+        } => AnnotationValue::Method {
+            name: *name,
+            method: *method,
+            offset: *offset,
+        },
+        AnnotationValue::Enum {
+            name,
+            field,
+            offset,
+        } => AnnotationValue::Enum {
+            name: *name,
+            field: *field,
+            offset: *offset,
+        },
+        AnnotationValue::MethodHandle(mh) => AnnotationValue::MethodHandle(*mh),
+        AnnotationValue::LiteralArray(vals) => AnnotationValue::LiteralArray(vals.clone()),
+        AnnotationValue::Void => AnnotationValue::Void,
+        AnnotationValue::StringNullptr => AnnotationValue::StringNullptr,
+        AnnotationValue::Annotation(_) | AnnotationValue::Array { .. } => return None,
+    })
+}
+
+enum AnnCloneFrame<'a> {
+    Ann {
+        class_descriptor: crate::StringId,
+        elems: &'a [AnnotationElem],
+        next_idx: usize,
+        pending_name: Option<crate::StringId>,
+        built: Vec<AnnotationElem>,
+    },
+    Arr {
+        tag: u8,
+        vals: &'a [AnnotationValue],
+        next_idx: usize,
+        built: Vec<AnnotationValue>,
+    },
+}
+
+fn run_ann_clone_stack(mut stack: Vec<AnnCloneFrame<'_>>) -> AnnotationValue {
+    let mut completed: Option<AnnotationValue> = None;
+    while let Some(frame) = stack.last_mut() {
+        if let Some(child_val) = completed.take() {
+            match frame {
+                AnnCloneFrame::Ann {
+                    pending_name,
+                    built,
+                    ..
+                } => {
+                    if let Some(name) = pending_name.take() {
+                        built.push(AnnotationElem {
+                            name,
+                            value: child_val,
+                        });
+                    }
+                }
+                AnnCloneFrame::Arr { built, .. } => {
+                    built.push(child_val);
+                }
+            }
+        }
+
+        let mut push_frame: Option<AnnCloneFrame<'_>> = None;
+        match frame {
+            AnnCloneFrame::Ann {
+                elems,
+                next_idx,
+                pending_name,
+                built,
+                ..
+            } => {
+                while *next_idx < elems.len() {
+                    let elem = &elems[*next_idx];
+                    *next_idx += 1;
+                    if let Some(leaf) = try_clone_leaf_annotation_value(&elem.value) {
+                        built.push(AnnotationElem {
+                            name: elem.name,
+                            value: leaf,
+                        });
+                    } else {
+                        *pending_name = Some(elem.name);
+                        push_frame = Some(match &elem.value {
+                            AnnotationValue::Annotation(inner) => AnnCloneFrame::Ann {
+                                class_descriptor: inner.class_descriptor,
+                                elems: &inner.elements,
+                                next_idx: 0,
+                                pending_name: None,
+                                built: Vec::with_capacity(inner.elements.len()),
+                            },
+                            AnnotationValue::Array { tag, values } => AnnCloneFrame::Arr {
+                                tag: *tag,
+                                vals: values,
+                                next_idx: 0,
+                                built: Vec::with_capacity(values.len()),
+                            },
+                            _ => unreachable!(),
+                        });
+                        break;
+                    }
+                }
+            }
+            AnnCloneFrame::Arr {
+                vals,
+                next_idx,
+                built,
+                ..
+            } => {
+                while *next_idx < vals.len() {
+                    let item = &vals[*next_idx];
+                    *next_idx += 1;
+                    if let Some(leaf) = try_clone_leaf_annotation_value(item) {
+                        built.push(leaf);
+                    } else {
+                        push_frame = Some(match item {
+                            AnnotationValue::Annotation(inner) => AnnCloneFrame::Ann {
+                                class_descriptor: inner.class_descriptor,
+                                elems: &inner.elements,
+                                next_idx: 0,
+                                pending_name: None,
+                                built: Vec::with_capacity(inner.elements.len()),
+                            },
+                            AnnotationValue::Array { tag, values } => AnnCloneFrame::Arr {
+                                tag: *tag,
+                                vals: values,
+                                next_idx: 0,
+                                built: Vec::with_capacity(values.len()),
+                            },
+                            _ => unreachable!(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(next) = push_frame {
+            stack.push(next);
+            continue;
+        }
+
+        let Some(finished) = stack.pop() else {
+            break;
+        };
+        let node = match finished {
+            AnnCloneFrame::Ann {
+                class_descriptor,
+                built,
+                ..
+            } => AnnotationValue::Annotation(Box::new(Annotation {
+                class_descriptor,
+                elements: built,
+            })),
+            AnnCloneFrame::Arr { tag, built, .. } => AnnotationValue::Array { tag, values: built },
+        };
+        if stack.is_empty() {
+            return node;
+        }
+        completed = Some(node);
+    }
+    AnnotationValue::Void
+}
+
+fn clone_annotation_value_iterative(root: &AnnotationValue) -> AnnotationValue {
+    if let Some(leaf) = try_clone_leaf_annotation_value(root) {
+        return leaf;
+    }
+    let init = match root {
+        AnnotationValue::Annotation(inner) => AnnCloneFrame::Ann {
+            class_descriptor: inner.class_descriptor,
+            elems: &inner.elements,
+            next_idx: 0,
+            pending_name: None,
+            built: Vec::with_capacity(inner.elements.len()),
+        },
+        AnnotationValue::Array { tag, values } => AnnCloneFrame::Arr {
+            tag: *tag,
+            vals: values,
+            next_idx: 0,
+            built: Vec::with_capacity(values.len()),
+        },
+        _ => unreachable!(),
+    };
+    run_ann_clone_stack(vec![init])
+}
+
+impl Clone for AnnotationValue {
+    fn clone(&self) -> Self {
+        clone_annotation_value_iterative(self)
+    }
+}
+
+impl Clone for AnnotationElem {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name,
+            value: clone_annotation_value_iterative(&self.value),
+        }
+    }
+}
+
+impl Clone for Annotation {
+    fn clone(&self) -> Self {
+        let mut elements = Vec::with_capacity(self.elements.len());
+        for elem in &self.elements {
+            elements.push(AnnotationElem {
+                name: elem.name,
+                value: clone_annotation_value_iterative(&elem.value),
+            });
+        }
+        Self {
+            class_descriptor: self.class_descriptor,
+            elements,
+        }
+    }
+}
+
+fn eq_annotation_value_pairs<'a>(
+    mut stack: Vec<(&'a AnnotationValue, &'a AnnotationValue)>,
+) -> bool {
+    while let Some((lhs, rhs)) = stack.pop() {
+        match (lhs, rhs) {
+            (AnnotationValue::Bool(a), AnnotationValue::Bool(b)) if a == b => {}
+            (AnnotationValue::I8(a), AnnotationValue::I8(b)) if a == b => {}
+            (AnnotationValue::U8(a), AnnotationValue::U8(b)) if a == b => {}
+            (AnnotationValue::I16(a), AnnotationValue::I16(b)) if a == b => {}
+            (AnnotationValue::U16(a), AnnotationValue::U16(b)) if a == b => {}
+            (AnnotationValue::I32(a), AnnotationValue::I32(b)) if a == b => {}
+            (AnnotationValue::U32(a), AnnotationValue::U32(b)) if a == b => {}
+            (AnnotationValue::I64(a), AnnotationValue::I64(b)) if a == b => {}
+            (AnnotationValue::U64(a), AnnotationValue::U64(b)) if a == b => {}
+            (AnnotationValue::F32(a), AnnotationValue::F32(b)) if a == b => {}
+            (AnnotationValue::F64(a), AnnotationValue::F64(b)) if a == b => {}
+            (AnnotationValue::String(a), AnnotationValue::String(b)) if a == b => {}
+            (AnnotationValue::Record(a), AnnotationValue::Record(b)) if a == b => {}
+            (
+                AnnotationValue::Method {
+                    name: na,
+                    method: ma,
+                    offset: oa,
+                },
+                AnnotationValue::Method {
+                    name: nb,
+                    method: mb,
+                    offset: ob,
+                },
+            ) if na == nb && ma == mb && oa == ob => {}
+            (
+                AnnotationValue::Enum {
+                    name: na,
+                    field: fa,
+                    offset: oa,
+                },
+                AnnotationValue::Enum {
+                    name: nb,
+                    field: fb,
+                    offset: ob,
+                },
+            ) if na == nb && fa == fb && oa == ob => {}
+            (AnnotationValue::MethodHandle(a), AnnotationValue::MethodHandle(b)) if a == b => {}
+            (AnnotationValue::LiteralArray(a), AnnotationValue::LiteralArray(b)) if a == b => {}
+            (AnnotationValue::Void, AnnotationValue::Void)
+            | (AnnotationValue::StringNullptr, AnnotationValue::StringNullptr) => {}
+            (AnnotationValue::Annotation(a), AnnotationValue::Annotation(b)) => {
+                if a.class_descriptor != b.class_descriptor || a.elements.len() != b.elements.len()
+                {
+                    return false;
+                }
+                for (le, re) in a.elements.iter().zip(&b.elements) {
+                    if le.name != re.name {
+                        return false;
+                    }
+                    stack.push((&le.value, &re.value));
+                }
+            }
+            (
+                AnnotationValue::Array {
+                    tag: ta,
+                    values: va,
+                },
+                AnnotationValue::Array {
+                    tag: tb,
+                    values: vb,
+                },
+            ) => {
+                if ta != tb || va.len() != vb.len() {
+                    return false;
+                }
+                for (lv, rv) in va.iter().zip(vb) {
+                    stack.push((lv, rv));
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+impl PartialEq for AnnotationValue {
+    fn eq(&self, other: &Self) -> bool {
+        eq_annotation_value_pairs(vec![(self, other)])
+    }
+}
+
+impl PartialEq for AnnotationElem {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && eq_annotation_value_pairs(vec![(&self.value, &other.value)])
+    }
+}
+
+impl PartialEq for Annotation {
+    fn eq(&self, other: &Self) -> bool {
+        if self.class_descriptor != other.class_descriptor
+            || self.elements.len() != other.elements.len()
+        {
+            return false;
+        }
+        let mut stack = Vec::with_capacity(self.elements.len());
+        for (le, re) in self.elements.iter().zip(&other.elements) {
+            if le.name != re.name {
+                return false;
+            }
+            stack.push((&le.value, &re.value));
+        }
+        eq_annotation_value_pairs(stack)
+    }
+}
+
+enum AnnDebugStep<'a> {
+    Str(&'static str),
+    Ann(&'a Annotation),
+    Elem(&'a AnnotationElem),
+    Value(&'a AnnotationValue),
+    ElemSlice {
+        slice: &'a [AnnotationElem],
+        idx: usize,
+    },
+    ValSlice {
+        slice: &'a [AnnotationValue],
+        idx: usize,
+    },
+}
+
+fn fmt_annotation_debug(
+    mut stack: Vec<AnnDebugStep<'_>>,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    while let Some(step) = stack.pop() {
+        match step {
+            AnnDebugStep::Str(s) => f.write_str(s)?,
+            AnnDebugStep::Ann(ann) => {
+                write!(
+                    f,
+                    "Annotation {{ class_descriptor: {:?}, elements: [",
+                    ann.class_descriptor
+                )?;
+                stack.push(AnnDebugStep::Str("] }"));
+                stack.push(AnnDebugStep::ElemSlice {
+                    slice: &ann.elements,
+                    idx: 0,
+                });
+            }
+            AnnDebugStep::Elem(elem) => {
+                write!(f, "AnnotationElem {{ name: {:?}, value: ", elem.name)?;
+                stack.push(AnnDebugStep::Str(" }"));
+                stack.push(AnnDebugStep::Value(&elem.value));
+            }
+            AnnDebugStep::ElemSlice { slice, idx } => {
+                if idx < slice.len() {
+                    if idx > 0 {
+                        f.write_str(", ")?;
+                    }
+                    stack.push(AnnDebugStep::ElemSlice {
+                        slice,
+                        idx: idx + 1,
+                    });
+                    stack.push(AnnDebugStep::Elem(&slice[idx]));
+                }
+            }
+            AnnDebugStep::ValSlice { slice, idx } => {
+                if idx < slice.len() {
+                    if idx > 0 {
+                        f.write_str(", ")?;
+                    }
+                    stack.push(AnnDebugStep::ValSlice {
+                        slice,
+                        idx: idx + 1,
+                    });
+                    stack.push(AnnDebugStep::Value(&slice[idx]));
+                }
+            }
+            AnnDebugStep::Value(val) => match val {
+                AnnotationValue::Bool(v) => write!(f, "Bool({v:?})")?,
+                AnnotationValue::I8(v) => write!(f, "I8({v:?})")?,
+                AnnotationValue::U8(v) => write!(f, "U8({v:?})")?,
+                AnnotationValue::I16(v) => write!(f, "I16({v:?})")?,
+                AnnotationValue::U16(v) => write!(f, "U16({v:?})")?,
+                AnnotationValue::I32(v) => write!(f, "I32({v:?})")?,
+                AnnotationValue::U32(v) => write!(f, "U32({v:?})")?,
+                AnnotationValue::I64(v) => write!(f, "I64({v:?})")?,
+                AnnotationValue::U64(v) => write!(f, "U64({v:?})")?,
+                AnnotationValue::F32(v) => write!(f, "F32({v:?})")?,
+                AnnotationValue::F64(v) => write!(f, "F64({v:?})")?,
+                AnnotationValue::String(v) => write!(f, "String({v:?})")?,
+                AnnotationValue::Record(v) => write!(f, "Record({v:?})")?,
+                AnnotationValue::Method {
+                    name,
+                    method,
+                    offset,
+                } => write!(
+                    f,
+                    "Method {{ name: {name:?}, method: {method:?}, offset: {offset:?} }}"
+                )?,
+                AnnotationValue::Enum {
+                    name,
+                    field,
+                    offset,
+                } => write!(
+                    f,
+                    "Enum {{ name: {name:?}, field: {field:?}, offset: {offset:?} }}"
+                )?,
+                AnnotationValue::MethodHandle(mh) => write!(f, "MethodHandle({mh:?})")?,
+                AnnotationValue::LiteralArray(vals) => write!(f, "LiteralArray({vals:?})")?,
+                AnnotationValue::Void => f.write_str("Void")?,
+                AnnotationValue::StringNullptr => f.write_str("StringNullptr")?,
+                AnnotationValue::Annotation(inner) => {
+                    f.write_str("Annotation(")?;
+                    stack.push(AnnDebugStep::Str(")"));
+                    stack.push(AnnDebugStep::Ann(inner));
+                }
+                AnnotationValue::Array { tag, values } => {
+                    write!(f, "Array {{ tag: {tag:?}, values: [")?;
+                    stack.push(AnnDebugStep::Str("] }"));
+                    stack.push(AnnDebugStep::ValSlice {
+                        slice: values,
+                        idx: 0,
+                    });
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+impl fmt::Debug for AnnotationValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_annotation_debug(vec![AnnDebugStep::Value(self)], f)
+    }
+}
+
+impl fmt::Debug for AnnotationElem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_annotation_debug(vec![AnnDebugStep::Elem(self)], f)
+    }
+}
+
+impl fmt::Debug for Annotation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_annotation_debug(vec![AnnDebugStep::Ann(self)], f)
+    }
 }
 
 #[cfg(test)]

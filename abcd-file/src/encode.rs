@@ -515,12 +515,27 @@ impl Builder {
 
     /// Seal staged param annotations into a `ParamAnnotationsItem`
     /// (`is_runtime`: `false` = compile-time `PARAM_ANNOTATION`, `true` =
-    /// runtime `RUNTIME_PARAM_ANNOTATION`). The vendored `MethodParamItem`
-    /// keeps a single annotation vector per param; sealing snapshots whatever
-    /// is staged at that moment.
-    pub fn method_seal_param_annotations(&mut self, m: MethodHandle, is_runtime: bool) {
+    /// runtime `RUNTIME_PARAM_ANNOTATION`). `AbcBuilder` maintains independent
+    /// staging buckets for compile-time vs. runtime parameter annotations.
+    pub fn method_seal_param_annotations(
+        &mut self,
+        m: MethodHandle,
+        is_runtime: bool,
+    ) -> Result<(), Error> {
         // SAFETY: `self.raw` is live; `m.0` is bounds-checked in C++.
-        unsafe { sys::abc_builder_method_seal_param_annotations(self.raw, m.0, is_runtime as i32) };
+        if unsafe {
+            sys::abc_builder_method_seal_param_annotations(self.raw, m.0, is_runtime as i32)
+        } == 0
+        {
+            return Err(Error::Malformed {
+                field: "param_annotations",
+                context: format!(
+                    "invalid method handle {} when sealing param annotations",
+                    m.0
+                ),
+            });
+        }
+        Ok(())
     }
 
     // --- Fields ---
@@ -1490,7 +1505,6 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
     let mut deferred_field_values: Vec<(FieldHandle, &FieldValue)> = Vec::new();
     let mut deferred_ann_las: Vec<(LiteralArrayHandle, Vec<LiteralValue>)> = Vec::new();
     let mut ann_la_counter: u32 = 0;
-    let ann_la_base = count_annotation_literal_arrays(file);
 
     // First pass: foreign classes
     for (&desc, cls) in &file.classes {
@@ -1746,8 +1760,10 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                 Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
                 Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
                 Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
-                Some(FieldValue::JsonFileContent { content, .. }) => {
-                    let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
+                Some(
+                    FieldValue::String(sid) | FieldValue::JsonFileContent { content: sid, .. },
+                ) => {
+                    let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *sid)?;
                     b.field_set_value_string(field_h, sh)?;
                 }
                 Some(
@@ -1759,6 +1775,14 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
             }
         }
     }
+
+    // Pre-create model `literal_handles` BEFORE encoding annotations so model
+    // literal arrays occupy `header.literalarray_idx[0..file.literal_arrays.len()]`
+    // (`LiteralValue::LiteralBufferIndex` stability on `<= 12.0.6.0`), while
+    // annotation-embedded literal arrays follow after them.
+    let literal_handles: Vec<_> = (0..file.literal_arrays.len())
+        .map(|index| b.add_literal_array(&index.to_string()))
+        .collect();
 
     // --- Attach annotations now that all MethodHandles & FieldHandles exist ---
     let mut flat_method_idx = 0usize;
@@ -1818,7 +1842,6 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                     param_handles.push(b.method_add_param_ex(method_h, ty, ref_cls));
                 }
 
-                let seal_as_runtime = !has_compile;
                 let mut ctx = AnnotationEncodeCtx {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
@@ -1827,25 +1850,24 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                     deferred_ann_las: &mut deferred_ann_las,
                     pool,
                 };
-                for (idx, param_h) in param_handles.iter().enumerate() {
-                    let staged: Vec<&Annotation> = if seal_as_runtime {
-                        pa.runtime.get(idx).into_iter().flatten().collect()
-                    } else {
-                        pa.compile_time
-                            .get(idx)
-                            .into_iter()
-                            .flatten()
-                            .chain(pa.runtime.get(idx).into_iter().flatten().filter(|ra| {
-                                !pa.compile_time.get(idx).is_some_and(|c| c.contains(*ra))
-                            }))
-                            .collect()
-                    };
-                    for ann in staged {
-                        let ann_h = encode_single_annotation(&mut b, &mut ctx, ann)?;
-                        b.method_param_add_annotation(method_h, *param_h, ann_h);
+                if has_compile {
+                    for (idx, param_h) in param_handles.iter().enumerate() {
+                        for ann in pa.compile_time.get(idx).into_iter().flatten() {
+                            let ann_h = encode_single_annotation(&mut b, &mut ctx, ann)?;
+                            b.method_param_add_annotation(method_h, *param_h, ann_h);
+                        }
                     }
+                    b.method_seal_param_annotations(method_h, false)?;
                 }
-                b.method_seal_param_annotations(method_h, seal_as_runtime);
+                if has_runtime {
+                    for (idx, param_h) in param_handles.iter().enumerate() {
+                        for ann in pa.runtime.get(idx).into_iter().flatten() {
+                            let ann_h = encode_single_annotation(&mut b, &mut ctx, ann)?;
+                            b.method_param_add_runtime_annotation(method_h, *param_h, ann_h);
+                        }
+                    }
+                    b.method_seal_param_annotations(method_h, true)?;
+                }
             }
         }
 
@@ -1889,9 +1911,6 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
     }
 
     // --- Literal array contents ---
-    let literal_handles: Vec<_> = (0..file.literal_arrays.len())
-        .map(|index| b.add_literal_array(&index.to_string()))
-        .collect();
     {
         let mut lit_ctx = LiteralEncodeCtx {
             string_handles: &mut string_handles,
@@ -1907,8 +1926,8 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
         for (i, (la, &la_h)) in file.literal_arrays.iter().zip(&literal_handles).enumerate() {
             debug_assert_eq!(
                 la_h.as_raw(),
-                ann_la_base + i as u32,
-                "model literal-array handles must follow annotation-embedded ones"
+                i as u32,
+                "model literal-array handles must occupy 0..file.literal_arrays.len()"
             );
             for val in &la.values {
                 encode_literal_value(&mut b, &mut lit_ctx, la_h, val)?;
@@ -2196,83 +2215,6 @@ fn validate_literal_array_graph(literal_arrays: &[LiteralArray]) -> Result<(), E
         }
     }
     Ok(())
-}
-
-fn count_annotation_literal_arrays(file: &File) -> u32 {
-    fn push_annotations<'a>(a: &'a Annotations, stack: &mut Vec<&'a AnnotationValue>) {
-        for ann in a
-            .compile_time
-            .iter()
-            .chain(a.runtime.iter())
-            .chain(a.compile_time_type.iter())
-            .chain(a.runtime_type.iter())
-        {
-            for e in &ann.elements {
-                stack.push(&e.value);
-            }
-        }
-    }
-
-    let mut stack: Vec<&AnnotationValue> = Vec::new();
-
-    for class in file.classes.values() {
-        push_annotations(&class.annotations, &mut stack);
-        for method in &class.methods {
-            push_annotations(&method.annotations, &mut stack);
-            let pa = &method.param_annotations;
-            let has_compile = pa.compile_time.iter().any(|v| !v.is_empty());
-            let has_runtime = pa.runtime.iter().any(|v| !v.is_empty());
-            if !method.is_external && (has_compile || has_runtime) {
-                let num_params = method
-                    .arg_types
-                    .len()
-                    .max(pa.compile_time.len())
-                    .max(pa.runtime.len());
-                let seal_as_runtime = !has_compile;
-                for idx in 0..num_params {
-                    if seal_as_runtime {
-                        for ann in pa.runtime.get(idx).into_iter().flatten() {
-                            for e in &ann.elements {
-                                stack.push(&e.value);
-                            }
-                        }
-                    } else {
-                        for ann in pa.compile_time.get(idx).into_iter().flatten().chain(
-                            pa.runtime.get(idx).into_iter().flatten().filter(|ra| {
-                                !pa.compile_time.get(idx).is_some_and(|c| c.contains(*ra))
-                            }),
-                        ) {
-                            for e in &ann.elements {
-                                stack.push(&e.value);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for field in &class.fields {
-            push_annotations(&field.annotations, &mut stack);
-        }
-    }
-
-    let mut count: u32 = 0;
-    while let Some(v) = stack.pop() {
-        match v {
-            AnnotationValue::LiteralArray(_) => count += 1,
-            AnnotationValue::Annotation(a) => {
-                for e in &a.elements {
-                    stack.push(&e.value);
-                }
-            }
-            AnnotationValue::Array { values, .. } => {
-                for item in values {
-                    stack.push(item);
-                }
-            }
-            _ => {}
-        }
-    }
-    count
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,65 +3148,138 @@ fn encode_literal_value(
             b.literal_array_add_u8(la, LiteralTag::NullValue as u8);
             b.literal_array_add_u8(la, *v);
         }
-        LiteralValue::ArrayU1(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayU1(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU1 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u8(la, u8::from(x));
+            }
         }
-        LiteralValue::ArrayU8(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayU8(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU8 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u8(la, x);
+            }
         }
-        LiteralValue::ArrayI8(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayI8(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI8 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u8(la, x as u8);
+            }
         }
-        LiteralValue::ArrayU16(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayU16(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU16 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u16(la, x);
+            }
         }
-        LiteralValue::ArrayI16(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayI16(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI16 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u16(la, x as u16);
+            }
         }
-        LiteralValue::ArrayU32(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayU32(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU32 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u32(la, x);
+            }
         }
-        LiteralValue::ArrayI32(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayI32(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI32 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u32(la, x as u32);
+            }
         }
-        LiteralValue::ArrayU64(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayU64(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayU64 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u64(la, x);
+            }
         }
-        LiteralValue::ArrayI64(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayI64(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayI64 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u64(la, x as u64);
+            }
         }
-        LiteralValue::ArrayF32(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayF32(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayF32 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u32(la, x.to_bits());
+            }
         }
-        LiteralValue::ArrayF64(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayF64(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayF64 as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &x in elems {
+                b.literal_array_add_u64(la, x.to_bits());
+            }
         }
-        LiteralValue::ArrayString(idx) => {
-            check_la_idx(*idx)?;
+        LiteralValue::ArrayString(elems) => {
+            let n = u32::try_from(elems.len()).map_err(|_| Error::Malformed {
+                field: "literal_array",
+                context: "typed literal array length overflows u32".into(),
+            })?;
             b.literal_array_add_u8(la, LiteralTag::ArrayString as u8);
-            b.literal_array_add_u32(la, 0);
+            b.literal_array_add_u32(la, n);
+            for &sid in elems {
+                let sh = get_or_add_string_id(b, ctx.string_handles, ctx.pool, sid)?;
+                b.literal_array_add_raw_string(la, sh);
+            }
         }
     }
     Ok(())

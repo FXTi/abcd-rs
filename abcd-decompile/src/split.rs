@@ -10,21 +10,22 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 
+use abcd_analysis::OhmUrl;
 use abcd_ir::consts::Const;
 use abcd_ir::id::{ClassId, FuncId};
-use abcd_ir::module::{ClassData, EsModule, ExportDecl, FunctionKind, ImportDecl, Module};
+use abcd_ir::module::{ClassData, EsModule, ExportDecl, FunctionKind, Module};
 use abcd_ir::op::{ModuleVarKind, Op};
 use rayon::prelude::*;
 
 use crate::consts::{render_pool_string, render_sym_string, sym_str};
 use crate::emit::{
     DecompileStats, EmitOptions, Emitter, MAX_BATCH_PREPARED_FUNCS, PreparedFunc,
-    collect_orphans_for_funcs, consumed_functions, func_may_have_orphan_lexenv,
-    index_has_fallback_module_slot, merge_fold_stats, merge_struct_stats, module_facing_name,
+    accumulate_decompile_stats, collect_orphans_for_funcs, consumed_functions, emit_esm_imports,
+    func_may_have_orphan_lexenv, index_has_fallback_module_slot, module_facing_name,
     next_bounded_top_batch, orphan_lexenv_names_in_func, prepare_func, prepare_func_only,
     try_extend_batch_funcs,
 };
-use crate::legalize::{Legalizer, is_legal_ident, sanitize};
+use crate::legalize::{Legalizer, sanitize};
 use crate::names::{DecompileIndex, module_slot_fallback};
 use crate::recover::recover_func_with_index;
 
@@ -96,23 +97,18 @@ pub fn normalize_record_path(descriptor: &str, is_json: bool, ext: &str) -> Opti
     if SYNTHETIC_DESCRIPTORS.contains(&descriptor) {
         return None;
     }
-    let raw = strip_descriptor(descriptor);
+    let raw = OhmUrl::strip_descriptor(descriptor);
     if raw.is_empty() {
         return None;
     }
-    // External system/SDK stub descriptors (`@ohos.app`, `@system.router`, `@kit.*`)
-    // are foreign references, not bundled user files.
-    if raw.starts_with("@ohos.")
-        || raw.starts_with("@ohos:")
-        || raw.starts_with("@system.")
-        || raw.starts_with("@system:")
-        || raw.starts_with("@kit.")
-        || raw.starts_with("@arkts.")
-    {
+    // External system/SDK/native stub descriptors (`@ohos.*`, `@hms:*`, `@kit.*`,
+    // `@arkts.*`, `@system.*`, `@native:*`, `@normalized:Y&...`) are foreign
+    // references, not bundled user files.
+    if OhmUrl::is_sdk_specifier(raw) {
         return None;
     }
 
-    let logical = peel_ohmurl(raw);
+    let logical = OhmUrl::peel_import_path(raw);
     let mut segments = Vec::new();
     for part in logical.split(['/', '\\']) {
         let trimmed = part.trim();
@@ -152,35 +148,6 @@ pub fn normalize_record_path(descriptor: &str, is_json: bool, ext: &str) -> Opti
         *seg = escape_windows_reserved_segment(seg);
     }
     Some(segments.join("/"))
-}
-
-fn strip_descriptor(desc: &str) -> &str {
-    desc.strip_prefix('L')
-        .and_then(|s| s.strip_suffix(';'))
-        .unwrap_or(desc)
-}
-
-/// Unwrap OHMUrl record prefixes (`@bundle:...`, `@package:...`, `@normalized:...`)
-/// into their underlying logical module path.
-fn peel_ohmurl(raw: &str) -> &str {
-    if let Some(rest) = raw.strip_prefix("@bundle:") {
-        return rest;
-    }
-    if let Some(rest) = raw.strip_prefix("@package:") {
-        return rest;
-    }
-    if let Some(rest) = raw.strip_prefix("@normalized:") {
-        // `@normalized:<isNative>&<moduleName>&<bundleName>/<importPath>&<version>`
-        let parts: Vec<&str> = rest.split('&').collect();
-        if parts.len() >= 4 && !parts[3].is_empty() {
-            return parts[3];
-        }
-        if parts.len() >= 3 && !parts[2].is_empty() {
-            return parts[2];
-        }
-        return rest;
-    }
-    raw
 }
 
 fn sanitize_path_segment(seg: &str) -> String {
@@ -347,7 +314,7 @@ where
         };
 
         let rel_path = disambiguate_path(base_path, &mut used_paths);
-        let record_name = strip_descriptor(&desc).to_string();
+        let record_name = OhmUrl::strip_descriptor(&desc).to_string();
         let kind = if is_json {
             SplitFileKind::Json
         } else if has_esm {
@@ -554,6 +521,7 @@ where
                 hoisted: BTreeSet::new(),
                 prepared: std::mem::take(&mut batch_prepared),
                 emitting_funcs: HashSet::new(),
+                arkui_components: HashMap::new(),
             };
 
             let text = emit_single_record(
@@ -572,7 +540,7 @@ where
             );
             batch_prepared = std::mem::take(&mut em.prepared);
             let file_stats = em.stats;
-            accumulate_stats(&mut total_stats, &file_stats);
+            accumulate_decompile_stats(&mut total_stats, &file_stats);
             on_file(SplitFile {
                 rel_path: plan.rel_path.clone(),
                 record_name: plan.record_name.clone(),
@@ -639,7 +607,12 @@ fn candidate_record_keys(record_name: &str, rel_path: &str) -> Vec<String> {
     // Dotted hvigor package descriptor (`com.example.app.entry.ets.pages.Index`
     // or `pkg_modules..ohpm...`): normalize `.` runs into `/` paths when
     // unambiguous for `@package:` / `@bundle:` matching.
-    keys.push(peel_ohmurl(record_name).to_string());
+    keys.push(OhmUrl::peel_import_path(record_name).to_string());
+    if let Some(u) = OhmUrl::parse(record_name)
+        && !u.bundle_name.is_empty()
+    {
+        keys.push(format!("{}/{}", u.bundle_name, u.import_path));
+    }
     keys
 }
 
@@ -698,56 +671,23 @@ fn emit_single_record(
         }
     };
 
-    // 1. Imports (plus side-effect-only module requests).
-    let mut referenced_requests = BTreeSet::new();
+    let record_env = em
+        .index
+        .and_then(|idx| idx.per_class_env.as_ref())
+        .and_then(|m| m.get(&cid));
+
+    // 1. Imports (plus side-effect-only module requests in exact `module_requests` order).
     if let Some(esm) = esm {
-        for imp in &esm.imports {
-            match imp {
-                ImportDecl::Regular {
-                    local_name,
-                    import_name,
-                    module_request,
-                } => {
-                    referenced_requests.insert(*module_request);
-                    let local = sanitize(&sym_str(module, *local_name));
-                    let import = module_facing_name(&sym_str(module, *import_name));
-                    let spec = resolve_spec(*module_request);
-                    em.fn_names.reserve(&local);
-                    if import == "default" && is_legal_ident(&local) {
-                        out.push_str(&format!("import {local} from {spec};\n"));
-                    } else if local == import {
-                        out.push_str(&format!("import {{ {local} }} from {spec};\n"));
-                    } else {
-                        out.push_str(&format!("import {{ {import} as {local} }} from {spec};\n"));
-                    }
-                }
-                ImportDecl::Namespace {
-                    local_name,
-                    module_request,
-                } => {
-                    referenced_requests.insert(*module_request);
-                    let local = sanitize(&sym_str(module, *local_name));
-                    let spec = resolve_spec(*module_request);
-                    em.fn_names.reserve(&local);
-                    out.push_str(&format!("import * as {local} from {spec};\n"));
-                }
-            }
-        }
-        for exp in &esm.exports {
-            match exp {
-                ExportDecl::Indirect { module_request, .. }
-                | ExportDecl::Star { module_request } => {
-                    referenced_requests.insert(*module_request);
-                }
-                ExportDecl::Local { .. } => {}
-            }
-        }
-        for req in &esm.module_requests {
-            if !referenced_requests.contains(&req.specifier) {
-                let spec = resolve_spec(req.specifier);
-                out.push_str(&format!("import {spec};\n"));
-            }
-        }
+        emit_esm_imports(
+            module,
+            &esm.imports,
+            &esm.exports,
+            &esm.module_requests,
+            record_env.map(|env| env.import_locals.as_slice()),
+            &mut em.fn_names,
+            &resolve_spec,
+            &mut out,
+        );
     }
 
     // 2. Global store hoists scoped strictly to this record's functions.
@@ -819,10 +759,6 @@ fn emit_single_record(
         em.fn_names.reserve(sname);
     }
 
-    let record_env = em
-        .index
-        .and_then(|idx| idx.per_class_env.as_ref())
-        .and_then(|m| m.get(&cid));
     let mut declared_locals = arkui_structs;
     for s in &local_slots {
         let name = record_env
@@ -889,6 +825,9 @@ fn emit_single_record(
             em.prepared = prepared_batch.into_iter().collect();
 
             for &f in chunk {
+                if opts.arkui {
+                    crate::arkui::precompute_arkui_components(em, f);
+                }
                 if opts.arkui
                     && !opts.call_entry
                     && module
@@ -904,9 +843,13 @@ fn emit_single_record(
                 }
             }
             em.prepared.clear();
+            em.arkui_components.clear();
         }
     } else {
         for &f in top_funcs {
+            if opts.arkui {
+                crate::arkui::precompute_arkui_components(em, f);
+            }
             if opts.arkui
                 && !opts.call_entry
                 && module
@@ -940,7 +883,7 @@ fn emit_single_record(
                         record_env,
                         &sym_str(module, *local_name),
                     );
-                    let export = module_facing_name(&sym_str(module, *export_name));
+                    let export = module_facing_name(module, &sym_str(module, *export_name));
                     if local == export {
                         out.push_str(&format!("export {{ {local} }};\n"));
                     } else {
@@ -952,8 +895,8 @@ fn emit_single_record(
                     import_name,
                     module_request,
                 } => {
-                    let import = module_facing_name(&sym_str(module, *import_name));
-                    let export = module_facing_name(&sym_str(module, *export_name));
+                    let import = module_facing_name(module, &sym_str(module, *import_name));
+                    let export = module_facing_name(module, &sym_str(module, *export_name));
                     let spec = resolve_spec(*module_request);
                     out.push_str(&format!("export {{ {import} as {export} }} from {spec};\n"));
                 }
@@ -992,19 +935,27 @@ fn rewrite_specifier(
         return None;
     }
 
-    if !(raw.starts_with("@bundle:")
-        || raw.starts_with("@package:")
-        || raw.starts_with("@normalized:"))
-    {
+    let parsed_ohm = OhmUrl::parse(raw)?;
+    if !parsed_ohm.is_internal_bundle_url() {
         return None;
     }
 
-    let peeled = peel_ohmurl(raw);
-    let lookup_candidates = [
+    let peeled = parsed_ohm.import_path;
+    let mut lookup_candidates = vec![
         peeled.to_string(),
         peeled.replace('@', "/"),
         strip_known_ext(peeled).to_string(),
     ];
+    if !parsed_ohm.bundle_name.is_empty() {
+        let with_bundle = format!("{}/{}", parsed_ohm.bundle_name, peeled);
+        lookup_candidates.push(strip_known_ext(&with_bundle).to_string());
+        lookup_candidates.push(with_bundle);
+    }
+    if !parsed_ohm.module_name.is_empty() && !peeled.starts_with(parsed_ohm.module_name) {
+        let with_mod = format!("{}/{}", parsed_ohm.module_name, peeled);
+        lookup_candidates.push(strip_known_ext(&with_mod).to_string());
+        lookup_candidates.push(with_mod);
+    }
     let target_idx = lookup_candidates
         .iter()
         .find_map(|k| spec_to_idx.get(k).copied())?;
@@ -1060,21 +1011,4 @@ fn relative_posix_path(from_file: &str, to_target: &str) -> String {
         out.push(seg.to_string());
     }
     out.join("/")
-}
-
-fn accumulate_stats(dst: &mut DecompileStats, src: &DecompileStats) {
-    dst.functions += src.functions;
-    dst.functions_with_fallbacks += src.functions_with_fallbacks;
-    for (&k, &v) in &src.fallback_comments {
-        *dst.fallback_comments.entry(k).or_insert(0) += v;
-    }
-    for (&k, &v) in &src.elided_comments {
-        *dst.elided_comments.entry(k).or_insert(0) += v;
-    }
-    dst.classes += src.classes;
-    dst.class_methods += src.class_methods;
-    dst.closures += src.closures;
-    dst.structure = merge_struct_stats(std::mem::take(&mut dst.structure), &src.structure);
-    dst.folds = merge_fold_stats(std::mem::take(&mut dst.folds), &src.folds);
-    dst.function_bodies += src.function_bodies;
 }

@@ -317,7 +317,8 @@ pub(in crate::folds) fn agen_entry_elide(
                 stack.push(otherwise);
                 stack.push(then);
             }
-            SNode::While { body, .. }
+            SNode::Block(body)
+            | SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
@@ -400,7 +401,7 @@ fn agen_fold_seq_inner(
                 );
             }
         }
-        agen_fold_multi_run_explicit_returns(seq, &cx.aliases, stats);
+        agen_fold_multi_run_explicit_returns(seq, &cx.aliases, &cx.uses, stats);
         let mut i = 0;
         while i + 1 < seq.len() {
             if let Some(site) = match_ag_yield_inner(seq, i, cx, bool_env) {
@@ -647,6 +648,9 @@ fn agen_fold_run_inner(
     if value_id != &at {
         return;
     }
+    if uses.get(rv).copied().unwrap_or(1) > 1 || uses.get(&at).copied().unwrap_or(1) > 1 {
+        return;
+    }
     let awaited = (**x).clone();
     run.remove(ret_at);
     run.remove(j);
@@ -661,6 +665,7 @@ fn agen_fold_run_inner(
 fn agen_fold_multi_run_explicit_returns(
     nodes: &mut [SNode],
     aliases: &BTreeSet<ValueId>,
+    uses: &BTreeMap<ValueId, usize>,
     stats: &mut FoldStats,
 ) {
     use crate::folds::machines::async_fn::prev_non_phi_multi;
@@ -726,6 +731,9 @@ fn agen_fold_multi_run_explicit_returns(
             continue;
         };
         if *value_id != at {
+            continue;
+        }
+        if uses.get(&rt).copied().unwrap_or(1) > 1 || uses.get(&at).copied().unwrap_or(1) > 1 {
             continue;
         }
         let awaited = (**x).clone();

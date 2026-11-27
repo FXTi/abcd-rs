@@ -3154,3 +3154,605 @@ fn array_proto_mutator_preserves_own_named_method_shadow() {
     );
     assert_eq!(pop_ans.sites, oracle.query(pop_clo, at).sites);
 }
+
+#[test]
+fn prototype_inheritance_super_unmapped_args_lex_compat_private_escapes_and_singleton_gate() {
+    use crate::dataflow::heap::{UpdateKind, update_kind};
+
+    let inst_of = |m: &Module, v: ValueId| -> InstId {
+        match m.value(v).unwrap().def {
+            abcd_ir::ValueDef::Inst(i) => i,
+            other => panic!("expected inst: {other:?}"),
+        }
+    };
+
+    let mut m = mk_module();
+    let proto_sym = intern(&mut m, "prototype");
+    let inh_sym = intern(&mut m, "inheritedMethod");
+    let over_sym = intern(&mut m, "overridden");
+    let stat_sym = intern(&mut m, "staticFactory");
+    let late_sym = intern(&mut m, "lateProtoProp");
+    let tag_sym = intern(&mut m, "tag");
+
+    // 1. Prototype & static inheritance (`class Sub extends Base`):
+    //    - `Base`: `inheritedMethod`, `overridden` (`Base` version), `static staticFactory`,
+    //      plus `Base.prototype.lateProtoProp = late_obj` attached dynamically!
+    //    - `Sub extends Base`: overrides `overridden` (calling `super.overridden()`),
+    //      forwards `super()` in constructor.
+    let (base_ctor, _) = add_static_func(&mut m, "Base", 0);
+    {
+        let b_bc = entry_of(&m, base_ctor);
+        emit_void(&mut m, b_bc, Op::Return { value: None });
+    }
+
+    let (base_inh, _) = add_static_func(&mut m, "Base_inh", 0);
+    let base_inh_obj = {
+        let b_bi = entry_of(&m, base_inh);
+        let o = alloc_object(&mut m, b_bi);
+        emit_void(&mut m, b_bi, Op::Return { value: Some(o) });
+        o
+    };
+
+    let (base_over, _) = add_static_func(&mut m, "Base_over", 0);
+    let base_over_obj = {
+        let b_bo = entry_of(&m, base_over);
+        let o = alloc_object(&mut m, b_bo);
+        emit_void(&mut m, b_bo, Op::Return { value: Some(o) });
+        o
+    };
+
+    let (base_stat, _) = add_static_func(&mut m, "Base_stat", 0);
+    let base_stat_obj = {
+        let b_bs = entry_of(&m, base_stat);
+        let o = alloc_object(&mut m, b_bs);
+        emit_void(&mut m, b_bs, Op::Return { value: Some(o) });
+        o
+    };
+
+    let (sub_ctor, sub_ctor_p) = add_static_func(&mut m, "Sub", 0);
+    let call_super_ctor = {
+        let b = entry_of(&m, sub_ctor);
+        let c = push_inst(
+            &mut m,
+            b,
+            Op::Call {
+                callee: sub_ctor_p[0],
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Super,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+        c
+    };
+
+    let (sub_over, sub_over_p) = add_static_func(&mut m, "Sub_over", 0);
+    let (call_super_prop, super_ret_val) = {
+        let b = entry_of(&m, sub_over);
+        let sup_fn = emit(
+            &mut m,
+            b,
+            Op::LoadSuper {
+                key: abcd_ir::SuperKey::Name(over_sym),
+                this_value: sub_over_p[2],
+            },
+        );
+        let sr = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: sup_fn,
+                this: Some(sub_over_p[2]),
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        let call_sp = inst_of(&m, sr);
+        emit_void(&mut m, b, Op::Return { value: Some(sr) });
+        (call_sp, sr)
+    };
+
+    // 2. `GetUnmappedArgs` with ZERO declared formals receiving excess positional args!
+    let (var_fn, _) = add_static_func(&mut m, "var_fn", 0);
+    let var_elem_read = {
+        let b = entry_of(&m, var_fn);
+        let args_arr = emit(&mut m, b, Op::GetUnmappedArgs);
+        let idx1 = load_number(&mut m, b, 1.0);
+        let elem = emit(
+            &mut m,
+            b,
+            Op::LoadPropIdx {
+                object: args_arr,
+                index: idx1,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: Some(elem) });
+        elem
+    };
+
+    // 3. Lexical variable context/activation compatibility:
+    //    - `set_lex(v)` is called ONLY internally (`set_lex(child_written_obj)`);
+    //      its write into `func_main_0`'s `NewLexEnv` MUST NOT be dropped even though
+    //      `func_main_0` has `recorded_funcs == false`, AND its phantom `None` base
+    //      activation MUST NOT pollute `func_main_0`'s `GetLexVar` with `Obj::Unknown`!
+    //    - `dead_lex_writer(p)` is NEVER called and NEVER escaped; its `PutLexVar(p)`
+    //      MUST NOT pollute `func_main_0`'s `GetLexVar` with `Obj::Unknown`!
+    let (set_lex, set_lex_p) = add_static_func(&mut m, "set_lex", 1);
+    {
+        let b = entry_of(&m, set_lex);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: set_lex_p[3],
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    let (dead_lex, dead_lex_p) = add_static_func(&mut m, "dead_lex", 1);
+    {
+        let b = entry_of(&m, dead_lex);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: dead_lex_p[3],
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    // 4. Private field closure & getter closure escape:
+    //    - `priv_cb(p)` stored into private field `(0, 0)` on an `Obj::Unknown`
+    //      host object -> `priv_cb` must be marked externally invocable (`p` is `Unknown`),
+    //      while private field `(0, 1)` on a local `AllocObject` resolves precisely!
+    //    - `getter_cb(p)` attached via `DefineGetterSetterByValue` on a local `AllocObject`
+    //      -> `getter_cb` must ALSO be marked externally invocable!
+    let (priv_cb, priv_cb_p) = add_static_func(&mut m, "priv_cb", 1);
+    let priv_cb_param = {
+        let b = entry_of(&m, priv_cb);
+        emit_void(&mut m, b, Op::Return { value: None });
+        priv_cb_p[3]
+    };
+
+    let (getter_cb, getter_cb_p) = add_static_func(&mut m, "getter_cb", 1);
+    let getter_cb_param = {
+        let b = entry_of(&m, getter_cb);
+        emit_void(&mut m, b, Op::Return { value: None });
+        getter_cb_p[3]
+    };
+
+    // 5. Multi-call helper allocating an object: `query` has `sites.len() == 1`,
+    //    but `site_info_at` MUST gate strong updates (`UpdateKind::Weak`)!
+    let (multi_alloc, _) = add_static_func(&mut m, "multi_alloc", 0);
+    let multi_obj = {
+        let b = entry_of(&m, multi_alloc);
+        let o = alloc_object(&mut m, b);
+        emit_void(&mut m, b, Op::Return { value: Some(o) });
+        o
+    };
+
+    let main = add_func_named(&mut m, "func_main_0");
+    let b = entry_of(&m, main);
+
+    let c_inh_s = m.consts.intern(Const::String(inh_sym));
+    let c_inh_m = m.consts.intern(Const::method_ref(base_inh));
+    let c_over_s = m.consts.intern(Const::String(over_sym));
+    let c_bover_m = m.consts.intern(Const::method_ref(base_over));
+    let c_stat_s = m.consts.intern(Const::String(stat_sym));
+    let c_stat_m = m.consts.intern(Const::method_ref(base_stat));
+    let base_mem = m.consts.push_array(vec![
+        c_inh_s, c_inh_m, c_over_s, c_bover_m, c_stat_s, c_stat_m,
+    ]);
+    let base_cls = emit(
+        &mut m,
+        b,
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+            ctor: base_ctor,
+            heritage: None,
+            members: base_mem,
+            member_attrs: vec![
+                abcd_ir::MemberAttrs {
+                    is_static: false,
+                    kind: abcd_ir::FunctionKind::Function,
+                },
+                abcd_ir::MemberAttrs {
+                    is_static: false,
+                    kind: abcd_ir::FunctionKind::Function,
+                },
+                abcd_ir::MemberAttrs {
+                    is_static: true,
+                    kind: abcd_ir::FunctionKind::Function,
+                },
+            ],
+            count: 2,
+        })),
+    );
+
+    let c_sover_m = m.consts.intern(Const::method_ref(sub_over));
+    let sub_mem = m.consts.push_array(vec![c_over_s, c_sover_m]);
+    // Pass `base_cls` through a `Mov` to mimic dynamic expression evaluation.
+    let heritage_val = emit(&mut m, b, Op::Mov { src: base_cls });
+    let sub_cls = emit(
+        &mut m,
+        b,
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+            ctor: sub_ctor,
+            heritage: Some(heritage_val),
+            members: sub_mem,
+            member_attrs: vec![abcd_ir::MemberAttrs {
+                is_static: false,
+                kind: abcd_ir::FunctionKind::Function,
+            }],
+            count: 1,
+        })),
+    );
+
+    // Construct `new Sub()` BEFORE mutating `Base.prototype.lateProtoProp` to test
+    // bucket re-arm propagation down `Base.prototype -> Sub.prototype -> sub_inst`!
+    let sub_inst = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: sub_cls,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::New,
+        },
+    );
+    let base_proto = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: base_cls,
+            name: proto_sym,
+        },
+    );
+    let late_obj = alloc_object(&mut m, b);
+    emit_void(
+        &mut m,
+        b,
+        Op::StoreProp {
+            object: base_proto,
+            name: late_sym,
+            value: late_obj,
+        },
+    );
+
+    let inh_callee = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: sub_inst,
+            name: inh_sym,
+        },
+    );
+    let inh_ret = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: inh_callee,
+            this: Some(sub_inst),
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let call_inh = inst_of(&m, inh_ret);
+
+    let over_callee = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: sub_inst,
+            name: over_sym,
+        },
+    );
+    let over_ret = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: over_callee,
+            this: Some(sub_inst),
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let call_over = inst_of(&m, over_ret);
+
+    let stat_callee = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: sub_cls,
+            name: stat_sym,
+        },
+    );
+    let stat_ret = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: stat_callee,
+            this: Some(sub_cls),
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let call_stat = inst_of(&m, stat_ret);
+
+    let late_read = emit(
+        &mut m,
+        b,
+        Op::LoadProp {
+            object: sub_inst,
+            name: late_sym,
+        },
+    );
+
+    // Excess positional args into `var_fn(arg0, arg1)` (`0` declared formals).
+    let var_clo = closure_of(&mut m, b, var_fn);
+    let ex0 = alloc_object(&mut m, b);
+    let ex1 = alloc_object(&mut m, b);
+    let var_ret = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: var_clo,
+            this: None,
+            args: vec![ex0, ex1],
+            kind: CallKind::Dynamic,
+        },
+    );
+
+    // Lexical environment in `func_main_0` written by `func_main_0` AND `set_lex`,
+    // with `dead_lex` defined but never called.
+    let _env = new_lex_env(&mut m, b);
+    let lex_init_obj = alloc_object(&mut m, b);
+    let lex_child_obj = alloc_object(&mut m, b);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: lex_init_obj,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+    let set_lex_clo = closure_of(&mut m, b, set_lex);
+    let _dead_lex_clo = closure_of(&mut m, b, dead_lex);
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: set_lex_clo,
+            this: None,
+            args: vec![lex_child_obj],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let lex_read = emit(
+        &mut m,
+        b,
+        Op::GetLexVar {
+            level: 0,
+            slot: 0,
+            kind: abcd_ir::LexEnvKind::Plain,
+        },
+    );
+
+    // Private fields & getter escapes.
+    let host_unk = emit(
+        &mut m,
+        b,
+        Op::TryGetGlobal {
+            name: tag_sym,
+            default: None,
+        },
+    );
+    let priv_clo = closure_of(&mut m, b, priv_cb);
+    let int_call_arg = alloc_object(&mut m, b);
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: priv_clo,
+            this: None,
+            args: vec![int_call_arg],
+            kind: CallKind::Dynamic,
+        },
+    );
+    emit_void(
+        &mut m,
+        b,
+        Op::StorePrivate {
+            obj: host_unk,
+            level: 0,
+            slot: 0,
+            value: priv_clo,
+        },
+    );
+
+    let local_priv_holder = alloc_object(&mut m, b);
+    let priv_val_obj = alloc_object(&mut m, b);
+    emit_void(
+        &mut m,
+        b,
+        Op::DefinePrivate {
+            obj: local_priv_holder,
+            level: 0,
+            slot: 1,
+            value: priv_val_obj,
+        },
+    );
+    let priv_loaded = emit(
+        &mut m,
+        b,
+        Op::LoadPrivate {
+            obj: local_priv_holder,
+            level: 0,
+            slot: 1,
+        },
+    );
+
+    let getter_clo = closure_of(&mut m, b, getter_cb);
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: getter_clo,
+            this: None,
+            args: vec![int_call_arg],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let key_str = load_number(&mut m, b, 0.0);
+    let _ = emit(
+        &mut m,
+        b,
+        Op::DefineGetterSetterByValue {
+            obj: local_priv_holder,
+            key: key_str,
+            getter: getter_clo,
+            setter: key_str,
+            set_name: key_str,
+        },
+    );
+
+    // Call `multi_alloc` twice so `multi_obj` is NOT a concrete runtime singleton.
+    let ma_clo = closure_of(&mut m, b, multi_alloc);
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: ma_clo,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let _ = emit(
+        &mut m,
+        b,
+        Op::Call {
+            callee: ma_clo,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let ret_iid = emit_void(&mut m, b, Op::Return { value: None });
+
+    let out = run(&m);
+    let cg = out.graph();
+
+    // Inherited prototype method, subclass override (without Base pollution!),
+    // `super.overridden()` -> `Base_over`, `Sub.staticFactory()` -> `Base_stat`,
+    // and `super()` -> `Base`!
+    assert_eq!(
+        cg.edge_at(call_inh).unwrap().targets,
+        CallTargets::Resolved(vec![base_inh])
+    );
+    assert_eq!(
+        cg.edge_at(call_over).unwrap().targets,
+        CallTargets::Resolved(vec![sub_over]),
+        "Sub.overridden must shadow Base.overridden on Sub instances"
+    );
+    assert_eq!(
+        cg.edge_at(call_super_prop).unwrap().targets,
+        CallTargets::Resolved(vec![base_over])
+    );
+    assert_eq!(
+        cg.edge_at(call_stat).unwrap().targets,
+        CallTargets::Resolved(vec![base_stat])
+    );
+    assert_eq!(
+        cg.edge_at(call_super_ctor).unwrap().targets,
+        CallTargets::Resolved(vec![base_ctor])
+    );
+
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+
+    assert_eq!(
+        oracle.query(inh_ret, ret_iid).sites,
+        oracle.query(base_inh_obj, ret_iid).sites
+    );
+    assert_eq!(
+        oracle.query(super_ret_val, ret_iid).sites,
+        oracle.query(base_over_obj, ret_iid).sites
+    );
+    assert_eq!(
+        oracle.query(over_ret, ret_iid).sites,
+        oracle.query(base_over_obj, ret_iid).sites
+    );
+    assert_eq!(
+        oracle.query(stat_ret, ret_iid).sites,
+        oracle.query(base_stat_obj, ret_iid).sites
+    );
+    assert_eq!(
+        oracle.query(late_read, ret_iid).sites,
+        oracle.query(late_obj, ret_iid).sites
+    );
+
+    // `GetUnmappedArgs` receives both excess actuals `{ex0, ex1}` with `has_unknown == false`!
+    let var_ans = oracle.query(var_ret, ret_iid);
+    assert!(!var_ans.has_unknown, "{var_ans:?}");
+    let mut expected_var = oracle.query(ex0, ret_iid).sites;
+    expected_var.union_with(&oracle.query(ex1, ret_iid).sites);
+    assert_eq!(var_ans.sites, expected_var);
+    assert_eq!(oracle.query(var_elem_read, ret_iid).sites, expected_var);
+
+    // Lexical read sees `{lex_init_obj, lex_child_obj}` with `has_unknown == false`!
+    let lex_ans = oracle.query(lex_read, ret_iid);
+    assert!(
+        !lex_ans.has_unknown,
+        "lex read must exclude phantom/dead None activations: {lex_ans:?}"
+    );
+    let mut expected_lex = oracle.query(lex_init_obj, ret_iid).sites;
+    expected_lex.union_with(&oracle.query(lex_child_obj, ret_iid).sites);
+    assert_eq!(lex_ans.sites, expected_lex);
+
+    // Private field on local object resolves precisely; closures escaping via
+    // `StorePrivate` on `Obj::Unknown` or `DefineGetterSetterByValue` retain `has_unknown`.
+    let priv_load_ans = oracle.query(priv_loaded, ret_iid);
+    assert!(!priv_load_ans.has_unknown);
+    assert_eq!(
+        priv_load_ans.sites,
+        oracle.query(priv_val_obj, ret_iid).sites
+    );
+    assert!(
+        oracle.query(priv_cb_param, ret_iid).has_unknown,
+        "closure stored into private field of Unknown object must be marked escaped"
+    );
+    assert!(
+        oracle.query(getter_cb_param, ret_iid).has_unknown,
+        "getter closure attached via DefineGetterSetterByValue must be marked escaped"
+    );
+
+    // Concrete-singleton strong-update gate (`D5`):
+    // - `late_obj` in `func_main_0` top-level IS a concrete singleton -> `UpdateKind::Strong`!
+    // - `multi_obj` in twice-called `multi_alloc` is single-site locally (`query.is_single_precise()`),
+    //   but NOT a concrete runtime singleton -> `site_info_at` gates to `UpdateKind::Weak`!
+    assert_eq!(
+        update_kind(&oracle.site_info_at(late_obj, ret_iid)),
+        UpdateKind::Strong
+    );
+    assert!(oracle.query(multi_obj, ret_iid).is_single_precise());
+    assert!(
+        oracle
+            .query(multi_obj, ret_iid)
+            .as_concrete_singleton(oracle.singletons())
+            .is_none()
+    );
+    assert_eq!(
+        update_kind(&oracle.site_info_at(multi_obj, ret_iid)),
+        UpdateKind::Weak
+    );
+}

@@ -773,7 +773,7 @@ fn issue87_frame_slots_abi_and_bare_name_reservation() {
     // 1. StaticArkTS: static method has H=0 (`params[0]` is `p0`, NOT `this`);
     //    instance method has H=1 (`params[0]` is `this`, `params[1]` is `p0`).
     {
-        let mut m = Module::new();
+        let mut m = Module::with_dialect(abcd_ir::Dialect::StaticArkTS);
         let c_sym = m.sym.intern("LAoo;");
         let mut cls = ClassData::new(c_sym, c_sym);
         cls.source_lang = SourceLang::ArkTS;

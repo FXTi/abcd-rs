@@ -4,5 +4,6 @@ mod common;
 
 mod adversarial;
 mod containers;
+mod manifest;
 mod wild_ohos;
 mod zip_reader;

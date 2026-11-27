@@ -183,11 +183,7 @@ fn check_emitted(
     }
     for (&before_tag, (_, after)) in before_body_tags.iter().zip(redecoded.all_methods()) {
         let after_tag = body_state(&after.body);
-        let ok = match before_tag {
-            "no body" => after_tag == "no body",
-            _ => after_tag == "body",
-        };
-        if !ok {
+        if before_tag != after_tag {
             return Err(CliError::Tool(format!(
                 "{}: --check: method body presence changed ({before_tag} -> {after_tag})",
                 ctx(),
@@ -382,8 +378,8 @@ mod tests {
 
     #[test]
     fn check_emitted_rejects_unliftable_or_corrupt_bytes_with_tool_error() {
-        use abcd_file::{AccessFlags, Builder, CodeEntity, Type};
-        use abcd_isa::{Bytecode, EntityId, Imm};
+        use abcd_file::{AccessFlags, Builder, Type};
+        use abcd_isa::{Bytecode, Label};
 
         let ctx = || "rewrite probe (probe.abc)".to_string();
 
@@ -392,22 +388,15 @@ mod tests {
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("--check:"), "{err}");
 
-        // Valid `.abc` carrying `ldthisbyname` decodes and passes method/body
-        // parity, then fails `abcd_lift::lift_file` inside `--check`.
+        // Valid `.abc` carrying `jeqnull` decodes and passes method/body
+        // parity, then fails `abcd_lift::lift_file` inside `--check` (`ADR-07`).
         let mut b = Builder::new();
         b.set_api(12, "");
         let cls = b.add_global_class();
         let proto = b.create_proto(Type::Void, &[]);
-        let placeholder = EntityId(u16::MAX as u32);
-        let (code, offsets) = abcd_isa::encode(&[
-            Bytecode::Ldthisbyname(Imm(0), placeholder),
-            Bytecode::Returnundefined,
-        ])
-        .unwrap();
-        let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
-        let key = b.add_string("key");
-        b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(key))
-            .unwrap();
+        let (code, _offsets) =
+            abcd_isa::encode(&[Bytecode::Jeqnull(Label(0)), Bytecode::Returnundefined]).unwrap();
+        b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
         b.deduplicate();
         let unliftable_abc = b.finalize().unwrap();
 
@@ -416,7 +405,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--check:"), "{msg}");
         assert!(msg.contains("re-lift"), "{msg}");
-        assert!(msg.contains("ldthisbyname"), "{msg}");
+        assert!(msg.contains("jeqnull"), "{msg}");
 
         // Method-count and body-presence parity mismatches also report `--check:` tool errors.
         let err_count = check_emitted(&ctx, &unliftable_abc, 2, &["body", "body"]).unwrap_err();
@@ -426,5 +415,53 @@ mod tests {
         let err_body = check_emitted(&ctx, &unliftable_abc, 1, &["no body"]).unwrap_err();
         assert_eq!(err_body.exit_code(), 2);
         assert!(err_body.to_string().contains("--check:"), "{err_body}");
+    }
+
+    #[test]
+    fn check_emitted_enforces_exact_body_state_parity() {
+        use abcd_file::{AccessFlags, Builder, Type};
+        use abcd_isa::Bytecode;
+
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (code, _) = abcd_isa::encode(&[Bytecode::Returnundefined]).unwrap();
+        b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 1, 3);
+        b.deduplicate();
+        let body_abc = b.finalize().unwrap();
+
+        let mut b2 = Builder::new();
+        b2.set_api(12, "");
+        let cls2 = b2.add_global_class();
+        let proto2 = b2.create_proto(Type::Void, &[]);
+        b2.class_add_method(cls2, "bodyless", proto2, AccessFlags::STATIC, &[], 0, 0);
+        b2.deduplicate();
+        let no_body_abc = b2.finalize().unwrap();
+
+        let ctx = || "rewrite parity (parity.abc)".to_string();
+        let insns =
+            check_emitted(&ctx, &body_abc, 1, &["body"]).expect("matching body parity succeeds");
+        assert_eq!(insns, 1);
+
+        // Exact 3-way tag equality: `"empty body"` must never alias `"body"` or `"no body"`.
+        let err_empty_to_body = check_emitted(&ctx, &body_abc, 1, &["empty body"]).unwrap_err();
+        assert!(
+            err_empty_to_body.to_string().contains("empty body -> body"),
+            "{err_empty_to_body}"
+        );
+        let err_empty_to_none = check_emitted(&ctx, &no_body_abc, 1, &["empty body"]).unwrap_err();
+        assert!(
+            err_empty_to_none
+                .to_string()
+                .contains("empty body -> no body"),
+            "{err_empty_to_none}"
+        );
+        // Matching `"no body"` passes parity and reaches `lift_file`.
+        let err_relift = check_emitted(&ctx, &no_body_abc, 1, &["no body"]).unwrap_err();
+        assert!(
+            err_relift.to_string().contains("failed to re-lift"),
+            "{err_relift}"
+        );
     }
 }

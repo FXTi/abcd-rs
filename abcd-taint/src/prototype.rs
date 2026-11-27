@@ -207,10 +207,11 @@ pub struct PrototypeResolver<'o, 'm> {
 
 enum ProtoStep {
     StartCompute { value: ValueId, at: InstId },
-    FinishCompute,
+    FinishCompute(ValueId),
     FinishGetIterator,
     FinishPromiseChain,
     Walk(ValueId),
+    LeaveWalk(ValueId),
 }
 
 impl<'o, 'm> PrototypeResolver<'o, 'm> {
@@ -261,12 +262,16 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         ans
     }
 
-    /// Iterative explicit-stack answer computation; `visiting` is shared across
-    /// the whole walk so phi back-edge cycles terminate (marked imprecise) with
-    /// zero call-stack recursion.
+    /// Iterative explicit-stack answer computation with active-path cycle
+    /// detection (`active_walk`) separated from DAG node memoization (`walk_memo`)
+    /// so diamond `Phi`/`Mov` sharing stays precise and `O(N)` while true
+    /// `Phi` back-edge cycles terminate (marked imprecise) with zero recursion.
     fn compute_iterative(&self, root_value: ValueId, root_at: InstId) -> FamilyAnswer {
-        let mut visiting = HashSet::new();
+        let mut active_compute: HashSet<ValueId> = HashSet::new();
+        let mut active_walk: Vec<HashSet<ValueId>> = Vec::new();
+        let mut walk_memo: Vec<HashMap<ValueId, FamilyAnswer>> = Vec::new();
         let mut ans_stack: Vec<FamilyAnswer> = Vec::new();
+        let mut cycle_tainted: Vec<bool> = Vec::new();
         let mut steps: Vec<ProtoStep> = vec![ProtoStep::StartCompute {
             value: root_value,
             at: root_at,
@@ -275,6 +280,20 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         while let Some(step) = steps.pop() {
             match step {
                 ProtoStep::StartCompute { value, at } => {
+                    if let Some(cached) = self.memo.borrow().get(&value).cloned() {
+                        ans_stack.push(cached);
+                        continue;
+                    }
+                    if !active_compute.insert(value) {
+                        if let Some(tc) = cycle_tainted.last_mut() {
+                            *tc = true;
+                        }
+                        ans_stack.push(FamilyAnswer {
+                            families: BTreeSet::new(),
+                            precise: false,
+                        });
+                        continue;
+                    }
                     let mut ans = FamilyAnswer {
                         families: BTreeSet::new(),
                         precise: true,
@@ -303,14 +322,29 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                         }
                     }
                     ans_stack.push(ans);
-                    steps.push(ProtoStep::FinishCompute);
+                    cycle_tainted.push(false);
+                    active_walk.push(HashSet::new());
+                    walk_memo.push(HashMap::new());
+                    steps.push(ProtoStep::FinishCompute(value));
                     steps.push(ProtoStep::Walk(value));
                 }
-                ProtoStep::FinishCompute => {
-                    if let Some(top) = ans_stack.last_mut()
-                        && top.families.is_empty()
+                ProtoStep::FinishCompute(value) => {
+                    active_compute.remove(&value);
+                    active_walk.pop();
+                    walk_memo.pop();
+                    let cycled = cycle_tainted.pop().unwrap_or(false);
+                    if let Some(parent_tc) = cycle_tainted.last_mut()
+                        && cycled
                     {
-                        top.precise = false;
+                        *parent_tc = true;
+                    }
+                    if let Some(top) = ans_stack.last_mut() {
+                        if top.families.is_empty() {
+                            top.precise = false;
+                        }
+                        if !cycled && value != root_value {
+                            self.memo.borrow_mut().insert(value, top.clone());
+                        }
                     }
                 }
                 ProtoStep::FinishGetIterator => {
@@ -336,13 +370,54 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                         parent.families.insert(ProtoFamily::Promise);
                     }
                 }
+                ProtoStep::LeaveWalk(value) => {
+                    if let Some(aw) = active_walk.last_mut() {
+                        aw.remove(&value);
+                    }
+                    let child = ans_stack.pop().unwrap_or_default();
+                    let node_cycled = cycle_tainted.pop().unwrap_or(false);
+                    if let Some(parent_tc) = cycle_tainted.last_mut()
+                        && node_cycled
+                    {
+                        *parent_tc = true;
+                    }
+                    if !node_cycled && let Some(wm) = walk_memo.last_mut() {
+                        wm.insert(value, child.clone());
+                    }
+                    if let Some(parent) = ans_stack.last_mut() {
+                        parent.families.extend(child.families);
+                        if !child.precise {
+                            parent.precise = false;
+                        }
+                    }
+                }
                 ProtoStep::Walk(value) => {
-                    if !visiting.insert(value) {
+                    if let Some(cached) = walk_memo.last().and_then(|wm| wm.get(&value)).cloned() {
                         if let Some(top) = ans_stack.last_mut() {
-                            top.precise = false;
+                            top.families.extend(cached.families);
+                            if !cached.precise {
+                                top.precise = false;
+                            }
                         }
                         continue;
                     }
+                    let is_back_edge = active_walk.last_mut().is_some_and(|aw| !aw.insert(value));
+                    if is_back_edge {
+                        if let Some(top) = ans_stack.last_mut() {
+                            top.precise = false;
+                        }
+                        if let Some(tc) = cycle_tainted.last_mut() {
+                            *tc = true;
+                        }
+                        continue;
+                    }
+                    ans_stack.push(FamilyAnswer {
+                        families: BTreeSet::new(),
+                        precise: true,
+                    });
+                    cycle_tainted.push(false);
+                    steps.push(ProtoStep::LeaveWalk(value));
+
                     let Some(v) = self.module.value(value) else {
                         if let Some(top) = ans_stack.last_mut() {
                             top.precise = false;
@@ -399,7 +474,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                                 ..
                             }) => {
                                 if let Some(top) = ans_stack.last_mut() {
-                                    self.constructor_family(*callee, &mut visiting, top);
+                                    self.constructor_family(*callee, top);
                                 }
                             }
                             Some(Op::Call { callee, args, .. }) => {
@@ -438,12 +513,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
     /// is walked through `Mov`/`Phi` to a `TryGetGlobal(name)` leaf; a
     /// KNOWN builtin constructor name types the constructed value with
     /// the matching family.
-    fn constructor_family(
-        &self,
-        callee: ValueId,
-        visiting: &mut HashSet<ValueId>,
-        ans: &mut FamilyAnswer,
-    ) {
+    fn constructor_family(&self, callee: ValueId, ans: &mut FamilyAnswer) {
         ans.precise = false;
         let mut stack = vec![callee];
         let mut mov_seen = HashSet::new();
@@ -460,14 +530,8 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
             match self.module.inst(iid).map(|i| &i.op) {
                 Some(Op::Mov { src }) => stack.push(*src),
                 Some(Op::Phi { entries }) => {
-                    let mut next = Vec::new();
-                    for (_, incoming) in entries {
-                        if visiting.insert(*incoming) {
-                            next.push(*incoming);
-                        }
-                    }
-                    for inc in next.into_iter().rev() {
-                        stack.push(inc);
+                    for (_, incoming) in entries.iter().rev() {
+                        stack.push(*incoming);
                     }
                 }
                 Some(Op::TryGetGlobal { name, .. }) => {
@@ -536,8 +600,9 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 }
             }
         }
-        // Chained `.then` / `.catch` / `.finally` on a Promise receiver.
-        if let Some(ValueDef::Inst(ciid)) = self.module.value(callee).map(|v| v.def) {
+        // Chained `.then` / `.catch` / `.finally` on a Promise receiver (peeling Movs).
+        let peeled_callee = abcd_analysis::dataflow::heap::peel_movs(self.module, callee);
+        if let Some(ValueDef::Inst(ciid)) = self.module.value(peeled_callee).map(|v| v.def) {
             match self.module.inst(ciid).map(|i| &i.op) {
                 Some(Op::LoadProp { object, name }) => {
                     if matches!(

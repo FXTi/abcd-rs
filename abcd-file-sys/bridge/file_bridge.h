@@ -145,7 +145,7 @@ uint32_t abc_proto_get_reference_type(AbcProtoAccessor *a, uint32_t idx);
 uint32_t abc_proto_get_ref_num(AbcProtoAccessor *a);
 
 typedef void (*AbcProtoTypeCb)(uint8_t type_id, void *ctx);
-void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx);
+int abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx);
 
 /* ========== Class Data Accessor ========== */
 
@@ -159,13 +159,13 @@ uint32_t abc_class_access_flags(AbcClassAccessor *a);
 /* Returns source file entity offset, UINT32_MAX if absent */
 uint32_t abc_class_source_file_off(AbcClassAccessor *a);
 
-/* Enumerate methods: callback receives method offset (no early-stop) */
+/* Enumerate methods: callback receives method offset (no early-stop). Returns 0 on ok, -1 on error. */
 typedef void (*AbcMethodOffsetCb)(uint32_t method_offset, void *ctx);
-void abc_class_enumerate_methods(AbcClassAccessor *a, AbcMethodOffsetCb cb, void *ctx);
+int abc_class_enumerate_methods(AbcClassAccessor *a, AbcMethodOffsetCb cb, void *ctx);
 
-/* Enumerate fields: callback receives field offset (no early-stop) */
+/* Enumerate fields: callback receives field offset (no early-stop). Returns 0 on ok, -1 on error. */
 typedef void (*AbcFieldOffsetCb)(uint32_t field_offset, void *ctx);
-void abc_class_enumerate_fields(AbcClassAccessor *a, AbcFieldOffsetCb cb, void *ctx);
+int abc_class_enumerate_fields(AbcClassAccessor *a, AbcFieldOffsetCb cb, void *ctx);
 
 /* Interfaces */
 uint32_t abc_class_get_ifaces_number(AbcClassAccessor *a);
@@ -176,13 +176,13 @@ uint8_t abc_class_get_source_lang(AbcClassAccessor *a);
 
 /* Class-level annotations. cb return value DISCARDED (no early stop — see
  * the contract block above); same for every *_enumerate_*annotations
- * function in this header. */
-void abc_class_enumerate_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_class_enumerate_runtime_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
+ * function in this header. Returns 0 on ok, -1 on error. */
+int abc_class_enumerate_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_class_enumerate_runtime_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Class type annotations */
-void abc_class_enumerate_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_class_enumerate_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Class annotation counts and ID */
 
@@ -211,9 +211,9 @@ uint32_t abc_method_get_proto_id(const AbcMethodAccessor *a);
 /* Source language: UINT8_MAX if absent */
 uint8_t abc_method_get_source_lang(AbcMethodAccessor *a);
 
-/* Method annotations */
-void abc_method_enumerate_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_method_enumerate_runtime_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
+/* Method annotations (0 on ok, -1 on error) */
+int abc_method_enumerate_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_method_enumerate_runtime_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Parameter annotation IDs: UINT32_MAX if absent */
 uint32_t abc_method_get_param_annotation_id(AbcMethodAccessor *a);
@@ -226,9 +226,9 @@ typedef int (*AbcParamAnnotationCb)(uint32_t param_idx, uint32_t annotation_off,
 int abc_param_annotations_enumerate(const AbcFileHandle *f, uint32_t item_off,
                                     AbcParamAnnotationCb cb, void *ctx);
 
-/* Method type annotations */
-void abc_method_enumerate_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
+/* Method type annotations (0 on ok, -1 on error) */
+int abc_method_enumerate_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Method annotation counts, size, ID, and misc */
 
@@ -250,10 +250,13 @@ void abc_code_close(AbcCodeAccessor *a);
 uint32_t abc_code_num_vregs(const AbcCodeAccessor *a);
 uint32_t abc_code_num_args(const AbcCodeAccessor *a);
 uint32_t abc_code_code_size(const AbcCodeAccessor *a);
+uint32_t abc_code_tries_size(const AbcCodeAccessor *a);
 const uint8_t *abc_code_instructions(const AbcCodeAccessor *a);
 
 /* Enumerate try blocks with full catch block info.
- * cb return value DISCARDED (no early stop — see the contract block above). */
+ * cb return value DISCARDED (no early stop — see the contract block above).
+ * Returns 0 when all `tries_size` try blocks and their catch blocks decode
+ * cleanly, or -1 on truncated / malformed try-block payloads. */
 struct AbcTryBlockInfo {
     uint32_t start_pc;
     uint32_t length;
@@ -266,7 +269,7 @@ struct AbcCatchBlockInfo {
 };
 typedef int (*AbcTryBlockFullCb)(const struct AbcTryBlockInfo *try_info,
                                   const struct AbcCatchBlockInfo *catches, void *ctx);
-void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb, void *ctx);
+int abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb, void *ctx);
 
 /* ========== Field Data Accessor ========== */
 
@@ -281,9 +284,9 @@ uint32_t abc_field_type(AbcFieldAccessor *a);
 uint8_t abc_field_type_id(AbcFieldAccessor *a);
 uint32_t abc_field_access_flags(AbcFieldAccessor *a);
 
-/* Enumerate field annotations */
-void abc_field_enumerate_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_field_enumerate_runtime_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
+/* Enumerate field annotations (0 on ok, -1 on error) */
+int abc_field_enumerate_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_field_enumerate_runtime_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Field initial values: returns 1 if present, 0 if absent */
 int abc_field_get_value_i32(AbcFieldAccessor *a, int32_t *out);
@@ -291,9 +294,9 @@ int abc_field_get_value_i64(AbcFieldAccessor *a, int64_t *out);
 int abc_field_get_value_f32(AbcFieldAccessor *a, float *out);
 int abc_field_get_value_f64(AbcFieldAccessor *a, double *out);
 
-/* Field type annotations */
-void abc_field_enumerate_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
-void abc_field_enumerate_runtime_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
+/* Field type annotations (0 on ok, -1 on error) */
+int abc_field_enumerate_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
+int abc_field_enumerate_runtime_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
 
 /* Field annotation counts and ID */
 
@@ -338,6 +341,18 @@ void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
 int abc_literal_enumerate_vals_checked(const AbcFileHandle *f, uint32_t array_off,
                                        AbcLiteralValCb cb, void *ctx);
 
+/* Read a typed literal-array payload starting at `payload_off` (the offset
+ * delivered in `AbcLiteralVal::data.u32_val` for `ARRAY_U1`..`ARRAY_STRING`,
+ * encoded as `[u32 len][len * element_size bytes]`).
+ * `element_size` must be 1, 2, 4, or 8.
+ * Query with `out_values == NULL` to validate bounds and obtain `len` (`>= 0`);
+ * fill by passing `out_values` with `max_count >= len` (each element is
+ * zero-extended to `uint64_t`, or raw u32 string offsets for `ARRAY_STRING`).
+ * Returns `len` (`>= 0`) on success, or `-1` on invalid/truncated data. */
+int32_t abc_literal_read_typed_array(const AbcFileHandle *f, uint32_t payload_off,
+                                     uint32_t element_size,
+                                     uint64_t *out_values, uint32_t max_count);
+
 /* ========== Module Data Accessor ========== */
 
 typedef struct AbcModuleAccessor AbcModuleAccessor;
@@ -350,12 +365,13 @@ uint32_t abc_module_num_requests(const AbcModuleAccessor *a);
 /* Get request module string offset by index */
 uint32_t abc_module_request_off(const AbcModuleAccessor *a, uint32_t idx);
 
-/* Module record callback: tag, export_name_off, module_request_idx, import_name_off, local_name_off (no early-stop) */
+/* Module record callback: tag, export_name_off, module_request_idx, import_name_off, local_name_off (no early-stop).
+ * Returns 0 on ok, -1 on truncated / malformed module records. */
 typedef void (*AbcModuleRecordCb)(uint8_t tag, uint32_t export_name_off,
                                   uint32_t module_request_idx,
                                   uint32_t import_name_off,
                                   uint32_t local_name_off, void *ctx);
-void abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, void *ctx);
+int abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, void *ctx);
 
 /* Module-request-phase blob (untagged u32 count + u8 lazy flags per module
  * request; vendored runtime layout in

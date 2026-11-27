@@ -127,7 +127,18 @@ enum FlatLitElem {
     LitNull(u8),
     Array(ShapeId),
     LiteralBufferRef(ShapeId),
-    TypedArray { tag: TypedArrayTag, items: ShapeId },
+    ArrayU1(Vec<bool>),
+    ArrayU8(Vec<u8>),
+    ArrayI8(Vec<i8>),
+    ArrayU16(Vec<u16>),
+    ArrayI16(Vec<i16>),
+    ArrayU32(Vec<u32>),
+    ArrayI32(Vec<i32>),
+    ArrayU64(Vec<u64>),
+    ArrayI64(Vec<i64>),
+    ArrayF32(Vec<u32>),
+    ArrayF64(Vec<u64>),
+    ArrayString(Vec<Sym>),
 }
 
 /// Module-scoped reverse entity resolver: IR identities → [`EntityRef`]
@@ -358,7 +369,6 @@ impl<'a> EntityResolver<'a> {
 enum NestedShapeWrap {
     Array,
     BufferRef { wrapper_cid: ConstId },
-    TypedArray(TypedArrayTag),
 }
 
 enum ConstShapeCursor<'m> {
@@ -376,9 +386,7 @@ enum ConstShapeCursor<'m> {
 impl<'m> ConstShapeCursor<'m> {
     fn from_const(c: &'m Const) -> Option<(Self, usize)> {
         match c {
-            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
-                Some((Self::Array { items, next: 0 }, items.len()))
-            }
+            Const::ArrayLiteral(items) => Some((Self::Array { items, next: 0 }, items.len())),
             Const::ObjectLiteral { keys, values } if keys.len() == values.len() => Some((
                 Self::Object {
                     keys,
@@ -423,7 +431,173 @@ fn wrap_flat_elem(wrap: NestedShapeWrap, id: ShapeId) -> FlatLitElem {
     match wrap {
         NestedShapeWrap::Array => FlatLitElem::Array(id),
         NestedShapeWrap::BufferRef { .. } => FlatLitElem::LiteralBufferRef(id),
-        NestedShapeWrap::TypedArray(tag) => FlatLitElem::TypedArray { tag, items: id },
+    }
+}
+
+/// Convert a homogeneous [`Const::TypedArrayLiteral`] into its tag-exact
+/// [`FlatLitElem::Array*`] payload.
+fn const_typed_array_elems(
+    module: &Module,
+    tag: TypedArrayTag,
+    items: &[ConstId],
+) -> Option<FlatLitElem> {
+    match tag {
+        TypedArrayTag::U1 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let b = match module.consts.get(cid)? {
+                    Const::Bool(b) => *b,
+                    Const::Int8(n) if *n <= 1 => *n != 0,
+                    Const::Int32(n) if *n <= 1 => *n != 0,
+                    _ => return None,
+                };
+                out.push(b);
+            }
+            Some(FlatLitElem::ArrayU1(out))
+        }
+        TypedArrayTag::U8 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => *n,
+                    Const::Int32(n) => u8::try_from(*n).ok()?,
+                    Const::UInt64(n) => u8::try_from(*n).ok()?,
+                    Const::Int64(n) => u8::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayU8(out))
+        }
+        TypedArrayTag::I8 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => *n as i8,
+                    Const::Int32(n) => i8::try_from(*n as i32).ok()?,
+                    Const::Int64(n) => i8::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayI8(out))
+        }
+        TypedArrayTag::U16 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => u16::from(*n),
+                    Const::Int32(n) => u16::try_from(*n).ok()?,
+                    Const::UInt64(n) => u16::try_from(*n).ok()?,
+                    Const::Int64(n) => u16::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayU16(out))
+        }
+        TypedArrayTag::I16 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => i16::from(*n as i8),
+                    Const::Int32(n) => i16::try_from(*n as i32).ok()?,
+                    Const::Int64(n) => i16::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayI16(out))
+        }
+        TypedArrayTag::U32 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => u32::from(*n),
+                    Const::Int32(n) => *n,
+                    Const::UInt64(n) => u32::try_from(*n).ok()?,
+                    Const::Int64(n) => u32::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayU32(out))
+        }
+        TypedArrayTag::I32 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int8(n) => i32::from(*n as i8),
+                    Const::Int32(n) => *n as i32,
+                    Const::Int64(n) => i32::try_from(*n).ok()?,
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayI32(out))
+        }
+        TypedArrayTag::U64 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::UInt64(n) => *n,
+                    Const::Int64(n) => u64::try_from(*n).ok()?,
+                    Const::Int32(n) => u64::from(*n),
+                    Const::Int8(n) => u64::from(*n),
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayU64(out))
+        }
+        TypedArrayTag::I64 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let v = match module.consts.get(cid)? {
+                    Const::Int64(n) => *n,
+                    Const::UInt64(n) => i64::try_from(*n).ok()?,
+                    Const::Int32(n) => i64::from(*n as i32),
+                    Const::Int8(n) => i64::from(*n as i8),
+                    _ => return None,
+                };
+                out.push(v);
+            }
+            Some(FlatLitElem::ArrayI64(out))
+        }
+        TypedArrayTag::F32 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let bits = match module.consts.get(cid)? {
+                    Const::Float32(b) => *b,
+                    Const::Number(b) => (f64::from_bits(*b) as f32).to_bits(),
+                    _ => return None,
+                };
+                out.push(bits);
+            }
+            Some(FlatLitElem::ArrayF32(out))
+        }
+        TypedArrayTag::F64 => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let bits = match module.consts.get(cid)? {
+                    Const::Number(b) => *b,
+                    Const::Float32(b) => f64::from(f32::from_bits(*b)).to_bits(),
+                    _ => return None,
+                };
+                out.push(bits);
+            }
+            Some(FlatLitElem::ArrayF64(out))
+        }
+        TypedArrayTag::String => {
+            let mut out = Vec::with_capacity(items.len());
+            for &cid in items {
+                let Const::String(sym) = module.consts.get(cid)? else {
+                    return None;
+                };
+                out.push(*sym);
+            }
+            Some(FlatLitElem::ArrayString(out))
+        }
     }
 }
 
@@ -446,6 +620,10 @@ fn canonicalize_const_shape(
             other => break other,
         }
     };
+    if let Const::TypedArrayLiteral { tag, items } = root_const {
+        let elem = const_typed_array_elems(module, *tag, items)?;
+        return interner.get(&vec![elem]).copied();
+    }
     let (root_cursor, root_cap) = ConstShapeCursor::from_const(root_const)?;
     let mut memo: HashMap<ConstId, ShapeId> = HashMap::new();
     let mut stack = vec![ConstShapeFrame {
@@ -458,18 +636,27 @@ fn canonicalize_const_shape(
     'outer: while let Some(mut frame) = stack.pop() {
         while let Some(child_cid) = frame.cursor.next_id() {
             let child_const = module.consts.get(child_cid)?;
+            if let Const::TypedArrayLiteral { tag, items } = child_const {
+                frame
+                    .items
+                    .push(const_typed_array_elems(module, *tag, items)?);
+                continue;
+            }
             let nested = match child_const {
                 Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {
                     Some((child_cid, child_const, NestedShapeWrap::Array))
-                }
-                Const::TypedArrayLiteral { tag, .. } => {
-                    Some((child_cid, child_const, NestedShapeWrap::TypedArray(*tag)))
                 }
                 Const::LiteralBufferRef(inner_cid) => {
                     if active.contains(&child_cid) {
                         return None;
                     }
                     let inner_const = module.consts.get(*inner_cid)?;
+                    if let Const::TypedArrayLiteral { tag, items } = inner_const {
+                        let elem = const_typed_array_elems(module, *tag, items)?;
+                        let child_id = *interner.get(&vec![elem])?;
+                        frame.items.push(FlatLitElem::LiteralBufferRef(child_id));
+                        continue;
+                    }
                     if !matches!(
                         inner_const,
                         Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
@@ -560,7 +747,6 @@ fn canonicalize_const_shape(
 enum FileNestedWrap {
     Array,
     BufferRef,
-    TypedArray(TypedArrayTag),
 }
 
 struct LitArrayFrame {
@@ -574,7 +760,6 @@ fn wrap_file_elem(wrap: FileNestedWrap, id: ShapeId) -> FlatLitElem {
     match wrap {
         FileNestedWrap::Array => FlatLitElem::Array(id),
         FileNestedWrap::BufferRef => FlatLitElem::LiteralBufferRef(id),
-        FileNestedWrap::TypedArray(tag) => FlatLitElem::TypedArray { tag, items: id },
     }
 }
 
@@ -611,42 +796,6 @@ fn intern_file_literal_array(
             let nested = match v {
                 LiteralValue::LiteralArray(idx) => Some((idx.0, FileNestedWrap::Array)),
                 LiteralValue::LiteralBufferIndex(idx) => Some((idx.0, FileNestedWrap::BufferRef)),
-                LiteralValue::ArrayU1(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U1)))
-                }
-                LiteralValue::ArrayU8(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U8)))
-                }
-                LiteralValue::ArrayI8(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I8)))
-                }
-                LiteralValue::ArrayU16(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U16)))
-                }
-                LiteralValue::ArrayI16(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I16)))
-                }
-                LiteralValue::ArrayU32(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U32)))
-                }
-                LiteralValue::ArrayI32(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I32)))
-                }
-                LiteralValue::ArrayU64(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::U64)))
-                }
-                LiteralValue::ArrayI64(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::I64)))
-                }
-                LiteralValue::ArrayF32(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::F32)))
-                }
-                LiteralValue::ArrayF64(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::F64)))
-                }
-                LiteralValue::ArrayString(idx) => {
-                    Some((idx.0, FileNestedWrap::TypedArray(TypedArrayTag::String)))
-                }
                 _ => None,
             };
 
@@ -761,20 +910,29 @@ fn scalar_literal_value_elem(
         LiteralValue::Getter(midx) => method_elem(*midx, LitMethodKind::Getter),
         LiteralValue::Setter(midx) => method_elem(*midx, LitMethodKind::Setter),
         LiteralValue::NullValue(n) => Some(FlatLitElem::LitNull(*n)),
-        LiteralValue::LiteralArray(_)
-        | LiteralValue::LiteralBufferIndex(_)
-        | LiteralValue::ArrayU1(_)
-        | LiteralValue::ArrayU8(_)
-        | LiteralValue::ArrayI8(_)
-        | LiteralValue::ArrayU16(_)
-        | LiteralValue::ArrayI16(_)
-        | LiteralValue::ArrayU32(_)
-        | LiteralValue::ArrayI32(_)
-        | LiteralValue::ArrayU64(_)
-        | LiteralValue::ArrayI64(_)
-        | LiteralValue::ArrayF32(_)
-        | LiteralValue::ArrayF64(_)
-        | LiteralValue::ArrayString(_) => None,
+        LiteralValue::ArrayU1(vals) => Some(FlatLitElem::ArrayU1(vals.clone())),
+        LiteralValue::ArrayU8(vals) => Some(FlatLitElem::ArrayU8(vals.clone())),
+        LiteralValue::ArrayI8(vals) => Some(FlatLitElem::ArrayI8(vals.clone())),
+        LiteralValue::ArrayU16(vals) => Some(FlatLitElem::ArrayU16(vals.clone())),
+        LiteralValue::ArrayI16(vals) => Some(FlatLitElem::ArrayI16(vals.clone())),
+        LiteralValue::ArrayU32(vals) => Some(FlatLitElem::ArrayU32(vals.clone())),
+        LiteralValue::ArrayI32(vals) => Some(FlatLitElem::ArrayI32(vals.clone())),
+        LiteralValue::ArrayU64(vals) => Some(FlatLitElem::ArrayU64(vals.clone())),
+        LiteralValue::ArrayI64(vals) => Some(FlatLitElem::ArrayI64(vals.clone())),
+        LiteralValue::ArrayF32(vals) => Some(FlatLitElem::ArrayF32(
+            vals.iter().map(|f| f.to_bits()).collect(),
+        )),
+        LiteralValue::ArrayF64(vals) => Some(FlatLitElem::ArrayF64(
+            vals.iter().map(|f| f.to_bits()).collect(),
+        )),
+        LiteralValue::ArrayString(sids) => {
+            let mut syms = Vec::with_capacity(sids.len());
+            for &sid in sids {
+                syms.push(lookup_sym_in_module(module, file, sid)?);
+            }
+            Some(FlatLitElem::ArrayString(syms))
+        }
+        LiteralValue::LiteralArray(_) | LiteralValue::LiteralBufferIndex(_) => None,
     }
 }
 

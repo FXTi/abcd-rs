@@ -100,19 +100,27 @@ pub fn resolve_callback_funcs(
     let mut funcs = BTreeSet::new();
     let mut visiting = HashSet::new();
     trace_value(module, value, &mut visiting, &mut funcs);
-    // The points-to arm: closure allocation sites → bodies.
+    // The points-to arm: closure, method, and function allocation sites → bodies.
     for site in oracle.may_sites_at(value, at).iter() {
-        let func_value = match module.inst(site).map(|i| &i.op) {
+        match module.inst(site).map(|i| &i.op) {
+            Some(Op::DefineFunc { body, .. }) => {
+                funcs.insert(*body);
+            }
             Some(
                 Op::AllocClosure { func }
                 | Op::CreateGenerator { func }
-                | Op::CreateAsyncGenerator { func },
-            ) => Some(*func),
-            _ => None,
-        };
-        if let Some(fv) = func_value {
-            let mut visiting = HashSet::new();
-            trace_value(module, fv, &mut visiting, &mut funcs);
+                | Op::CreateAsyncGenerator { func }
+                | Op::DefineMethod { func, .. },
+            ) => {
+                let mut visiting = HashSet::new();
+                trace_value(module, *func, &mut visiting, &mut funcs);
+            }
+            Some(Op::LoadConst(c)) => {
+                if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c) {
+                    funcs.insert(*f);
+                }
+            }
+            _ => {}
         }
     }
     funcs
@@ -140,32 +148,38 @@ fn trace_value(
         let Some(v) = module.value(cur) else {
             continue;
         };
-        let ValueDef::Inst(iid) = v.def else {
-            continue;
-        };
-        match module.inst(iid).map(|i| &i.op) {
-            Some(Op::Mov { src }) => stack.push(*src),
-            Some(Op::Phi { entries }) => {
-                for (_, incoming) in entries.iter().rev() {
-                    stack.push(*incoming);
-                }
-            }
-            Some(Op::DefineFunc { body, .. }) => {
-                funcs.insert(*body);
-            }
-            Some(
-                Op::AllocClosure { func }
-                | Op::CreateGenerator { func }
-                | Op::CreateAsyncGenerator { func },
-            ) => {
-                stack.push(*func);
-            }
-            Some(Op::LoadConst(c)) => {
-                if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c) {
+        match v.def {
+            ValueDef::Const(c) => {
+                if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(c) {
                     funcs.insert(*f);
                 }
             }
-            _ => {}
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => {}
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::Phi { entries }) => {
+                    for (_, incoming) in entries.iter().rev() {
+                        stack.push(*incoming);
+                    }
+                }
+                Some(Op::DefineFunc { body, .. }) => {
+                    funcs.insert(*body);
+                }
+                Some(
+                    Op::AllocClosure { func }
+                    | Op::CreateGenerator { func }
+                    | Op::CreateAsyncGenerator { func }
+                    | Op::DefineMethod { func, .. },
+                ) => {
+                    stack.push(*func);
+                }
+                Some(Op::LoadConst(c)) => {
+                    if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c) {
+                        funcs.insert(*f);
+                    }
+                }
+                _ => {}
+            },
         }
     }
 }

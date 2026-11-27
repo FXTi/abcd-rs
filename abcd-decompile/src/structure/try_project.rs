@@ -50,7 +50,7 @@ pub(in crate::structure) struct LoopCutState {
     pub(in crate::structure) while_cond: Expr,
 }
 
-fn schedule_dedup_handlers(
+pub(in crate::structure) fn schedule_dedup_handlers(
     handlers: &[BlockId],
     uniq: bool,
     extra_continue: bool,

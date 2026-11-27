@@ -92,6 +92,7 @@ fn emitter<'m>(module: &'m Module, opts: &'m EmitOptions) -> Emitter<'m> {
         hoisted: BTreeSet::new(),
         prepared: BTreeMap::new(),
         emitting_funcs: HashSet::new(),
+        arkui_components: std::collections::HashMap::new(),
     }
 }
 
@@ -639,8 +640,11 @@ fn module_facing_name_sanitize() {
         export_name: bad,
     });
     let out = decompile_module(&m, &EmitOptions::default());
-    assert!(out.text.contains("import { has_space as x } from \"m\";\n"));
-    assert!(out.text.contains("export { x as bad_name };\n"));
+    assert!(
+        out.text
+            .contains("import { \"has space\" as x } from \"m\";\n")
+    );
+    assert!(out.text.contains("export { x as \"bad name\" };\n"));
 }
 
 // ── collect_method_refs const shapes (383-385, 393-394, 410-413) ──
@@ -1327,6 +1331,7 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
         Leaf::Raw(Stmt::LexStore {
             level: 0,
             slot: 0,
+            own: true,
             name: "inner_lex".to_string(),
             value: Expr::Temp {
                 value: ValueId::new(0),

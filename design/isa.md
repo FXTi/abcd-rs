@@ -4,13 +4,13 @@ The ISA layer provides safe, deterministic, table-driven decoding, encoding, ope
 
 ---
 
-## 1. Code Generation & FFI Architecture (`abcd-isa-sys`)
+## 1. Code Generation & Differential Oracle Architecture (`abcd-isa`, `abcd-isa-sys`)
 
-- **Authoritative Upstream Source**: Opcode definitions, instruction formats, prefixes (`wide.*`, `deprecated.*`, `callruntime.*`, `throw.*`), and property/exception flags derive directly from `vendor/arkcompiler_runtime_core/isa/isa.yaml` via `python3 scripts/vendor-gen.py codegen` (`vendor-sync.md`).
-- **Hermetic Pre-Generated Tables**: Pre-generated C++ headers (`vendor/generated/`, `abcd-isa-sys/bridge/generated/`) and pure-Rust ISA codec/classification tables (`abcd-isa-sys/src/generated/`) are checked into Git and verified byte-for-byte in Tier-1 CI (`vendor-verify`), requiring zero Ruby or `bindgen`/`libclang` during `cargo build`.
-- **Pure-Rust Hot Path + C++ Differential Oracle**:
-  - `abcd-isa-sys` generates 100% pure-Rust `const fn` instruction classification (`BytecodeFlags`, `ExceptionType`), modern `24.0.0.0` `decode_modern`, `(byte_offset, byte_width)` `modern_entity_id_slot` lookup, and `classify_for_encode` format-selection & jump-inversion tables directly from `isa.yaml`.
-  - `isa_bridge.cpp` wraps `file_format_version.cpp` (format/API version queries) and retains upstream `BytecodeInst` / `BytecodeEmitter` C99 entrypoints as an automated **differential test oracle** verifying bit-for-bit parity across all `246` ISA opcodes.
+- **Authoritative Upstream Source**: Opcode definitions, instruction formats, prefixes (`wide.*`, `deprecated.*`, `callruntime.*`, `throw.*`), `0.0.0.2` translator tables, and property/exception flags derive directly from `vendor/arkcompiler_runtime_core/isa/isa.yaml` and `file_format_version.h` via `python3 scripts/vendor-gen.py codegen` (`vendor-sync.md`).
+- **Hermetic Pre-Generated Tables**: Pre-generated C++ headers (`vendor/generated/`, `abcd-isa-sys/bridge/generated/`) and pure-Rust ISA codec/classification/version tables (`abcd-isa/src/generated/`) are checked into Git and verified byte-for-byte in Tier-1 CI (`vendor-verify`), requiring zero Ruby or `bindgen`/`libclang` during `cargo build`.
+- **100% Pure-Rust Runtime + Dev-Only C++ Differential Oracle**:
+  - `abcd-isa` enforces `#![forbid(unsafe_code)]` with zero runtime `abcd-*` dependencies, generating `const fn` instruction classification (`BytecodeFlags`, `ExceptionType`), modern `24.0.0.0` `decode_modern`, `0.0.0.2` `legacy_table`, `.abc` `Version` queries, `(byte_offset, byte_width)` `modern_entity_id_slot` lookup, and `classify_for_encode` format-selection & jump-inversion tables directly from `isa.yaml`.
+  - `abcd-isa-sys` (`isa_bridge.cpp`, linked solely under `[dev-dependencies]` of `abcd-isa`) wraps upstream `file_format_version.cpp`, `BytecodeInst`, and `BytecodeEmitter` C99 entrypoints as an automated **differential test oracle** verifying bit-for-bit parity across all `0..=0xFFFF` opcode values.
 
 ---
 

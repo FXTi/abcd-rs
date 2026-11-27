@@ -1,4 +1,4 @@
-use abcd_isa_sys::{Bytecode, Label, ModernDecodeFault};
+use crate::generated::{Bytecode, Label, ModernDecodeFault};
 
 /// Errors from [`decode`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

@@ -97,15 +97,17 @@ fn static_version_header_reports_static_type() {
 }
 
 #[test]
-fn trailing_bytes_past_the_declared_size_report_invalid_type() {
-    // GetFileType requires buffer size == header-declared file_size; the
-    // decoder itself accepts a larger buffer, so one trailing byte keeps
-    // the file decodable while the type reads `invalid`.
+fn trailing_bytes_past_the_declared_size_preserve_file_type() {
+    // Trailing zero-padding past `header.file_size` (e.g. page-aligned `.abc`
+    // container slices) is accepted by both `GetFileType` and `decode` (#91).
     let mut abc = common::tiny_abc();
+    let declared = abc.len() as u32;
     abc.push(0);
-    let modules = input::load_bytes(&abc, "invalid.abc", ModuleSelection::Single).unwrap();
+    let modules = input::load_bytes(&abc, "padded.abc", ModuleSelection::Single).unwrap();
     let report = info::report(&modules[0], false).unwrap();
-    assert_eq!(report.file_type, "invalid");
+    assert_eq!(report.file_type, "dynamic");
+    assert_eq!(report.header_size, declared);
+    assert_eq!(report.input_bytes, declared as usize + 1);
 }
 
 #[test]

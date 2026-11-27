@@ -388,7 +388,7 @@ fn a06_dispatch_mismatch_keeps_site_loud() {
     let text = decompiled(&m);
     expect(
         &text,
-        "async function odd(p1) {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n  const v0 = undefined /*fallback AsyncFunctionEnter: async-context value used after elided AsyncFunctionEnter*/;\n  const v3 = await p1;\n  /*async-machinery suspend (R4; not a source yield)*/ v3;\n  const v5 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v0;\n  const v6 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v0;\n  switch (v6) {\n  case 1.0: {\n      throw v6;\n      /* unreachable */\n    }\n  default: {\n      return v5;\n    }\n  }\n}\n",
+        "async function odd(p1) {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n  const v0 = undefined /*fallback AsyncFunctionEnter: async-context value used after elided AsyncFunctionEnter*/;\n  const v3 = await p1;\n  /*async-machinery suspend (R4; not a source yield)*/ v3;\n  const v5 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v0;\n  const v6 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v0;\n  if (!(1.0 == v6)) {\n    return v5;\n  } else {\n    throw v6;\n    /* unreachable */\n  }\n}\n",
     );
 }
 

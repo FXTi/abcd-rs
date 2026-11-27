@@ -56,23 +56,11 @@ fn access_path_cutoff() {
     let this = add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
 
-    // Build a chain-grower: base-taint p itself is the source; loads
-    // extend the chain and stores re-key it into the heap.
-    //   a1 = p.f1          → Local(a1, [f1])
-    //   o1.f2 = a1         → Heap(s1, [f2, f1])
-    //   a2 = o1.f2         → Local(a2, [f1])
-    //   ... alternating grows the chain until the cap merges it.
-    let f1 = intern(&mut m, "f1");
+    // Build a chain-grower: nest `p` inside 6 object wrappers (`obj.f2 = cur`),
+    // growing `Heap(s_k, [f2, ...])` until the `max_field_chain = 2` cap
+    // merges extensions onto the 2-element prefix, then unwrap 6 times.
     let f2 = intern(&mut m, "f2");
-    let mut cur = emit(
-        &mut m,
-        entry,
-        Op::LoadProp {
-            object: p,
-            name: f1,
-        },
-    );
-    let mut last_store = None;
+    let mut cur = p;
     for _ in 0..6 {
         let obj = alloc_object(&mut m, entry);
         emit_void(
@@ -84,17 +72,18 @@ fn access_path_cutoff() {
                 value: cur,
             },
         );
+        cur = obj;
+    }
+    for _ in 0..6 {
         cur = emit(
             &mut m,
             entry,
             Op::LoadProp {
-                object: obj,
+                object: cur,
                 name: f2,
             },
         );
-        last_store = Some(obj);
     }
-    let _ = last_store;
     print_call(&mut m, entry, vec![cur]);
     emit_void(&mut m, entry, Op::Return { value: None });
     let _ = this;
@@ -1703,13 +1692,16 @@ fn prototype_iterator_next_family() {
     emit_void(&mut m, entry, Op::Return { value: None });
 
     let report = abcd_taint::run_taint(&m, &builtin_config());
-    // Two hits — the same double-fire as pop (the Base→Return leftover
-    // rides alongside the precise Field([AnyIndex]) carrier).
+    // Both `Base -> Return` (`Local(r, [AnyIndex])`) and `Field([AnyIndex]) -> Return`
+    // (`Local(r, [])`) converge onto whole-value `Local(v, [])` after reading `.value`.
     assert_eq!(
         report.hits.len(),
-        2,
-        "the element taint rode next().value out of the loop protocol"
+        1,
+        "the element taint rode next().value out of the loop protocol: {:?}",
+        report.hits
     );
+    assert_eq!(report.hits[0].fact.local_base(), Some(v));
+    assert!(report.hits[0].fact.fields.is_empty());
     assert!(
         report
             .summaries_applied
@@ -2095,10 +2087,9 @@ fn gap_for_each_discards_callback_return_but_runs_body() {
     );
 }
 
-/// Exclusive × gap (`R4-H3`): an EXCLUSIVE summary with a callback must
-/// still run the user callback (the gap edge is distinct from the
-/// callee-body edge), killing field-bearing `Local(ext).[k]` on the
-/// call-to-return bypass edge while scalar pass-by-value `Local(p)` survives.
+/// Exclusive × gap: an EXCLUSIVE summary kills only the call edge into the
+/// callee body (never the callback gap edge and never unmodeled caller
+/// operands unless listed in `Summary::clears`).
 #[test]
 fn gap_exclusive_callback_summary_still_enters() {
     let mut m = mk_module();
@@ -2143,10 +2134,11 @@ fn gap_exclusive_callback_summary_still_enters() {
             kind: CallKind::Dynamic,
         },
     );
-    print_call(&mut m, entry, vec![p]); // scalar Local(p) survives exclusive bypass
-    let print_ext = print_call(&mut m, entry, vec![ext]); // field-bearing Local(ext).[k] killed
+    print_call(&mut m, entry, vec![p]);
+    let print_ext = print_call(&mut m, entry, vec![ext]);
     emit_void(&mut m, entry, Op::Return { value: None });
 
+    // (1) Without `clears`: `exclusive` enters the callback and preserves both `p` and `ext`.
     let config = abcd_taint::TaintConfig {
         extra_summaries: vec![(
             "collect".to_owned(),
@@ -2170,11 +2162,8 @@ fn gap_exclusive_callback_summary_still_enters() {
         report.hits
     );
     assert!(
-        !report
-            .hits
-            .iter()
-            .any(|h| h.call == print_ext || h.fact.local_base() == Some(ext)),
-        "field-bearing Local(ext).[k] is killed on the exclusive bypass edge: {:?}",
+        report.hits.iter().any(|h| h.call == print_ext),
+        "unmodeled field-bearing Local(ext).[k] survives exclusive bypass unless cleared: {:?}",
         report.hits
     );
     assert!(
@@ -2183,6 +2172,35 @@ fn gap_exclusive_callback_summary_still_enters() {
         report.summaries_applied
     );
     assert_eq!(report.gap_sites_resolved, 1);
+
+    // (2) With explicit `.clear(Endpoint::Param(2))`: `Local(ext).[k]` is cleared.
+    let cleared_config = abcd_taint::TaintConfig {
+        extra_summaries: vec![(
+            "collect".to_owned(),
+            Some(3),
+            abcd_taint::Summary::new("exclusive gap test with explicit clear")
+                .exclusive()
+                .clear(Endpoint::Param(2))
+                .callback(1)
+                .gap_enter(Endpoint::Param(0), 0),
+        )],
+        ..builtin_config()
+    };
+    let cleared_report = abcd_taint::run_taint(&m, &cleared_config);
+    assert!(
+        cleared_report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(e))
+    );
+    assert!(
+        !cleared_report
+            .hits
+            .iter()
+            .any(|h| h.call == print_ext || h.fact.local_base() == Some(ext)),
+        "explicit `clear(Param(2))` kills Local(ext).[k]: {:?}",
+        cleared_report.hits
+    );
 }
 
 /// The honest fallback: the callback value is an opaque global load —

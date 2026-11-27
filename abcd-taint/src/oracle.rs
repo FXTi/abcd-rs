@@ -28,7 +28,8 @@
 
 use abcd_analysis::dataflow::alias::Rung1AliasOracle;
 use abcd_analysis::dataflow::heap::{
-    self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, Rung0AliasOracle, SiteInfo,
+    self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, Rung0AliasOracle,
+    SingletonSiteClassifier, SiteInfo,
 };
 use abcd_analysis::dataflow::pta::{EnvAnswer, Rung2AliasOracle};
 use abcd_ir::{InstId, ValueId};
@@ -62,12 +63,33 @@ impl<'m> Oracle<'m> {
 
     /// The point-aware resolution: the refined arms answer through
     /// their engines when the answer is complete; rung 0 (and any
-    /// imprecise query) answers with the local def chain.
+    /// imprecise query) answers with the local def chain, gated by
+    /// [`SingletonSiteClassifier`] (`D5`).
     pub fn site_info_at(&self, value: ValueId, at: InstId) -> SiteInfo {
         match self {
-            Oracle::Rung0(o) => o.resolve(value),
+            Oracle::Rung0(o) => o.site_info_at(value, at),
             Oracle::Rung1(o) => o.site_info_at(value, at),
             Oracle::Rung2(o) => o.site_info_at(value, at),
+        }
+    }
+
+    /// Borrow the active [`SingletonSiteClassifier`] (`D5`).
+    #[must_use]
+    pub fn singletons(&self) -> &SingletonSiteClassifier {
+        match self {
+            Oracle::Rung0(o) => o.singletons(),
+            Oracle::Rung1(o) => o.singletons(),
+            Oracle::Rung2(o) => o.singletons(),
+        }
+    }
+
+    /// Whether `site` executes at most once in a concrete program run (`D5`).
+    #[must_use]
+    pub fn is_concrete_singleton_site(&self, site: InstId) -> bool {
+        match self {
+            Oracle::Rung0(o) => o.is_concrete_singleton_site(site),
+            Oracle::Rung1(o) => o.is_concrete_singleton_site(site),
+            Oracle::Rung2(o) => o.is_concrete_singleton_site(site),
         }
     }
 

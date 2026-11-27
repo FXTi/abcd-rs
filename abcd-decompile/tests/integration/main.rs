@@ -11,6 +11,8 @@ mod golden_module;
 mod golden_split_arkui;
 mod golden_structure;
 mod golden_template;
+mod issue95_remediations;
+mod regions_crafted;
 mod round5_wave1;
 mod round5_wave2;
 mod structure_w8;

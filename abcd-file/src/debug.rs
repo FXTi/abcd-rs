@@ -315,12 +315,17 @@ impl DebugSink for ModelDebugSink<'_> {
 /// Decode a single `DebugInfoItem` + its `LineNumberProgramItem` directly from
 /// `file_bytes` with exact parity against upstream `DebugInfoExtractor` and
 /// zero C++ `DebugInfoExtractor` heap / `LOG(FATAL)` exposure (`D2`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "debug decoder threads class/method FFI context, code size bound, and sink directly"
+)]
 pub(crate) fn decode_method_debug_item<S: DebugSink>(
     f: *const sys::AbcFileHandle,
     file_bytes: &[u8],
     class_id: u32,
     class_source_file_off: u32,
     mr: *mut sys::AbcMethodAccessor,
+    code_size: u32,
     debug_off: u32,
     sink: &mut S,
 ) -> Result<(), Error> {
@@ -473,6 +478,20 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
     let mut source_code_off = 0u32;
 
     // ProcessBegin() unconditionally emits `{ offset: 0, line: line_start }`.
+    let max_rows = (code_size as usize).saturating_mul(4).max(1_000_000);
+    let mut emitted_rows = 1usize;
+    let check_row_cap = |rows: &mut usize| -> Result<(), Error> {
+        *rows = rows.saturating_add(1);
+        if *rows > max_rows {
+            return Err(Error::Malformed {
+                field: "line_number_program",
+                context: format!(
+                    "method debug info at {debug_off:#x} exceeded LNP row cap ({max_rows})"
+                ),
+            });
+        }
+        Ok(())
+    };
     sink.push_line(0, line_start);
 
     loop {
@@ -496,6 +515,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             0x03 => {
                 // START_LOCAL
+                check_row_cap(&mut emitted_rows)?;
                 let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 let name_id =
                     crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
@@ -508,6 +528,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             0x04 => {
                 // START_LOCAL_EXTENDED
+                check_row_cap(&mut emitted_rows)?;
                 let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 let name_id =
                     crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
@@ -549,6 +570,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             0x0b => {
                 // SET_COLUMN
+                check_row_cap(&mut emitted_rows)?;
                 let column =
                     crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 sink.push_column(address, column);
@@ -556,6 +578,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             _ => {
                 // Special opcode (>= 0x0c): LINE_BASE = -4, LINE_RANGE = 15.
+                check_row_cap(&mut emitted_rows)?;
                 let adjust = i32::from(opcode - 0x0c);
                 let pc_off = (adjust / 15) as u32;
                 let line_off = (adjust % 15) - 4;

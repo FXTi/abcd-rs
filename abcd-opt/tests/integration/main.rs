@@ -11,6 +11,7 @@ mod opt_inline;
 mod opt_inline_e2e;
 mod opt_inline_red;
 mod opt_inline_skip_reasons;
+mod opt_issue93_remediations;
 mod opt_merge_empty_phi;
 mod opt_round3_soundness;
 mod opt_sccp_exception_soundness;

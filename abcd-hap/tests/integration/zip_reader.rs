@@ -40,7 +40,7 @@ fn stored_and_deflated_entries_roundtrip() {
         EntryData::Owned(_) => panic!("STORED entry must be returned as a borrowed slice"),
     }
     match archive.read("dir/b.txt").expect("read b") {
-        EntryData::Owned(v) => assert_eq!(v, deflated_data),
+        EntryData::Owned(v) => assert_eq!(v.as_ref(), deflated_data.as_slice()),
         EntryData::Borrowed(_) => panic!("DEFLATE entry must be returned as owned bytes"),
     }
 }
@@ -304,7 +304,44 @@ fn signing_block_junk_before_central_directory_is_tolerated() {
 fn empty_zip_opens_with_zero_entries() {
     let built = build_zip(&[]);
     let archive = ZipArchive::open(&built.bytes).expect("open");
+    assert_eq!(archive.len(), 0);
+    assert!(archive.is_empty());
+    assert!(archive.entry_at(0).is_none());
     assert_eq!(archive.entries().count(), 0);
+}
+
+#[test]
+fn entry_at_indexes_central_directory_ordinals_including_duplicate_names() {
+    let built = build_zip(&[
+        ZipEntry::stored("dup.bin", b"first-payload"),
+        ZipEntry::deflated("dup.bin", b"second-payload-longer"),
+        ZipEntry::stored("tail.txt", b"tail"),
+    ]);
+    let archive = ZipArchive::open(&built.bytes).expect("open");
+    assert_eq!(archive.len(), 3);
+    assert!(!archive.is_empty());
+    assert!(archive.entry_at(3).is_none());
+
+    let e0 = archive.entry_at(0).expect("ordinal 0");
+    let e1 = archive.entry_at(1).expect("ordinal 1");
+    let e2 = archive.entry_at(2).expect("ordinal 2");
+    assert_eq!(e0.name, "dup.bin");
+    assert_eq!(e1.name, "dup.bin");
+    assert_eq!(e2.name, "tail.txt");
+    assert_ne!(e0.local_header_offset, e1.local_header_offset);
+
+    assert_eq!(
+        archive.read_entry(e0).expect("read ordinal 0").as_slice(),
+        b"first-payload"
+    );
+    assert_eq!(
+        archive.read_entry(e1).expect("read ordinal 1").as_slice(),
+        b"second-payload-longer"
+    );
+    assert_eq!(
+        archive.read_entry(e2).expect("read ordinal 2").as_slice(),
+        b"tail"
+    );
 }
 
 #[test]

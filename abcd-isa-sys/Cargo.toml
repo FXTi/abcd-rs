@@ -12,8 +12,5 @@ categories = ["api-bindings", "compilers"]
 [lints]
 workspace = true
 
-[dependencies]
-bitflags.workspace = true
-
 [build-dependencies]
 cc = "1"

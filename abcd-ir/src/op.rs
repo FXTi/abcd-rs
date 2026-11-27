@@ -11,9 +11,11 @@
 //! [`Op::is_terminator`] — never against a hand-maintained variant list, so
 //! variant lists cannot drift.
 
-use crate::function::Edge;
+use crate::consts::Const;
+use crate::function::{Edge, ValueDef};
 use crate::id::{BlockId, ConstId, FuncId, Sym, ValueId};
-use crate::module::FunctionKind;
+use crate::module::{FunctionKind, Module};
+use crate::ty::{DynPrim, StaticTy, Ty};
 
 /// Per-member attribute payloads of a class member buffer (B2 —
 /// `defineclasswithbuffer`'s literal array), one entry per buffer member
@@ -70,7 +72,7 @@ pub struct DefineClassData {
 
 /// Binary arithmetic/bitwise operator kind. Typed twins
 /// (`add_i32` vs `add_f64`) are `BinaryOp::Add` plus the result value's
-/// [`Ty`](crate::ty::Ty), not two ops.
+/// [`Ty`], not two ops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     /// `+`.
@@ -679,9 +681,8 @@ pub enum Op {
     NewLexEnvWithName {
         /// Number of variables in the new environment.
         num_vars: u16,
-        /// The scope-names constant (an
-        /// [`Const::ArrayLiteral`](crate::consts::Const::ArrayLiteral) of
-        /// [`Const::String`](crate::consts::Const::String) names).
+        /// The scope-names constant (an [`Const::ArrayLiteral`] of
+        /// [`Const::String`] names).
         scope_names: ConstId,
     },
     /// Pop the current lexical environment (vendor `poplexenv`,
@@ -873,9 +874,8 @@ pub enum Op {
     CreatePrivateNames {
         /// How many private names to register.
         count: u16,
-        /// The private-name strings (an
-        /// [`Const::ArrayLiteral`](crate::consts::Const::ArrayLiteral) of
-        /// [`Const::String`](crate::consts::Const::String)) — vendor
+        /// The private-name strings (an [`Const::ArrayLiteral`] of
+        /// [`Const::String`]) — vendor
         /// `callruntime.createprivateproperty imm:u16, literalarray_id`
         /// (isa.yaml:843-848).
         names: ConstId,
@@ -2109,6 +2109,626 @@ impl Op {
             | Debugger => {}
         }
     }
+
+    /// Visit every [`BlockId`] referenced directly by this op (terminator
+    /// targets and [`Op::Phi`] incoming edge sources).
+    pub fn for_each_block_id<F: FnMut(BlockId)>(&self, mut f: F) {
+        use Op::*;
+        match self {
+            Branch { dest } => f(*dest),
+            CondBranch {
+                true_dest,
+                false_dest,
+                ..
+            } => {
+                f(*true_dest);
+                f(*false_dest);
+            }
+            Phi { entries } => {
+                for (edge, _) in entries {
+                    f(edge.from);
+                }
+            }
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineFunc { .. }
+            | DefineClass(_)
+            | DefineSendableClass(_)
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Return { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit each mutable [`BlockId`] referenced directly by this op in exact
+    /// [`Op::for_each_block_id`] order.
+    pub fn for_each_block_id_mut<'a, F: FnMut(&'a mut BlockId)>(&'a mut self, mut f: F) {
+        use Op::*;
+        match self {
+            Branch { dest } => f(dest),
+            CondBranch {
+                true_dest,
+                false_dest,
+                ..
+            } => {
+                f(true_dest);
+                f(false_dest);
+            }
+            Phi { entries } => {
+                for (edge, _) in entries {
+                    f(&mut edge.from);
+                }
+            }
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineFunc { .. }
+            | DefineClass(_)
+            | DefineSendableClass(_)
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Return { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit each mutable [`ConstId`] referenced directly by this op in exact
+    /// [`Op::for_each_const_id`] order.
+    pub fn for_each_const_id_mut<'a, F: FnMut(&'a mut ConstId)>(&'a mut self, mut f: F) {
+        use Op::*;
+        match self {
+            LoadConst(c) => f(c),
+            AllocObject { shape } => f(shape),
+            AllocArray { shape } => {
+                if let Some(c) = shape {
+                    f(c);
+                }
+            }
+            NewLexEnvWithName { scope_names, .. } => f(scope_names),
+            DefineClass(d) | DefineSendableClass(d) => f(&mut d.members),
+            CreatePrivateNames { names, .. } => f(names),
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineFunc { .. }
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit each mutable [`FuncId`] referenced directly by this op in exact
+    /// [`Op::for_each_func_id`] order.
+    pub fn for_each_func_id_mut<'a, F: FnMut(&'a mut FuncId)>(&'a mut self, mut f: F) {
+        use Op::*;
+        match self {
+            DefineFunc { body, .. } => f(body),
+            DefineClass(d) | DefineSendableClass(d) => f(&mut d.ctor),
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit each mutable [`Sym`] referenced directly by this op in exact
+    /// [`Op::for_each_sym`] order.
+    pub fn for_each_sym_mut<'a, F: FnMut(&'a mut Sym)>(&'a mut self, mut f: F) {
+        use Op::*;
+        match self {
+            AllocRegExp { pattern, .. } => f(pattern),
+            LoadProp { name, .. }
+            | StoreProp { name, .. }
+            | StoreOwnPropName { name, .. }
+            | DefineMethod { name, .. }
+            | TryGetGlobal { name, .. }
+            | StoreGlobal { name, .. }
+            | StoreGlobalRecord { name, .. }
+            | TryStoreGlobal { name, .. }
+            | ThrowUndefinedIfHoleWithName { name, .. } => f(name),
+            TestProp { key, .. } => {
+                if let PropKey::Name(s) = key {
+                    f(s);
+                }
+            }
+            DefineFunc { captures, .. } => {
+                for (s, _) in captures {
+                    f(s);
+                }
+            }
+            LoadSuper { key, .. } | StoreSuper { key, .. } => {
+                if let SuperKey::Name(s) = key {
+                    f(s);
+                }
+            }
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocClosure { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DeleteProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineClass(_)
+            | DefineSendableClass(_)
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | CreateAsyncGenerator { .. }
+            | SetGeneratorState { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | AsyncGeneratorResolve { .. }
+            | AsyncGeneratorReject { .. }
+            | NotifyConcurrentResult { .. }
+            | LoadSymbol
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Whether this op unconditionally produces an ECMAScript boolean result
+    /// from its opcode semantics alone (`Compare`, boolean `UnaryOp`,
+    /// `TestProp`, `TestPrivate`, `DeleteProp`).
+    #[must_use]
+    pub const fn produces_bool(&self) -> bool {
+        match self {
+            Op::Compare { .. }
+            | Op::TestProp { .. }
+            | Op::TestPrivate { .. }
+            | Op::DeleteProp { .. } => true,
+            Op::UnaryOp { op, .. } => op.is_boolean_result(),
+            _ => false,
+        }
+    }
+
+    /// Context-sensitive boolean-result query inspecting `module` constants,
+    /// `Mov` chains, and `Phi` inputs when [`Op::produces_bool`] is `false`.
+    #[must_use]
+    pub fn produces_bool_in(&self, module: &Module) -> bool {
+        let is_val_bool = |start: ValueId| -> bool {
+            let mut cur = start;
+            let limit = module.values.len();
+            for _ in 0..=limit {
+                let Some(val) = module.value(cur) else {
+                    return false;
+                };
+                if matches!(
+                    val.ty,
+                    Ty::DynPrim(DynPrim::Bool) | Ty::Static(StaticTy::U1)
+                ) {
+                    return true;
+                }
+                match val.def {
+                    ValueDef::Const(cid) => {
+                        return matches!(module.consts.get(cid), Some(Const::Bool(_)));
+                    }
+                    ValueDef::Inst(iid) => {
+                        let Some(inst) = module.inst(iid) else {
+                            return false;
+                        };
+                        if inst.op.produces_bool() {
+                            return true;
+                        }
+                        match &inst.op {
+                            Op::LoadConst(cid) => {
+                                return matches!(module.consts.get(*cid), Some(Const::Bool(_)));
+                            }
+                            Op::Mov { src } => {
+                                if *src == cur {
+                                    return false;
+                                }
+                                cur = *src;
+                            }
+                            _ => return false,
+                        }
+                    }
+                    ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return false,
+                }
+            }
+            false
+        };
+
+        if self.produces_bool() {
+            return true;
+        }
+        match self {
+            Op::LoadConst(cid) => matches!(module.consts.get(*cid), Some(Const::Bool(_))),
+            Op::Mov { src } => is_val_bool(*src),
+            Op::Phi { entries } => {
+                !entries.is_empty() && entries.iter().all(|(_, v)| is_val_bool(*v))
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2651,11 +3271,151 @@ mod tests {
             if let Arity::Exact(n) = op.arity() {
                 assert_eq!(vec_ops.len(), n, "arity mismatch: {op:?}");
             }
+
+            // Entity visitor & mut-visitor parity across all 94 variants.
+            let mut b_imm = Vec::new();
+            let mut b_mut = Vec::new();
+            op.for_each_block_id(|id| b_imm.push(id));
+            op.for_each_block_id_mut(|id| {
+                b_mut.push(*id);
+                *id = BlockId::new(id.0 + 10);
+            });
+            assert_eq!(b_imm, b_mut, "block_id visitor mismatch: {op:?}");
+            let mut b_after = Vec::new();
+            op.for_each_block_id(|id| b_after.push(id));
+            assert_eq!(
+                b_after,
+                b_imm
+                    .iter()
+                    .map(|id| BlockId::new(id.0 + 10))
+                    .collect::<Vec<_>>()
+            );
+
+            let mut c_imm = Vec::new();
+            let mut c_mut = Vec::new();
+            op.for_each_const_id(|id| c_imm.push(id));
+            op.for_each_const_id_mut(|id| {
+                c_mut.push(*id);
+                *id = ConstId::new(id.0 + 10);
+            });
+            assert_eq!(c_imm, c_mut, "const_id visitor mismatch: {op:?}");
+
+            let mut f_imm = Vec::new();
+            let mut f_mut = Vec::new();
+            op.for_each_func_id(|id| f_imm.push(id));
+            op.for_each_func_id_mut(|id| {
+                f_mut.push(*id);
+                *id = FuncId::new(id.0 + 10);
+            });
+            assert_eq!(f_imm, f_mut, "func_id visitor mismatch: {op:?}");
+
+            let mut s_imm = Vec::new();
+            let mut s_mut = Vec::new();
+            op.for_each_sym(|id| s_imm.push(id));
+            op.for_each_sym_mut(|id| {
+                s_mut.push(*id);
+                *id = Sym::new(id.0 + 10);
+            });
+            assert_eq!(s_imm, s_mut, "sym visitor mismatch: {op:?}");
         }
         assert_eq!(
             distinct_discriminants.len(),
             94,
             "test must cover all 94 Op variants"
+        );
+    }
+
+    #[test]
+    fn produces_bool_and_produces_bool_in_cover_constants_movs_and_phis() {
+        use crate::function::{EdgeKind, Inst, Value};
+        use crate::id::InstId;
+
+        let mut m = Module::new();
+        let c_true = m.consts.push(Const::Bool(true));
+        let c_num = m.consts.push(Const::number(1.0));
+        let b0 = BlockId::new(0);
+
+        let v_bool_const = ValueId::new(0);
+        m.values.push(Value {
+            def: ValueDef::Inst(InstId::new(0)),
+            ty: Ty::Any,
+        });
+        m.insts.push(Inst {
+            op: Op::LoadConst(c_true),
+            result: Some(v_bool_const),
+            block: b0,
+            loc: None,
+        });
+
+        let v_mov = ValueId::new(1);
+        m.values.push(Value {
+            def: ValueDef::Inst(InstId::new(1)),
+            ty: Ty::Any,
+        });
+        m.insts.push(Inst {
+            op: Op::Mov { src: v_bool_const },
+            result: Some(v_mov),
+            block: b0,
+            loc: None,
+        });
+
+        let v_num = ValueId::new(2);
+        m.values.push(Value {
+            def: ValueDef::Const(c_num),
+            ty: Ty::DynPrim(DynPrim::Number),
+        });
+
+        assert!(
+            Op::Compare {
+                op: CmpOp::Eq,
+                left: v_num,
+                right: v_num,
+            }
+            .produces_bool()
+        );
+        assert!(
+            Op::TestProp {
+                object: v_num,
+                key: PropKey::Name(Sym::new(0)),
+            }
+            .produces_bool()
+        );
+        assert!(
+            Op::TestPrivate {
+                level: 0,
+                slot: 0,
+                obj: v_num,
+            }
+            .produces_bool()
+        );
+        assert!(
+            Op::DeleteProp {
+                object: v_num,
+                key: v_num,
+            }
+            .produces_bool()
+        );
+        assert!(!Op::LoadConst(c_true).produces_bool());
+        assert!(Op::LoadConst(c_true).produces_bool_in(&m));
+        assert!(!Op::LoadConst(c_num).produces_bool_in(&m));
+        assert!(Op::Mov { src: v_mov }.produces_bool_in(&m));
+        assert!(!Op::Mov { src: v_num }.produces_bool_in(&m));
+
+        let edge = Edge {
+            from: b0,
+            kind: EdgeKind::Normal,
+        };
+        assert!(
+            Op::Phi {
+                entries: vec![(edge, v_bool_const), (edge, v_mov)],
+            }
+            .produces_bool_in(&m)
+        );
+        assert!(
+            !Op::Phi {
+                entries: vec![(edge, v_bool_const), (edge, v_num)],
+            }
+            .produces_bool_in(&m)
         );
     }
 

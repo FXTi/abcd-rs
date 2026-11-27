@@ -603,3 +603,233 @@ fn try_get_global(m: &mut Module, b: abcd_ir::BlockId, name: &str) -> ValueId {
         },
     )
 }
+
+#[test]
+fn out_of_bounds_ids_and_balanced_module_hop_context_preservation() {
+    use abcd_ir::ClassId;
+    use abcd_ir::module::{ClassData, EsModule, ExportDecl, ImportDecl, ModuleRequest};
+    use abcd_ir::op::ModuleVarKind;
+
+    // 1. Out-of-bounds ValueId / InstId / BlockId / FuncId never panic.
+    let mut m_oob = mk_module();
+    let f_oob = add_func_named(&mut m_oob, "oob");
+    let b_oob = entry_of(&m_oob, f_oob);
+    emit_void(&mut m_oob, b_oob, Op::Return { value: None });
+    // Inject an out-of-bounds block/param reference on a synthetic function.
+    m_oob.functions[f_oob.index()]
+        .blocks
+        .push(abcd_ir::BlockId::new(999));
+    m_oob.functions[f_oob.index()]
+        .params
+        .push(ValueId::new(999));
+    let g_oob = CallGraph::build(&m_oob);
+    let r1_oob = Rung1AliasOracle::new(&m_oob, &g_oob);
+    let ans_oob = r1_oob.query(ValueId::new(9999), InstId::new(9999));
+    assert!(ans_oob.has_unknown);
+    let info_oob = r1_oob.site_info_at(ValueId::new(9999), InstId::new(9999));
+    assert!(info_oob.has_unknown);
+
+    // 2. Balanced `ModuleHop`:
+    //    - Record A (`Lmod_a;`): `id_fn(x) { return x; }`; `func_main_0` calls
+    //      `id_fn(exported_obj)` AND `id_fn(decoy_obj)`, storing `id_fn(exported_obj)`
+    //      into `StoreModuleVar(0)`.
+    //    - Record B (`Lmod_b;`): `wrap(y)` loads `LoadModuleVar(External, 0)` (hopping
+    //      across modules while `ctx = [call_wrap]` is non-empty!) AND returns a `Phi`
+    //      of `(imported, y)` so `y` MUST still pop `call_wrap` from `ctx` AFTER
+    //      `ModuleHop` finishes!
+    let mut m = Module::new();
+    let s_x = m.sym.intern("x");
+    let req_a = m.sym.intern("./mod_a");
+
+    let cid_a = ClassId::new(0);
+    let mut cls_a = ClassData::new(m.sym.intern("Lmod_a;"), m.sym.intern("mod_a"));
+    cls_a.es_module = Some(EsModule {
+        imports: Vec::new(),
+        exports: vec![ExportDecl::Local {
+            local_name: s_x,
+            export_name: s_x,
+        }],
+        module_requests: Vec::new(),
+    });
+    m.classes.push(cls_a);
+
+    let cid_b = ClassId::new(1);
+    let mut cls_b = ClassData::new(m.sym.intern("Lmod_b;"), m.sym.intern("mod_b"));
+    cls_b.es_module = Some(EsModule {
+        imports: vec![ImportDecl::Regular {
+            local_name: s_x,
+            import_name: s_x,
+            module_request: req_a,
+        }],
+        exports: Vec::new(),
+        module_requests: vec![ModuleRequest {
+            specifier: req_a,
+            lazy: false,
+        }],
+    });
+    m.classes.push(cls_b);
+
+    let add_rec_fn = |m: &mut Module, cid: ClassId, name: &str, formals: u16| {
+        let sym = m.sym.intern(name);
+        let fid = FuncId::new(m.functions.len() as u32);
+        let mut fd = abcd_ir::FunctionData::new(cid, sym, abcd_ir::FunctionKind::Function);
+        fd.modifiers = abcd_ir::Modifiers::STATIC;
+        m.functions.push(fd);
+        m.classes[cid.index()].methods.push(fid);
+        let b = add_block(m, fid);
+        let mut ps = Vec::new();
+        for i in 0..(3 + formals) {
+            ps.push(add_param(m, fid, i));
+        }
+        (fid, b, ps)
+    };
+
+    // `id_fn(x) { return x; }` in `mod_a`.
+    let (id_fn, b_id, p_id) = add_rec_fn(&mut m, cid_a, "id_fn", 1);
+    emit_void(
+        &mut m,
+        b_id,
+        Op::Return {
+            value: Some(p_id[3]),
+        },
+    );
+
+    // `mod_a::func_main_0`: exports `id_fn(exp_obj)` and separately calls `id_fn(decoy_a)`.
+    let (_, b_ma, _) = add_rec_fn(&mut m, cid_a, "func_main_0", 0);
+    let exp_obj = alloc_object(&mut m, b_ma);
+    let exp_site = exp_obj.inst_of(&m);
+    let decoy_a = alloc_object(&mut m, b_ma);
+    let id_ref1 = load_method_ref(&mut m, b_ma, id_fn);
+    let exp_via_id = emit(
+        &mut m,
+        b_ma,
+        Op::Call {
+            callee: id_ref1,
+            this: None,
+            args: vec![exp_obj],
+            kind: CallKind::Direct,
+        },
+    );
+    let _ = emit(
+        &mut m,
+        b_ma,
+        Op::Call {
+            callee: id_ref1,
+            this: None,
+            args: vec![decoy_a],
+            kind: CallKind::Direct,
+        },
+    );
+    emit_void(
+        &mut m,
+        b_ma,
+        Op::StoreModuleVar {
+            index: 0,
+            value: exp_via_id,
+        },
+    );
+    emit_void(&mut m, b_ma, Op::Return { value: None });
+
+    // `mod_b::wrap(y)`: merges `LoadModuleVar(External, 0)` AND parameter `y`.
+    let (wrap_fn, b_w_entry, p_w) = add_rec_fn(&mut m, cid_b, "wrap", 1);
+    let b_w_left = add_block(&mut m, wrap_fn);
+    let b_w_right = add_block(&mut m, wrap_fn);
+    let b_w_join = add_block(&mut m, wrap_fn);
+    let cond = load_number(&mut m, b_w_entry, 1.0);
+    emit_void(
+        &mut m,
+        b_w_entry,
+        Op::CondBranch {
+            cond,
+            true_dest: b_w_left,
+            false_dest: b_w_right,
+        },
+    );
+    link(&mut m, b_w_entry, b_w_left);
+    link(&mut m, b_w_entry, b_w_right);
+
+    let imp_val = emit(
+        &mut m,
+        b_w_left,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::External,
+        },
+    );
+    emit_void(&mut m, b_w_left, Op::Branch { dest: b_w_join });
+    emit_void(&mut m, b_w_right, Op::Branch { dest: b_w_join });
+    link(&mut m, b_w_left, b_w_join);
+    link(&mut m, b_w_right, b_w_join);
+
+    let merged = emit(
+        &mut m,
+        b_w_join,
+        Op::Phi {
+            entries: vec![
+                (
+                    abcd_ir::Edge {
+                        from: b_w_left,
+                        kind: abcd_ir::EdgeKind::Normal,
+                    },
+                    imp_val,
+                ),
+                (
+                    abcd_ir::Edge {
+                        from: b_w_right,
+                        kind: abcd_ir::EdgeKind::Normal,
+                    },
+                    p_w[3],
+                ),
+            ],
+        },
+    );
+    emit_void(
+        &mut m,
+        b_w_join,
+        Op::Return {
+            value: Some(merged),
+        },
+    );
+
+    // `mod_b::func_main_0` calls `wrap(caller1_arg)` and `wrap(caller2_decoy)`:
+    // querying `res1` MUST resolve `imp_val` to `{exp_site}` AND `p_w[3]` ONLY to
+    // `{caller1_site}` (never `decoy_a` and never `caller2_decoy`)!
+    let (_, b_mb, _) = add_rec_fn(&mut m, cid_b, "func_main_0", 0);
+    let caller1_arg = alloc_object(&mut m, b_mb);
+    let caller1_site = caller1_arg.inst_of(&m);
+    let caller2_decoy = alloc_object(&mut m, b_mb);
+    let wrap_ref = load_method_ref(&mut m, b_mb, wrap_fn);
+    let res1 = emit(
+        &mut m,
+        b_mb,
+        Op::Call {
+            callee: wrap_ref,
+            this: None,
+            args: vec![caller1_arg],
+            kind: CallKind::Direct,
+        },
+    );
+    let call1_iid = res1.inst_of(&m);
+    let _ = emit(
+        &mut m,
+        b_mb,
+        Op::Call {
+            callee: wrap_ref,
+            this: None,
+            args: vec![caller2_decoy],
+            kind: CallKind::Direct,
+        },
+    );
+    emit_void(&mut m, b_mb, Op::Return { value: None });
+
+    let cg = CallGraph::build(&m);
+    let r1 = Rung1AliasOracle::new(&m, &cg);
+    let ans = r1.query(res1, call1_iid);
+    assert!(
+        ans.precise_for_keying(),
+        "balanced across ModuleHop: {ans:?}"
+    );
+    let mut expected = vec![exp_site, caller1_site];
+    expected.sort();
+    assert_eq!(ans.sites.iter().collect::<Vec<_>>(), expected);
+}

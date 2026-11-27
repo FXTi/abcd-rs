@@ -1,9 +1,11 @@
 //! Container-level tests: sniffing, `.hap`/`.hsp`/`.hqf` extraction, and
 //! `.app` nesting with provenance.
 
+use std::sync::Arc;
+
 use crate::common;
 use abcd_hap::{
-    Compression, Container, EntryData, Error, Limits, MODULE_ABC, abc_modules,
+    Compression, Container, EntryData, Error, Limits, MODULE_ABC, ManifestSummary, abc_modules,
     abc_modules_with_limits,
 };
 use common::*;
@@ -72,7 +74,7 @@ fn deflated_abc_roundtrip() {
     let m = &modules[0];
     assert_eq!(m.compression, Compression::Deflated);
     match &m.data {
-        EntryData::Owned(v) => assert_eq!(v, &abc),
+        EntryData::Owned(v) => assert_eq!(v.as_ref(), abc.as_slice()),
         EntryData::Borrowed(_) => panic!("deflated abc must be owned"),
     }
     assert_eq!(
@@ -504,4 +506,197 @@ fn abc_modules_with_limits_enforces_cumulative_max_total_bytes_across_app() {
         abc_modules_with_limits(&app, tiny_entry_budget),
         Err(Error::EntryTooLarge { .. })
     ));
+}
+
+#[test]
+fn multi_abc_shared_manifest_uses_single_arc_under_tight_limits() {
+    // Construct large manifest payloads so per-module duplication would blow
+    // the cumulative `max_total_bytes` budget.
+    let mut big_manifest = br#"{"module":{"name":"shared_entry","type":"entry","pad":""#.to_vec();
+    big_manifest.extend(std::iter::repeat_n(b'M', 32 * 1024));
+    big_manifest.extend_from_slice(br#""}}"#);
+
+    let mut big_patch = br#"{"patch":{"name":"hotfix","pad":""#.to_vec();
+    big_patch.extend(std::iter::repeat_n(b'P', 16 * 1024));
+    big_patch.extend_from_slice(br#""}}"#);
+
+    let abc0 = abc_bytes(0x90);
+    let abc1 = abc_bytes(0x91);
+    let abc2 = abc_bytes(0x92);
+    let abc3 = abc_bytes(0x93);
+
+    // 1. Top-level container with DEFLATED manifests + 4 .abc modules.
+    let top_hap = build_zip(&[
+        ZipEntry::deflated("module.json", &big_manifest),
+        ZipEntry::deflated("patch.json", &big_patch),
+        ZipEntry::stored(MODULE_ABC, &abc0),
+        ZipEntry::stored("ets/AbilityA.abc", &abc1),
+        ZipEntry::stored("ets/AbilityB.abc", &abc2),
+        ZipEntry::stored("ets/AbilityC.abc", &abc3),
+    ])
+    .bytes;
+
+    let exact_inner_bytes =
+        (big_manifest.len() + big_patch.len() + abc0.len() + abc1.len() + abc2.len() + abc3.len())
+            as u64;
+    let top_limits = Limits {
+        max_entry_bytes: 64 * 1024,
+        max_total_bytes: exact_inner_bytes,
+    };
+    let top_modules =
+        abc_modules_with_limits(&top_hap, top_limits).expect("shared Arc fits exact budget");
+    assert_eq!(top_modules.len(), 4);
+
+    let EntryData::Owned(first_mod_arc) = top_modules[0].module_json.as_ref().expect("module.json")
+    else {
+        panic!("deflated module.json must be EntryData::Owned(Arc<[u8]>)");
+    };
+    let EntryData::Owned(first_patch_arc) = top_modules[0].patch_json.as_ref().expect("patch.json")
+    else {
+        panic!("deflated patch.json must be EntryData::Owned(Arc<[u8]>)");
+    };
+    for m in &top_modules[1..] {
+        let EntryData::Owned(mod_arc) = m.module_json.as_ref().expect("module.json") else {
+            panic!("expected owned Arc");
+        };
+        let EntryData::Owned(patch_arc) = m.patch_json.as_ref().expect("patch.json") else {
+            panic!("expected owned Arc");
+        };
+        assert!(
+            Arc::ptr_eq(first_mod_arc, mod_arc),
+            "top-level deflated module.json must share a single Arc<[u8]> allocation"
+        );
+        assert!(
+            Arc::ptr_eq(first_patch_arc, patch_arc),
+            "top-level deflated patch.json must share a single Arc<[u8]> allocation"
+        );
+    }
+
+    // 2. Nested .hap inside an .app with STORED manifests + 4 .abc modules:
+    //    `coerce(..., true)` and `into_static()` must coerce once before the
+    //    loop and preserve the single `Arc<[u8]>` in O(1) across all 4 modules.
+    let nested_hap = build_zip(&[
+        ZipEntry::stored("module.json", &big_manifest),
+        ZipEntry::stored("patch.json", &big_patch),
+        ZipEntry::stored(MODULE_ABC, &abc0),
+        ZipEntry::stored("ets/AbilityA.abc", &abc1),
+        ZipEntry::stored("ets/AbilityB.abc", &abc2),
+        ZipEntry::stored("ets/AbilityC.abc", &abc3),
+    ])
+    .bytes;
+    let app = build_zip(&[
+        ZipEntry::stored("pack.info", PACK_INFO),
+        ZipEntry::deflated("entry.hap", &nested_hap),
+    ])
+    .bytes;
+
+    let exact_app_budget = nested_hap.len() as u64 + exact_inner_bytes;
+    let app_limits = Limits {
+        max_entry_bytes: 128 * 1024,
+        max_total_bytes: exact_app_budget,
+    };
+    let app_modules = abc_modules_with_limits(&app, app_limits)
+        .expect("nested multi-abc hap fits exact un-duplicated budget");
+    assert_eq!(app_modules.len(), 4);
+
+    let EntryData::Owned(nested_mod_arc) =
+        app_modules[0].module_json.as_ref().expect("module.json")
+    else {
+        panic!("nested module.json must be EntryData::Owned(Arc<[u8]>)");
+    };
+    let EntryData::Owned(nested_patch_arc) =
+        app_modules[0].patch_json.as_ref().expect("patch.json")
+    else {
+        panic!("nested patch.json must be EntryData::Owned(Arc<[u8]>)");
+    };
+    for m in &app_modules[1..] {
+        let EntryData::Owned(mod_arc) = m.module_json.as_ref().expect("module.json") else {
+            panic!("expected owned Arc");
+        };
+        let EntryData::Owned(patch_arc) = m.patch_json.as_ref().expect("patch.json") else {
+            panic!("expected owned Arc");
+        };
+        assert!(
+            Arc::ptr_eq(nested_mod_arc, mod_arc),
+            "nested module.json must share a single Arc<[u8]> across into_static()"
+        );
+        assert!(
+            Arc::ptr_eq(nested_patch_arc, patch_arc),
+            "nested patch.json must share a single Arc<[u8]> across into_static()"
+        );
+    }
+
+    // Consuming one clone via into_owned() leaves sibling Arcs intact.
+    let owned_vec = app_modules[0]
+        .module_json
+        .clone()
+        .expect("module.json")
+        .into_owned();
+    assert_eq!(owned_vec, big_manifest);
+    assert_eq!(
+        app_modules[3].manifest_summary(),
+        Some(ManifestSummary {
+            module_name: Some("shared_entry".to_string()),
+            module_type: Some("entry".to_string()),
+            is_stage_model: true,
+        })
+    );
+}
+
+#[test]
+fn app_with_duplicate_named_hap_entries_extracts_both_payloads() {
+    let hap_first = build_zip(&[
+        ZipEntry::stored(
+            "module.json",
+            br#"{"module":{"name":"first_mod","type":"entry"}}"#,
+        ),
+        ZipEntry::stored(MODULE_ABC, &abc_bytes(0x71)),
+    ])
+    .bytes;
+    let hap_second = build_zip(&[
+        ZipEntry::stored(
+            "module.json",
+            br#"{"module":{"name":"second_mod","type":"feature"}}"#,
+        ),
+        ZipEntry::stored(MODULE_ABC, &abc_bytes(0x72)),
+    ])
+    .bytes;
+
+    let app = build_zip(&[
+        ZipEntry::stored("pack.info", PACK_INFO),
+        ZipEntry::deflated("dup.hap", &hap_first),
+        ZipEntry::deflated("dup.hap", &hap_second),
+    ])
+    .bytes;
+
+    match Container::sniff(&app).expect("sniff") {
+        Container::App { outer, modules } => {
+            assert_eq!(outer.len(), 3);
+            assert_eq!(modules, ["dup.hap", "dup.hap"]);
+        }
+        Container::Module(_) => panic!("expected Container::App"),
+    }
+
+    let extracted = abc_modules(&app).expect("extract both dup.hap CD entries");
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(extracted[0].container_path, ["dup.hap".to_string()]);
+    assert_eq!(extracted[1].container_path, ["dup.hap".to_string()]);
+    assert_eq!(extracted[0].data.as_slice(), abc_bytes(0x71).as_slice());
+    assert_eq!(extracted[1].data.as_slice(), abc_bytes(0x72).as_slice());
+    assert_eq!(
+        extracted[0].manifest_summary(),
+        Some(ManifestSummary {
+            module_name: Some("first_mod".to_string()),
+            module_type: Some("entry".to_string()),
+            is_stage_model: true,
+        })
+    );
+    assert_eq!(
+        extracted[1].manifest_summary(),
+        Some(ManifestSummary {
+            module_name: Some("second_mod".to_string()),
+            module_type: Some("feature".to_string()),
+            is_stage_model: true,
+        })
+    );
 }

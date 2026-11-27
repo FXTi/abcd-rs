@@ -34,7 +34,7 @@ use std::fmt;
 use crate::cfg::{ExceptionHandlerMap, SplitValueDom, normal_succs_inline};
 use crate::consts::Const;
 use crate::function::{Edge, EdgeKind, ValueDef};
-use crate::id::{BlockId, ClassId, ConstId, FuncId, InstId, Sym, ValueId};
+use crate::id::{BlockId, ClassId, ConstId, FieldId, FuncId, InstId, Sym, ValueId};
 use crate::module::{AnnValue, ExportDecl, ImportDecl, Module};
 use crate::op::{CallKind, LexEnvKind, Op, OwnStoreKind};
 use crate::ty::{StaticTy, Ty};
@@ -290,6 +290,49 @@ pub enum VerifyErrorKind {
         /// Value count.
         values: usize,
     },
+    /// An external function carries body blocks (`T6`).
+    #[error("external function must not have body blocks")]
+    ExternalFunctionHasBody,
+    /// A field reference outside the owning class's field table.
+    #[error("field {field} is outside class {class}'s field table")]
+    FieldOutOfRange {
+        /// The referenced class.
+        class: ClassId,
+        /// The out-of-range field id.
+        field: FieldId,
+    },
+    /// A function id is listed more than once across `ClassData::methods`.
+    #[error("function {0} is listed multiple times across class method tables")]
+    DuplicateClassMethod(FuncId),
+    /// `ClassData::methods` lists a function whose `class_id` names another class.
+    #[error("class {class} lists method {func}, whose class_id is {actual_class}")]
+    ClassMethodOwnerMismatch {
+        /// The class listing `func` in `methods`.
+        class: ClassId,
+        /// The mismatched function id.
+        func: FuncId,
+        /// The `class_id` recorded on `func`.
+        actual_class: ClassId,
+    },
+    /// A function in `module.functions` is missing from `module.classes[func.class_id].methods`.
+    #[error("function {func} declares class_id {class} but is missing from its methods list")]
+    UnlistedClassMethod {
+        /// The expected owning class.
+        class: ClassId,
+        /// The unlisted function id.
+        func: FuncId,
+    },
+    /// `DebugData` references an in-arena `InstId` that does not belong to this function.
+    #[error("debug info references instruction {0} not in this function")]
+    DebugInstNotInFunc(InstId),
+    /// A [`Const`] entry or constant-referencing site has an incompatible payload shape.
+    #[error("constant {const_id} has invalid payload shape: {detail}")]
+    InvalidConstShape {
+        /// The offending constant id.
+        const_id: ConstId,
+        /// Description of the violated shape invariant.
+        detail: &'static str,
+    },
 }
 
 /// The warning taxonomy (non-fatal findings).
@@ -413,6 +456,72 @@ fn block_normal_succs(module: &Module, bb: BlockId) -> ([BlockId; 2], usize) {
     normal_succs_inline(&inst.op)
 }
 
+#[inline]
+const fn is_literal_shape_const(c: &Const) -> bool {
+    matches!(
+        c,
+        Const::ArrayLiteral(_)
+            | Const::TypedArrayLiteral { .. }
+            | Const::ObjectLiteral { .. }
+            | Const::LiteralBufferRef(_)
+    )
+}
+
+#[inline]
+const fn is_loadable_scalar_const(c: &Const) -> bool {
+    !matches!(
+        c,
+        Const::Accessor(_)
+            | Const::MethodAffiliate(_)
+            | Const::BuiltinTypeIndex(_)
+            | Const::ArrayLiteral(_)
+            | Const::TypedArrayLiteral { .. }
+            | Const::ObjectLiteral { .. }
+            | Const::LiteralBufferRef(_)
+            | Const::MethodRef { .. }
+    )
+}
+
+fn check_debug_insts(
+    module: &Module,
+    func_id: FuncId,
+    seen_insts: &HashSet<InstId>,
+    report: &mut VerifyReport,
+) {
+    let Some(dbg) = module.func(func_id).and_then(|f| f.debug.as_ref()) else {
+        return;
+    };
+    let mut check_iid = |iid: InstId| {
+        let kind = if module.inst(iid).is_none() {
+            Some(VerifyErrorKind::InstOutOfArena(iid))
+        } else if !seen_insts.contains(&iid) {
+            Some(VerifyErrorKind::DebugInstNotInFunc(iid))
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            report.errors.push(VerifyError {
+                func: Some(func_id),
+                block: None,
+                inst: Some(iid),
+                kind,
+            });
+        }
+    };
+    for entry in &dbg.line_table {
+        check_iid(entry.inst);
+    }
+    for entry in &dbg.column_table {
+        check_iid(entry.inst);
+    }
+    for ln in &dbg.local_names {
+        if let Some(scope) = ln.scope {
+            check_iid(scope.start);
+            check_iid(scope.end);
+        }
+    }
+}
+
 /// Verify one function.
 #[must_use = "verification findings must be checked via VerifyReport::is_ok()"]
 pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
@@ -433,6 +542,61 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         kind,
     };
 
+    if func.is_external && !func.blocks.is_empty() {
+        report
+            .errors
+            .push(err(None, None, VerifyErrorKind::ExternalFunctionHasBody));
+    }
+
+    let mut defined: HashSet<ValueId> = HashSet::new();
+    for (i, &val) in func.params.iter().enumerate() {
+        let expected_idx = u16::try_from(i).ok();
+        match module.value(val).map(|v| v.def) {
+            None => report
+                .errors
+                .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
+            Some(def) if expected_idx.is_none_or(|idx| def != ValueDef::Param(idx)) => {
+                report.errors.push(err(
+                    None,
+                    None,
+                    VerifyErrorKind::ParamDefMismatch {
+                        value: val,
+                        actual: def,
+                    },
+                ));
+            }
+            _ => {
+                if !defined.insert(val) {
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::DuplicateValueDef(val)));
+                }
+            }
+        }
+    }
+    for &val in &func.frame_init_consts {
+        match module.value(val).map(|v| v.def) {
+            None => report
+                .errors
+                .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
+            Some(ValueDef::Const(c)) => {
+                if module.consts.get(c).is_some() {
+                    defined.insert(val);
+                } else {
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::ConstOutOfRange(c)));
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::ForeignValue(val)));
+                }
+            }
+            Some(_) => report
+                .errors
+                .push(err(None, None, VerifyErrorKind::ForeignValue(val))),
+        }
+    }
+
     // External functions carry no body (T6).
     if func.blocks.is_empty() {
         if !func.is_external {
@@ -440,6 +604,21 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                 .errors
                 .push(err(None, None, VerifyErrorKind::MissingBody));
         }
+        for region in &func.try_regions {
+            for &p in &region.protected {
+                report
+                    .errors
+                    .push(err(None, None, VerifyErrorKind::ForeignTryBlock(p)));
+            }
+            for catch in &region.catches {
+                report.errors.push(err(
+                    None,
+                    None,
+                    VerifyErrorKind::ForeignHandler(catch.handler),
+                ));
+            }
+        }
+        check_debug_insts(module, func_id, &HashSet::new(), &mut report);
         return report;
     }
 
@@ -454,11 +633,20 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             }
         }
     }
+    let mut block_pred_sets: HashMap<BlockId, HashSet<Edge>> =
+        HashMap::with_capacity(func.blocks.len());
     for &bb in &func.blocks {
-        if module.block(bb).is_none() {
-            report
-                .errors
-                .push(err(None, None, VerifyErrorKind::BlockOutOfArena(bb)));
+        match module.block(bb) {
+            Some(b) => {
+                block_pred_sets
+                    .entry(bb)
+                    .or_insert_with(|| b.preds.iter().copied().collect());
+            }
+            None => {
+                report
+                    .errors
+                    .push(err(None, None, VerifyErrorKind::BlockOutOfArena(bb)));
+            }
         }
     }
     let entry = func.blocks[0];
@@ -510,11 +698,16 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                         handler: catch.handler,
                     },
                 ));
+            } else if func_blocks.contains(&catch.handler) {
+                defined.insert(catch.exception);
             }
             // Exceptional edges are first-class (T5): the handler lists
-            // every protected block as an Exceptional predecessor.
+            // every protected block as an Exceptional predecessor (using hoisted
+            // `block_pred_sets` rather than rebuilding `h_preds` per catch).
             if let Some(handler) = module.block(catch.handler) {
-                let h_preds: HashSet<Edge> = handler.preds.iter().copied().collect();
+                let h_preds = block_pred_sets
+                    .entry(catch.handler)
+                    .or_insert_with(|| handler.preds.iter().copied().collect());
                 for &p in &region.protected {
                     let edge = Edge {
                         from: p,
@@ -539,64 +732,9 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         return report;
     };
 
-    // ── Defined-value & instruction ownership scan ───────────────────
-    let mut defined: HashSet<ValueId> = HashSet::new();
+    // ── Instruction ownership scan ───────────────────────────────────
     let mut seen_insts: HashSet<InstId> = HashSet::new();
     let mut inst_pos: HashMap<InstId, usize> = HashMap::new();
-    for (i, &val) in func.params.iter().enumerate() {
-        let expected_idx = u16::try_from(i).ok();
-        match module.value(val).map(|v| v.def) {
-            None => report
-                .errors
-                .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
-            Some(def) if expected_idx.is_none_or(|idx| def != ValueDef::Param(idx)) => {
-                report.errors.push(err(
-                    None,
-                    None,
-                    VerifyErrorKind::ParamDefMismatch {
-                        value: val,
-                        actual: def,
-                    },
-                ));
-            }
-            _ => {
-                if !defined.insert(val) {
-                    report
-                        .errors
-                        .push(err(None, None, VerifyErrorKind::DuplicateValueDef(val)));
-                }
-            }
-        }
-    }
-    for region in &func.try_regions {
-        for catch in &region.catches {
-            if module.value(catch.exception).is_some() {
-                defined.insert(catch.exception);
-            }
-        }
-    }
-    for &val in &func.frame_init_consts {
-        match module.value(val).map(|v| v.def) {
-            None => report
-                .errors
-                .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
-            Some(ValueDef::Const(c)) => {
-                if module.consts.get(c).is_some() {
-                    defined.insert(val);
-                } else {
-                    report
-                        .errors
-                        .push(err(None, None, VerifyErrorKind::ConstOutOfRange(c)));
-                    report
-                        .errors
-                        .push(err(None, None, VerifyErrorKind::ForeignValue(val)));
-                }
-            }
-            Some(_) => report
-                .errors
-                .push(err(None, None, VerifyErrorKind::ForeignValue(val))),
-        }
-    }
     for &bb in &func.blocks {
         let Some(block) = module.block(bb) else {
             continue;
@@ -667,6 +805,8 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         }
     }
 
+    check_debug_insts(module, func_id, &seen_insts, &mut report);
+
     // Entry predecessors: only a Normal self-loop back-edge is legal.
     if let Some(entry_block) = module.block(entry)
         && entry_block
@@ -677,14 +817,6 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         report
             .errors
             .push(err(Some(entry), None, VerifyErrorKind::EntryHasPred));
-    }
-
-    let mut block_pred_sets: HashMap<BlockId, HashSet<Edge>> =
-        HashMap::with_capacity(func.blocks.len());
-    for &bb in &func.blocks {
-        if let Some(b) = module.block(bb) {
-            block_pred_sets.insert(bb, b.preds.iter().copied().collect());
-        }
     }
 
     // ── Per-block structural checks ──────────────────────────────────
@@ -842,6 +974,56 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     ));
                 }
             });
+            match &inst.op {
+                Op::LoadConst(cid) => {
+                    if let Some(c) = module.consts.get(*cid)
+                        && !is_loadable_scalar_const(c)
+                    {
+                        report.errors.push(err(
+                            Some(bb),
+                            Some(inst_id),
+                            VerifyErrorKind::InvalidConstShape {
+                                const_id: *cid,
+                                detail: "LoadConst requires a scalar constant, not a literal shape or method tag",
+                            },
+                        ));
+                    }
+                }
+                Op::AllocObject { shape: cid }
+                | Op::AllocArray { shape: Some(cid) }
+                | Op::NewLexEnvWithName {
+                    scope_names: cid, ..
+                }
+                | Op::CreatePrivateNames { names: cid, .. } => {
+                    if let Some(c) = module.consts.get(*cid)
+                        && !is_literal_shape_const(c)
+                    {
+                        report.errors.push(err(
+                            Some(bb),
+                            Some(inst_id),
+                            VerifyErrorKind::InvalidConstShape {
+                                const_id: *cid,
+                                detail: "op requires a literal-shape constant",
+                            },
+                        ));
+                    }
+                }
+                Op::DefineClass(d) | Op::DefineSendableClass(d) => {
+                    if let Some(c) = module.consts.get(d.members)
+                        && !is_literal_shape_const(c)
+                    {
+                        report.errors.push(err(
+                            Some(bb),
+                            Some(inst_id),
+                            VerifyErrorKind::InvalidConstShape {
+                                const_id: d.members,
+                                detail: "DefineClass members requires a literal-shape constant",
+                            },
+                        ));
+                    }
+                }
+                _ => {}
+            }
             inst.op.for_each_func_id(|fid| {
                 if module.func(fid).is_none() {
                     report.errors.push(err(
@@ -941,13 +1123,20 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     let ownership = |val: ValueId| -> Option<VerifyErrorKind> {
         let v = module.value(val)?;
         let owned = match v.def {
-            ValueDef::Param(i) => func.params.get(i as usize) == Some(&val),
-            ValueDef::Inst(def) => match module.inst(def) {
-                Some(inst) => inst.result == Some(val) && func_blocks.contains(&inst.block),
-                None => false,
-            },
             ValueDef::Const(c) => module.consts.get(c).is_some(),
-            ValueDef::ExceptionParam(h) => catch_pairs.contains(&(h, val)),
+            ValueDef::Param(i) => {
+                defined.contains(&val) && func.params.get(i as usize) == Some(&val)
+            }
+            ValueDef::Inst(def) => {
+                defined.contains(&val)
+                    && seen_insts.contains(&def)
+                    && module.inst(def).is_some_and(|inst| {
+                        inst.result == Some(val) && func_blocks.contains(&inst.block)
+                    })
+            }
+            ValueDef::ExceptionParam(h) => {
+                defined.contains(&val) && catch_pairs.contains(&(h, val))
+            }
         };
         if owned {
             None
@@ -1019,6 +1208,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     verify_dominance(
         module,
         func_id,
+        &defined,
         &block_to_idx,
         &inst_pos,
         &vdom,
@@ -1070,6 +1260,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
 fn verify_dominance(
     module: &Module,
     func_id: FuncId,
+    defined: &HashSet<ValueId>,
     index: &HashMap<BlockId, usize>,
     inst_pos: &HashMap<InstId, usize>,
     vdom: &SplitValueDom,
@@ -1110,6 +1301,9 @@ fn verify_dominance(
                     match v.def {
                         ValueDef::Param(_) | ValueDef::Const(_) => {}
                         ValueDef::ExceptionParam(h) => {
+                            if !defined.contains(val) {
+                                continue;
+                            }
                             let Some(&hi) = index.get(&h) else {
                                 continue;
                             };
@@ -1127,6 +1321,9 @@ fn verify_dominance(
                             }
                         }
                         ValueDef::Inst(def_inst) => {
+                            if !defined.contains(val) {
+                                continue;
+                            }
                             let Some(def) = module.inst(def_inst) else {
                                 continue;
                             };
@@ -1160,6 +1357,9 @@ fn verify_dominance(
                 match v.def {
                     ValueDef::Param(_) | ValueDef::Const(_) => {}
                     ValueDef::ExceptionParam(h) => {
+                        if !defined.contains(&val) {
+                            return;
+                        }
                         let Some(&hi) = index.get(&h) else { return };
                         let h_pt = vdom.entry_pt(hi);
                         if bb_reachable && !vdom.dominates_pt(h_pt, bb_entry_pt) {
@@ -1174,6 +1374,9 @@ fn verify_dominance(
                         }
                     }
                     ValueDef::Inst(def_inst) => {
+                        if !defined.contains(&val) {
+                            return;
+                        }
                         let Some(def) = module.inst(def_inst) else {
                             return;
                         };
@@ -1279,7 +1482,7 @@ fn check_annotations(
                     inst: None,
                     kind: VerifyErrorKind::ConstOutOfRange(*c),
                 }),
-                AnnValue::Class(c) | AnnValue::Field(c, _) if module.class(*c).is_none() => {
+                AnnValue::Class(c) if module.class(*c).is_none() => {
                     out.push(VerifyError {
                         func,
                         block: None,
@@ -1287,6 +1490,24 @@ fn check_annotations(
                         kind: VerifyErrorKind::ClassOutOfRange(*c),
                     });
                 }
+                AnnValue::Field(c, f) => match module.class(*c) {
+                    None => out.push(VerifyError {
+                        func,
+                        block: None,
+                        inst: None,
+                        kind: VerifyErrorKind::ClassOutOfRange(*c),
+                    }),
+                    Some(cls) if f.index() >= cls.fields.len() => out.push(VerifyError {
+                        func,
+                        block: None,
+                        inst: None,
+                        kind: VerifyErrorKind::FieldOutOfRange {
+                            class: *c,
+                            field: *f,
+                        },
+                    }),
+                    Some(_) => {}
+                },
                 AnnValue::Name(s) if module.sym.resolve(*s).is_none() => out.push(VerifyError {
                     func,
                     block: None,
@@ -1321,7 +1542,10 @@ pub fn verify_module(module: &Module) -> VerifyReport {
         }
     };
 
-    for class in &module.classes {
+    let mut method_claimed_by: Vec<Option<ClassId>> = vec![None; module.functions.len()];
+
+    for (ci, class) in module.classes.iter().enumerate() {
+        let cid = ClassId::new(ci as u32);
         check_sym(class.descriptor, None, &mut report.errors);
         check_sym(class.name, None, &mut report.errors);
         if let Some(sf) = class.source_file {
@@ -1342,10 +1566,27 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             }
         }
         for &m in &class.methods {
-            if module.func(m).is_none() {
+            let Some(f_data) = module.func(m) else {
                 report
                     .errors
                     .push(module_err(VerifyErrorKind::FuncOutOfRange(m)));
+                continue;
+            };
+            if method_claimed_by[m.index()].is_some() {
+                report
+                    .errors
+                    .push(module_err(VerifyErrorKind::DuplicateClassMethod(m)));
+            } else {
+                method_claimed_by[m.index()] = Some(cid);
+            }
+            if f_data.class_id != cid {
+                report
+                    .errors
+                    .push(module_err(VerifyErrorKind::ClassMethodOwnerMismatch {
+                        class: cid,
+                        func: m,
+                        actual_class: f_data.class_id,
+                    }));
             }
         }
         for field in &class.fields {
@@ -1361,12 +1602,21 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             check_annotations(module, &field.annotations, None, &mut report.errors);
         }
         check_annotations(module, &class.annotations, None, &mut report.errors);
-        if let Some(sn) = class.scope_names
-            && module.consts.get(sn).is_none()
-        {
-            report
-                .errors
-                .push(module_err(VerifyErrorKind::ConstOutOfRange(sn)));
+        if let Some(sn) = class.scope_names {
+            match module.consts.get(sn) {
+                None => report
+                    .errors
+                    .push(module_err(VerifyErrorKind::ConstOutOfRange(sn))),
+                Some(c) if !is_literal_shape_const(c) => {
+                    report
+                        .errors
+                        .push(module_err(VerifyErrorKind::InvalidConstShape {
+                            const_id: sn,
+                            detail: "scope_names requires a literal-shape constant",
+                        }));
+                }
+                Some(_) => {}
+            }
         }
         if let Some(esm) = &class.es_module {
             for imp in &esm.imports {
@@ -1475,6 +1725,13 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             report
                 .errors
                 .push(module_err(VerifyErrorKind::ClassOutOfRange(func.class_id)));
+        } else if method_claimed_by[fi].is_none() {
+            report
+                .errors
+                .push(module_err(VerifyErrorKind::UnlistedClassMethod {
+                    class: func.class_id,
+                    func: fid,
+                }));
         }
         check_sym(func.name, Some(fid), &mut report.errors);
         if let Some(sig) = &func.sig {
@@ -1499,15 +1756,27 @@ pub fn verify_module(module: &Module) -> VerifyReport {
                     check_ty_classes(module, ty, &mut report.errors, Some(fid));
                 }
             }
-            if let Some(sn) = dbg.scope_names
-                && module.consts.get(sn).is_none()
-            {
-                report.errors.push(VerifyError {
-                    func: Some(fid),
-                    block: None,
-                    inst: None,
-                    kind: VerifyErrorKind::ConstOutOfRange(sn),
-                });
+            if let Some(sn) = dbg.scope_names {
+                match module.consts.get(sn) {
+                    None => report.errors.push(VerifyError {
+                        func: Some(fid),
+                        block: None,
+                        inst: None,
+                        kind: VerifyErrorKind::ConstOutOfRange(sn),
+                    }),
+                    Some(c) if !is_literal_shape_const(c) => {
+                        report.errors.push(VerifyError {
+                            func: Some(fid),
+                            block: None,
+                            inst: None,
+                            kind: VerifyErrorKind::InvalidConstShape {
+                                const_id: sn,
+                                detail: "scope_names requires a literal-shape constant",
+                            },
+                        });
+                    }
+                    Some(_) => {}
+                }
             }
         }
 
@@ -1548,7 +1817,11 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             }
         }
         let mut func_unique_insts: HashSet<InstId> = HashSet::new();
-        for &bb in &func_unique_blocks {
+        let mut seen_func_blocks: HashSet<BlockId> = HashSet::with_capacity(func.blocks.len());
+        for &bb in &func.blocks {
+            if !seen_func_blocks.insert(bb) {
+                continue;
+            }
             if let Some(block) = module.block(bb) {
                 for &iid in &block.insts {
                     if func_unique_insts.insert(iid) && !global_insts.insert(iid) {
@@ -1600,13 +1873,20 @@ pub fn verify_module(module: &Module) -> VerifyReport {
             Const::String(s) | Const::BigInt(s) | Const::EtsImplements(s) => {
                 check_sym(*s, None, &mut report.errors);
             }
-            Const::LiteralBufferRef(child) => {
-                if module.consts.get(*child).is_none() {
+            Const::LiteralBufferRef(child) => match module.consts.get(*child) {
+                None => report
+                    .errors
+                    .push(module_err(VerifyErrorKind::ConstOutOfRange(*child))),
+                Some(inner) if !is_literal_shape_const(inner) => {
                     report
                         .errors
-                        .push(module_err(VerifyErrorKind::ConstOutOfRange(*child)));
+                        .push(module_err(VerifyErrorKind::InvalidConstShape {
+                            const_id: cid,
+                            detail: "LiteralBufferRef target must be a literal-shape constant",
+                        }));
                 }
-            }
+                Some(_) => {}
+            },
             Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
                 for &child in items {
                     if module.consts.get(child).is_none() {
@@ -1716,6 +1996,7 @@ mod tests {
             name,
             FunctionKind::Function,
         ));
+        m.classes[0].methods.push(id);
         add_block(m, id); // entry
         id
     }
@@ -3859,6 +4140,7 @@ mod tests {
         }
         let (a, b) = (func.params[3], func.params[4]);
         module.functions.push(func);
+        module.classes[0].methods.push(FuncId::new(0));
 
         let sum_inst = InstId::new(0);
         let sum_val = ValueId::new(module.values.len() as u32);
@@ -3890,5 +4172,170 @@ mod tests {
             .extend([sum_inst, ret_inst]);
 
         assert!(verify_module(&module).is_ok());
+    }
+
+    #[test]
+    fn detached_inst_value_class_methods_bijection_debug_and_const_shapes_are_checked() {
+        use crate::function::{ColumnEntry, DebugData, LineEntry, LocalName, LocalScope};
+        use crate::module::Annotation;
+
+        // 1. Detached `ValueDef::Inst` (instruction in arena with `block = entry`,
+        //    but unlinked from `entry.insts`) MUST be rejected!
+        let (mut m1, f1) = minimal_func_module();
+        let e1 = entry_of(&m1, f1);
+        let c1 = m1.consts.push(Const::number(42.0));
+        let detached_iid = InstId::new(m1.insts.len() as u32);
+        let detached_val = ValueId::new(m1.values.len() as u32);
+        m1.values.push(Value {
+            def: ValueDef::Inst(detached_iid),
+            ty: Ty::Any,
+        });
+        m1.insts.push(Inst {
+            op: Op::LoadConst(c1),
+            result: Some(detached_val),
+            block: e1,
+            loc: None,
+        });
+        m1.block_mut(e1).unwrap().insts.clear();
+        emit_void(
+            &mut m1,
+            e1,
+            Op::Return {
+                value: Some(detached_val),
+            },
+        );
+        let r1 = verify_func(&m1, f1);
+        expect_error(
+            &r1,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(v) if *v == detached_val),
+            "ForeignValue(detached inst)",
+        );
+
+        // 2. ClassData::methods <-> FunctionData::class_id bijection, AnnValue::Field,
+        //    ExternalFunctionHasBody, DebugData InstIds, and Const payload shapes.
+        let (mut m2, f2) = minimal_func_module();
+        let e2 = entry_of(&m2, f2);
+        let sym = m2.sym.intern("x");
+        m2.classes.push(ClassData::new(sym, sym)); // ClassId(1)
+
+        // Duplicate method + owner mismatch (`f2` has `class_id == ClassId(0)`, also listed in `ClassId(1)`).
+        m2.classes[1].methods.push(f2);
+
+        // Unlisted method (`f_unlisted` has `class_id == ClassId(1)`, not in `classes[1].methods`)
+        // AND is external with non-empty blocks (`ExternalFunctionHasBody`).
+        let f_unlisted = FuncId::new(m2.functions.len() as u32);
+        let b_ext = BlockId::new(m2.blocks.len() as u32);
+        m2.blocks.push(Block::default());
+        emit_void(&mut m2, b_ext, Op::Return { value: None });
+        let mut ext_fd = FunctionData::new(ClassId::new(1), sym, FunctionKind::Function);
+        ext_fd.is_external = true;
+        ext_fd.blocks.push(b_ext);
+        m2.functions.push(ext_fd);
+
+        // AnnValue::Field out of range on `ClassId(0)` (`0` fields).
+        m2.classes[0].annotations.push(Annotation {
+            class: ClassId::new(0),
+            elements: vec![(sym, AnnValue::Field(ClassId::new(0), FieldId::new(3)))],
+        });
+
+        // DebugData referencing an instruction of `f_unlisted` (foreign to `f2`) + out-of-arena InstId.
+        let foreign_iid = m2.block(b_ext).unwrap().insts[0];
+        m2.func_mut(f2).unwrap().debug = Some(DebugData {
+            line_table: vec![LineEntry {
+                inst: foreign_iid,
+                line: 1,
+            }],
+            column_table: vec![ColumnEntry {
+                inst: InstId::new(9999),
+                column: 1,
+            }],
+            local_names: vec![LocalName {
+                name: sym,
+                ty: None,
+                scope: Some(LocalScope {
+                    start: foreign_iid,
+                    end: foreign_iid,
+                }),
+            }],
+            ..DebugData::default()
+        });
+
+        // InvalidConstShape: LiteralBufferRef pointing to scalar + AllocObject pointing to scalar + LoadConst of ArrayLiteral.
+        let c_scalar = m2.consts.push(Const::Null);
+        let c_bad_bref = m2.consts.push(Const::LiteralBufferRef(c_scalar));
+        let c_arr = m2.consts.push_array(vec![c_scalar]);
+        m2.block_mut(e2).unwrap().insts.clear();
+        let _ = emit(&mut m2, e2, Op::AllocObject { shape: c_scalar });
+        let _ = emit(&mut m2, e2, Op::LoadConst(c_arr));
+        emit_void(&mut m2, e2, Op::Return { value: None });
+
+        let r2 = verify_module(&m2);
+        expect_error(
+            &r2,
+            |k| matches!(k, VerifyErrorKind::DuplicateClassMethod(id) if *id == f2),
+            "DuplicateClassMethod",
+        );
+        expect_error(
+            &r2,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::ClassMethodOwnerMismatch {
+                        class,
+                        func,
+                        actual_class,
+                    } if *class == ClassId::new(1) && *func == f2 && *actual_class == ClassId::new(0)
+                )
+            },
+            "ClassMethodOwnerMismatch",
+        );
+        expect_error(
+            &r2,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::UnlistedClassMethod { class, func }
+                        if *class == ClassId::new(1) && *func == f_unlisted
+                )
+            },
+            "UnlistedClassMethod",
+        );
+        expect_error(
+            &r2,
+            |k| matches!(k, VerifyErrorKind::ExternalFunctionHasBody),
+            "ExternalFunctionHasBody",
+        );
+        expect_error(
+            &r2,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::FieldOutOfRange { class, field }
+                        if *class == ClassId::new(0) && *field == FieldId::new(3)
+                )
+            },
+            "FieldOutOfRange",
+        );
+        assert!(has_error(&r2, |k| {
+            matches!(k, VerifyErrorKind::DebugInstNotInFunc(id) if *id == foreign_iid)
+        }));
+        assert!(has_error(&r2, |k| {
+            matches!(k, VerifyErrorKind::InstOutOfArena(id) if *id == InstId::new(9999))
+        }));
+        expect_error(
+            &r2,
+            |k| matches!(k, VerifyErrorKind::InvalidConstShape { const_id, .. } if *const_id == c_bad_bref),
+            "InvalidConstShape(LiteralBufferRef)",
+        );
+        expect_error(
+            &r2,
+            |k| matches!(k, VerifyErrorKind::InvalidConstShape { const_id, .. } if *const_id == c_scalar),
+            "InvalidConstShape(AllocObject)",
+        );
+        expect_error(
+            &r2,
+            |k| matches!(k, VerifyErrorKind::InvalidConstShape { const_id, .. } if *const_id == c_arr),
+            "InvalidConstShape(LoadConst)",
+        );
     }
 }

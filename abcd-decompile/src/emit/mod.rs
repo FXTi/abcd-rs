@@ -41,7 +41,7 @@
 //!   lists under the flag.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 
 use abcd_ir::function::Loc;
@@ -189,6 +189,7 @@ pub fn decompile_module_to_writer<W: Write>(
         hoisted: BTreeSet::new(),
         prepared: BTreeMap::new(),
         emitting_funcs: HashSet::new(),
+        arkui_components: HashMap::new(),
     };
     out.write_all(
         "// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n".as_bytes(),
@@ -204,53 +205,26 @@ pub fn decompile_module_to_writer<W: Write>(
         )?;
     }
 
-    // Imports (1:1 enum mapping, plus side-effect-only module requests).
-    let mut referenced_requests = BTreeSet::new();
-    for imp in &module.imports {
-        match imp {
-            ImportDecl::Regular {
-                local_name,
-                import_name,
-                module_request,
-            } => {
-                referenced_requests.insert(*module_request);
-                let local = sanitize(&sym_str(module, *local_name));
-                let import = module_facing_name(&sym_str(module, *import_name));
-                let spec = render_sym_string(module, *module_request);
-                em.fn_names.reserve(&local);
-                if import == "default" && crate::legalize::is_legal_ident(&local) {
-                    writeln!(out, "import {local} from {spec};")?;
-                } else if local == import {
-                    writeln!(out, "import {{ {local} }} from {spec};")?;
-                } else {
-                    writeln!(out, "import {{ {import} as {local} }} from {spec};")?;
-                }
-            }
-            ImportDecl::Namespace {
-                local_name,
-                module_request,
-            } => {
-                referenced_requests.insert(*module_request);
-                let local = sanitize(&sym_str(module, *local_name));
-                let spec = render_sym_string(module, *module_request);
-                em.fn_names.reserve(&local);
-                writeln!(out, "import * as {local} from {spec};")?;
-            }
-        }
-    }
-    for exp in &module.exports {
-        match exp {
-            ExportDecl::Indirect { module_request, .. } | ExportDecl::Star { module_request } => {
-                referenced_requests.insert(*module_request);
-            }
-            ExportDecl::Local { .. } => {}
-        }
-    }
-    for req in &module.module_requests {
-        if !referenced_requests.contains(&req.specifier) {
-            writeln!(out, "import {};", render_sym_string(module, req.specifier))?;
-        }
-    }
+    let slot_names = &index.slot_names;
+    let record_env = index
+        .per_class_env
+        .as_ref()
+        .and_then(|m| m.get(&abcd_ir::ClassId::new(0)));
+
+    // Imports (1:1 enum mapping, plus side-effect-only module requests in exact
+    // `[[RequestedModules]]` index order).
+    let mut import_buf = String::new();
+    emit_esm_imports(
+        module,
+        &module.imports,
+        &module.exports,
+        &module.module_requests,
+        record_env.map(|env| env.import_locals.as_slice()),
+        &mut em.fn_names,
+        &|spec| render_sym_string(module, spec),
+        &mut import_buf,
+    );
+    out.write_all(import_buf.as_bytes())?;
 
     // Global-binding name RESERVATION (the hoist itself is now
     // module-only — see below): `StoreGlobal`/`StoreGlobalRecord`/
@@ -311,11 +285,6 @@ pub fn decompile_module_to_writer<W: Write>(
     // synthetic `m{index}` fallback). Declaring them at module scope
     // keeps the output strict-mode-parseable AND gives the trailing
     // `export { name }` records a binding to reference.
-    let slot_names = &index.slot_names;
-    let record_env = index
-        .per_class_env
-        .as_ref()
-        .and_then(|m| m.get(&abcd_ir::ClassId::new(0)));
     let mut local_slots = BTreeSet::new();
     let mut unresolved_ns_slots = BTreeSet::new();
     for inst in &module.insts {
@@ -391,6 +360,9 @@ pub fn decompile_module_to_writer<W: Write>(
 
         for &f in chunk {
             fn_buf.clear();
+            if opts.arkui {
+                crate::arkui::precompute_arkui_components(&mut em, f);
+            }
             if opts.arkui
                 && !opts.call_entry
                 && module
@@ -416,6 +388,7 @@ pub fn decompile_module_to_writer<W: Write>(
         // Drop any remaining ASTs in this batch (e.g. skipped synthetic ArkUI methods)
         // before starting the next batch.
         em.prepared.clear();
+        em.arkui_components.clear();
     }
 
     // The recompile gate: invoke the module entry point WITH the
@@ -446,7 +419,7 @@ pub fn decompile_module_to_writer<W: Write>(
                     record_env,
                     &sym_str(module, *local_name),
                 );
-                let export = module_facing_name(&sym_str(module, *export_name));
+                let export = module_facing_name(module, &sym_str(module, *export_name));
                 if local == export {
                     writeln!(out, "export {{ {local} }};")?;
                 } else {
@@ -458,8 +431,8 @@ pub fn decompile_module_to_writer<W: Write>(
                 import_name,
                 module_request,
             } => {
-                let import = module_facing_name(&sym_str(module, *import_name));
-                let export = module_facing_name(&sym_str(module, *export_name));
+                let import = module_facing_name(module, &sym_str(module, *import_name));
+                let export = module_facing_name(module, &sym_str(module, *export_name));
                 let spec = render_sym_string(module, *module_request);
                 writeln!(out, "export {{ {import} as {export} }} from {spec};")?;
             }
@@ -474,15 +447,111 @@ pub fn decompile_module_to_writer<W: Write>(
     Ok(em.stats)
 }
 
-/// A module-facing name (`export { x as NAME }`, `import { NAME as x
-/// }`) is an IdentifierName, not a binding: reserved words are legal
-/// (`as default` is THE default-export spelling). Keep valid
-/// IdentifierNames verbatim; sanitize only genuinely broken shapes.
-pub(crate) fn module_facing_name(raw: &str) -> String {
+/// Emit ES `import` declarations and side-effect-only `import "spec";` requests
+/// in exact `module_requests` (`[[RequestedModules]]`) evaluation order, using
+/// `import_locals` to disambiguate any import bindings colliding with module-top
+/// declarations (`import { foo as foo$1 }`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ESM import emitter coordinates module pool, import/export/request slices, disambiguated locals, legalizer, and specifier formatter"
+)]
+pub(crate) fn emit_esm_imports(
+    module: &Module,
+    imports: &[ImportDecl],
+    exports: &[ExportDecl],
+    module_requests: &[abcd_ir::module::ModuleRequest],
+    import_locals: Option<&[String]>,
+    fn_names: &mut Legalizer,
+    resolve_spec: &dyn Fn(abcd_ir::Sym) -> String,
+    out: &mut String,
+) {
+    let mut indirect_or_star = HashSet::new();
+    for exp in exports {
+        match exp {
+            ExportDecl::Indirect { module_request, .. } | ExportDecl::Star { module_request } => {
+                indirect_or_star.insert(*module_request);
+            }
+            ExportDecl::Local { .. } => {}
+        }
+    }
+
+    let emit_one_import =
+        |imp_idx: usize, imp: &ImportDecl, fn_names: &mut Legalizer, out: &mut String| match imp {
+            ImportDecl::Regular {
+                local_name,
+                import_name,
+                module_request,
+            } => {
+                let local = import_locals
+                    .and_then(|v| v.get(imp_idx))
+                    .cloned()
+                    .unwrap_or_else(|| sanitize(&sym_str(module, *local_name)));
+                let import = module_facing_name(module, &sym_str(module, *import_name));
+                let spec = resolve_spec(*module_request);
+                fn_names.reserve(&local);
+                if import == "default" && is_legal_ident(&local) {
+                    out.push_str(&format!("import {local} from {spec};\n"));
+                } else if local == import && is_legal_ident(&local) {
+                    out.push_str(&format!("import {{ {local} }} from {spec};\n"));
+                } else {
+                    out.push_str(&format!("import {{ {import} as {local} }} from {spec};\n"));
+                }
+            }
+            ImportDecl::Namespace {
+                local_name,
+                module_request,
+            } => {
+                let local = import_locals
+                    .and_then(|v| v.get(imp_idx))
+                    .cloned()
+                    .unwrap_or_else(|| sanitize(&sym_str(module, *local_name)));
+                let spec = resolve_spec(*module_request);
+                fn_names.reserve(&local);
+                out.push_str(&format!("import * as {local} from {spec};\n"));
+            }
+        };
+
+    let mut emitted_imp = vec![false; imports.len()];
+    let mut seen_req_specs = HashSet::new();
+    for req in module_requests {
+        if !seen_req_specs.insert(req.specifier) {
+            continue;
+        }
+        let mut matched_any = false;
+        for (imp_idx, imp) in imports.iter().enumerate() {
+            let req_sym = match imp {
+                ImportDecl::Regular { module_request, .. }
+                | ImportDecl::Namespace { module_request, .. } => *module_request,
+            };
+            if req_sym == req.specifier {
+                matched_any = true;
+                emitted_imp[imp_idx] = true;
+                emit_one_import(imp_idx, imp, fn_names, out);
+            }
+        }
+        if !matched_any && !indirect_or_star.contains(&req.specifier) {
+            let spec = resolve_spec(req.specifier);
+            out.push_str(&format!("import {spec};\n"));
+        }
+    }
+
+    for (imp_idx, imp) in imports.iter().enumerate() {
+        if !emitted_imp[imp_idx] {
+            emit_one_import(imp_idx, imp, fn_names, out);
+        }
+    }
+}
+
+/// A module-facing name (`export { x as NAME }`, `import { NAME as x }`) is an
+/// ES2022 `ModuleExportName` (`IdentifierName` or `StringLiteral`): reserved
+/// words are legal unquoted (`as default`), and non-identifier names emit as
+/// quoted string literals (`export { x as "a-b" }`) rather than mangling the
+/// public export contract.
+pub(crate) fn module_facing_name(module: &Module, raw: &str) -> String {
     if crate::legalize::is_ident_name(raw) {
         raw.to_string()
     } else {
-        sanitize(raw)
+        render_pool_string(module, raw)
     }
 }
 
@@ -632,7 +701,7 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
 
 /// Walk a pooled constant graph (iteratively via an explicit heap workstack and
 /// visited-`ConstId` cycle guard) for `MethodRef` functions.
-pub(in crate::emit) fn collect_method_refs(
+pub(crate) fn collect_method_refs(
     module: &Module,
     root_cid: abcd_ir::ConstId,
     out: &mut BTreeSet<FuncId>,
@@ -830,6 +899,9 @@ pub(crate) struct Emitter<'m> {
     /// Active function emission stack to break cyclic `DefineFunc` / `MethodRef`
     /// inline chains without stack overflow (`#87.5`).
     pub(crate) emitting_funcs: HashSet<FuncId>,
+    /// Precomputed `@Component struct` outputs keyed by `(ctor, var_name)` so
+    /// [`Emitter::step_start_class`] never calls back into `crate::arkui`.
+    pub(crate) arkui_components: HashMap<(FuncId, String), (String, DecompileStats, bool)>,
 }
 
 #[derive(Clone)]
@@ -1331,7 +1403,7 @@ fn scan_nodes_inline_funcs(module: &Module, nodes: &[SNode], out: &mut Vec<FuncI
                     scan_expr_inline_funcs(module, cond, out);
                     stack.push(body);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Block(body) | SNode::Labeled { body, .. } => stack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -1388,7 +1460,8 @@ fn collect_negated_ifs_in_nodes(
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::While { body, .. }
+                SNode::Block(body)
+                | SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }
@@ -1814,6 +1887,14 @@ impl<'m> Emitter<'m> {
                     indent,
                 });
             }
+            SNode::Block(body) => {
+                out.push_str(&format!("{pad}{{\n"));
+                tasks.push(PrintTask::RawOwned(format!("{pad}}}\n")));
+                tasks.push(PrintTask::Nodes {
+                    slice: body,
+                    indent: indent + 1,
+                });
+            }
             SNode::If {
                 cond,
                 then,
@@ -1821,9 +1902,9 @@ impl<'m> Emitter<'m> {
             } => {
                 let (cond_ref, then_arm, else_arm) = if then.is_empty() && !otherwise.is_empty() {
                     let neg = negated_ifs.get(&std::ptr::from_ref(n)).unwrap_or(cond);
-                    (neg, otherwise, then)
+                    (expr::peel_truthiness(neg), otherwise, then)
                 } else {
-                    (cond, then, otherwise)
+                    (expr::peel_truthiness(cond), then, otherwise)
                 };
                 out.push_str(&format!("{pad}if ("));
                 if else_arm.is_empty() {
@@ -1865,7 +1946,10 @@ impl<'m> Emitter<'m> {
                 });
                 tasks.push(PrintTask::Raw(") {\n"));
                 match cond {
-                    Some(c) => tasks.push(PrintTask::Expr { expr: c, prec: 0 }),
+                    Some(c) => tasks.push(PrintTask::Expr {
+                        expr: expr::peel_truthiness(c),
+                        prec: 0,
+                    }),
                     None => tasks.push(PrintTask::Raw("true")),
                 }
             }
@@ -1874,7 +1958,7 @@ impl<'m> Emitter<'m> {
                 out.push_str(&format!("{pad}{lbl}do {{\n"));
                 tasks.push(PrintTask::Raw(");\n"));
                 tasks.push(PrintTask::Expr {
-                    expr: cond,
+                    expr: expr::peel_truthiness(cond),
                     prec: 0,
                 });
                 tasks.push(PrintTask::RawOwned(format!("{pad}}} while (")));
@@ -2009,10 +2093,12 @@ impl<'m> Emitter<'m> {
                 let mut parts: Vec<String> = keys
                     .iter()
                     .map(|(k, t)| {
-                        if k == t {
+                        if k == t && is_legal_ident(k) {
                             k.clone()
-                        } else {
+                        } else if crate::legalize::is_ident_name(k) {
                             format!("{k}: {t}")
+                        } else {
+                            format!("{}: {t}", render_pool_string(self.module, k))
                         }
                     })
                     .collect();
@@ -2121,7 +2207,7 @@ impl<'m> Emitter<'m> {
                 });
             }
             Stmt::Expr(expr) => {
-                let wrap = matches!(expr, Expr::ObjectLit { .. } | Expr::ObjectBuild { .. });
+                let wrap = expr::expr_needs_stmt_parens(expr);
                 out.push_str(&pad);
                 if wrap {
                     out.push('(');
@@ -2220,12 +2306,13 @@ impl<'m> Emitter<'m> {
                 out.push_str(&pad);
                 if self.class_depth > 0 {
                     let tag = if *define { " /*define*/" } else { "" };
+                    let pname = expr::format_private_ident(name);
                     tasks.push(PrintTask::RawOwned(format!(";{tag}\n")));
                     tasks.push(PrintTask::Expr {
                         expr: value,
                         prec: 0,
                     });
-                    tasks.push(PrintTask::RawOwned(format!(".#{name} = ")));
+                    tasks.push(PrintTask::RawOwned(format!(".#{pname} = ")));
                     tasks.push(PrintTask::Expr {
                         expr: object,
                         prec: 19,
@@ -2434,9 +2521,12 @@ pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
                             // ancestor, and a local `let` would SHADOW
                             // the capture (dream gate: local/closure
                             // printed NaN from exactly that shadowing).
-                            Leaf::Raw(Stmt::LexStore { level, name, .. })
-                                if (*level as usize) < own =>
-                            {
+                            Leaf::Raw(Stmt::LexStore {
+                                level,
+                                own: true,
+                                name,
+                                ..
+                            }) if (*level as usize) < own => {
                                 let name = sanitize(name);
                                 if seen.insert(name.clone()) {
                                     out.push(name);
@@ -2452,7 +2542,8 @@ pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
                     stack.push(otherwise.iter());
                     stack.push(then.iter());
                 }
-                SNode::While { body, .. }
+                SNode::Block(body)
+                | SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }
@@ -2492,7 +2583,7 @@ pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
 }
 
 /// All expression nodes of a statement (for the escape analysis).
-pub(in crate::emit) fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
+pub(crate) fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
     match s {
         Stmt::Declare { value, .. } => vec![value],
         Stmt::PhiAssign { value, .. } => vec![value],
@@ -2653,7 +2744,8 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                             frames.push(EscapeFrame::PushPath(0));
                             frames.push(EscapeFrame::PushPath(i));
                         }
-                        SNode::Labeled { body, .. }
+                        SNode::Block(body)
+                        | SNode::Labeled { body, .. }
                         | SNode::ForOf { body, .. }
                         | SNode::ForIn { body, .. } => {
                             if let SNode::ForOf { iter: head, .. }
@@ -2739,6 +2831,23 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
         }
     }
     out
+}
+
+pub(crate) fn accumulate_decompile_stats(dst: &mut DecompileStats, src: &DecompileStats) {
+    dst.functions += src.functions;
+    dst.functions_with_fallbacks += src.functions_with_fallbacks;
+    for (&k, &v) in &src.fallback_comments {
+        *dst.fallback_comments.entry(k).or_insert(0) += v;
+    }
+    for (&k, &v) in &src.elided_comments {
+        *dst.elided_comments.entry(k).or_insert(0) += v;
+    }
+    dst.classes += src.classes;
+    dst.class_methods += src.class_methods;
+    dst.closures += src.closures;
+    dst.structure = merge_struct_stats(std::mem::take(&mut dst.structure), &src.structure);
+    dst.folds = merge_fold_stats(std::mem::take(&mut dst.folds), &src.folds);
+    dst.function_bodies += src.function_bodies;
 }
 
 pub(crate) fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {

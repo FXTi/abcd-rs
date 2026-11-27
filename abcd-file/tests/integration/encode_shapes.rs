@@ -477,7 +477,10 @@ fn param_type_annotation_wrappers() {
     // MethodParamItem snapshots the staged vector on seal regardless.
     b.method_param_add_type_annotation(m, p0, ann);
     b.method_param_add_runtime_type_annotation(m, p0, ann);
-    b.method_seal_param_annotations(m, false);
+    b.method_seal_param_annotations(m, false)
+        .expect("seal compile-time param annotations");
+    b.method_seal_param_annotations(m, true)
+        .expect("seal runtime param annotations");
 
     let data = b.finalize().expect("finalize");
     let file = decode(&data).expect("decode");

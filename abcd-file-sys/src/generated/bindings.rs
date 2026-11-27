@@ -149,7 +149,7 @@ unsafe extern "C" {
         a: *mut AbcProtoAccessor,
         cb: AbcProtoTypeCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -179,7 +179,7 @@ unsafe extern "C" {
         a: *mut AbcClassAccessor,
         cb: AbcMethodOffsetCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 pub type AbcFieldOffsetCb = ::std::option::Option<
     unsafe extern "C" fn(field_offset: u32, ctx: *mut ::std::os::raw::c_void),
@@ -189,7 +189,7 @@ unsafe extern "C" {
         a: *mut AbcClassAccessor,
         cb: AbcFieldOffsetCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_class_get_ifaces_number(a: *mut AbcClassAccessor) -> u32;
@@ -205,28 +205,28 @@ unsafe extern "C" {
         a: *mut AbcClassAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_class_enumerate_runtime_annotations(
         a: *mut AbcClassAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_class_enumerate_type_annotations(
         a: *mut AbcClassAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_class_enumerate_runtime_type_annotations(
         a: *mut AbcClassAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_class_get_class_id(a: *const AbcClassAccessor) -> u32;
@@ -265,14 +265,14 @@ unsafe extern "C" {
         a: *mut AbcMethodAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_method_enumerate_runtime_annotations(
         a: *mut AbcMethodAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_method_get_param_annotation_id(a: *mut AbcMethodAccessor) -> u32;
@@ -300,14 +300,14 @@ unsafe extern "C" {
         a: *mut AbcMethodAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_method_enumerate_runtime_type_annotations(
         a: *mut AbcMethodAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_method_get_method_id(a: *const AbcMethodAccessor) -> u32;
@@ -343,6 +343,9 @@ unsafe extern "C" {
     pub fn abc_code_code_size(a: *const AbcCodeAccessor) -> u32;
 }
 unsafe extern "C" {
+    pub fn abc_code_tries_size(a: *const AbcCodeAccessor) -> u32;
+}
+unsafe extern "C" {
     pub fn abc_code_instructions(a: *const AbcCodeAccessor) -> *const u8;
 }
 #[repr(C)]
@@ -371,7 +374,7 @@ unsafe extern "C" {
         a: *mut AbcCodeAccessor,
         cb: AbcTryBlockFullCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -401,14 +404,14 @@ unsafe extern "C" {
         a: *mut AbcFieldAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_field_enumerate_runtime_annotations(
         a: *mut AbcFieldAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_field_get_value_i32(
@@ -439,14 +442,14 @@ unsafe extern "C" {
         a: *mut AbcFieldAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_field_enumerate_runtime_type_annotations(
         a: *mut AbcFieldAccessor,
         cb: AbcAnnotationCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_field_get_field_id(a: *const AbcFieldAccessor) -> u32;
@@ -503,6 +506,15 @@ unsafe extern "C" {
         ctx: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int;
 }
+unsafe extern "C" {
+    pub fn abc_literal_read_typed_array(
+        f: *const AbcFileHandle,
+        payload_off: u32,
+        element_size: u32,
+        out_values: *mut u64,
+        max_count: u32,
+    ) -> i32;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct AbcModuleAccessor {
@@ -535,7 +547,7 @@ unsafe extern "C" {
         a: *mut AbcModuleAccessor,
         cb: AbcModuleRecordCb,
         ctx: *mut ::std::os::raw::c_void,
-    );
+    ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
     pub fn abc_module_request_phase_read(

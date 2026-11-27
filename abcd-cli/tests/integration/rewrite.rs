@@ -162,13 +162,13 @@ fn rewrite_corrupt_input_is_a_tool_error() {
 
 #[test]
 fn rewrite_lift_failure_is_a_tool_error() {
-    // The ldthisbyname fixture decodes but the lifter refuses it (N51).
+    // The jeqnull fixture decodes but the lifter refuses it (ADR-07).
     let module = module_of(&common::lift_fail_abc(), "liftfail.abc");
     let err = rewrite::rewrite(&module, RewriteOptions::default()).unwrap_err();
     assert_eq!(err.exit_code(), 2);
     let msg = err.to_string();
     assert!(msg.contains("lift failed"), "{msg}");
-    assert!(msg.contains("ldthisbyname"), "{msg}");
+    assert!(msg.contains("jeqnull"), "{msg}");
 }
 
 #[test]

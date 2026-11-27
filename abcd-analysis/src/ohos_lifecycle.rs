@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
-use abcd_ir::function::{Block, FunctionData, Inst, Value};
+use abcd_ir::function::{Block, Edge, EdgeKind, FunctionData, Inst, Value};
 use abcd_ir::id::{BlockId, ClassId, ConstId, FuncId, InstId, Sym, ValueId};
 use abcd_ir::module::{FunctionKind, Modifiers, Module};
 use abcd_ir::op::{CallKind, Op};
@@ -44,8 +44,51 @@ pub const OHOS_WANT_GLOBAL: &str = "__ohos_want__";
 /// `ExtensionContext` attached to `this.context` on Ability instances.
 pub const OHOS_CONTEXT_GLOBAL: &str = "__ohos_ability_context__";
 
+/// Synthetic global condition marker driving non-deterministic dispatch in
+/// [`OHOS_HARNESS_FUNC`]'s steady-state lifecycle loop.
+pub const OHOS_LIFECYCLE_COND_GLOBAL: &str = "__ohos_lifecycle_cond__";
+
 /// Synthetic harness function name appended to augmented modules.
 pub const OHOS_HARNESS_FUNC: &str = "__abcd_ohos_harness__";
+
+/// Explicit OpenHarmony and multi-record entry-point model (`D3`, `#94`).
+///
+/// Exposes [`Self::harness_func`] and [`Self::entry_funcs`] directly so
+/// downstream call-graph, PTA, and taint drivers never need to string-match
+/// [`OHOS_HARNESS_FUNC`].
+#[derive(Clone, Debug)]
+pub struct EntryModel {
+    /// Cloned module augmented with [`Self::harness_func`] when multi-record
+    /// initializers (`> 1`) or OpenHarmony components exist; `None` for plain
+    /// single-record modules.
+    pub augmented_module: Option<Module>,
+    /// Synthesized lifecycle harness `FuncId` inside [`Self::augmented_module`],
+    /// when synthesized.
+    pub harness_func: Option<FuncId>,
+    /// Topological `func_main_0` module initializer sequence.
+    pub init_funcs: Vec<FuncId>,
+    /// Discovered OpenHarmony Ability, ExtensionAbility, and ArkUI components.
+    pub components: Vec<DiscoveredComponent>,
+    /// Effective root entry functions (`[harness_func]` when synthesized, else
+    /// top-level initializers / entry functions in `module`).
+    pub entry_funcs: Vec<FuncId>,
+}
+
+impl EntryModel {
+    /// Discover module initializers and OpenHarmony components in `module` and
+    /// synthesize the lifecycle harness (with creation, steady-state `while (*)`
+    /// callback dispatch loop, and teardown phases) when needed.
+    #[must_use]
+    pub fn build(module: &Module, manifest_json: Option<&str>) -> Self {
+        build_entry_model(module, manifest_json)
+    }
+
+    /// Borrow [`Self::augmented_module`] when present, or fall back to `original`.
+    #[must_use]
+    pub fn active_module<'a>(&'a self, original: &'a Module) -> &'a Module {
+        self.augmented_module.as_ref().unwrap_or(original)
+    }
+}
 
 /// Classification of an OpenHarmony framework component class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,26 +115,36 @@ pub struct DiscoveredComponent {
     pub methods: BTreeMap<String, Vec<FuncId>>,
 }
 
-/// Lifecycle methods invoked in deterministic order on `UIAbility` / `Ability` /
-/// `AbilityStage` instances, paired with whether the first parameter is a `Want`.
-const ABILITY_LIFECYCLE: &[(&str, bool, usize)] = &[
+/// Creation-phase callbacks on `UIAbility` / `Ability` / `AbilityStage`
+/// instances, paired with `(first_is_want, arity)`.
+const ABILITY_CREATE: &[(&str, bool, usize)] = &[
     ("onCreate", true, 2),
     ("onAcceptWant", true, 1),
     ("onWindowStageCreate", false, 1),
     ("onWindowStageRestore", false, 1),
+];
+
+/// Steady-state re-entrant callbacks dispatched inside `while (*)` on
+/// `UIAbility` / `Ability` / `AbilityStage` instances (`D3`, `#94`).
+const ABILITY_STEADY: &[(&str, bool, usize)] = &[
     ("onForeground", false, 0),
     ("onNewWant", true, 2),
     ("onShare", true, 1),
     ("onContinue", true, 1),
     ("onSaveState", true, 2),
     ("onBackground", false, 0),
-    ("onWindowStageDestroy", false, 0),
-    ("onDestroy", false, 0),
 ];
 
-/// Lifecycle callbacks invoked on `*ExtensionAbility` instances.
-const EXTENSION_LIFECYCLE: &[(&str, bool, usize)] = &[
-    ("onCreate", true, 1),
+/// Teardown-phase callbacks on `UIAbility` / `Ability` / `AbilityStage`.
+const ABILITY_TEARDOWN: &[(&str, bool, usize)] =
+    &[("onWindowStageDestroy", false, 0), ("onDestroy", false, 0)];
+
+/// Creation-phase callbacks on `*ExtensionAbility` instances.
+const EXTENSION_CREATE: &[(&str, bool, usize)] = &[("onCreate", true, 1)];
+
+/// Steady-state re-entrant callbacks dispatched inside `while (*)` on
+/// `*ExtensionAbility` instances (`D3`, `#94`).
+const EXTENSION_STEADY: &[(&str, bool, usize)] = &[
     ("onRequest", true, 2),
     ("onConnect", true, 1),
     ("onAddForm", true, 1),
@@ -105,18 +158,28 @@ const EXTENSION_LIFECYCLE: &[(&str, bool, usize)] = &[
     ("onBackup", false, 0),
     ("onRestore", false, 1),
     ("onDisconnect", true, 1),
-    ("onDestroy", false, 0),
 ];
 
-/// Lifecycle and render methods invoked on ArkUI `ViewPU` / `View` instances.
-const ARKUI_LIFECYCLE: &[&str] = &[
-    "aboutToAppear",
+/// Teardown-phase callbacks on `*ExtensionAbility` instances.
+const EXTENSION_TEARDOWN: &[(&str, bool, usize)] = &[("onDestroy", false, 0)];
+
+/// Creation-phase hooks on ArkUI `ViewPU` / `View` instances.
+const ARKUI_CREATE: &[&str] = &["aboutToAppear"];
+
+/// Steady-state render/page hooks dispatched inside `while (*)` on ArkUI
+/// `ViewPU` / `View` instances (`D3`, `#94`).
+const ARKUI_STEADY: &[&str] = &[
     "onPageShow",
     "initialRender",
+    "build",
+    "rerender",
+    "updateStateVars",
     "onBackPress",
     "onPageHide",
-    "aboutToDisappear",
 ];
+
+/// Teardown-phase hooks on ArkUI `ViewPU` / `View` instances.
+const ARKUI_TEARDOWN: &[&str] = &["aboutToDisappear"];
 
 /// Extract `srcEntry` record hints from a Stage-model `module.json` or FA-model
 /// `config.json` text payload (`"srcEntry": "./ets/entryability/EntryAbility.ets"`).
@@ -242,18 +305,23 @@ pub fn discover_components(
             }
         }
 
-        let record_desc = sym_str(module, module.classes[cid.index()].descriptor);
+        let record_desc = module
+            .class(cid)
+            .map_or("", |cls_data| sym_str(module, cls_data.descriptor));
         let in_manifest = manifest_entries
             .iter()
             .any(|e| record_desc.contains(e.as_str()));
 
         for (cls_val, ctor, heritage, members) in class_defs {
-            if !seen_ctors.insert(ctor) {
+            if module.func(ctor).is_none() || !seen_ctors.insert(ctor) {
                 continue;
             }
             let mut methods = collect_member_methods(module, members);
             if let Some(extras) = extra_methods.get(&cls_val) {
                 for (mname, mfid) in extras {
+                    if module.func(*mfid).is_none() {
+                        continue;
+                    }
                     let list = methods.entry(mname.clone()).or_default();
                     if !list.contains(mfid) {
                         list.push(*mfid);
@@ -287,21 +355,47 @@ pub fn discover_components(
 ///
 /// Returns `None` for ordinary single-module JS inputs so single-module
 /// analyses incur zero cloning or call-site changes.
+///
+/// Prefer [`EntryModel::build`] when the caller also needs structured
+/// [`EntryModel::harness_func`] / [`EntryModel::entry_funcs`] metadata.
 pub fn synthesize_ohos_harness(
     module: &Module,
     manifest_json: Option<&str>,
 ) -> Option<(Module, FuncId)> {
+    let model = EntryModel::build(module, manifest_json);
+    model.augmented_module.zip(model.harness_func)
+}
+
+fn build_entry_model(module: &Module, manifest_json: Option<&str>) -> EntryModel {
     let links = ModuleLinkTable::build(module);
     let components = discover_components(module, &links, manifest_json);
-    let init_funcs = links.init_order();
+    let init_funcs = links.init_order().to_vec();
     if components.is_empty() && init_funcs.len() <= 1 {
-        return None;
+        let entry_funcs = if init_funcs.is_empty() {
+            default_single_module_entries(module)
+        } else {
+            init_funcs.clone()
+        };
+        return EntryModel {
+            augmented_module: None,
+            harness_func: None,
+            init_funcs,
+            components,
+            entry_funcs,
+        };
+    }
+
+    if module.classes.is_empty() {
+        return EntryModel {
+            augmented_module: None,
+            harness_func: None,
+            entry_funcs: init_funcs.clone(),
+            init_funcs,
+            components,
+        };
     }
 
     let mut m = module.clone();
-    if m.classes.is_empty() {
-        return None;
-    }
     let host_cid = m
         .classes
         .iter()
@@ -312,13 +406,11 @@ pub fn synthesize_ohos_harness(
     let mut hfd = FunctionData::new(host_cid, harness_sym, FunctionKind::Function);
     hfd.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
     m.functions.push(hfd);
-    m.classes[host_cid.index()].methods.push(harness_fid);
-
-    let b = BlockId::new(m.blocks.len() as u32);
-    m.blocks.push(Block::default());
-    if let Some(fd) = m.func_mut(harness_fid) {
-        fd.blocks.push(b);
+    if let Some(cls) = m.classes.get_mut(host_cid.index()) {
+        cls.methods.push(harness_fid);
     }
+
+    let b_entry = alloc_harness_block(&mut m, harness_fid);
     for idx in 0..3u16 {
         let vid = ValueId::new(m.values.len() as u32);
         m.values.push(Value {
@@ -331,7 +423,7 @@ pub fn synthesize_ohos_harness(
     }
 
     let undef_cid = m.consts.push(Const::Undefined);
-    let undef_val = emit_inst_val(&mut m, b, Op::LoadConst(undef_cid));
+    let undef_val = emit_inst_val(&mut m, b_entry, Op::LoadConst(undef_cid));
     let empty_shape = m.consts.push(Const::ObjectLiteral {
         keys: Vec::new(),
         values: Vec::new(),
@@ -340,12 +432,16 @@ pub fn synthesize_ohos_harness(
     // 1. Run top-level `func_main_0` initializers in topological order so
     //    cross-module `StoreModuleVar` exports and prototype methods initialize
     //    before importers and lifecycle hooks execute.
-    for &init_fid in init_funcs {
-        let mref = m.consts.push(Const::method_ref(init_fid));
-        let callee = emit_inst_val(&mut m, b, Op::LoadConst(mref));
+    for &init_fid in &init_funcs {
+        if m.func(init_fid)
+            .is_none_or(|fd| fd.is_external || fd.blocks.is_empty())
+        {
+            continue;
+        }
+        let callee = const_method_ref_val(&mut m, init_fid);
         let _ = emit_inst_val(
             &mut m,
-            b,
+            b_entry,
             Op::Call {
                 callee,
                 this: Some(undef_val),
@@ -367,23 +463,28 @@ pub fn synthesize_ohos_harness(
         let want_sym = m.sym.intern(OHOS_WANT_GLOBAL);
         let w = emit_inst_val(
             &mut m,
-            b,
+            b_entry,
             Op::TryGetGlobal {
                 name: want_sym,
                 default: Some(undef_val),
             },
         );
-        let p = emit_inst_val(&mut m, b, Op::AllocObject { shape: empty_shape });
+        let p = emit_inst_val(&mut m, b_entry, Op::AllocObject { shape: empty_shape });
         let c_sym = m.sym.intern("context");
         (Some(w), Some(p), Some(c_sym))
     } else {
         (None, None, None)
     };
 
-    // 3. Instantiate each component with a dedicated concrete `AllocObject`
-    //    receiver (`this`) and invoke its lifecycle methods in order.
+    // 3. Creation phase: instantiate each component once in `b_entry` with a
+    //    dedicated concrete singleton `AllocObject` receiver (`this`), run its
+    //    constructor + creation hooks, and collect its steady-state & teardown
+    //    callbacks for the loop and teardown blocks.
+    let mut steady_calls: Vec<(FuncId, ValueId, Vec<ValueId>)> = Vec::new();
+    let mut teardown_calls: Vec<(FuncId, ValueId, Vec<ValueId>)> = Vec::new();
+
     for comp in &components {
-        let inst_obj = emit_inst_val(&mut m, b, Op::AllocObject { shape: empty_shape });
+        let inst_obj = emit_inst_val(&mut m, b_entry, Op::AllocObject { shape: empty_shape });
 
         if matches!(
             comp.kind,
@@ -393,7 +494,7 @@ pub fn synthesize_ohos_harness(
             let ctx_marker_sym = m.sym.intern(OHOS_CONTEXT_GLOBAL);
             let ctx_obj = emit_inst_val(
                 &mut m,
-                b,
+                b_entry,
                 Op::TryGetGlobal {
                     name: ctx_marker_sym,
                     default: Some(undef_val),
@@ -401,7 +502,7 @@ pub fn synthesize_ohos_harness(
             );
             emit_inst_void(
                 &mut m,
-                b,
+                b_entry,
                 Op::StoreProp {
                     object: inst_obj,
                     name: context_prop,
@@ -411,17 +512,37 @@ pub fn synthesize_ohos_harness(
         }
 
         // Constructor invocation on `inst_obj`.
-        invoke_method(&mut m, b, comp.ctor, inst_obj, &[]);
+        invoke_method(&mut m, b_entry, comp.ctor, inst_obj, &[]);
 
         match comp.kind {
             OhosComponentKind::Ability => {
                 let w = want_val.unwrap_or(undef_val);
                 let p = misc_param_val.unwrap_or(undef_val);
-                for &(mname, first_is_want, arity) in ABILITY_LIFECYCLE {
+                for &(mname, first_is_want, arity) in ABILITY_CREATE {
                     if let Some(fids) = comp.methods.get(mname) {
                         let args = build_lifecycle_args(arity, first_is_want, w, p);
                         for &mfid in fids {
-                            invoke_method(&mut m, b, mfid, inst_obj, &args);
+                            invoke_method(&mut m, b_entry, mfid, inst_obj, &args);
+                        }
+                    }
+                }
+                for &(mname, first_is_want, arity) in ABILITY_STEADY {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        let args = build_lifecycle_args(arity, first_is_want, w, p);
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                steady_calls.push((mfid, inst_obj, args.clone()));
+                            }
+                        }
+                    }
+                }
+                for &(mname, first_is_want, arity) in ABILITY_TEARDOWN {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        let args = build_lifecycle_args(arity, first_is_want, w, p);
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                teardown_calls.push((mfid, inst_obj, args.clone()));
+                            }
                         }
                     }
                 }
@@ -429,32 +550,74 @@ pub fn synthesize_ohos_harness(
             OhosComponentKind::ExtensionAbility => {
                 let w = want_val.unwrap_or(undef_val);
                 let p = misc_param_val.unwrap_or(undef_val);
-                for &(mname, first_is_want, arity) in EXTENSION_LIFECYCLE {
+                for &(mname, first_is_want, arity) in EXTENSION_CREATE {
                     if let Some(fids) = comp.methods.get(mname) {
                         let args = build_lifecycle_args(arity, first_is_want, w, p);
                         for &mfid in fids {
-                            invoke_method(&mut m, b, mfid, inst_obj, &args);
+                            invoke_method(&mut m, b_entry, mfid, inst_obj, &args);
+                        }
+                    }
+                }
+                for &(mname, first_is_want, arity) in EXTENSION_STEADY {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        let args = build_lifecycle_args(arity, first_is_want, w, p);
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                steady_calls.push((mfid, inst_obj, args.clone()));
+                            }
+                        }
+                    }
+                }
+                for &(mname, first_is_want, arity) in EXTENSION_TEARDOWN {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        let args = build_lifecycle_args(arity, first_is_want, w, p);
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                teardown_calls.push((mfid, inst_obj, args.clone()));
+                            }
                         }
                     }
                 }
             }
             OhosComponentKind::ArkUiView => {
-                for &mname in ARKUI_LIFECYCLE {
+                for &mname in ARKUI_CREATE {
                     if let Some(fids) = comp.methods.get(mname) {
                         for &mfid in fids {
-                            invoke_method(&mut m, b, mfid, inst_obj, &[]);
+                            invoke_method(&mut m, b_entry, mfid, inst_obj, &[]);
                         }
                     }
                 }
-                // Also invoke custom `@Builder` methods (any non-synthetic method
-                // calling `observeComponentCreation*`) with `this = inst_obj`.
+                for &mname in ARKUI_STEADY {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                steady_calls.push((mfid, inst_obj, Vec::new()));
+                            }
+                        }
+                    }
+                }
+                // Also dispatch custom `@Builder` methods (any non-lifecycle
+                // method calling `observeComponentCreation*`) inside steady-state.
                 for (mname, fids) in &comp.methods {
-                    if ARKUI_LIFECYCLE.contains(&mname.as_str()) {
+                    let s = mname.as_str();
+                    if ARKUI_CREATE.contains(&s)
+                        || ARKUI_STEADY.contains(&s)
+                        || ARKUI_TEARDOWN.contains(&s)
+                    {
                         continue;
                     }
                     for &mfid in fids {
-                        if func_calls_observe(&m, mfid) {
-                            invoke_method(&mut m, b, mfid, inst_obj, &[]);
+                        if is_invocable_internal(&m, mfid) && func_calls_observe(&m, mfid) {
+                            steady_calls.push((mfid, inst_obj, Vec::new()));
+                        }
+                    }
+                }
+                for &mname in ARKUI_TEARDOWN {
+                    if let Some(fids) = comp.methods.get(mname) {
+                        for &mfid in fids {
+                            if is_invocable_internal(&m, mfid) {
+                                teardown_calls.push((mfid, inst_obj, Vec::new()));
+                            }
                         }
                     }
                 }
@@ -462,8 +625,160 @@ pub fn synthesize_ohos_harness(
         }
     }
 
-    emit_inst_void(&mut m, b, Op::Return { value: None });
-    Some((m, harness_fid))
+    // 4. Steady-state `while (*)` dispatch loop + teardown phase (`D3`).
+    if steady_calls.is_empty() {
+        for (mfid, recv, args) in teardown_calls {
+            invoke_method(&mut m, b_entry, mfid, recv, &args);
+        }
+        emit_inst_void(&mut m, b_entry, Op::Return { value: None });
+    } else {
+        let cond_sym = m.sym.intern(OHOS_LIFECYCLE_COND_GLOBAL);
+        let b_loop_head = alloc_harness_block(&mut m, harness_fid);
+        let b_teardown = alloc_harness_block(&mut m, harness_fid);
+
+        emit_inst_void(&mut m, b_entry, Op::Branch { dest: b_loop_head });
+        link_normal_edge(&mut m, b_entry, b_loop_head);
+
+        if steady_calls.len() == 1 {
+            let (mfid, recv, args) = &steady_calls[0];
+            let b_call = alloc_harness_block(&mut m, harness_fid);
+            let cond = emit_inst_val(
+                &mut m,
+                b_loop_head,
+                Op::TryGetGlobal {
+                    name: cond_sym,
+                    default: Some(undef_val),
+                },
+            );
+            emit_inst_void(
+                &mut m,
+                b_loop_head,
+                Op::CondBranch {
+                    cond,
+                    true_dest: b_call,
+                    false_dest: b_teardown,
+                },
+            );
+            link_normal_edge(&mut m, b_loop_head, b_call);
+            link_normal_edge(&mut m, b_loop_head, b_teardown);
+
+            invoke_method(&mut m, b_call, *mfid, *recv, args);
+            emit_inst_void(&mut m, b_call, Op::Branch { dest: b_loop_head });
+            link_normal_edge(&mut m, b_call, b_loop_head);
+        } else {
+            let mut choice_blocks = Vec::with_capacity(steady_calls.len());
+            let mut call_blocks = Vec::with_capacity(steady_calls.len());
+            for _ in 0..steady_calls.len() {
+                choice_blocks.push(alloc_harness_block(&mut m, harness_fid));
+                call_blocks.push(alloc_harness_block(&mut m, harness_fid));
+            }
+            let cond = emit_inst_val(
+                &mut m,
+                b_loop_head,
+                Op::TryGetGlobal {
+                    name: cond_sym,
+                    default: Some(undef_val),
+                },
+            );
+            emit_inst_void(
+                &mut m,
+                b_loop_head,
+                Op::CondBranch {
+                    cond,
+                    true_dest: choice_blocks[0],
+                    false_dest: b_teardown,
+                },
+            );
+            link_normal_edge(&mut m, b_loop_head, choice_blocks[0]);
+            link_normal_edge(&mut m, b_loop_head, b_teardown);
+
+            for (idx, (mfid, recv, args)) in steady_calls.iter().enumerate() {
+                let b_choice = choice_blocks[idx];
+                let b_call = call_blocks[idx];
+                let b_next = choice_blocks.get(idx + 1).copied().unwrap_or(b_loop_head);
+
+                let c_val = emit_inst_val(
+                    &mut m,
+                    b_choice,
+                    Op::TryGetGlobal {
+                        name: cond_sym,
+                        default: Some(undef_val),
+                    },
+                );
+                emit_inst_void(
+                    &mut m,
+                    b_choice,
+                    Op::CondBranch {
+                        cond: c_val,
+                        true_dest: b_call,
+                        false_dest: b_next,
+                    },
+                );
+                link_normal_edge(&mut m, b_choice, b_call);
+                link_normal_edge(&mut m, b_choice, b_next);
+
+                invoke_method(&mut m, b_call, *mfid, *recv, args);
+                emit_inst_void(&mut m, b_call, Op::Branch { dest: b_next });
+                link_normal_edge(&mut m, b_call, b_next);
+            }
+        }
+
+        for (mfid, recv, args) in teardown_calls {
+            invoke_method(&mut m, b_teardown, mfid, recv, &args);
+        }
+        emit_inst_void(&mut m, b_teardown, Op::Return { value: None });
+    }
+
+    EntryModel {
+        augmented_module: Some(m),
+        harness_func: Some(harness_fid),
+        init_funcs,
+        components,
+        entry_funcs: vec![harness_fid],
+    }
+}
+
+fn default_single_module_entries(module: &Module) -> Vec<FuncId> {
+    let mut mains = Vec::new();
+    for (fi, fd) in module.functions.iter().enumerate() {
+        if !fd.is_external && !fd.blocks.is_empty() && sym_str(module, fd.name) == "func_main_0" {
+            mains.push(FuncId::new(fi as u32));
+        }
+    }
+    if !mains.is_empty() {
+        return mains;
+    }
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, fd)| {
+            (!fd.is_external && !fd.blocks.is_empty()).then_some(FuncId::new(fi as u32))
+        })
+        .collect()
+}
+
+fn alloc_harness_block(m: &mut Module, harness_fid: FuncId) -> BlockId {
+    let bid = BlockId::new(m.blocks.len() as u32);
+    m.blocks.push(Block::default());
+    if let Some(fd) = m.func_mut(harness_fid) {
+        fd.blocks.push(bid);
+    }
+    bid
+}
+
+fn link_normal_edge(m: &mut Module, from: BlockId, to: BlockId) {
+    if let Some(bb) = m.block_mut(to) {
+        bb.preds.push(Edge {
+            from,
+            kind: EdgeKind::Normal,
+        });
+    }
+}
+
+fn is_invocable_internal(m: &Module, target: FuncId) -> bool {
+    m.func(target)
+        .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
 }
 
 fn build_lifecycle_args(
@@ -483,13 +798,22 @@ fn build_lifecycle_args(
     args
 }
 
+fn const_method_ref_val(m: &mut Module, target: FuncId) -> ValueId {
+    let mref = m.consts.push(Const::method_ref(target));
+    let vid = ValueId::new(m.values.len() as u32);
+    m.values.push(Value {
+        def: ValueDef::Const(mref),
+        ty: Ty::Any,
+    });
+    vid
+}
+
 fn invoke_method(m: &mut Module, b: BlockId, target: FuncId, this_val: ValueId, args: &[ValueId]) {
     let Some(fd) = m.func(target) else { return };
     if fd.is_external || fd.blocks.is_empty() {
         return;
     }
-    let mref = m.consts.push(Const::method_ref(target));
-    let callee = emit_inst_val(m, b, Op::LoadConst(mref));
+    let callee = const_method_ref_val(m, target);
     let _ = emit_inst_val(
         m,
         b,
@@ -1191,5 +1515,308 @@ mod tests {
             .external_load(cid_glob, 0)
             .expect("standalone ESM preserved on L_GLOBAL; after harness synthesis");
         assert_eq!(ext.external_imports, vec![(s_kit, s_uiab)]);
+    }
+
+    #[test]
+    fn steady_state_lifecycle_loop_propagates_on_background_write_to_next_on_foreground_read() {
+        use crate::dataflow::ifds::{IfdsConfig, IfdsProblem, IfdsSolver};
+
+        let mut m = Module::new();
+        let d = m
+            .sym
+            .intern("L@bundle:com.app/entry/ets/entryability/EntryAbility;");
+        let n = m
+            .sym
+            .intern("@bundle:com.app/entry/ets/entryability/EntryAbility");
+        let cid = ClassId::new(0);
+        m.classes.push(ClassData::new(d, n));
+
+        let s_cached = m.sym.intern("cachedSecret");
+        let s_uiab = m.sym.intern("UIAbility");
+        let s_bg = m.sym.intern("onBackground");
+        let s_fg = m.sym.intern("onForeground");
+        let s_destroy = m.sym.intern("onDestroy");
+
+        let (ctor, b_c, _) = add_fn(&mut m, cid, "EntryAbility", FunctionKind::Constructor, 3);
+        emit_inst_void(&mut m, b_c, Op::Return { value: None });
+
+        // `onBackground`: `this.cachedSecret = "secret"`
+        let (on_bg, b_bg, p_bg) = add_fn(&mut m, cid, "onBackground", FunctionKind::Function, 3);
+        let s_secret = m.sym.intern("secret");
+        let c_secret = m.consts.intern(Const::String(s_secret));
+        let v_secret = emit_inst_val(&mut m, b_bg, Op::LoadConst(c_secret));
+        let bg_store_iid = InstId::new(m.insts.len() as u32);
+        emit_inst_void(
+            &mut m,
+            b_bg,
+            Op::StoreProp {
+                object: p_bg[2],
+                name: s_cached,
+                value: v_secret,
+            },
+        );
+        emit_inst_void(&mut m, b_bg, Op::Return { value: None });
+
+        // `onForeground`: `let x = this.cachedSecret; sink(x)`
+        // In a single linear pass (`onForeground -> onBackground -> onDestroy`),
+        // `onForeground` ran ONLY BEFORE `onBackground` and missed `this.cachedSecret`!
+        let sink_sym = m.sym.intern("sink");
+        let sink_fid = FuncId::new(m.functions.len() as u32);
+        let mut sink_fd = FunctionData::new(cid, sink_sym, FunctionKind::Function);
+        sink_fd.is_external = true;
+        m.functions.push(sink_fd);
+        m.classes[cid.index()].methods.push(sink_fid);
+
+        let (on_fg, b_fg, p_fg) = add_fn(&mut m, cid, "onForeground", FunctionKind::Function, 3);
+        let fg_load_iid = InstId::new(m.insts.len() as u32);
+        let loaded = emit_inst_val(
+            &mut m,
+            b_fg,
+            Op::LoadProp {
+                object: p_fg[2],
+                name: s_cached,
+            },
+        );
+        let callee_sink = const_method_ref_val(&mut m, sink_fid);
+        let sink_call = InstId::new(m.insts.len() as u32);
+        let _ = emit_inst_val(
+            &mut m,
+            b_fg,
+            Op::Call {
+                callee: callee_sink,
+                this: None,
+                args: vec![loaded],
+                kind: CallKind::Direct,
+            },
+        );
+        emit_inst_void(&mut m, b_fg, Op::Return { value: None });
+
+        // `onDestroy` teardown hook.
+        let (on_destroy, b_dt, _) = add_fn(&mut m, cid, "onDestroy", FunctionKind::Function, 3);
+        let dt_ret = InstId::new(m.insts.len() as u32);
+        emit_inst_void(&mut m, b_dt, Op::Return { value: None });
+
+        let (_, b_main, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
+        let h_uiab = emit_inst_val(
+            &mut m,
+            b_main,
+            Op::TryGetGlobal {
+                name: s_uiab,
+                default: None,
+            },
+        );
+        let c_s_bg = m.consts.intern(Const::String(s_bg));
+        let c_bg = m.consts.intern(Const::method_ref(on_bg));
+        let c_s_fg = m.consts.intern(Const::String(s_fg));
+        let c_fg = m.consts.intern(Const::method_ref(on_fg));
+        let c_s_dt = m.consts.intern(Const::String(s_destroy));
+        let c_dt = m.consts.intern(Const::method_ref(on_destroy));
+        let mem = m
+            .consts
+            .push_array(vec![c_s_fg, c_fg, c_s_bg, c_bg, c_s_dt, c_dt]);
+        let _ = emit_inst_val(
+            &mut m,
+            b_main,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor,
+                heritage: Some(h_uiab),
+                members: mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        emit_inst_void(&mut m, b_main, Op::Return { value: None });
+
+        let model = EntryModel::build(&m, None);
+        let harness_fid = model.harness_func.expect("harness synthesized");
+        assert_eq!(model.entry_funcs, vec![harness_fid]);
+        let aug = model.augmented_module.as_ref().expect("augmented module");
+        let rep = verify_module(aug);
+        assert!(rep.errors.is_empty(), "verify errors: {:?}", rep.errors);
+
+        let base_cg = CallGraph::build(aug);
+        let (cg, tables, stats) = analyze(
+            aug,
+            &base_cg,
+            &PtaConfig {
+                harness_func: Some(harness_fid),
+                ..PtaConfig::default()
+            },
+        )
+        .into_parts();
+        let r2 = Rung2AliasOracle::new(aug, tables, stats);
+        let bg_sites = r2.query(p_bg[2], bg_store_iid).sites;
+        let fg_sites = r2.query(p_fg[2], fg_load_iid).sites;
+        assert_eq!(bg_sites.len(), 1);
+        assert_eq!(bg_sites, fg_sites);
+        let recv_site = bg_sites.iter().next().unwrap();
+
+        // Run IFDS over the synthesized harness: `onBackground` taints
+        // `(recv_site, cachedSecret)`, which loops around `while (*)` into the
+        // next `onForeground` (`sink_call`) AND reaches `onDestroy` (`dt_ret`)!
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        enum LfFact {
+            Zero,
+            Val(ValueId),
+            HeapCached(InstId),
+        }
+
+        struct LfProblem {
+            harness: FuncId,
+            bg_store: InstId,
+            fg_load: InstId,
+            loaded_val: ValueId,
+            recv_site: InstId,
+        }
+
+        impl IfdsProblem for LfProblem {
+            type Fact = LfFact;
+
+            fn zero(&self) -> LfFact {
+                LfFact::Zero
+            }
+
+            fn initial_seeds(&self) -> Vec<(FuncId, LfFact)> {
+                vec![(self.harness, LfFact::Zero)]
+            }
+
+            fn normal_flow(
+                &self,
+                _module: &Module,
+                curr: InstId,
+                _succ: InstId,
+                source: &LfFact,
+                out: &mut Vec<LfFact>,
+            ) {
+                match *source {
+                    LfFact::Zero => {
+                        if curr == self.bg_store {
+                            out.push(LfFact::HeapCached(self.recv_site));
+                        }
+                    }
+                    LfFact::HeapCached(site) => {
+                        out.push(LfFact::HeapCached(site));
+                        if curr == self.fg_load && site == self.recv_site {
+                            out.push(LfFact::Val(self.loaded_val));
+                        }
+                    }
+                    LfFact::Val(v) => out.push(LfFact::Val(v)),
+                }
+            }
+
+            fn call_flow(
+                &self,
+                _module: &Module,
+                _call: InstId,
+                _callee: FuncId,
+                source: &LfFact,
+                out: &mut Vec<LfFact>,
+            ) {
+                if let LfFact::HeapCached(s) = *source {
+                    out.push(LfFact::HeapCached(s));
+                }
+            }
+
+            fn return_flow(
+                &self,
+                _module: &Module,
+                _call_site: Option<InstId>,
+                _callee: FuncId,
+                _exit: InstId,
+                _return_site: Option<InstId>,
+                source: &LfFact,
+                out: &mut Vec<LfFact>,
+            ) {
+                if let LfFact::HeapCached(s) = *source {
+                    out.push(LfFact::HeapCached(s));
+                }
+            }
+
+            fn call_to_return_flow(
+                &self,
+                module: &Module,
+                call: InstId,
+                _return_site: InstId,
+                source: &LfFact,
+                out: &mut Vec<LfFact>,
+            ) {
+                match *source {
+                    LfFact::Zero => {}
+                    LfFact::Val(v) => out.push(LfFact::Val(v)),
+                    LfFact::HeapCached(s) => {
+                        // Resolved internal calls propagate heap facts through callee;
+                        // external `sink` bypasses.
+                        let is_ext_call =
+                            matches!(module.inst(call).map(|i| &i.op), Some(Op::Call { .. }))
+                                && module
+                                    .inst(call)
+                                    .is_some_and(|_| call == InstId::new(999_999));
+                        let _ = is_ext_call;
+                        out.push(LfFact::HeapCached(s));
+                    }
+                }
+            }
+        }
+
+        let prob = LfProblem {
+            harness: harness_fid,
+            bg_store: bg_store_iid,
+            fg_load: fg_load_iid,
+            loaded_val: loaded,
+            recv_site,
+        };
+        let res = IfdsSolver::new(aug, &prob, &cg, IfdsConfig::default()).solve();
+        assert!(
+            res.is_reached(sink_call, &LfFact::Val(loaded)),
+            "state written in onBackground must flow around steady-state loop to next onForeground"
+        );
+        assert!(
+            res.is_reached(dt_ret, &LfFact::HeapCached(recv_site)),
+            "steady-state loop exit must reach teardown onDestroy"
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_class_and_func_ids_do_not_panic() {
+        let mut m = Module::new();
+        let d = m.sym.intern("L_GLOBAL;");
+        let n = m.sym.intern("_GLOBAL");
+        m.classes.push(ClassData::new(d, n));
+
+        // Function with out-of-bounds `class_id = ClassId(999)` and `DefineClass`
+        // referencing out-of-bounds `ctor = FuncId(999)`.
+        let sym = m.sym.intern("func_main_0");
+        let mut fd = FunctionData::new(ClassId::new(999), sym, FunctionKind::Function);
+        let b = BlockId::new(0);
+        m.blocks.push(Block::default());
+        fd.blocks.push(b);
+        m.functions.push(fd);
+
+        let s_uiab = m.sym.intern("UIAbility");
+        let h = emit_inst_val(
+            &mut m,
+            b,
+            Op::TryGetGlobal {
+                name: s_uiab,
+                default: None,
+            },
+        );
+        let empty_mem = m.consts.push_array(Vec::new());
+        let _ = emit_inst_val(
+            &mut m,
+            b,
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                ctor: FuncId::new(999),
+                heritage: Some(h),
+                members: empty_mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            })),
+        );
+        emit_inst_void(&mut m, b, Op::Return { value: None });
+
+        let model = EntryModel::build(&m, Some(r#"{"srcEntry":"./ets/EntryAbility.ets"}"#));
+        assert!(model.components.is_empty());
+        assert!(synthesize_ohos_harness(&m, None).is_none());
     }
 }

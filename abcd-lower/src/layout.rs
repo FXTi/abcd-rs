@@ -26,11 +26,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use abcd_ir::cfg::block_succs;
 use abcd_ir::{BlockId, ClassId, FuncId, InstId, Module, Op};
 use abcd_isa::{Bytecode, EntityKind, Label};
 
 use crate::LowerError;
-use crate::analysis;
 use crate::copy_resolve::{emit_copy, resolve_slot_copies};
 use crate::isel::{EntityTrace, IselResult};
 use crate::regalloc::{RegAlloc, RegSlot};
@@ -145,14 +145,14 @@ pub fn layout(
         }
     }
     for &(pred, succ) in edge_codes.keys() {
-        if exception_edges.contains(&(pred, succ)) {
-            return Err(LowerError::HandlerEdgeCopies {
-                func: func_id,
-                pred,
-                handler: succ,
-            });
-        }
-        if !analysis::block_succs(module, pred).contains(&succ) {
+        if !block_succs(module, pred).contains(&succ) {
+            if exception_edges.contains(&(pred, succ)) {
+                return Err(LowerError::HandlerEdgeCopies {
+                    func: func_id,
+                    pred,
+                    handler: succ,
+                });
+            }
             return Err(LowerError::InconsistentEdgeCopies {
                 func: func_id,
                 pred,

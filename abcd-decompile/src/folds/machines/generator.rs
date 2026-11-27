@@ -141,7 +141,8 @@ pub(in crate::folds) fn entry_site_matches(nodes: &[SNode], cx: &mut GenDriverCx
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::While { body, .. }
+                SNode::Block(body)
+                | SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }

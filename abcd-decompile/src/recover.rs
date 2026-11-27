@@ -92,7 +92,7 @@ impl OpStat {
 
 /// A recovered statement (block-local; d-P3 re-parents these into the
 /// structured region tree).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stmt {
     /// A temporary introduction: `const name = value` (`mutable = false`;
     /// the single-assignment proof for `const` is SSA itself).
@@ -208,6 +208,9 @@ pub enum Stmt {
         level: u16,
         /// The slot (provenance).
         slot: u16,
+        /// Whether the target frame was pushed inside this function (`true`)
+        /// vs inherited from an enclosing closure (`false`).
+        own: bool,
         /// The resolved binding name (NOT legalized — lexical bindings
         /// are source identifiers; d-P3's scope reconstruction owns the
         /// final namespace).
@@ -444,7 +447,9 @@ fn inline_barrier(op: &Op) -> bool {
         | Op::GetPropIterator { .. }
         | Op::AsyncGeneratorResolve { .. }
         | Op::SetGeneratorState { .. }
-        | Op::NotifyConcurrentResult { .. } => false,
+        | Op::NotifyConcurrentResult { .. }
+        | Op::GetModuleNamespace { .. } => false,
+        Op::LoadModuleVar { kind, .. } if !kind.is_lazy() => false,
         _ => !op.effects().is_removable_if_unused(),
     }
 }
@@ -987,29 +992,9 @@ impl<'m> Recover<'m> {
             .unwrap_or_default();
         let n = f.params.len();
         let is_static_method = f.modifiers.contains(abcd_ir::Modifiers::STATIC);
-        // `es2abc` tags `.ets` (ArkTS 1.0/1.1 dynamic bytecode) classes with
-        // `SourceLang::ArkTS` while still using the 3-slot dynamic ECMA frame
-        // (`[func][new.target][this]`) and emitting `L_ES*` annotation classes
-        // (`L_ESSlotNumberAnnotation;`, etc.) / ECMAScript module records.
-        let is_es2abc_dynamic = !self.module.imports.is_empty()
-            || !self.module.exports.is_empty()
-            || !self.module.module_requests.is_empty()
-            || f.annotations.iter().any(|ann| {
-                self.module
-                    .class(ann.class)
-                    .and_then(|c| self.module.sym.resolve(c.descriptor))
-                    .is_some_and(|d| d.starts_with("L_ES"))
-            })
-            || self.module.classes.iter().any(|c| {
-                self.module
-                    .sym
-                    .resolve(c.descriptor)
-                    .is_some_and(|d| d.starts_with("L_ES"))
-            });
         let slots_opt = if let Some(ann_slots) = decode_call_type_slots(self.module, f) {
             Some(ann_slots)
-        } else if !is_es2abc_dynamic && self.module.func_dialect(f) == abcd_ir::Dialect::StaticArkTS
-        {
+        } else if self.module.func_dialect(f) == abcd_ir::Dialect::StaticArkTS {
             Some(abcd_ir::frame::FrameSlots::for_static_arkts(
                 is_static_method,
             ))
@@ -1089,7 +1074,20 @@ impl<'m> Recover<'m> {
                 catches.push((c.handler, c.exception));
             }
         }
+        let mut handler_names: HashMap<BlockId, String> = HashMap::new();
         for (handler, exc) in catches {
+            if let Some(existing) = handler_names.get(&handler).cloned() {
+                self.catch_names.entry(exc).or_insert(existing);
+                continue;
+            }
+            if let Some(existing) = self.catch_names.get(&exc).cloned() {
+                handler_names.insert(handler, existing.clone());
+                self.handler_binds
+                    .entry(handler)
+                    .or_default()
+                    .push(existing);
+                continue;
+            }
             let hint = self
                 .module
                 .block(handler)
@@ -1104,6 +1102,7 @@ impl<'m> Recover<'m> {
                 Some(explicit) => self.legal.mint(&explicit),
                 None => self.legal.mint_avoiding("e", &self.referenced_bare_names),
             };
+            handler_names.insert(handler, name.clone());
             self.catch_names.insert(exc, name.clone());
             self.handler_binds.entry(handler).or_default().push(name);
         }
@@ -1350,13 +1349,34 @@ impl<'m> Recover<'m> {
                 } else if let Some(&(_, edge)) = phi.first() {
                     // The assignment materializes at the END of the
                     // predecessor block: barrier-free from the def to the
-                    // block end (same-block rule, edge use).
+                    // block end (same-block rule, edge use), and coercing /
+                    // effectful / throwing ops must NEVER inline into
+                    // conditional or exceptional `PhiAssign`s (`R5-6a`).
                     let end = self
                         .barriers
                         .get(&def_block)
                         .map(|p| p.len().saturating_sub(1))
                         .unwrap_or(usize::MAX);
-                    edge.from == def_block && self.barrier_count(def_block, def_pos, end) == 0
+                    let eff = inst.op.effects_in(self.module);
+                    let uncond_normal_edge = edge.kind == EdgeKind::Normal
+                        && self
+                            .module
+                            .block(def_block)
+                            .and_then(|bb| bb.insts.last())
+                            .and_then(|&last_iid| self.module.inst(last_iid))
+                            .is_some_and(|last_inst| match &last_inst.op {
+                                Op::Branch { .. } => true,
+                                Op::CondBranch {
+                                    true_dest,
+                                    false_dest,
+                                    ..
+                                } => true_dest == false_dest,
+                                _ => false,
+                            });
+                    let phi_safe = eff.is_pure() || uncond_normal_edge;
+                    edge.from == def_block
+                        && phi_safe
+                        && self.barrier_count(def_block, def_pos, end) == 0
                 } else {
                     false
                 };
@@ -1681,7 +1701,7 @@ impl<'m> Recover<'m> {
 
     /// Compute the exact evaluation order in which `flush_phi_tail` will
     /// evaluate incoming `val` expressions for a single `(pred, to, exceptional)`
-    /// phi group `(phi_res, incoming_val)`.
+    /// phi group `(phi_res, incoming_val)`, using [`schedule_parallel_phi_copies`].
     fn schedule_phi_eval_order(&self, entries: &[(ValueId, ValueId)]) -> Vec<ValueId> {
         let peel = |mut v: ValueId| -> ValueId {
             let mut g = 0usize;
@@ -1711,16 +1731,10 @@ impl<'m> Recover<'m> {
             item_tid.push(tid);
             writers_of_tid[tid].push(j);
         }
-        let nt = writers_of_tid.len();
-        let mut writers_rem: Vec<usize> = writers_of_tid.iter().map(Vec::len).collect();
 
         let mut read_tids: Vec<Vec<usize>> = Vec::with_capacity(k);
-        let mut readers_of_tid: Vec<Vec<usize>> = vec![Vec::new(); nt];
-        let mut total_readers_rem: Vec<usize> = vec![0; nt];
-        let mut self_reads: Vec<bool> = vec![false; k];
         let mut is_self_noop_cand: Vec<bool> = Vec::with_capacity(k);
-
-        for (i, &(phi_res, val)) in entries.iter().enumerate() {
+        for &(phi_res, val) in entries {
             is_self_noop_cand.push(peel(val) == phi_res);
             let mut r_tids: Vec<usize> = Vec::new();
             let mut visited: HashSet<ValueId> = HashSet::new();
@@ -1745,209 +1759,33 @@ impl<'m> Recover<'m> {
             }
             r_tids.sort_unstable();
             r_tids.dedup();
-            for &rtid in &r_tids {
-                if rtid == item_tid[i] {
-                    self_reads[i] = true;
-                }
-                readers_of_tid[rtid].push(i);
-                total_readers_rem[rtid] += 1;
-            }
             read_tids.push(r_tids);
         }
 
-        let mut done = vec![false; k];
+        let steps =
+            schedule_parallel_phi_copies(&writers_of_tid, &item_tid, is_self_noop_cand, read_tids);
         let mut victim_cleared = vec![false; k];
-        let mut in_heap = vec![false; k];
-        let mut ready_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
-            std::collections::BinaryHeap::new();
-        let is_ready = |j: usize,
-                        done: &[bool],
-                        is_self_noop_cand: &[bool],
-                        writers_rem: &[usize],
-                        total_readers_rem: &[usize],
-                        self_reads: &[bool],
-                        item_tid: &[usize]|
-         -> bool {
-            if done[j] {
-                return false;
-            }
-            let tid = item_tid[j];
-            (is_self_noop_cand[j] && writers_rem[tid] == 1)
-                || total_readers_rem[tid] == usize::from(self_reads[j])
-        };
-
-        for (j, in_h) in in_heap.iter_mut().enumerate().take(k) {
-            if is_ready(
-                j,
-                &done,
-                &is_self_noop_cand,
-                &writers_rem,
-                &total_readers_rem,
-                &self_reads,
-                &item_tid,
-            ) {
-                *in_h = true;
-                ready_heap.push(std::cmp::Reverse(j));
+        let mut eval_order = Vec::with_capacity(k);
+        for step in steps {
+            match step {
+                ParallelPhiStep::BreakCycle { victim } => {
+                    victim_cleared[victim] = true;
+                    eval_order.push(entries[victim].1);
+                }
+                ParallelPhiStep::Emit(j) => {
+                    if !victim_cleared[j] {
+                        eval_order.push(entries[j].1);
+                    }
+                }
             }
         }
-
-        let mut remaining = k;
-        let mut scan_cursor = 0usize;
-        let mut reader_cursor = vec![0usize; nt];
-        let mut path_pos: Vec<Option<usize>> = vec![None; k];
-        let mut eval_order: Vec<ValueId> = Vec::with_capacity(k);
-
-        while remaining > 0 {
-            let mut next_ready = None;
-            while let Some(std::cmp::Reverse(j)) = ready_heap.pop() {
-                if !done[j] {
-                    next_ready = Some(j);
-                    break;
-                }
-            }
-
-            if let Some(j) = next_ready {
-                done[j] = true;
-                remaining -= 1;
-                if !victim_cleared[j] {
-                    eval_order.push(entries[j].1);
-                }
-                let wtid = item_tid[j];
-                writers_rem[wtid] -= 1;
-                if writers_rem[wtid] == 1 {
-                    for &w in &writers_of_tid[wtid] {
-                        if !in_heap[w]
-                            && is_ready(
-                                w,
-                                &done,
-                                &is_self_noop_cand,
-                                &writers_rem,
-                                &total_readers_rem,
-                                &self_reads,
-                                &item_tid,
-                            )
-                        {
-                            in_heap[w] = true;
-                            ready_heap.push(std::cmp::Reverse(w));
-                        }
-                    }
-                }
-                for rtid in std::mem::take(&mut read_tids[j]) {
-                    total_readers_rem[rtid] -= 1;
-                    if total_readers_rem[rtid] <= 1 {
-                        for &w in &writers_of_tid[rtid] {
-                            if !in_heap[w]
-                                && is_ready(
-                                    w,
-                                    &done,
-                                    &is_self_noop_cand,
-                                    &writers_rem,
-                                    &total_readers_rem,
-                                    &self_reads,
-                                    &item_tid,
-                                )
-                            {
-                                in_heap[w] = true;
-                                ready_heap.push(std::cmp::Reverse(w));
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            while scan_cursor < k && (done[scan_cursor] || victim_cleared[scan_cursor]) {
-                scan_cursor += 1;
-            }
-            let start = if scan_cursor < k {
-                scan_cursor
-            } else {
-                match (0..k).find(|&i| !done[i]) {
-                    Some(i) => i,
-                    None => break,
-                }
-            };
-            let mut path: Vec<usize> = Vec::new();
-            let mut cur = start;
-            let victim = loop {
-                if let Some(pos) = path_pos[cur] {
-                    let v = path[pos..]
-                        .iter()
-                        .copied()
-                        .filter(|&x| !victim_cleared[x])
-                        .min()
-                        .unwrap_or_else(|| path[pos..].iter().copied().min().unwrap_or(cur));
-                    break v;
-                }
-                path_pos[cur] = Some(path.len());
-                path.push(cur);
-                let ctid = item_tid[cur];
-                let rlist = &readers_of_tid[ctid];
-                let cursor = &mut reader_cursor[ctid];
-                while *cursor < rlist.len() {
-                    let r = rlist[*cursor];
-                    if !done[r] && !victim_cleared[r] && r != cur {
-                        break;
-                    }
-                    *cursor += 1;
-                }
-                if *cursor < rlist.len() {
-                    cur = rlist[*cursor];
-                } else {
-                    break cur;
-                }
-            };
-            for &node in &path {
-                path_pos[node] = None;
-            }
-
-            eval_order.push(entries[victim].1);
-            is_self_noop_cand[victim] = false;
-            self_reads[victim] = false;
-            victim_cleared[victim] = true;
-            for rtid in std::mem::take(&mut read_tids[victim]) {
-                total_readers_rem[rtid] -= 1;
-                if total_readers_rem[rtid] <= 1 {
-                    for &w in &writers_of_tid[rtid] {
-                        if !in_heap[w]
-                            && is_ready(
-                                w,
-                                &done,
-                                &is_self_noop_cand,
-                                &writers_rem,
-                                &total_readers_rem,
-                                &self_reads,
-                                &item_tid,
-                            )
-                        {
-                            in_heap[w] = true;
-                            ready_heap.push(std::cmp::Reverse(w));
-                        }
-                    }
-                }
-            }
-            if !in_heap[victim]
-                && is_ready(
-                    victim,
-                    &done,
-                    &is_self_noop_cand,
-                    &writers_rem,
-                    &total_readers_rem,
-                    &self_reads,
-                    &item_tid,
-                )
-            {
-                in_heap[victim] = true;
-                ready_heap.push(std::cmp::Reverse(victim));
-            }
-        }
-
         eval_order
     }
 
     /// Schedule parallel out-of-SSA `PhiAssign` copies per
-    /// `(pred, to, exceptional)` edge so inlined expressions and cyclic phi
-    /// updates never clobber a variable before a sibling copy reads it.
+    /// `(pred, to, exceptional)` edge via [`schedule_parallel_phi_copies`] so
+    /// inlined expressions and cyclic phi updates never clobber a variable
+    /// before a sibling copy reads it.
     fn flush_phi_tail(
         &mut self,
         blocks: &mut [BlockStmts],
@@ -1986,274 +1824,13 @@ impl<'m> Recover<'m> {
             let Some(&bi) = block_index.get(&pred) else {
                 continue;
             };
-            // Fast path: <= 1 copy or all self-assignments -> byte-identical output.
-            if assigns.len() <= 1
-                || assigns
-                    .iter()
-                    .all(|(target, value)| is_self_phi_assign(target, value))
-            {
-                for (target, value) in assigns {
-                    blocks[bi].stmts.push(Stmt::PhiAssign {
-                        target,
-                        value,
-                        to,
-                        exceptional,
-                    });
-                }
-                continue;
-            }
-
-            let k = assigns.len();
-            let mut items: Vec<(String, Expr)> = assigns;
-
-            // Map every target name in this edge group to a dense target id `0..nt`.
-            let mut target_id: HashMap<String, usize> = HashMap::with_capacity(k);
-            let mut item_tid: Vec<usize> = Vec::with_capacity(k);
-            let mut writers_of_tid: Vec<Vec<usize>> = Vec::new();
-            for (j, (target, _)) in items.iter().enumerate() {
-                let tid = *target_id.entry(target.clone()).or_insert_with(|| {
-                    let id = writers_of_tid.len();
-                    writers_of_tid.push(Vec::new());
-                    id
-                });
-                item_tid.push(tid);
-                writers_of_tid[tid].push(j);
-            }
-            let nt = writers_of_tid.len();
-            let mut writers_rem: Vec<usize> = writers_of_tid.iter().map(Vec::len).collect();
-
-            // Per-copy read target IDs (`read_tids[i]`) and inverse reader lists.
-            let mut read_tids: Vec<Vec<usize>> = Vec::with_capacity(k);
-            let mut readers_of_tid: Vec<Vec<usize>> = vec![Vec::new(); nt];
-            let mut total_readers_rem: Vec<usize> = vec![0; nt];
-            let mut self_reads: Vec<bool> = vec![false; k];
-            let mut is_self_noop_cand: Vec<bool> = Vec::with_capacity(k);
-
-            for (i, (target, value)) in items.iter().enumerate() {
-                is_self_noop_cand.push(is_self_phi_assign(target, value));
-                let raw_reads = collect_expr_reads(value);
-                let mut r_tids: Vec<usize> = raw_reads
-                    .iter()
-                    .filter_map(|name| target_id.get(name).copied())
-                    .collect();
-                r_tids.sort_unstable();
-                r_tids.dedup();
-                for &rtid in &r_tids {
-                    if rtid == item_tid[i] {
-                        self_reads[i] = true;
-                    }
-                    readers_of_tid[rtid].push(i);
-                    total_readers_rem[rtid] += 1;
-                }
-                read_tids.push(r_tids);
-            }
-
-            let mut done = vec![false; k];
-            let mut victim_cleared = vec![false; k];
-            let mut in_heap = vec![false; k];
-            let mut ready_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
-                std::collections::BinaryHeap::new();
-            let is_ready = |j: usize,
-                            done: &[bool],
-                            is_self_noop_cand: &[bool],
-                            writers_rem: &[usize],
-                            total_readers_rem: &[usize],
-                            self_reads: &[bool],
-                            item_tid: &[usize]|
-             -> bool {
-                if done[j] {
-                    return false;
-                }
-                let tid = item_tid[j];
-                (is_self_noop_cand[j] && writers_rem[tid] == 1)
-                    || total_readers_rem[tid] == usize::from(self_reads[j])
-            };
-
-            for (j, in_h) in in_heap.iter_mut().enumerate().take(k) {
-                if is_ready(
-                    j,
-                    &done,
-                    &is_self_noop_cand,
-                    &writers_rem,
-                    &total_readers_rem,
-                    &self_reads,
-                    &item_tid,
-                ) {
-                    *in_h = true;
-                    ready_heap.push(std::cmp::Reverse(j));
-                }
-            }
-
-            let mut remaining = k;
-            let mut scan_cursor = 0usize;
-            let mut reader_cursor = vec![0usize; nt];
-            let mut path_pos: Vec<Option<usize>> = vec![None; k];
-            let mut emitted: Vec<Stmt> = Vec::with_capacity(k + 2);
-            let mut decls: Vec<Stmt> = Vec::new();
-
-            while remaining > 0 {
-                let mut next_ready = None;
-                while let Some(std::cmp::Reverse(j)) = ready_heap.pop() {
-                    if !done[j] {
-                        next_ready = Some(j);
-                        break;
-                    }
-                }
-
-                if let Some(j) = next_ready {
-                    done[j] = true;
-                    remaining -= 1;
-                    emitted.push(Stmt::PhiAssign {
-                        target: items[j].0.clone(),
-                        value: items[j].1.clone(),
-                        to,
-                        exceptional,
-                    });
-                    let wtid = item_tid[j];
-                    writers_rem[wtid] -= 1;
-                    if writers_rem[wtid] == 1 {
-                        for &w in &writers_of_tid[wtid] {
-                            if !in_heap[w]
-                                && is_ready(
-                                    w,
-                                    &done,
-                                    &is_self_noop_cand,
-                                    &writers_rem,
-                                    &total_readers_rem,
-                                    &self_reads,
-                                    &item_tid,
-                                )
-                            {
-                                in_heap[w] = true;
-                                ready_heap.push(std::cmp::Reverse(w));
-                            }
-                        }
-                    }
-                    for rtid in std::mem::take(&mut read_tids[j]) {
-                        total_readers_rem[rtid] -= 1;
-                        if total_readers_rem[rtid] <= 1 {
-                            for &w in &writers_of_tid[rtid] {
-                                if !in_heap[w]
-                                    && is_ready(
-                                        w,
-                                        &done,
-                                        &is_self_noop_cand,
-                                        &writers_rem,
-                                        &total_readers_rem,
-                                        &self_reads,
-                                        &item_tid,
-                                    )
-                                {
-                                    in_heap[w] = true;
-                                    ready_heap.push(std::cmp::Reverse(w));
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // Every unscheduled assignment's target is read by another
-                // unscheduled assignment; walk `cur -> first active reader(cur)`
-                // to locate a directed cycle and break at the smallest index.
-                while scan_cursor < k && done[scan_cursor] {
-                    scan_cursor += 1;
-                }
-                if scan_cursor >= k {
-                    break;
-                }
-                let mut path: Vec<usize> = Vec::new();
-                let mut cur = scan_cursor;
-                let victim = loop {
-                    if let Some(pos) = path_pos[cur] {
-                        break path[pos..].iter().copied().min().unwrap_or(cur);
-                    }
-                    path_pos[cur] = Some(path.len());
-                    path.push(cur);
-
-                    let tid = item_tid[cur];
-                    let rlist = &readers_of_tid[tid];
-                    while reader_cursor[tid] < rlist.len() {
-                        let cand = rlist[reader_cursor[tid]];
-                        if done[cand] || victim_cleared[cand] {
-                            reader_cursor[tid] += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    let mut found_reader = None;
-                    let mut idx = reader_cursor[tid];
-                    while idx < rlist.len() {
-                        let cand = rlist[idx];
-                        if !done[cand] && !victim_cleared[cand] && cand != cur {
-                            found_reader = Some(cand);
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    match found_reader {
-                        Some(next) => cur = next,
-                        None => break cur,
-                    }
-                };
-                for &node in &path {
-                    path_pos[node] = None;
-                }
-
-                let tmp = self.legal.mint("phi");
-                let synth_vid = ValueId::new(u32::MAX.saturating_sub(synth_phi_seq));
-                synth_phi_seq = synth_phi_seq.saturating_add(1);
-                decls.push(Stmt::PhiDecl {
-                    name: tmp.clone(),
-                    value_id: synth_vid,
-                });
-                let old_val = std::mem::replace(&mut items[victim].1, Expr::Ident(tmp.clone()));
-                emitted.push(Stmt::PhiAssign {
-                    target: tmp,
-                    value: old_val,
-                    to,
-                    exceptional,
-                });
-                is_self_noop_cand[victim] = false;
-                self_reads[victim] = false;
-                victim_cleared[victim] = true;
-                for rtid in std::mem::take(&mut read_tids[victim]) {
-                    total_readers_rem[rtid] -= 1;
-                    if total_readers_rem[rtid] <= 1 {
-                        for &w in &writers_of_tid[rtid] {
-                            if !in_heap[w]
-                                && is_ready(
-                                    w,
-                                    &done,
-                                    &is_self_noop_cand,
-                                    &writers_rem,
-                                    &total_readers_rem,
-                                    &self_reads,
-                                    &item_tid,
-                                )
-                            {
-                                in_heap[w] = true;
-                                ready_heap.push(std::cmp::Reverse(w));
-                            }
-                        }
-                    }
-                }
-                if !in_heap[victim]
-                    && is_ready(
-                        victim,
-                        &done,
-                        &is_self_noop_cand,
-                        &writers_rem,
-                        &total_readers_rem,
-                        &self_reads,
-                        &item_tid,
-                    )
-                {
-                    in_heap[victim] = true;
-                    ready_heap.push(std::cmp::Reverse(victim));
-                }
-            }
-
+            let (decls, emitted) = schedule_parallel_phi_stmts(
+                assigns,
+                to,
+                exceptional,
+                &mut self.legal,
+                &mut synth_phi_seq,
+            );
             if !decls.is_empty()
                 && let Some(entry_blk) = blocks.first_mut()
             {
@@ -2267,7 +1844,322 @@ impl<'m> Recover<'m> {
             blocks[bi].stmts.extend(emitted);
         }
     }
+}
 
+/// One step of the canonical parallel-copy out-of-SSA scheduler (`R5-6a`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParallelPhiStep {
+    /// Emit assignment `j` directly (`target_j = value_j`).
+    Emit(usize),
+    /// Save `value_victim` into a fresh temporary and replace `value_victim`
+    /// with that temporary to break a permutation cycle.
+    BreakCycle { victim: usize },
+}
+
+/// Schedule `k` parallel assignments `(item_tid[j], read_tids[j])` in `O(k + E)`
+/// via a deterministic min-index ready heap and cycle-breaking walk (`R5-6a`).
+pub(crate) fn schedule_parallel_phi_copies(
+    writers_of_tid: &[Vec<usize>],
+    item_tid: &[usize],
+    mut is_self_noop_cand: Vec<bool>,
+    mut read_tids: Vec<Vec<usize>>,
+) -> Vec<ParallelPhiStep> {
+    let k = item_tid.len();
+    let nt = writers_of_tid.len();
+    let mut writers_rem: Vec<usize> = writers_of_tid.iter().map(Vec::len).collect();
+    let mut readers_of_tid: Vec<Vec<usize>> = vec![Vec::new(); nt];
+    let mut total_readers_rem: Vec<usize> = vec![0; nt];
+    let mut self_reads: Vec<bool> = vec![false; k];
+
+    for (i, r_tids) in read_tids.iter().enumerate() {
+        for &rtid in r_tids {
+            if rtid == item_tid[i] {
+                self_reads[i] = true;
+            }
+            readers_of_tid[rtid].push(i);
+            total_readers_rem[rtid] += 1;
+        }
+    }
+
+    let mut done = vec![false; k];
+    let mut victim_cleared = vec![false; k];
+    let mut in_heap = vec![false; k];
+    let mut ready_heap: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+        std::collections::BinaryHeap::new();
+    let is_ready = |j: usize,
+                    done: &[bool],
+                    is_self_noop_cand: &[bool],
+                    writers_rem: &[usize],
+                    total_readers_rem: &[usize],
+                    self_reads: &[bool],
+                    item_tid: &[usize]|
+     -> bool {
+        if done[j] {
+            return false;
+        }
+        let tid = item_tid[j];
+        (is_self_noop_cand[j] && writers_rem[tid] == 1)
+            || total_readers_rem[tid] == usize::from(self_reads[j])
+    };
+
+    for (j, in_h) in in_heap.iter_mut().enumerate().take(k) {
+        if is_ready(
+            j,
+            &done,
+            &is_self_noop_cand,
+            &writers_rem,
+            &total_readers_rem,
+            &self_reads,
+            item_tid,
+        ) {
+            *in_h = true;
+            ready_heap.push(std::cmp::Reverse(j));
+        }
+    }
+
+    let mut remaining = k;
+    let mut scan_cursor = 0usize;
+    let mut reader_cursor = vec![0usize; nt];
+    let mut path_pos: Vec<Option<usize>> = vec![None; k];
+    let mut steps: Vec<ParallelPhiStep> = Vec::with_capacity(k + 2);
+
+    while remaining > 0 {
+        let mut next_ready = None;
+        while let Some(std::cmp::Reverse(j)) = ready_heap.pop() {
+            if !done[j] {
+                next_ready = Some(j);
+                break;
+            }
+        }
+
+        if let Some(j) = next_ready {
+            done[j] = true;
+            remaining -= 1;
+            steps.push(ParallelPhiStep::Emit(j));
+            let wtid = item_tid[j];
+            writers_rem[wtid] -= 1;
+            if writers_rem[wtid] == 1 {
+                for &w in &writers_of_tid[wtid] {
+                    if !in_heap[w]
+                        && is_ready(
+                            w,
+                            &done,
+                            &is_self_noop_cand,
+                            &writers_rem,
+                            &total_readers_rem,
+                            &self_reads,
+                            item_tid,
+                        )
+                    {
+                        in_heap[w] = true;
+                        ready_heap.push(std::cmp::Reverse(w));
+                    }
+                }
+            }
+            for rtid in std::mem::take(&mut read_tids[j]) {
+                total_readers_rem[rtid] -= 1;
+                if total_readers_rem[rtid] <= 1 {
+                    for &w in &writers_of_tid[rtid] {
+                        if !in_heap[w]
+                            && is_ready(
+                                w,
+                                &done,
+                                &is_self_noop_cand,
+                                &writers_rem,
+                                &total_readers_rem,
+                                &self_reads,
+                                item_tid,
+                            )
+                        {
+                            in_heap[w] = true;
+                            ready_heap.push(std::cmp::Reverse(w));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        while scan_cursor < k && (done[scan_cursor] || victim_cleared[scan_cursor]) {
+            scan_cursor += 1;
+        }
+        let start = if scan_cursor < k {
+            scan_cursor
+        } else {
+            match (0..k).find(|&i| !done[i]) {
+                Some(i) => i,
+                None => break,
+            }
+        };
+        let mut path: Vec<usize> = Vec::new();
+        let mut cur = start;
+        let victim = loop {
+            if let Some(pos) = path_pos[cur] {
+                let v = path[pos..]
+                    .iter()
+                    .copied()
+                    .filter(|&x| !victim_cleared[x])
+                    .min()
+                    .unwrap_or_else(|| path[pos..].iter().copied().min().unwrap_or(cur));
+                break v;
+            }
+            path_pos[cur] = Some(path.len());
+            path.push(cur);
+            let ctid = item_tid[cur];
+            let rlist = &readers_of_tid[ctid];
+            let cursor = &mut reader_cursor[ctid];
+            while *cursor < rlist.len() {
+                let r = rlist[*cursor];
+                if !done[r] && !victim_cleared[r] && r != cur {
+                    break;
+                }
+                *cursor += 1;
+            }
+            if *cursor < rlist.len() {
+                cur = rlist[*cursor];
+            } else {
+                break cur;
+            }
+        };
+        for &node in &path {
+            path_pos[node] = None;
+        }
+
+        steps.push(ParallelPhiStep::BreakCycle { victim });
+        is_self_noop_cand[victim] = false;
+        self_reads[victim] = false;
+        victim_cleared[victim] = true;
+        for rtid in std::mem::take(&mut read_tids[victim]) {
+            total_readers_rem[rtid] -= 1;
+            if total_readers_rem[rtid] <= 1 {
+                for &w in &writers_of_tid[rtid] {
+                    if !in_heap[w]
+                        && is_ready(
+                            w,
+                            &done,
+                            &is_self_noop_cand,
+                            &writers_rem,
+                            &total_readers_rem,
+                            &self_reads,
+                            item_tid,
+                        )
+                    {
+                        in_heap[w] = true;
+                        ready_heap.push(std::cmp::Reverse(w));
+                    }
+                }
+            }
+        }
+        if !in_heap[victim]
+            && is_ready(
+                victim,
+                &done,
+                &is_self_noop_cand,
+                &writers_rem,
+                &total_readers_rem,
+                &self_reads,
+                item_tid,
+            )
+        {
+            in_heap[victim] = true;
+            ready_heap.push(std::cmp::Reverse(victim));
+        }
+    }
+
+    steps
+}
+
+/// Schedule a parallel `(target, value)` `PhiAssign` batch onto `(decls, assigns)`,
+/// shared across Stage-A `flush_phi_tail` and Stage-B structuring (`R5-6a`).
+pub(crate) fn schedule_parallel_phi_stmts(
+    assigns: Vec<(String, Expr)>,
+    to: BlockId,
+    exceptional: bool,
+    legal: &mut Legalizer,
+    synth_phi_seq: &mut u32,
+) -> (Vec<Stmt>, Vec<Stmt>) {
+    if assigns.len() <= 1
+        || assigns
+            .iter()
+            .all(|(target, value)| is_self_phi_assign(target, value))
+    {
+        let emitted = assigns
+            .into_iter()
+            .map(|(target, value)| Stmt::PhiAssign {
+                target,
+                value,
+                to,
+                exceptional,
+            })
+            .collect();
+        return (Vec::new(), emitted);
+    }
+
+    let k = assigns.len();
+    let mut items = assigns;
+    let mut target_id: HashMap<String, usize> = HashMap::with_capacity(k);
+    let mut item_tid: Vec<usize> = Vec::with_capacity(k);
+    let mut writers_of_tid: Vec<Vec<usize>> = Vec::new();
+    for (j, (target, _)) in items.iter().enumerate() {
+        let tid = *target_id.entry(target.clone()).or_insert_with(|| {
+            let id = writers_of_tid.len();
+            writers_of_tid.push(Vec::new());
+            id
+        });
+        item_tid.push(tid);
+        writers_of_tid[tid].push(j);
+    }
+
+    let mut read_tids: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut is_self_noop_cand: Vec<bool> = Vec::with_capacity(k);
+    for (target, value) in &items {
+        is_self_noop_cand.push(is_self_phi_assign(target, value));
+        let raw_reads = collect_expr_reads(value);
+        let mut r_tids: Vec<usize> = raw_reads
+            .iter()
+            .filter_map(|name| target_id.get(name).copied())
+            .collect();
+        r_tids.sort_unstable();
+        r_tids.dedup();
+        read_tids.push(r_tids);
+    }
+
+    let steps =
+        schedule_parallel_phi_copies(&writers_of_tid, &item_tid, is_self_noop_cand, read_tids);
+    let mut decls = Vec::new();
+    let mut emitted = Vec::with_capacity(k + 2);
+    for step in steps {
+        match step {
+            ParallelPhiStep::BreakCycle { victim } => {
+                let tmp = legal.mint("phi");
+                let synth_vid = ValueId::new(u32::MAX.saturating_sub(*synth_phi_seq));
+                *synth_phi_seq = synth_phi_seq.saturating_add(1);
+                decls.push(Stmt::PhiDecl {
+                    name: tmp.clone(),
+                    value_id: synth_vid,
+                });
+                let old_val = std::mem::replace(&mut items[victim].1, Expr::Ident(tmp.clone()));
+                emitted.push(Stmt::PhiAssign {
+                    target: tmp,
+                    value: old_val,
+                    to,
+                    exceptional,
+                });
+            }
+            ParallelPhiStep::Emit(j) => {
+                emitted.push(Stmt::PhiAssign {
+                    target: items[j].0.clone(),
+                    value: items[j].1.clone(),
+                    to,
+                    exceptional,
+                });
+            }
+        }
+    }
+    (decls, emitted)
+}
+
+impl<'a> Recover<'a> {
     /// One instruction → statement(s) (or nothing, when inlined/dead).
     fn step_inst(
         &mut self,
@@ -2695,13 +2587,16 @@ impl<'m> Recover<'m> {
                                 format!("v{level}_{slot}")
                             }
                         });
-                let eff_level = match kind {
-                    abcd_ir::LexEnvKind::Patch => u16::MAX,
-                    abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => *level,
+                let (eff_level, own) = match kind {
+                    abcd_ir::LexEnvKind::Patch => (u16::MAX, false),
+                    abcd_ir::LexEnvKind::Plain | abcd_ir::LexEnvKind::Sendable => {
+                        (*level, self.scopes.is_own_lex(iid))
+                    }
                 };
                 out.push(Stmt::LexStore {
                     level: eff_level,
                     slot: *slot,
+                    own,
                     name,
                     value: self.expr_of(*value),
                 });

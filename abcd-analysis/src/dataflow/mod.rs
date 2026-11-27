@@ -26,7 +26,10 @@ pub mod usedef;
 
 pub use alias::{AliasEngineStats, QueryAnswer, Rung1AliasOracle};
 pub use heap::{
-    AliasOracle, AllocSiteSet, FieldChain, FieldKey, HeapRef, Rung0AliasOracle, Tribool, peel_movs,
+    AliasOracle, AllocSiteSet, FieldChain, FieldKey, HeapRef, Rung0AliasOracle,
+    SingletonSiteClassifier, SiteInfo, Tribool, UpdateKind, is_concrete_singleton_site,
+    is_keyed_alloc, key_may_alias, peel_movs, resolve_alloc_sites, update_kind, update_kind_for,
 };
+pub use ifds::{FactId, FlowOut, FlowSink};
 pub use pta::{EnvAnswer, PtaConfig, PtaOutcome, PtaStats, Rung2AliasOracle, Rung2Tables};
 pub use usedef::UseDefChains;

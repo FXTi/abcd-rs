@@ -371,7 +371,8 @@ pub(in crate::folds) fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<Va
                             }
                             stack.push(FsTask::Slice(body));
                         }
-                        SNode::While { body, .. }
+                        SNode::Block(body)
+                        | SNode::While { body, .. }
                         | SNode::DoWhile { body, .. }
                         | SNode::Labeled { body, .. }
                         | SNode::ForOf { body, .. }
@@ -430,7 +431,8 @@ pub(in crate::folds) fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<Va
                         tasks.push(VisitTask::Slice(otherwise));
                         tasks.push(VisitTask::Slice(then));
                     }
-                    SNode::Labeled { body, .. }
+                    SNode::Block(body)
+                    | SNode::Labeled { body, .. }
                     | SNode::ForOf { body, .. }
                     | SNode::ForIn { body, .. } => {
                         tasks.push(VisitTask::Slice(body));

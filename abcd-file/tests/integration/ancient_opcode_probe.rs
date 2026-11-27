@@ -51,7 +51,14 @@ fn dump_methods(data: &[u8]) -> ([u8; 4], Vec<(u32, Vec<u8>)>) {
                 continue;
             }
             let mut moffs: Vec<u32> = Vec::new();
-            sys::abc_class_enumerate_methods(cr, Some(push_off), (&raw mut moffs).cast::<c_void>());
+            assert_eq!(
+                sys::abc_class_enumerate_methods(
+                    cr,
+                    Some(push_off),
+                    (&raw mut moffs).cast::<c_void>()
+                ),
+                0
+            );
             for m in moffs {
                 let mr = sys::abc_method_open(f, m);
                 if mr.is_null() {

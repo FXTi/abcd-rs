@@ -155,6 +155,7 @@ struct EvalFrame {
     work: Vec<(FuncId, ValueId)>,
     visited: HashSet<(FuncId, ValueId)>,
     out: BTreeSet<Prov>,
+    truncated: bool,
     cont: FrameCont,
 }
 
@@ -875,6 +876,7 @@ impl<'m> ClassHierarchyIndex<'m> {
             work: vec![(root_func, root_val)],
             visited: HashSet::new(),
             out: BTreeSet::new(),
+            truncated: false,
             cont: FrameCont::Root,
         }];
         let mut memo: HashMap<(FuncId, ValueId), BTreeSet<Prov>> = HashMap::new();
@@ -886,6 +888,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                     continue;
                 }
                 if frames[top_idx].out.len() >= MAX_PROV_SET || steps >= MAX_STEPS {
+                    frames[top_idx].truncated = true;
                     frames[top_idx].work.clear();
                     continue;
                 }
@@ -1086,8 +1089,11 @@ impl<'m> ClassHierarchyIndex<'m> {
                                         work: vec![sub],
                                         visited: HashSet::new(),
                                         out: BTreeSet::new(),
+                                        truncated: false,
                                         cont: FrameCont::LoadProp { name: *name },
                                     });
+                                } else {
+                                    frames[top_idx].truncated = true;
                                 }
                             }
                             Op::Call { callee, kind, .. } => {
@@ -1104,8 +1110,11 @@ impl<'m> ClassHierarchyIndex<'m> {
                                         work: vec![sub],
                                         visited: HashSet::new(),
                                         out: BTreeSet::new(),
+                                        truncated: false,
                                         cont: FrameCont::Call { kind: *kind },
                                     });
+                                } else {
+                                    frames[top_idx].truncated = true;
                                 }
                             }
                             _ => {}
@@ -1116,7 +1125,8 @@ impl<'m> ClassHierarchyIndex<'m> {
                 let Some(finished) = frames.pop() else {
                     break;
                 };
-                if steps < MAX_STEPS
+                if !finished.truncated
+                    && steps < MAX_STEPS
                     && let Some(origin) = finished.origin
                 {
                     memo.insert(origin, finished.out.clone());
@@ -1125,11 +1135,13 @@ impl<'m> ClassHierarchyIndex<'m> {
                     FrameCont::Root => return finished.out,
                     FrameCont::LoadProp { name } => {
                         if let Some(parent) = frames.last_mut() {
+                            parent.truncated |= finished.truncated;
                             self.apply_load_prop(&finished.out, name, parent);
                         }
                     }
                     FrameCont::Call { kind } => {
                         if let Some(parent) = frames.last_mut() {
+                            parent.truncated |= finished.truncated;
                             self.apply_call_result(&finished.out, kind, &mut parent.out);
                         }
                     }
@@ -1267,13 +1279,9 @@ impl<'m> ClassHierarchyIndex<'m> {
             }
         }
 
-        // 1b. Static `ClassData` hierarchy CHA: collect subtype overrides/implementations.
-        if !is_static
-            && self
-                .classes
-                .get(start_cid.index())
-                .is_some_and(|c| c.static_record.is_some())
-        {
+        // 1b. Subtype CHA (`ClassData` AND dynamic `DefineClass` / `DefineSendableClass`
+        // `extends` hierarchies): collect subtype overrides/implementations (`#94`).
+        if !is_static {
             let mut sub_q = VecDeque::new();
             let mut visited_sub = HashSet::from([start_cid]);
             if let Some(start_cls) = self.classes.get(start_cid.index()) {
@@ -1817,37 +1825,9 @@ fn compute_augmented_rpo(
     let Some(entry) = func.entry() else {
         return Vec::new();
     };
-    let mut visited = HashSet::new();
-    let mut post_order = Vec::new();
-    visited.insert(entry);
-    let mut stack: Vec<(BlockId, std::vec::IntoIter<BlockId>)> = vec![(
-        entry,
-        augmented_succs_with_map(module, exc_map, entry).into_iter(),
-    )];
-    while let Some((node, succs)) = stack.last_mut() {
-        let node = *node;
-        match succs.next() {
-            Some(succ) => {
-                if visited.insert(succ) {
-                    stack.push((
-                        succ,
-                        augmented_succs_with_map(module, exc_map, succ).into_iter(),
-                    ));
-                }
-            }
-            None => {
-                post_order.push(node);
-                stack.pop();
-            }
-        }
-    }
-    post_order.reverse();
-    for &bb in &func.blocks {
-        if visited.insert(bb) {
-            post_order.push(bb);
-        }
-    }
-    post_order
+    abcd_ir::cfg::compute_rpo_with(entry, &func.blocks, |bb| {
+        augmented_succs_with_map(module, exc_map, bb)
+    })
 }
 
 fn compute_func_env_stacks(

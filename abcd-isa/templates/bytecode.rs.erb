@@ -165,6 +165,10 @@ bitflags::bitflags! {
   raise 'Missing jmp imm32 instruction in isa.yaml' unless jmp_imm32_insn && !jmp_imm32_insn.format.prefixed?
   jmp_imm32_opcode = jmp_imm32_insn.opcode_idx
 
+  nop_insn = mnemonic_groups.fetch('nop').first
+  raise 'Missing nop instruction in isa.yaml' unless nop_insn && !nop_insn.format.prefixed?
+  nop_opcode = nop_insn.opcode_idx
+
   def decode_raw_bits_expr(op)
     off = op.offset
     w = op.width
@@ -283,6 +287,9 @@ pub const MIN_PREFIX_OPCODE: u8 = <%= min_prefix_opcode %>;
 
 /// Opcode byte for unconditional 32-bit jump (`jmp imm32`).
 pub const JMP_IMM32_OPCODE: u8 = <%= format("0x%02x", jmp_imm32_opcode) %>;
+
+/// Opcode byte for 1-byte `nop` instruction.
+pub const NOP_OPCODE: u8 = <%= format("0x%02x", nop_opcode) %>;
 
 /// Role of an entity operand, taken from the vendored ISA signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -917,55 +924,6 @@ impl Bytecode {
         }
     }
 
-    /// Decode a single instruction from raw bytes via C FFI (retained for
-    /// differential oracle verification against [`Self::decode_modern`]).
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to at least `isa_get_size_by_opcode(opcode)` readable
-    /// bytes. `opcode` must have been obtained from `isa_get_opcode(ptr)`.
-    pub unsafe fn decode_one(ptr: *const u8, opcode: u16) -> Option<(Self, Option<i64>)> {
-        match opcode as u32 {
-% mnemonic_groups.each do |mnemonic, group|
-%   vname = mnemonic_variant_name(mnemonic)
-%   is_jump = group.first.jump?
-%   ops = group.first.operands
-%   opcode_literals = group.map { |i| "#{i.opcode_idx}" }
-            <%= opcode_literals.join(' | ') %> => {
-%   if ops.empty?
-                let _ = ptr;
-                Some((Bytecode::<%= vname %>, None))
-%   else
-%     type_indices = { reg?: 0, imm?: 0, id?: 0 }
-%     field_exprs = []
-%     raw_imm_expr = nil
-%     ops.each do |op|
-%       key = [:reg?, :imm?, :id?].find { |k| op.send(k) }
-%       tidx = type_indices[key]
-%       type_indices[key] += 1
-%       if is_jump && op.imm?
-%         raw_imm_expr = "unsafe { crate::isa_get_imm64(ptr, #{tidx}) }"
-%         field_exprs << 'Label(0)'
-%       elsif op.reg?
-%         field_exprs << "Reg(unsafe { crate::isa_get_vreg(ptr, #{tidx}) } as u16)"
-%       elsif op.id?
-%         field_exprs << "EntityId(unsafe { crate::isa_get_id(ptr, #{tidx}) })"
-%       else
-%         field_exprs << "Imm(unsafe { crate::isa_get_imm_data(ptr, #{tidx}) })"
-%       end
-%     end
-%     if is_jump && raw_imm_expr
-                let raw_imm = <%= raw_imm_expr %>;
-                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), Some(raw_imm)))
-%     else
-                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), None))
-%     end
-%   end
-            }
-% end
-            _ => None,
-        }
-    }
 }
 
 // ============================================================================

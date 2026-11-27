@@ -6,13 +6,18 @@
 //! this crate is the boundary between the `.abc`/ISA container layer and the
 //! semantic IR:
 //!
+//! - **Dialect & class metadata (`D3`)** — [`abcd_file::Dialect`] maps
+//!   directly onto [`abcd_ir::Module::dialect`], and every [`abcd_ir::ClassData`]
+//!   header (including `es_module`, `scope_names`, `annotations`, and `fields`)
+//!   plus standalone module records are published before lifting method bodies.
 //! - **Entity resolution → [`abcd_ir::SymbolTable`] + [`FuncId`]** — strings
 //!   intern losslessly as content-keyed [`Sym`]s (UTF-8 or raw MUTF-8 bytes);
 //!   method references resolve via dense [`abcd_file::MethodIdx`] slots into
 //!   [`FuncId`] indices (never name-keyed, never raw offsets).
 //! - **Literal arrays → [`abcd_ir::ConstPool`]** — lossless typed [`Const`]
-//!   trees (including nested arrays, literal-buffer refs, and typed primitive
-//!   arrays), with method references lifted to [`Const::MethodRef`].
+//!   trees (including nested arrays, literal-buffer refs, and inline typed
+//!   primitive/string arrays), with method references lifted to
+//!   [`Const::MethodRef`].
 //! - **Module records → [`abcd_ir::EsModule`] / [`abcd_ir::ImportDecl`] / [`abcd_ir::ExportDecl`]** —
 //!   standalone `_ESModuleRecord` and `--merge-abc` `moduleRecordIdx`
 //!   field blobs (`FieldValue::ModuleData`) parse into declarations with
@@ -34,13 +39,15 @@
 //!   for uninitialized vregs, [`Const::Hole`](abcd_ir::Const) for
 //!   accumulator-read-before-write), catch-handler
 //!   [`ExceptionParam`](abcd_ir::ValueDef) values, and predecessor-complete
-//!   Braun SSA construction with trivial-phi pruning.
+//!   Braun SSA construction with iterative union-find + user-cascade
+//!   trivial-phi elimination.
 //! - **Try regions** — structured [`TryRegion`]s with materialized
 //!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges in `Block.preds` for
 //!   every `(protected block → handler)` pair, followed by unreachable-block
-//!   pruning over exception-augmented reachability.
+//!   pruning over [`abcd_ir::cfg::ExceptionHandlerMap`] exception-augmented
+//!   reachability.
 //! - **Opcode coverage** — every modern (`9.0.0.0`..`24.0.0.0`) and legacy
-//!   (`0.0.0.2`) bytecode opcode maps into the 88-op IR taxonomy (see
+//!   (`0.0.0.2`) bytecode opcode maps into the 94-op IR taxonomy (see
 //!   `translate.rs` for the full opcode mapping).
 //!
 //! Library rule: no panics on data; every malformed or unsupported input
@@ -106,18 +113,6 @@ pub enum LiftError {
         "super-property access by constant index has no ArkCompiler opcode (isa.yaml has no super-by-index form)"
     )]
     UnsupportedSuperByIndex,
-    /// `ldthisbyname` / `stthisbyname` / `ldthisbyvalue` /
-    /// `stthisbyvalue` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1627-1642):
-    /// IC-fused `this` property access that es2panda NEVER emits (N51 —
-    /// upstream source grep zero hits; the 36-compile matrix shows
-    /// `this[k] = v` always compiles to `ldthis` + `stobjbyvalue`).
-    /// Corpus coverage is zero, so there is no VM evidence for the IC
-    /// semantics — a hard error (maintainer ruling 2026-09-20), never
-    /// silently invented.
-    #[error(
-        "unsupported this-by-* opcode `{0}` (N51): es2panda never emits this IC-fused family and its IC semantics are unsupported — please report this file to the abcd-rs maintainers"
-    )]
-    UnsupportedThisByAccess(&'static str),
     /// The fused compare-and-branch family — the acc-branch forms
     /// (`jstricteqz` / `jnstricteqz`, `jeqnull` / `jnenull`,
     /// `jstricteqnull` / `jnstricteqnull`, `jequndefined` /
@@ -250,9 +245,15 @@ pub(crate) struct Lifter<'f> {
 
 impl<'f> Lifter<'f> {
     fn new(file: &'f File) -> Self {
+        let dialect = match file.dialect() {
+            Some(abcd_file::Dialect::Static) => abcd_ir::Dialect::StaticArkTS,
+            Some(abcd_file::Dialect::DynamicModern | abcd_file::Dialect::DynamicLegacy) | None => {
+                abcd_ir::Dialect::DynamicEcma
+            }
+        };
         Self {
             file,
-            module: Module::new(),
+            module: Module::with_dialect(dialect),
             method_names: Vec::new(),
             class_to_id: HashMap::new(),
             field_ids: Vec::new(),
@@ -369,15 +370,30 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
         }
     }
 
-    // Pass 2 — lift classes (same order as pass 1).
+    // Pass 2a — lift all class headers (`ClassData` with `es_module`,
+    // `scope_names`, `annotations`, `fields`, and `methods`) plus standalone
+    // `_ESModuleRecord` / `_ModuleRequestPhaseRecord` / `_ESScopeNamesRecord`
+    // tables BEFORE lifting any method body (`D3`). This ensures enclosing
+    // `ClassData` (`source_lang` for `FrameSlots`, `es_module` slot tables for
+    // legacy `0.0.0.2` module-var opcodes, and `scope_names`) is populated
+    // immediately when translating methods.
     let mut func_base = 0u32;
+    let mut class_schedule: Vec<(ClassId, &abcd_file::Class, u32)> =
+        Vec::with_capacity(total_classes);
     for (&class_sid, class) in &file.classes {
-        metadata::lift_class(&mut lf, class_sid, class, func_base)?;
+        let class_id = metadata::lift_class_header(&mut lf, class_sid, class, func_base)?;
+        class_schedule.push((class_id, class, func_base));
         func_base += class.methods.len() as u32;
     }
-
-    // Module records → imports/exports/module-requests.
     metadata::emit_module_records(&mut lf)?;
+
+    // Pass 2b — lift method bodies in deterministic class × declaration order.
+    for (class_id, class, base) in class_schedule {
+        for (mi, method) in class.methods.iter().enumerate() {
+            let func_id = FuncId::new(base + mi as u32);
+            lift_method(&mut lf, class_id, method, func_id)?;
+        }
+    }
 
     for cls in &mut lf.module.classes {
         cls.interfaces.shrink_to_fit();
@@ -689,8 +705,13 @@ pub(crate) fn lift_method<'f>(
     fd.frame_init_consts = fx.ssa.frame_init_consts.clone();
     fx.lf.module.functions[func_id.index()] = fd;
 
-    // N18 dead-island sweep (augmented reachability).
+    // N18 dead-island sweep (augmented reachability via `ExceptionHandlerMap`).
     sweep_dead_blocks(&mut fx);
+
+    // Finalize iterative trivial-phi cascade (including any phis reduced to a
+    // single live predecessor by `sweep_dead_blocks`) and rewrite all surviving
+    // instruction operands (`Op::for_each_operand_mut`) and debug references.
+    fx.ssa.finalize_function(&mut fx.lf.module, func_id);
 
     // Debug data (line/column tables keyed by the lifted InstIds,
     // locals with scope extents, param names, source file/code).
@@ -782,75 +803,52 @@ fn build_try_regions(
 }
 
 /// N18 dead-island sweep: remove blocks unreachable over the AUGMENTED
-/// successor relation (terminator edges + try→handler exception edges)
-/// and repair preds/phi entries/try regions of the survivors.
+/// successor relation (`abcd_ir::cfg::augmented_succs_with_map` over
+/// [`abcd_ir::cfg::ExceptionHandlerMap`]) and repair preds/phi entries/try
+/// regions of the survivors.
 fn sweep_dead_blocks(fx: &mut translate::FnLift) {
+    use abcd_ir::cfg::{ExceptionHandlerMap, augmented_succs_with_map};
     use std::collections::{HashSet, VecDeque};
 
     let func_id = fx.func_id;
     let module = &mut fx.lf.module;
-    let entry = module.functions[func_id.index()].blocks[0];
-    let func_blocks: HashSet<BlockId> = module.functions[func_id.index()]
-        .blocks
-        .iter()
-        .copied()
-        .collect();
-
-    let augmented_succs = |module: &Module, func_id: FuncId, bb: BlockId| -> Vec<BlockId> {
-        let mut out = Vec::new();
-        if let Some(block) = module.blocks.get(bb.index())
-            && let Some(&last) = block.insts.last()
-            && let Some(inst) = module.insts.get(last.index())
-        {
-            match &inst.op {
-                abcd_ir::Op::Branch { dest } => out.push(*dest),
-                abcd_ir::Op::CondBranch {
-                    true_dest,
-                    false_dest,
-                    ..
-                } => {
-                    out.push(*true_dest);
-                    out.push(*false_dest);
-                }
-                _ => {}
-            }
-        }
-        for region in &module.functions[func_id.index()].try_regions {
-            if region.protected.contains(&bb) {
-                out.extend(region.catches.iter().map(|c| c.handler));
-            }
-        }
-        out
+    let Some(exc_map) = ExceptionHandlerMap::build(module, func_id) else {
+        return;
     };
+    let all_blocks = module.functions[func_id.index()].blocks.clone();
+    let Some(&entry) = all_blocks.first() else {
+        return;
+    };
+    let func_blocks: HashSet<BlockId> = all_blocks.iter().copied().collect();
 
-    let mut reachable: HashSet<BlockId> = HashSet::new();
+    let mut reachable: HashSet<BlockId> = HashSet::with_capacity(all_blocks.len());
     let mut queue: VecDeque<BlockId> = VecDeque::new();
     reachable.insert(entry);
     queue.push_back(entry);
     while let Some(bb) = queue.pop_front() {
-        for succ in augmented_succs(module, func_id, bb) {
+        for succ in augmented_succs_with_map(module, &exc_map, bb) {
             if func_blocks.contains(&succ) && reachable.insert(succ) {
                 queue.push_back(succ);
             }
         }
     }
-    let dead: HashSet<BlockId> = func_blocks
-        .into_iter()
-        .filter(|bb| !reachable.contains(bb))
-        .collect();
-    if dead.is_empty() {
+    if reachable.len() == all_blocks.len() {
         return;
     }
+    let dead: HashSet<BlockId> = all_blocks
+        .iter()
+        .copied()
+        .filter(|bb| !reachable.contains(bb))
+        .collect();
 
     // Kept blocks: drop dead predecessors and the phi entries keyed by
     // them (verify requires phi entry count == predecessor count).
-    let kept: Vec<BlockId> = module.functions[func_id.index()]
-        .blocks
-        .iter()
-        .filter(|bb| !dead.contains(bb))
-        .copied()
-        .collect();
-    for bb in kept {
+    for &bb in &all_blocks {
+        if dead.contains(&bb) {
+            module.blocks[bb.index()].insts.shrink_to_fit();
+            module.blocks[bb.index()].preds.shrink_to_fit();
+            continue;
+        }
         module.blocks[bb.index()]
             .preds
             .retain(|e| !dead.contains(&e.from));
@@ -869,10 +867,6 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
 
     // Remove the dead blocks and prune dependent metadata: try-region
     // coverage/handler references.
-    for &bb in &dead {
-        module.blocks[bb.index()].insts.shrink_to_fit();
-        module.blocks[bb.index()].preds.shrink_to_fit();
-    }
     let func = &mut module.functions[func_id.index()];
     func.blocks.retain(|bb| !dead.contains(bb));
     for region in &mut func.try_regions {

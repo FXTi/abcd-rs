@@ -43,10 +43,13 @@ fn proto_queries_preserve_arguments_in_any_order() {
             assert_eq!(sys::abc_proto_get_ref_num(proto), 0);
             assert_eq!(sys::abc_proto_num_args(proto), args.len() as u32);
             let mut types = Vec::<u8>::new();
-            sys::abc_proto_enumerate_types(
-                proto,
-                Some(collect_type),
-                (&mut types as *mut Vec<u8>).cast(),
+            assert_eq!(
+                sys::abc_proto_enumerate_types(
+                    proto,
+                    Some(collect_type),
+                    (&mut types as *mut Vec<u8>).cast(),
+                ),
+                0
             );
             let expected = [
                 sys::Type_TypeId_TAGGED,

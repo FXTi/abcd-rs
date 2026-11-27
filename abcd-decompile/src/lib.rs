@@ -11,7 +11,7 @@
 //!   private, and G2 module-var names resolve from IR/debug evidence.
 //! - **Stage B — control-flow structuring & desugaring** ([`structure`],
 //!   [`folds`], [`classfold`]): pattern-independent structuring over
-//!   [`abcd_analysis::control::structure_regions`], `TryRegion` / `finally` / cut-try
+//!   [`structure::regions::structure_regions`], `TryRegion` / `finally` / cut-try
 //!   projection, class reconstruction, raw+cooked template literals,
 //!   `for..of` / `for..in` / `for await..of`, and generator / async /
 //!   async-generator / `yield*` state-machine folds.

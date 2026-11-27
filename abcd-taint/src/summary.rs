@@ -89,6 +89,59 @@ pub enum Endpoint {
     ReturnField(FieldChain),
 }
 
+impl Endpoint {
+    /// Parse a textual summary endpoint specification (`"base"`, `"return"`,
+    /// `"param:N"`, or `"any_param_from:N"`).
+    ///
+    /// Returns a descriptive error message when `text` does not match a known
+    /// endpoint syntax or its parameter index is not a valid `u16`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "base" => Ok(Self::Base),
+            "return" => Ok(Self::Return),
+            _ => {
+                if let Some(rest) = text.strip_prefix("param:") {
+                    if rest.is_empty() {
+                        return Err(format!(
+                            "invalid summary endpoint '{text}': missing parameter index after 'param:'"
+                        ));
+                    }
+                    let idx = rest.parse::<u16>().map_err(|_| {
+                        format!(
+                            "invalid summary endpoint '{text}': expected u16 parameter index after 'param:'"
+                        )
+                    })?;
+                    Ok(Self::Param(idx))
+                } else if let Some(rest) = text.strip_prefix("any_param_from:") {
+                    if rest.is_empty() {
+                        return Err(format!(
+                            "invalid summary endpoint '{text}': missing parameter index after 'any_param_from:'"
+                        ));
+                    }
+                    let idx = rest.parse::<u16>().map_err(|_| {
+                        format!(
+                            "invalid summary endpoint '{text}': expected u16 parameter index after 'any_param_from:'"
+                        )
+                    })?;
+                    Ok(Self::AnyParamFrom(idx))
+                } else {
+                    Err(format!(
+                        "unknown summary endpoint '{text}': expected 'base', 'return', 'param:N', or 'any_param_from:N'"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Whether this endpoint can serve as the `from` (source) side of a
+    /// [`Flow`] rule (`false` for [`Endpoint::Return`] and sink-only
+    /// [`Endpoint::ReturnField`]).
+    #[must_use]
+    pub fn is_valid_flow_source(&self) -> bool {
+        !matches!(self, Self::Return | Self::ReturnField(_))
+    }
+}
+
 /// One gap-enter rule of a callback summary: taint matching `from` at
 /// the summary call site enters the callback body on formal `formal`
 /// (0-based over the callback's declared formals — the implicit frame
@@ -1002,5 +1055,42 @@ mod tests {
             crate::UNCAUGHT_EXCEPTION_VALUE,
             abcd_ir::ValueId::new(u32::MAX)
         );
+    }
+
+    #[test]
+    fn endpoint_parse_and_flow_source_validation() {
+        assert_eq!(Endpoint::parse("base"), Ok(Endpoint::Base));
+        assert_eq!(Endpoint::parse("return"), Ok(Endpoint::Return));
+        assert_eq!(Endpoint::parse("param:0"), Ok(Endpoint::Param(0)));
+        assert_eq!(Endpoint::parse("param:42"), Ok(Endpoint::Param(42)));
+        assert_eq!(
+            Endpoint::parse("param:65535"),
+            Ok(Endpoint::Param(u16::MAX))
+        );
+        assert_eq!(
+            Endpoint::parse("any_param_from:0"),
+            Ok(Endpoint::AnyParamFrom(0))
+        );
+        assert_eq!(
+            Endpoint::parse("any_param_from:3"),
+            Ok(Endpoint::AnyParamFrom(3))
+        );
+
+        assert!(Endpoint::Base.is_valid_flow_source());
+        assert!(Endpoint::Param(0).is_valid_flow_source());
+        assert!(Endpoint::AnyParamFrom(1).is_valid_flow_source());
+        assert!(Endpoint::Field(FieldChain::new()).is_valid_flow_source());
+        assert!(!Endpoint::Return.is_valid_flow_source());
+        assert!(!Endpoint::ReturnField(FieldChain::new()).is_valid_flow_source());
+
+        assert!(Endpoint::parse("").is_err());
+        assert!(Endpoint::parse("this").is_err());
+        assert!(Endpoint::parse("param:").is_err());
+        assert!(Endpoint::parse("param:-1").is_err());
+        assert!(Endpoint::parse("param:65536").is_err());
+        assert!(Endpoint::parse("param:abc").is_err());
+        assert!(Endpoint::parse("any_param_from:").is_err());
+        assert!(Endpoint::parse("any_param_from:-1").is_err());
+        assert!(Endpoint::parse("any_param_from:70000").is_err());
     }
 }

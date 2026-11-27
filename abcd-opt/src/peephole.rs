@@ -1,31 +1,38 @@
-//! Peephole optimization: local constant folding and identity elimination
-//! (`design/ir.md`, `design/decisions.md` `N36`–`N42`).
+//! Peephole optimization: local constant folding and conditional-branch
+//! folding backed by [`crate::const_eval`] (`design/ir.md`,
+//! `design/decisions.md` `N23`, `N36`–`N42`).
 //!
 //! Key design invariants:
 //!
-//! - Arithmetic folds operate on [`Op::BinaryOp`] ([`BinOp`]), relational and
-//!   equality folds on [`Op::Compare`] ([`CmpOp`]), and unary folds on
-//!   [`Op::UnaryOp`] ([`UnOp`], including `Minus`, `BitNot`, `LogicalNot`,
-//!   `IsTrue`, and `IsFalse`).
-//! - Folded results become [`Op::LoadConst`] of a freshly pooled [`Const`]
-//!   (append-only pool; the instruction keeps its result [`ValueId`], so no use
-//!   rewrites are needed).
-//! - Constants are resolved from BOTH constant-carrying definitions:
-//!   [`Op::LoadConst`] instructions and [`ValueDef::Const`] values
-//!   (frame-initial constants).
+//! - Arithmetic, relational/equality, and unary folds delegate to the single
+//!   shared ECMA-262 constant-evaluation kernel in [`crate::const_eval`].
+//! - Folded value instructions become [`Op::LoadConst`] of a freshly interned
+//!   [`Const`] (append-only pool; the instruction keeps its result
+//!   [`abcd_ir::ValueId`], so no use rewrites are needed).
+//! - Block-ending [`Op::CondBranch`] instructions fold to [`Op::Branch`] when
+//!   `true_dest == false_dest` or when `cond`'s ECMA-262 `ToBoolean` truthiness
+//!   is statically known, pruning any dropped normal predecessor edge and
+//!   matching [`Op::Phi`] incoming entries (`N23`) while leaving `cond`'s
+//!   producer instruction intact if it has observable effects.
 
-use abcd_ir::{BinOp, BlockId, CmpOp, Const, FuncId, InstId, Module, Op, UnOp, ValueDef, ValueId};
+use abcd_ir::{BlockId, Const, FuncId, InstId, Module, Op};
 
 use crate::FuncPass;
-use crate::{canonical_number_const, ecma_pow, has_static_ty, to_int32, to_uint32};
+use crate::const_eval::{
+    block_phis, const_of_value, eval_binary_op, eval_compare_op, eval_truthiness, eval_unary_op,
+    fold_cond_branch_to_jump, has_static_ty,
+};
 
-/// The peephole pass: constant folding over local instruction patterns.
+/// The peephole pass: local constant folding and branch simplification.
 pub struct Peephole;
 
 impl FuncPass for Peephole {
     fn run(&self, module: &mut Module, func: FuncId) -> bool {
         let mut changed = false;
         let Some(func_data) = module.func(func) else {
+            return false;
+        };
+        let Some(entry) = func_data.entry() else {
             return false;
         };
         let blocks: Vec<BlockId> = func_data.blocks.clone();
@@ -42,6 +49,10 @@ impl FuncPass for Peephole {
                         inst.op = Op::LoadConst(cid);
                         changed = true;
                     }
+                    continue;
+                }
+                if try_fold_cond_branch(module, entry, bb, inst_id) {
+                    changed = true;
                 }
             }
         }
@@ -49,294 +60,62 @@ impl FuncPass for Peephole {
     }
 }
 
-/// Try to fold an instruction into a constant. The caller interns the
-/// returned [`Const`] into [`abcd_ir::ConstPool`] and rewrites the instruction
-/// to [`Op::LoadConst`] (the pool is append-only, so this never disturbs other
-/// ids).
+/// Try to fold a value-producing instruction into a scalar [`Const`].
 fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
     if has_static_ty(module, inst_id) {
         return None;
     }
     let inst = module.inst(inst_id)?;
-    let op = &inst.op;
-    match op {
-        // BinaryOp(op, Lit(a), Lit(b)) → Lit(eval(op, a, b)).
-        //
-        // Operand order (N36): the IR convention is `left` = acc
-        // operand, `right` = register operand (lift `binary_op`), while
-        // every vendored `*2` handler computes `vreg OP acc` (e.g. div2
-        // interpreter_assembly.cpp:1095-1096: `left = GET_VREG_VALUE(v0);
-        // right = acc`). The true semantic is therefore `right OP left`
-        // in IR field terms — evaluate a = right, b = left.
+    inst.result?;
+    match &inst.op {
         Op::BinaryOp { op, left, right } => {
-            let a = as_number(module, *right)?;
-            let b = as_number(module, *left)?;
-            let result = eval_binop(*op, a, b)?;
-            Some(canonical_number_const(result))
+            let lc = const_of_value(module, *left)?;
+            let rc = const_of_value(module, *right)?;
+            eval_binary_op(*op, &lc, &rc)
         }
-
-        // Compare(op, Lit(a), Lit(b)) → Bool constant.
-        Op::Compare { op, left, right } => try_fold_comparison(*op, module, *left, *right),
-
-        // UnOp(Minus, Lit(n)) → Lit(-n) — -0.0 folds to +0.0, +0.0 folds to
-        // -0.0, and NaN canonicalizes (`N37`, `#60`).
-        Op::UnaryOp {
-            op: UnOp::Minus,
-            operand,
-        } => {
-            let n = as_number(module, *operand)?;
-            Some(canonical_number_const(-n))
+        Op::Compare { op, left, right } => {
+            let lc = const_of_value(module, *left)?;
+            let rc = const_of_value(module, *right)?;
+            eval_compare_op(&module.sym, *op, &lc, &rc)
         }
-
-        // UnOp(BitNot, Lit(n)) → Lit(~ToInt32(n)) — wrap, not saturate (N42).
-        Op::UnaryOp {
-            op: UnOp::BitNot,
-            operand,
-        } => {
-            let n = as_number(module, *operand)?;
-            Some(canonical_number_const(!to_int32(n) as f64))
+        Op::UnaryOp { op, operand } => {
+            let oc = const_of_value(module, *operand);
+            eval_unary_op(module, *op, *operand, oc.as_ref())
         }
-
-        // UnOp(LogicalNot, Lit(b)) → Lit(!b) (the BOOLEAN not — N39:
-        // vendor `not` is BitNot, lifted distinctly).
-        Op::UnaryOp {
-            op: UnOp::LogicalNot,
-            operand,
-        } => {
-            let b = as_bool(module, *operand)?;
-            Some(Const::Bool(!b))
-        }
-
-        // IsTrue(Lit(b)) → Lit(b)
-        Op::UnaryOp {
-            op: UnOp::IsTrue,
-            operand,
-        } => {
-            let b = as_bool(module, *operand)?;
-            Some(Const::Bool(b))
-        }
-
-        // IsFalse(Lit(b)) → Lit(!b)
-        Op::UnaryOp {
-            op: UnOp::IsFalse,
-            operand,
-        } => {
-            let b = as_bool(module, *operand)?;
-            Some(Const::Bool(!b))
-        }
-
-        // Raw ArkCompiler `jeqz` / `jnez` predicates (`#61` `R3-X1`).
-        Op::UnaryOp {
-            op: UnOp::JumpEqz,
-            operand,
-        } => eval_jump_eqz(&const_of(module, *operand)?).map(Const::Bool),
-
-        Op::UnaryOp {
-            op: UnOp::JumpNez,
-            operand,
-        } => eval_jump_nez(&const_of(module, *operand)?).map(Const::Bool),
-
-        // `ToPropertyKey` on an already-string constant is the identity.
-        Op::UnaryOp {
-            op: UnOp::ToPropertyKey,
-            operand,
-        } => match const_of(module, *operand)? {
-            Const::String(sym) => Some(Const::String(sym)),
-            _ => None,
-        },
-
         _ => None,
     }
 }
 
-/// Try to fold a comparison with constant operands into a Bool constant.
-///
-/// Operand order (N36): `left` is the acc operand, `right` the register
-/// operand, and the vendored handlers compute `vreg CMP acc` (e.g. less
-/// interpreter_assembly.cpp:1188-1189: `left = GET_VREG_VALUE(v0);
-/// right = GET_ACC()`), so `a` is extracted from `right` and `b` from
-/// `left`. (For the symmetric Eq/NotEq/StrictEq/StrictNotEq the order is
-/// immaterial but kept uniform.)
-fn try_fold_comparison(op: CmpOp, module: &Module, left: ValueId, right: ValueId) -> Option<Const> {
-    match op {
-        CmpOp::Eq => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a == b))
-        }
-        CmpOp::NotEq => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a != b))
-        }
-        CmpOp::StrictEq => {
-            // StrictEq requires same type — only fold when both are numbers or both are bools.
-            // N40: JS strict equality on numbers is plain ==, NOT a bit
-            // comparison: `0 === -0` is true and `NaN === NaN` is false.
-            if let (Some(a), Some(b)) = (
-                as_number_strict(module, left),
-                as_number_strict(module, right),
-            ) {
-                return Some(Const::Bool(a == b));
-            }
-            if let (Some(a), Some(b)) =
-                (as_bool_strict(module, left), as_bool_strict(module, right))
-            {
-                return Some(Const::Bool(a == b));
-            }
-            None
-        }
-        CmpOp::StrictNotEq => {
-            if let (Some(a), Some(b)) = (
-                as_number_strict(module, left),
-                as_number_strict(module, right),
-            ) {
-                return Some(Const::Bool(a != b));
-            }
-            if let (Some(a), Some(b)) =
-                (as_bool_strict(module, left), as_bool_strict(module, right))
-            {
-                return Some(Const::Bool(a != b));
-            }
-            None
-        }
-        CmpOp::Less => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a < b))
-        }
-        CmpOp::LessEq => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a <= b))
-        }
-        CmpOp::Greater => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a > b))
-        }
-        CmpOp::GreaterEq => {
-            let a = as_number(module, right)?;
-            let b = as_number(module, left)?;
-            Some(Const::Bool(a >= b))
-        }
-        // In / InstanceOf cannot be folded at compile time.
-        _ => None,
-    }
-}
-
-/// The constant a value carries, from either constant-carrying
-/// definition form ([`Op::LoadConst`] instruction or
-/// [`ValueDef::Const`]).
-fn const_of(module: &Module, val: ValueId) -> Option<Const> {
-    let cid = match module.value(val)?.def {
-        ValueDef::Const(c) => c,
-        ValueDef::Inst(inst) => match &module.inst(inst)?.op {
-            Op::LoadConst(c) => *c,
-            _ => return None,
-        },
-        _ => return None,
+/// Try to fold a `CondBranch` (`true_dest == false_dest` or statically known
+/// `ToBoolean` condition) into an unconditional `Branch`.
+fn try_fold_cond_branch(module: &mut Module, entry: BlockId, bb: BlockId, inst_id: InstId) -> bool {
+    let Some(inst) = module.inst(inst_id) else {
+        return false;
     };
-    module.consts.get(cid).cloned()
-}
-
-/// Extract a constant number only if the value is a Number constant.
-/// (Does not coerce bools/null — used for strict equality checks.)
-fn as_number_strict(module: &Module, val: ValueId) -> Option<f64> {
-    match const_of(module, val)? {
-        Const::Number(bits) => Some(f64::from_bits(bits)),
-        _ => None,
+    let Op::CondBranch {
+        cond,
+        true_dest,
+        false_dest,
+    } = inst.op
+    else {
+        return false;
+    };
+    if true_dest == false_dest {
+        return fold_cond_branch_to_jump(module, bb, inst_id, true_dest, false_dest);
     }
-}
-
-/// Extract a constant bool only if the value is a Bool constant.
-fn as_bool_strict(module: &Module, val: ValueId) -> Option<bool> {
-    match const_of(module, val)? {
-        Const::Bool(b) => Some(b),
-        _ => None,
+    let known_const = const_of_value(module, cond);
+    let Some(is_true) = eval_truthiness(module, cond, known_const.as_ref()) else {
+        return false;
+    };
+    let target = if is_true { true_dest } else { false_dest };
+    let dead = if is_true { false_dest } else { true_dest };
+    // Defensive guard for unverified IR: never leave a reachable zero-predecessor
+    // phi on `entry` (`N27`).
+    if dead == entry
+        && !block_phis(module, entry).is_empty()
+        && module.block(entry).is_some_and(|b| b.preds.len() <= 1)
+    {
+        return false;
     }
-}
-
-/// Try to extract a constant number from a value.
-///
-/// N41: `Const::Null` is NOT coerced to 0.0 here — doing so folded
-/// `null == 0` to true where JS loose equality says false (null equals
-/// only null/undefined), and folded null arithmetic through a zero the
-/// program never computes. (ToNumber(null) IS 0 for the arithmetic
-/// slow path, but a compile-time fold through coercion was proven
-/// unsound by P3-T19 — no eq-nullish fold lives in peephole.)
-fn as_number(module: &Module, val: ValueId) -> Option<f64> {
-    match const_of(module, val)? {
-        Const::Number(bits) => Some(f64::from_bits(bits)),
-        Const::Bool(true) => Some(1.0),
-        Const::Bool(false) => Some(0.0),
-        _ => None,
-    }
-}
-
-/// Try to extract a constant bool (truthiness) from a value.
-fn as_bool(module: &Module, val: ValueId) -> Option<bool> {
-    match const_of(module, val)? {
-        Const::Bool(b) => Some(b),
-        Const::Number(bits) => {
-            let n = f64::from_bits(bits);
-            Some(n != 0.0 && !n.is_nan())
-        }
-        Const::Null | Const::Undefined => Some(false),
-        Const::String(s) => Some(!module.sym.resolve(s).unwrap_or("").is_empty()),
-        _ => None,
-    }
-}
-
-/// ArkCompiler raw `jeqz` predicate (`#61` `R3-X1`): `true` iff `false` or
-/// numeric `±0.0` (`NaN`, nullish, strings, and bigints are `false`).
-fn eval_jump_eqz(c: &Const) -> Option<bool> {
-    match c {
-        Const::Bool(b) => Some(!*b),
-        Const::Number(bits) => Some(f64::from_bits(*bits) == 0.0),
-        Const::Null | Const::Undefined | Const::String(_) | Const::BigInt(_) => Some(false),
-        _ => None,
-    }
-}
-
-/// ArkCompiler raw `jnez` predicate (`#61` `R3-X1`): `true` iff `true` or
-/// numeric `!= 0.0` (**`true` for `NaN`**; nullish, strings, and bigints are
-/// `false`).
-fn eval_jump_nez(c: &Const) -> Option<bool> {
-    match c {
-        Const::Bool(b) => Some(*b),
-        Const::Number(bits) => Some(f64::from_bits(*bits) != 0.0),
-        Const::Null | Const::Undefined | Const::String(_) | Const::BigInt(_) => Some(false),
-        _ => None,
-    }
-}
-
-/// Evaluate a binary operation on two constant numbers.
-fn eval_binop(op: BinOp, a: f64, b: f64) -> Option<f64> {
-    Some(match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
-        BinOp::Mod => a % b,
-        BinOp::Exp => ecma_pow(a, b),
-        // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
-        // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's
-        // saturating `as` casts — matches vendored DoubleToInt
-        // (number_helper.cpp:1137). The shift count is masked `& 0x1f`
-        // AFTER the wrap (vendored HandleShl2Imm8V8:
-        // `static_cast<uint32_t>(opNumber1) & 0x1f`), so -1 shifts by 31.
-        BinOp::Shl => (to_int32(a) << (to_uint32(b) & 0x1f)) as f64,
-        // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift
-        // (interpreter_assembly.cpp HandleShr2Imm8V8: (uint32)ToInt32(v)
-        // >> shift — the unsigned reinterpret goes through i32; a direct
-        // `as u32` float cast would saturate negatives to 0).
-        BinOp::Shr => ((to_int32(a) as u32) >> (to_uint32(b) & 0x1f)) as f64,
-        // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift
-        // (HandleAshr2Imm8V8: int32 >> shift). The two arms were inverted.
-        BinOp::Ashr => (to_int32(a) >> (to_uint32(b) & 0x1f)) as f64,
-        BinOp::BitAnd => (to_int32(a) & to_int32(b)) as f64,
-        BinOp::BitOr => (to_int32(a) | to_int32(b)) as f64,
-        BinOp::BitXor => (to_int32(a) ^ to_int32(b)) as f64,
-    })
+    fold_cond_branch_to_jump(module, bb, inst_id, target, dead)
 }

@@ -535,7 +535,7 @@ fn ag03_dispatch_mismatch_keeps_site_loud() {
     // independently (it is a valid d-P13 await site).
     expect(
         &text,
-        "async function* odd() {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  const v1 = /*CreateGenerator plumbing*/ this;\n  const v6 = await 1.0;\n  yield v6;\n  const v8 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n  if (!(1.0 == /*hard-fallback GetResumeMode (generator driver, R4)*/ v1)) {\n    const v14 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n    const v15 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v1;\n    switch (v15) {\n    case 0.0: {\n        const v21 = await v14;\n        return v21;\n      }\n    case 1.0: {\n        throw v15;\n        /* unreachable */\n      }\n    default: {\n        return undefined;\n      }\n    }\n  } else {\n    throw v8;\n    /* unreachable */\n  }\n}\n",
+        "async function* odd() {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  const v1 = /*CreateGenerator plumbing*/ this;\n  const v6 = await 1.0;\n  yield v6;\n  const v8 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n  if (!(1.0 == /*hard-fallback GetResumeMode (generator driver, R4)*/ v1)) {\n    const v14 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v1;\n    const v15 = /*hard-fallback GetResumeMode (generator driver, R4)*/ v1;\n    if (!(0.0 == v15)) {\n      if (!(1.0 == v15)) {\n        return undefined;\n      } else {\n        throw v15;\n        /* unreachable */\n      }\n    } else {\n      const v21 = await v14;\n      return v21;\n    }\n  } else {\n    throw v8;\n    /* unreachable */\n  }\n}\n",
     );
 }
 

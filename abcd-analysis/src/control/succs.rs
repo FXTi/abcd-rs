@@ -1,82 +1,12 @@
-//! CFG successor relations and cross-block async/generator resumption pairing
-//! (`design/ir.md`, `design/analysis.md`; `#81`, `#82`, `#83`).
+//! CFG successor relations re-exported from [`abcd_ir::cfg`] (`D1`) plus
+//! cross-block async/generator resumption pairing (`#81`, `#82`, `#83`).
 
 use std::collections::{HashMap, HashSet};
 
-use abcd_ir::{
-    BlockId, EdgeKind, ExceptionHandlerMap, FuncId, InstId, Module, Op, ValueId,
-    normal_succs_inline,
-};
+pub use abcd_ir::cfg::{augmented_succs, augmented_succs_with_map, block_succs, inst_succs};
+use abcd_ir::{BlockId, EdgeKind, FuncId, InstId, Module, Op, ValueId};
 
 use crate::dataflow::heap::peel_movs;
-
-/// Extract successor blocks from a block's terminator.
-#[must_use]
-pub fn block_succs(module: &Module, block: BlockId) -> Vec<BlockId> {
-    let Some(bb) = module.block(block) else {
-        return Vec::new();
-    };
-    match bb.insts.last() {
-        Some(&last) => module
-            .inst(last)
-            .map(|inst| inst_succs(&inst.op))
-            .unwrap_or_default(),
-        None => Vec::new(),
-    }
-}
-
-/// Extract deduplicated successor blocks from an op (terminators only).
-#[must_use]
-pub fn inst_succs(op: &Op) -> Vec<BlockId> {
-    let (targets, count) = normal_succs_inline(op);
-    targets[..count].to_vec()
-}
-
-/// Successors of `block` including implicit exception edges via a prebuilt
-/// [`ExceptionHandlerMap`] (`O(1)` handler lookup).
-#[must_use]
-pub fn augmented_succs_with_map(
-    module: &Module,
-    exc_map: &ExceptionHandlerMap,
-    block: BlockId,
-) -> Vec<BlockId> {
-    let mut succs = block_succs(module, block);
-    for &handler in exc_map.handlers_of(block) {
-        if !succs.contains(&handler) {
-            succs.push(handler);
-        }
-    }
-    succs
-}
-
-/// Successors of `block` INCLUDING implicit exception edges: the terminator
-/// successors (`block_succs`) plus, for every try region that protects
-/// `block`, each of the region's catch-handler blocks owned by `func`.
-///
-/// Callers querying many blocks of the same function should prefer building an
-/// [`ExceptionHandlerMap`] once and calling [`augmented_succs_with_map`].
-#[must_use]
-pub fn augmented_succs(module: &Module, func: FuncId, block: BlockId) -> Vec<BlockId> {
-    let mut succs = block_succs(module, block);
-    let Some(func_data) = module.func(func) else {
-        return succs;
-    };
-    if func_data.try_regions.is_empty() {
-        return succs;
-    }
-    for region in &func_data.try_regions {
-        if !region.protected.contains(&block) {
-            continue;
-        }
-        for catch in &region.catches {
-            let handler = catch.handler;
-            if func_data.blocks.contains(&handler) && !succs.contains(&handler) {
-                succs.push(handler);
-            }
-        }
-    }
-    succs
-}
 
 /// Walk backward from `resume_iid` within its block and across
 /// [`EdgeKind::Normal`] predecessor blocks (iterative workstack + visited

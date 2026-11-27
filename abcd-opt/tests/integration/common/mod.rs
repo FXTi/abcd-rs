@@ -46,6 +46,7 @@ impl<'m> V2Builder<'m> {
         module
             .functions
             .push(FunctionData::new(ClassId::new(0), sym, kind));
+        module.classes[0].methods.push(func);
         let entry = BlockId::new(module.blocks.len() as u32);
         module.blocks.push(Block::default());
         module.functions[func.index()].blocks.push(entry);

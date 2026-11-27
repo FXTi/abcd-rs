@@ -10,16 +10,14 @@ readme = "README.md"
 # Crate-graph invariant (design/ir.md §1, §5): layering is lift =
 # decode→IR, opt = IR→IR, lower = IR→file. The lower pipeline is the ONLY
 # IR consumer allowed to see the format layer. The LIBRARY may depend on
-# `abcd-ir` (the IR), `abcd-file` + `abcd-isa` (the container end),
-# `abcd-analysis` (format-independent CFG successor/RPO infrastructure,
-# design/analysis.md; analysis depends only on abcd-ir, so this adds no
-# format knowledge to the lower pipeline), and NOTHING else from this
-# workspace — in particular never on `abcd-lift` (the forward direction)
-# or `abcd-opt`. Integration tests under `tests/` pull `abcd-lift` /
-# `abcd-opt` as dev-dependencies only to verify end-to-end round-trips.
+# `abcd-ir` (the IR, including shared CFG/DomTree/ExceptionHandlerMap
+# infrastructure), `abcd-file` + `abcd-isa` (the container end), and NOTHING
+# else from this workspace — in particular never on `abcd-analysis`,
+# `abcd-lift` (the forward direction), or `abcd-opt`. Integration tests under
+# `tests/` pull `abcd-lift` / `abcd-opt` as dev-dependencies only to verify
+# end-to-end round-trips.
 [dependencies]
 abcd-ir = { workspace = true }
-abcd-analysis = { workspace = true }
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
 rayon = { workspace = true }

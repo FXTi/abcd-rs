@@ -729,8 +729,9 @@ fn t10_catch_binding_and_handler_phi() {
     let want = r#"fn #0 "f" kind=function params=(this, p1)
   bb B0 preds=[]:
     const v2 = (p1()) ; v2
+    const v4 = (v2 + 1.0) ; v4
     branch B2
-    phi-assign v6 = (v2 + 1.0) ; edge -> B1 (exceptional)
+    phi-assign v6 = v4 ; edge -> B1 (exceptional)
   bb B1 preds=[B0:X]:
     catch e
     let v6 ; phi v6

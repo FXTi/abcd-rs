@@ -48,10 +48,14 @@ fn invalid_inputs_are_rejected() {
     assert_eq!(file_type(&[0xAB; 100]), FileType::Invalid);
     // Too small for a header.
     assert_eq!(file_type(&[0x50, 0x41, 0x4E, 0x44]), FileType::Invalid);
-    // Header file_size mismatch (append one byte).
-    let mut data = minimal_file();
-    data.push(0);
-    assert_eq!(file_type(&data), FileType::Invalid);
+    // Truncated buffer smaller than declared header.file_size must be Invalid,
+    // while trailing zero padding (e.g. open_zeropadded / ZIP alignment) stays Dynamic.
+    let mut truncated = minimal_file();
+    truncated.pop();
+    assert_eq!(file_type(&truncated), FileType::Invalid);
+    let mut padded = minimal_file();
+    padded.extend_from_slice(&[0u8; 16]);
+    assert_eq!(file_type(&padded), FileType::Dynamic);
     // Empty input.
     assert_eq!(file_type(&[]), FileType::Invalid);
 }

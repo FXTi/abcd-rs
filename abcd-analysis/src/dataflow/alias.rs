@@ -67,10 +67,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 use abcd_ir::{BlockId, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
-use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
+use super::heap::{
+    AliasOracle, AllocSiteSet, SingletonSiteClassifier, SiteInfo, is_keyed_alloc,
+    resolve_alloc_sites,
+};
 use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
@@ -118,9 +122,26 @@ impl QueryAnswer {
     }
 
     /// Whether the answer is provably a single site with no phi in
-    /// between — the rung-1 strong-update / must-alias condition.
+    /// between — the local SSA precision condition.
     pub fn is_single_precise(&self) -> bool {
         self.precise_for_keying() && self.sites.len() == 1 && !self.has_phi
+    }
+
+    /// Return the unique allocation site when [`Self::is_single_precise`] holds.
+    #[must_use]
+    pub fn as_singleton(&self) -> Option<InstId> {
+        self.is_single_precise()
+            .then(|| self.sites.iter().next())
+            .flatten()
+    }
+
+    /// Return the unique allocation site ONLY when [`Self::is_single_precise`]
+    /// holds AND `classifier` proves that site executes at most once at runtime
+    /// (`D5`, `#94`).
+    #[must_use]
+    pub fn as_concrete_singleton(&self, classifier: &SingletonSiteClassifier) -> Option<InstId> {
+        let site = self.as_singleton()?;
+        classifier.site_is_concrete(site).then_some(site)
     }
 
     /// Union in place (the flags are monotone).
@@ -180,10 +201,15 @@ enum QueryTask {
     },
     /// Cross-module `LoadModuleVar` / namespace accumulation: fold one
     /// `(exporting FuncId, stored ValueId)` definition per resume.
+    ///
+    /// Exported module-variable stores execute in module-init (`[]`) context,
+    /// NOT the importer's active call-site stack, so `saved_ctx` preserves and
+    /// restores the importer's `ctx` across the module hop (`#94`).
     ModuleHop {
         key: QueryKey,
         pending: VecDeque<(FuncId, ValueId)>,
         acc: QueryAnswer,
+        saved_ctx: Vec<InstId>,
     },
     /// Call-result accumulation (`ctx` carries `call` until the frame
     /// completes): fold one callee-return answer per resume, then
@@ -243,6 +269,8 @@ pub struct Rung1AliasOracle<'m> {
     memo: RefCell<HashMap<QueryKey, QueryAnswer>>,
     /// In-progress queries (the recursion-cycle guard).
     in_progress: RefCell<HashSet<QueryKey>>,
+    /// Lazily built concrete-singleton classifier (`D5`).
+    singletons: OnceLock<SingletonSiteClassifier>,
     // Counters.
     queries: Cell<usize>,
     memo_hits: Cell<usize>,
@@ -267,10 +295,14 @@ impl<'m> Rung1AliasOracle<'m> {
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
             for &b in &f.blocks {
-                block_func[b.index()] = Some(func);
+                if let Some(slot) = block_func.get_mut(b.index()) {
+                    *slot = Some(func);
+                }
             }
             for &p in &f.params {
-                value_func[p.index()] = Some(func);
+                if let Some(slot) = value_func.get_mut(p.index()) {
+                    *slot = Some(func);
+                }
             }
             let mut returns = Vec::new();
             for &b in &f.blocks {
@@ -279,8 +311,10 @@ impl<'m> Rung1AliasOracle<'m> {
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    if let Some(v) = inst.result {
-                        value_func[v.index()] = Some(func);
+                    if let Some(v) = inst.result
+                        && let Some(slot) = value_func.get_mut(v.index())
+                    {
+                        *slot = Some(func);
                     }
                     match &inst.op {
                         Op::Return { value: Some(v) } => returns.push(*v),
@@ -300,7 +334,7 @@ impl<'m> Rung1AliasOracle<'m> {
                 && let Some(val) = module.value(vid)
                 && let ValueDef::ExceptionParam(b) = val.def
             {
-                *slot = block_func[b.index()];
+                *slot = block_func.get(b.index()).copied().flatten();
             }
         }
         let links = ModuleLinkTable::build(module);
@@ -315,6 +349,7 @@ impl<'m> Rung1AliasOracle<'m> {
             has_void_return,
             memo: RefCell::new(HashMap::new()),
             in_progress: RefCell::new(HashSet::new()),
+            singletons: OnceLock::new(),
             queries: Cell::new(0),
             memo_hits: Cell::new(0),
             capped: Cell::new(0),
@@ -324,6 +359,18 @@ impl<'m> Rung1AliasOracle<'m> {
     /// The module the engine runs over.
     pub fn module(&self) -> &'m Module {
         self.module
+    }
+
+    /// Lazily built [`SingletonSiteClassifier`] over `(module, graph)`.
+    pub fn singletons(&self) -> &SingletonSiteClassifier {
+        self.singletons.get_or_init(|| {
+            SingletonSiteClassifier::build_with_links(self.module, &self.links, self.graph, None)
+        })
+    }
+
+    /// `O(1)` query (after first build): whether `site` is a concrete runtime singleton.
+    pub fn is_concrete_singleton_site(&self, site: InstId) -> bool {
+        self.singletons().site_is_concrete(site)
     }
 
     /// The engine counters.
@@ -350,10 +397,11 @@ impl<'m> Rung1AliasOracle<'m> {
 
     /// The consumer-facing answer: the engine result when it is complete
     /// and balanced, else the rung-0 local def-chain answer (the sound
-    /// floor — see module docs).
+    /// floor — see module docs), gated by [`SingletonSiteClassifier`] so
+    /// non-singleton sites never trigger unsound strong updates (`D5`).
     pub fn site_info_at(&self, base: ValueId, at: InstId) -> SiteInfo {
         let ans = self.query(base, at);
-        if ans.precise_for_keying() {
+        let raw = if ans.precise_for_keying() {
             SiteInfo {
                 sites: ans.sites,
                 has_phi: ans.has_phi,
@@ -361,7 +409,8 @@ impl<'m> Rung1AliasOracle<'m> {
             }
         } else {
             resolve_alloc_sites(self.module, base)
-        }
+        };
+        self.singletons().gate_site_info(raw)
     }
 
     /// The function owning a value (params, exception params, results).
@@ -391,7 +440,7 @@ impl<'m> Rung1AliasOracle<'m> {
                     self.enter_query(value, func, ctx, &mut stack, &mut results)
                 }
                 QueryTask::Leave { key } => {
-                    let ans = results.pop().expect("child answer");
+                    let ans = results.pop().unwrap_or_else(QueryAnswer::unknown);
                     self.finish_query(key, ans, &mut results);
                 }
                 QueryTask::Phi {
@@ -400,7 +449,7 @@ impl<'m> Rung1AliasOracle<'m> {
                     mut pending,
                     mut acc,
                 } => {
-                    acc.union_with(&results.pop().expect("phi incoming answer"));
+                    acc.union_with(&results.pop().unwrap_or_else(QueryAnswer::unknown));
                     match pending.pop_front() {
                         Some(v) => {
                             stack.push(QueryTask::Phi {
@@ -418,17 +467,27 @@ impl<'m> Rung1AliasOracle<'m> {
                     key,
                     mut pending,
                     mut acc,
+                    saved_ctx,
                 } => {
-                    acc.union_with(&results.pop().expect("module hop answer"));
+                    acc.union_with(&results.pop().unwrap_or_else(QueryAnswer::unknown));
                     match pending.pop_front() {
                         Some((def_fn, def_val)) => {
-                            stack.push(QueryTask::ModuleHop { key, pending, acc });
+                            ctx.clear();
+                            stack.push(QueryTask::ModuleHop {
+                                key,
+                                pending,
+                                acc,
+                                saved_ctx,
+                            });
                             stack.push(QueryTask::Enter {
                                 value: def_val,
                                 func: def_fn,
                             });
                         }
-                        None => self.finish_query(key, acc, &mut results),
+                        None => {
+                            *ctx = saved_ctx;
+                            self.finish_query(key, acc, &mut results);
+                        }
                     }
                 }
                 QueryTask::Call {
@@ -438,7 +497,7 @@ impl<'m> Rung1AliasOracle<'m> {
                     mut pending,
                     mut acc,
                 } => {
-                    let child_ans = results.pop().expect("callee return answer");
+                    let child_ans = results.pop().unwrap_or_else(QueryAnswer::unknown);
                     if is_new && child_ans.sites.is_empty() && !child_ans.has_unknown {
                         acc.sites.union_with(&AllocSiteSet::one(call));
                     }
@@ -468,12 +527,12 @@ impl<'m> Rung1AliasOracle<'m> {
                 }
                 QueryTask::ParamBal { key, call } => {
                     ctx.push(call);
-                    let ans = results.pop().expect("bind answer");
+                    let ans = results.pop().unwrap_or_else(QueryAnswer::unknown);
                     self.finish_query(key, ans, &mut results);
                 }
                 QueryTask::ParamUnbal(mut fan) => {
                     fan.acc
-                        .union_with(&results.pop().expect("caller bind answer"));
+                        .union_with(&results.pop().unwrap_or_else(QueryAnswer::unknown));
                     if fan.pending.is_empty() {
                         *ctx = fan.saved_ctx;
                         // `acc.unbalanced` was set when the fan-out
@@ -486,7 +545,7 @@ impl<'m> Rung1AliasOracle<'m> {
                 }
             }
         }
-        results.pop().expect("root answer")
+        results.pop().unwrap_or_else(QueryAnswer::unknown)
     }
 
     /// `Enter` dispatch: memo hit / in-progress cycle cut, else the def
@@ -601,7 +660,13 @@ impl<'m> Rung1AliasOracle<'m> {
                                 has_unknown,
                                 ..QueryAnswer::default()
                             };
-                            stack.push(QueryTask::ModuleHop { key, pending, acc });
+                            let saved_ctx = std::mem::take(ctx);
+                            stack.push(QueryTask::ModuleHop {
+                                key,
+                                pending,
+                                acc,
+                                saved_ctx,
+                            });
                             stack.push(QueryTask::Enter {
                                 value: def_val,
                                 func: def_fn,
@@ -785,7 +850,10 @@ impl<'m> Rung1AliasOracle<'m> {
         stack: &mut Vec<QueryTask>,
         results: &mut Vec<QueryAnswer>,
     ) {
-        let call = fan.pending.pop_front().expect("a caller to bind");
+        let Some(call) = fan.pending.pop_front() else {
+            self.finish_query(fan.key, fan.acc, results);
+            return;
+        };
         match self.bind_at_call_plan(fan.func, fan.param, call) {
             Bind::Leaf(ans) => {
                 results.push(ans);

@@ -13,7 +13,7 @@ use abcd_ir::{BlockId, FuncId, Module};
 use super::dom::Dominators;
 
 /// All back edges `(from, header)` within an explicit `blocks` slice.
-pub(crate) fn back_edges_in_blocks(
+pub fn back_edges_in_blocks(
     blocks: &[BlockId],
     dom: &Dominators,
     succ: &dyn Fn(BlockId) -> Vec<BlockId>,

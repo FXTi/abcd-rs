@@ -332,18 +332,22 @@ fn array_i64_u64_f64_decode() {
     }
 }
 
-/// An unknown scalar tag byte ('0' = AVT::Unknown) decodes as a raw U32
-/// (the vendored fallback).
+/// An unknown scalar tag byte ('0' = AVT::Unknown) is rejected with `Error::Malformed`.
 #[test]
-fn unknown_scalar_tag_decodes_as_u32() {
+fn unknown_scalar_tag_is_hard_error() {
     let mut data = build_single_elem("unk", b'7', AnnotationElemValue::Scalar(42));
     let tag_pos = locate_tag_byte(&data, "unk", b'7');
     data[tag_pos] = b'0';
-    let file = decode(&data).expect("decode");
-    assert_eq!(
-        single_element_value(&file),
-        &AnnotationValue::U32(42),
-        "unknown tag falls back to the raw u32 value"
+    let err = decode(&data).expect_err("unknown annotation element tag must fail");
+    assert!(
+        matches!(
+            err,
+            abcd_file::Error::Malformed {
+                field: "annotation element tag",
+                ..
+            }
+        ),
+        "expected Malformed/annotation element tag, got: {err:?}"
     );
 }
 

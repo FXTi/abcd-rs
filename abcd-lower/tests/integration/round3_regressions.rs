@@ -174,7 +174,6 @@ fn pure_16bit_ic_stream_beyond_u16_matches_upstream_0xffff_and_0xff_degradation(
     let mut module = Module::new();
     let func =
         V2Builder::create_function(&mut module, "pure_16bit_overflow", FunctionKind::Function);
-    module.classes[0].methods.push(func);
     {
         let mut b = V2Builder::new(&mut module, func);
         let p = b.create_param();
@@ -1168,9 +1167,7 @@ fn typed_catch_arkts_metadata_and_lossless_literal_tags_roundtrip() {
     m.classes.push(err_cls);
 
     let f_ctor = V2Builder::create_function(&mut m, "ctor", FunctionKind::Constructor);
-    m.classes[0].methods.push(f_ctor);
     let f_arrow = V2Builder::create_function(&mut m, "arrow_fn", FunctionKind::AsyncArrow);
-    m.classes[0].methods.push(f_arrow);
     {
         let mut b = V2Builder::new(&mut m, f_arrow);
         b.emit_void(Op::Return { value: None });
@@ -1324,7 +1321,6 @@ fn deep_5000_nested_literal_shape_lowers_and_resolves_on_256kib_stack() {
         .spawn(|| {
             let mut module = Module::new();
             let func = V2Builder::create_function(&mut module, "deep5000", FunctionKind::Function);
-            module.classes[0].methods.push(func);
             let leaf = module.consts.push(Const::Int32(99));
             let mut cur = module.consts.push_array(vec![leaf]);
             for _ in 1..5_000 {
@@ -1356,7 +1352,6 @@ fn deep_5000_nested_literal_shape_lowers_and_resolves_on_256kib_stack() {
 fn definefieldbyvalue_emits_key_then_obj_for_dyn_and_unfused_idx_and_roundtrips() {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "define_field_dyn", FunctionKind::Function);
-    module.classes[0].methods.push(func);
     {
         let mut b = V2Builder::new(&mut module, func);
         let p_obj = b.create_param();

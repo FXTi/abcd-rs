@@ -17,36 +17,42 @@ tabulation solver over `abcd_ir::Module`:
 | Module | Responsibility |
 | :--- | :--- |
 | [`fact`](src/fact.rs) | `Fact = Zero \| Taint(TaintFact)` access-path lattice (`TaintBase` + `k`-capped `FieldChain`, default `k = 5`). |
-| [`names`](src/names.rs) | Cycle-guarded callee-name resolution across `TryGetGlobal`, `LoadProp`, ES `ModuleLinkTable` imports, `@kit.*` aliases, and SDK factories. |
-| [`summary`](src/summary.rs) | `(Sym, Option<usize>)` summary registry with endpoint flows, clears, `is_alias`, `exclusive` kills, negative caching, and miss telemetry. |
-| [`gap`](src/gap.rs) | Eager callback-gap propagator (`GapCallGraph`) materializing synthetic IFDS call edges into user closures passed to higher-order builtins. |
-| [`prototype`](src/prototype.rs) | Receiver prototype-family resolver (`Array`, `Object`, `RegExp`, `Function`, `String`, `Number`, `Boolean`, `Iterator`, `Promise`). |
-| [`oracle`](src/oracle.rs) | Uniform point-aware adapter (`Oracle`) over Alias Oracle Rungs `0`, `1`, and `2`. |
-| [`problem`](src/problem.rs) | `TaintProblem` flow functions (`normal`, `call`, `return`, `call_to_return`, `call_uncaught_exit`), multi-frame uncaught exception propagation (`UNCAUGHT_EXCEPTION_VALUE`), `ExceptionParam` catch dispatch, and JSBridge seed discovery. |
+| [`names`](src/names.rs) | Cycle-guarded, DAG-memoized callee-name resolution across `TryGetGlobal`, `LoadProp`, ES `ModuleLinkTable` (`GetModuleNamespace` / `export * as ns`), `OhmUrl` / `@kit.*` aliases, and SDK factories. |
+| [`summary`](src/summary.rs) | `(Sym, Option<usize>)` summary registry with `Endpoint::parse` validation, endpoint flows, clears, `is_alias`, `exclusive` call-edge kills, negative caching, and miss telemetry. |
+| [`gap`](src/gap.rs) | Eager callback-gap propagator (`GapCallGraph`) materializing synthetic IFDS call edges into user closures and `DefineMethod` / `MethodRef` callbacks passed to higher-order builtins. |
+| [`prototype`](src/prototype.rs) | DAG-memoized receiver prototype-family resolver (`Array`, `Object`, `RegExp`, `Function`, `String`, `Number`, `Boolean`, `Iterator`, `Promise`). |
+| [`oracle`](src/oracle.rs) | Uniform point-aware adapter (`Oracle`) over Alias Oracle Rungs `0`, `1`, and `2` plus `SingletonSiteClassifier` concrete-singleton gating. |
+| [`problem`](src/problem.rs) | Zero-copy `FlowSink::pass_through()` `TaintProblem` flow functions (`normal_flow_out`, `call_flow_out`, `return_flow_out`, `call_to_return_flow_out`, `call_uncaught_exit_flow_out`), `#private` field symbols, static `LexVar` scope resolution, multi-frame uncaught exception propagation, and JSBridge seed discovery. |
 | [`ohos`](src/ohos.rs) | Versioned OpenHarmony (`@ohos.*` / `@kit.*`) sources, sinks, and ArkUI declarative component summaries (`ohos_preset`). |
-| [`driver`](src/driver.rs) | Pipeline driver (`run_taint`), `ohos_lifecycle` harness synthesis, sink matching, and backward-BFS witness-path reconstruction. |
+| [`driver`](src/driver.rs) | Pipeline driver (`run_taint`), steady-state `EntryModel` OHOS lifecycle harness integration, sink matching, and replay-guided witness-path reconstruction. |
 
 ### Access-Path Fact Model
-Each `TaintFact` pairs a `FieldChain` (`Named(Sym)`, `AnyIndex`, `AnyDynamic`)
-with one of five bases:
-- `Local(ValueId)` — function-local SSA value; rebased across `Mov`/`Phi`/calls/returns
-  and dropped at procedure exits unless returned or thrown.
+Each `TaintFact` pairs a `FieldChain` (`Named(Sym)`, `AnyIndex`, `AnyDynamic`,
+plus collision-free synthetic symbols for `#private` class slots and Rung 2
+lexical slots) with one of five bases:
+- `Local(ValueId)` — function-local SSA value; rebased across `Mov`/`Phi`/calls/returns,
+  strong-killed on `Normal` edges when `v == object` overwrites an exact named
+  property (never on `EdgeKind::Exceptional`), and preserved alongside `Heap(sites)`
+  when a store receiver has `has_unknown && !sites.is_empty()`.
 - `Heap(AllocSiteSet)` — allocation-site-keyed heap state; crosses call/return edges
-  unchanged and performs strong kills only when `update_kind == Strong` (single proven
-  site, no intervening `Phi`, no unknown def).
-- `Global(Sym)` — global property/lexical-record binding (`StoreGlobal*` / `TryGetGlobal`),
-  always weak-updated across scripts.
+  unchanged via zero-copy `FlowSink::pass_through()` and performs strong kills only
+  on `Normal` edges when `SiteInfo::as_concrete_singleton` proves a concrete runtime
+  singleton (single proven site outside every CFG loop and inside a single-execution
+  function).
+- `Global(Sym)` — global property/lexical-record binding (`StoreGlobal*`, `TryGetGlobal`,
+  and `Mov`-peeled `LoadGlobalObject` `globalThis.<name>` accesses), always weak-updated.
 - `ModuleVar(ClassId, u32)` — per-record ES module slot bridged across `import`,
-  `export`, and `export *` declarations via `ModuleLinkTable`.
-- `LexVar(u16, u16)` — closure lexical slot `(level, slot)`, refined at Rung 2 into
-  `Heap(NewLexEnv)` environment sites when capture provenance is exact.
+  `export`, `export *`, `export * as ns`, and `GetModuleNamespace` via `ModuleLinkTable`.
+- `LexVar(u16, u16)` — closure lexical slot `(scope_id, slot)` resolved via static
+  enclosing `NewLexEnv` / closure capture chains at Rungs `0` and `1` (handling nested
+  `level` shifts) and refined at Rung `2` into `Heap(NewLexEnv)` environment sites.
 
 ### Fallback Ladder, Summaries, Callback Gaps & Receiver Prototype Resolver
 Each call site is classified once in strict precedence order:
 1. **Direct-name user summary** (`TaintConfig::extra_summaries` / `SummaryRegistry::register`) —
    overrides both preloaded builtins and resolved function bodies; `exclusive` summaries kill the
-   callee-body call edge and field-bearing operand bypass taints while preserving scalar
-   pass-by-value caller locals unless explicitly cleared.
+   callee-body call edge while preserving caller operand facts on `call_to_return_flow` unless
+   explicitly listed in `Summary::clears`.
 2. **Resolved user body** — steps into non-external `FunctionData` bodies via normal
    IFDS call/return edges (concrete user code takes precedence over preloaded builtin summaries
    and receiver heuristics; incomplete or mixed external/body call edges additionally retain

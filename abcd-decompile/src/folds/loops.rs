@@ -53,10 +53,69 @@ enum FlowStep<'a> {
     FinishIf {
         non_empty: bool,
     },
+    FinishLabeled {
+        can_break_out: bool,
+    },
     FinishInfiniteWhile,
     FinishTry {
         count: usize,
     },
+}
+
+/// Whether `nodes` contains a `Break { label: Some(target) }` not shadowed by
+/// an inner construct carrying the same `target` label.
+fn slice_breaks_to_label(nodes: &[SNode], target: &str) -> bool {
+    let mut stack: Vec<&[SNode]> = vec![nodes];
+    while let Some(seq) = stack.pop() {
+        for n in seq {
+            match n {
+                SNode::Break { label: Some(l) } if l == target => return true,
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    stack.push(otherwise);
+                    stack.push(then);
+                }
+                SNode::Labeled { label, body } => {
+                    if label != target {
+                        stack.push(body);
+                    }
+                }
+                SNode::While { label, body, .. } | SNode::DoWhile { label, body, .. } => {
+                    if label.as_deref() != Some(target) {
+                        stack.push(body);
+                    }
+                }
+                SNode::Block(body) | SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => {
+                    stack.push(body);
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    if let Some(f) = finally {
+                        stack.push(f);
+                    }
+                    for c in catches.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                    stack.push(body);
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
+                SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
+        }
+    }
+    false
 }
 
 fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
@@ -98,8 +157,12 @@ fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
                                 .iter()
                                 .all(|l| matches!(l, Leaf::Raw(Stmt::Unreachable)))),
                 }),
-                SNode::Break { .. } => vals.push(SeqFlow {
+                SNode::Break { label: None } => vals.push(SeqFlow {
                     live_break: true,
+                    diverges: true,
+                }),
+                SNode::Break { label: Some(_) } => vals.push(SeqFlow {
+                    live_break: false,
                     diverges: true,
                 }),
                 SNode::Continue { .. } => vals.push(SeqFlow {
@@ -142,7 +205,18 @@ fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
                 | SNode::ForOf { .. }
                 | SNode::ForIn { .. }
                 | SNode::Switch { .. } => vals.push(FLOW_FALLTHROUGH),
-                SNode::Labeled { body, .. } => steps.push(FlowStep::Seq {
+                SNode::Labeled { label, body } => {
+                    steps.push(FlowStep::FinishLabeled {
+                        can_break_out: slice_breaks_to_label(body, label),
+                    });
+                    steps.push(FlowStep::Seq {
+                        slice: body,
+                        idx: 0,
+                        acc: FLOW_FALLTHROUGH,
+                        awaiting_child: false,
+                    });
+                }
+                SNode::Block(body) => steps.push(FlowStep::Seq {
                     slice: body,
                     idx: 0,
                     acc: FLOW_FALLTHROUGH,
@@ -188,6 +262,13 @@ fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
                     diverges: non_empty && t.diverges && o.diverges,
                 });
             }
+            FlowStep::FinishLabeled { can_break_out } => {
+                let mut b = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
+                if can_break_out {
+                    b.diverges = false;
+                }
+                vals.push(b);
+            }
             FlowStep::FinishInfiniteWhile => {
                 let b = vals.pop().unwrap_or(FLOW_FALLTHROUGH);
                 vals.push(SeqFlow {
@@ -208,28 +289,52 @@ fn run_flow_steps(initial: FlowStep<'_>) -> SeqFlow {
     vals.pop().unwrap_or(FLOW_FALLTHROUGH)
 }
 
-/// Any labeled break/continue anywhere in the subtree → the caller
-/// bails (a labeled jump could target a label between the loop and the
-/// residue in shapes this pass does not model — doubt keeps the block).
+/// Any FREE labeled break/continue anywhere in the subtree (one whose target
+/// label is not bound within `nodes` itself) → the caller bails (an escaping
+/// labeled jump could target a label between the loop and the residue).
 pub(in crate::folds) fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
-    let mut stack: Vec<&[SNode]> = vec![nodes];
-    while let Some(seq) = stack.pop() {
-        for n in seq {
+    enum JumpScan<'a> {
+        Seq(&'a [SNode]),
+        PopLabel,
+    }
+    let mut stack: Vec<JumpScan<'_>> = vec![JumpScan::Seq(nodes)];
+    let mut bound: Vec<&str> = Vec::new();
+    while let Some(item) = stack.pop() {
+        let JumpScan::Seq(seq) = item else {
+            bound.pop();
+            continue;
+        };
+        if let Some((n, rest)) = seq.split_first() {
+            if !rest.is_empty() {
+                stack.push(JumpScan::Seq(rest));
+            }
             match n {
-                SNode::Break { label: Some(_) } | SNode::Continue { label: Some(_) } => {
-                    return true;
+                SNode::Break { label: Some(l) } | SNode::Continue { label: Some(l) } => {
+                    if !bound.contains(&l.as_str()) {
+                        return true;
+                    }
                 }
                 SNode::If {
                     then, otherwise, ..
                 } => {
-                    stack.push(otherwise);
-                    stack.push(then);
+                    stack.push(JumpScan::Seq(otherwise));
+                    stack.push(JumpScan::Seq(then));
                 }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => stack.push(body),
+                SNode::Labeled { label, body } => {
+                    bound.push(label.as_str());
+                    stack.push(JumpScan::PopLabel);
+                    stack.push(JumpScan::Seq(body));
+                }
+                SNode::While { label, body, .. } | SNode::DoWhile { label, body, .. } => {
+                    if let Some(lbl) = label.as_deref() {
+                        bound.push(lbl);
+                        stack.push(JumpScan::PopLabel);
+                    }
+                    stack.push(JumpScan::Seq(body));
+                }
+                SNode::Block(body) | SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => {
+                    stack.push(JumpScan::Seq(body));
+                }
                 SNode::Try {
                     body,
                     catches,
@@ -237,16 +342,16 @@ pub(in crate::folds) fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
                     ..
                 } => {
                     if let Some(f) = finally {
-                        stack.push(f);
+                        stack.push(JumpScan::Seq(f));
                     }
                     for c in catches.iter().rev() {
-                        stack.push(&c.body);
+                        stack.push(JumpScan::Seq(&c.body));
                     }
-                    stack.push(body);
+                    stack.push(JumpScan::Seq(body));
                 }
                 SNode::Switch { cases, .. } => {
                     for c in cases.iter().rev() {
-                        stack.push(&c.body);
+                        stack.push(JumpScan::Seq(&c.body));
                     }
                 }
                 SNode::Stmts(_)
@@ -461,6 +566,26 @@ pub(in crate::folds) fn fold_loops(nodes: &mut Vec<SNode>, stats: &mut FoldStats
         };
         if !matches!(&nodes[i], SNode::While { label: None, .. }) {
             unreachable!()
+        }
+        // Consumed pre-loop declares (everything in `extra_internals` except
+        // hoisted pass-through phis) must not be referenced past the loop.
+        let hoisted_names: BTreeSet<&str> = folded
+            .hoisted
+            .iter()
+            .filter_map(|l| match l {
+                Leaf::Raw(Stmt::PhiDecl { name, .. }) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let consumed_names: Vec<String> = folded
+            .extra_internals
+            .iter()
+            .filter(|n| !hoisted_names.contains(n.as_str()))
+            .cloned()
+            .collect();
+        if !consumed_names.is_empty() && nodes_use_any(&nodes[i + 1..], &consumed_names) {
+            i += 1;
+            continue;
         }
         let Some((binding, new_body)) = rebuild_loop_body(&norm_body, &folded) else {
             i += 1;
@@ -745,7 +870,7 @@ pub(in crate::folds) fn subtree_has_continue(nodes: &[SNode]) -> bool {
                 | SNode::DoWhile { .. }
                 | SNode::ForOf { .. }
                 | SNode::ForIn { .. } => {}
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -836,6 +961,30 @@ pub(in crate::folds) fn match_for_of(
             _ => break,
         }
     }
+    // Braun trivial-phi elimination collapses a loop-invariant done-flag
+    // header phi into a pre-loop `const flag = false;` declare right after
+    // `const next = it.next;`.
+    let mut flag_decl: Option<String> = None;
+    if tail >= 3
+        && let Leaf::Raw(Stmt::Declare {
+            name: fname,
+            value: Expr::Lit(Lit::Bool(false)),
+            ..
+        }) = &pre[tail - 1]
+        && matches!(
+            &pre[tail - 3],
+            Leaf::Raw(Stmt::Declare {
+                value: Expr::Iter {
+                    op: IterOp::GetIterator | IterOp::GetAsyncIterator,
+                    ..
+                },
+                ..
+            })
+        )
+    {
+        flag_decl = Some(fname.clone());
+        tail -= 1;
+    }
     if tail < 2 {
         return None;
     }
@@ -870,8 +1019,8 @@ pub(in crate::folds) fn match_for_of(
         }) if name == "next" && temp_name(object) == Some(it_name.as_str()) => next_name.clone(),
         _ => return None,
     };
-    // The header: phi decls, `res = <next-phi>()`, [elided guards],
-    // `done = res.done` — and nothing else.
+    // The header: [phi decls], `res = <next>()` / `next.call(it)`,
+    // [elided guards], `done = res.done` — and nothing else.
     let SNode::Stmts(hdr) = body.first()? else {
         return None;
     };
@@ -881,15 +1030,16 @@ pub(in crate::folds) fn match_for_of(
         phi_names.push(name.clone());
         k += 1;
     }
-    if phi_names.is_empty() {
+    if !assigns.iter().all(|(t, _)| phi_names.contains(t)) {
         return None;
     }
-    let (res_name, next_phi) = match hdr.get(k) {
+    let (res_name, callee_name, recv_name) = match hdr.get(k) {
         Some(Leaf::Raw(Stmt::Declare {
             name: res,
             value:
                 Expr::Call {
                     callee,
+                    this,
                     args,
                     kind: abcd_ir::op::CallKind::Dynamic | abcd_ir::op::CallKind::Direct,
                     ..
@@ -897,13 +1047,36 @@ pub(in crate::folds) fn match_for_of(
             ..
         })) if args.is_empty() => {
             let callee = temp_name(callee)?.to_string();
-            if !phi_names.contains(&callee) {
-                return None;
-            }
-            (res.clone(), callee)
+            let recv = match this {
+                Some(r) => Some(temp_name(r)?.to_string()),
+                None => None,
+            };
+            (res.clone(), callee, recv)
         }
         _ => return None,
     };
+    let callee_ok = if phi_names.contains(&callee_name) {
+        assigns
+            .iter()
+            .any(|(t, v)| *t == callee_name && temp_name(v) == Some(next_name.as_str()))
+    } else {
+        callee_name == next_name && assigns.is_empty()
+    };
+    if !callee_ok {
+        return None;
+    }
+    if let Some(recv) = &recv_name {
+        let recv_ok = if phi_names.contains(recv) {
+            assigns
+                .iter()
+                .any(|(t, v)| t == recv && temp_name(v) == Some(it_name.as_str()))
+        } else {
+            *recv == it_name
+        };
+        if !recv_ok {
+            return None;
+        }
+    }
     k += 1;
     while matches!(hdr.get(k), Some(Leaf::Raw(Stmt::Elided { .. }))) {
         k += 1;
@@ -924,21 +1097,16 @@ pub(in crate::folds) fn match_for_of(
     if temp_name(strip_cond(wcond))? != done_name {
         return None;
     }
-    // The pre-loop phi assigns must wire `next` and `it` into the
-    // header phis.
     let it_phi = assigns
         .iter()
         .find(|(_, v)| temp_name(v) == Some(it_name.as_str()))
         .map(|(t, _)| t.clone());
-    if !assigns
-        .iter()
-        .any(|(t, v)| *t == next_phi && temp_name(v) == Some(next_name.as_str()))
-    {
-        return None;
-    }
     let mut extra = vec![it_name, next_name, done_name.clone()];
     if let Some(p) = it_phi {
         extra.push(p);
+    }
+    if let Some(f) = flag_decl {
+        extra.push(f);
     }
     Some(LoopFold {
         is_await,
@@ -953,7 +1121,8 @@ pub(in crate::folds) fn match_for_of(
     })
 }
 
-/// for-in: `it = get-prop-iterator(obj)` (phi at the header),
+/// for-in: `it = get-prop-iterator(obj)` (header phi or direct pre-loop
+/// declare when Braun trivial-phi elimination collapsed the self-phi),
 /// `k = next-prop-name(it)`, `undefined == k` exit test.
 ///
 /// N74: the header may carry EXTRA phis besides the iterator — any
@@ -968,8 +1137,8 @@ pub(in crate::folds) fn match_for_in(
     wcond: &Expr,
     body: &[SNode],
 ) -> Option<LoopFold> {
-    // The header: one or more phi decls, then `const k = next-prop-name(it)`
-    // reading one of them — and nothing else.
+    // The header: zero or more phi decls, then `const k = next-prop-name(it)`
+    // — and nothing else.
     let SNode::Stmts(hdr) = body.first()? else {
         return None;
     };
@@ -979,10 +1148,10 @@ pub(in crate::folds) fn match_for_in(
         phi_names.push(name.clone());
         k += 1;
     }
-    if phi_names.is_empty() || k + 1 != hdr.len() {
+    if k + 1 != hdr.len() {
         return None;
     }
-    let (binding, it_phi) = match &hdr[k] {
+    let (binding, it_name) = match &hdr[k] {
         Leaf::Raw(Stmt::Declare {
             name,
             value:
@@ -992,17 +1161,12 @@ pub(in crate::folds) fn match_for_in(
                     ..
                 },
             ..
-        }) => {
-            let it = temp_name(it)?.to_string();
-            if !phi_names.contains(&it) {
-                return None;
-            }
-            (name.clone(), it)
-        }
+        }) => (name.clone(), temp_name(it)?.to_string()),
         _ => return None,
     };
-    // The pre-loop tail: exactly one wiring phi-assign per header phi
-    // (any order). The iterator's value must be the `GetPropIterator`.
+    // The pre-loop tail: one wiring phi-assign per header phi (any order),
+    // preceded (when `it_name` is not itself a header phi) by the direct
+    // `const it = GetPropIterator(obj)` declare.
     let mut tail = pre.len();
     let mut wiring: BTreeMap<String, Leaf> = BTreeMap::new();
     while tail > 0 {
@@ -1019,17 +1183,40 @@ pub(in crate::folds) fn match_for_in(
     if wiring.len() != phi_names.len() {
         return None;
     }
-    let obj = match &wiring.remove(&it_phi) {
-        Some(Leaf::Raw(Stmt::PhiAssign {
-            value:
-                Expr::Iter {
-                    op: IterOp::GetPropIterator,
-                    obj,
-                    ..
-                },
-            ..
-        })) => obj.as_ref().clone(),
-        _ => return None,
+    let it_in_phis = phi_names.contains(&it_name);
+    let obj = if it_in_phis {
+        match &wiring.remove(&it_name) {
+            Some(Leaf::Raw(Stmt::PhiAssign {
+                value:
+                    Expr::Iter {
+                        op: IterOp::GetPropIterator,
+                        obj,
+                        ..
+                    },
+                ..
+            })) => obj.as_ref().clone(),
+            _ => return None,
+        }
+    } else {
+        if tail == 0 {
+            return None;
+        }
+        match &pre[tail - 1] {
+            Leaf::Raw(Stmt::Declare {
+                name: decl_name,
+                value:
+                    Expr::Iter {
+                        op: IterOp::GetPropIterator,
+                        obj,
+                        ..
+                    },
+                ..
+            }) if *decl_name == it_name => {
+                tail -= 1;
+                obj.as_ref().clone()
+            }
+            _ => return None,
+        }
     };
     // The extra phis' initial values must not reference any header
     // internal — the hoisted assign is emitted ABOVE the loop, where
@@ -1038,7 +1225,7 @@ pub(in crate::folds) fn match_for_in(
         let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l else {
             unreachable!()
         };
-        phi_names.iter().any(|n| expr_uses_name(value, n))
+        expr_uses_name(value, &it_name) || phi_names.iter().any(|n| expr_uses_name(value, n))
     }) {
         return None;
     }
@@ -1046,7 +1233,7 @@ pub(in crate::folds) fn match_for_in(
     // assign (the iterator's own wiring is consumed by the fold).
     let mut hoisted: Vec<Leaf> = Vec::new();
     for (idx, name) in phi_names.iter().enumerate() {
-        if *name == it_phi {
+        if *name == it_name {
             continue;
         }
         hoisted.push(hdr[idx].clone());
@@ -1073,15 +1260,19 @@ pub(in crate::folds) fn match_for_in(
     if !eq_ok {
         return None;
     }
+    let mut extra_internals = phi_names.clone();
+    if !it_in_phis {
+        extra_internals.push(it_name);
+    }
     Some(LoopFold {
         is_await: false,
         is_in: true,
         iter: obj,
         pre_cut: pre.len() - tail,
-        phi_names: phi_names.clone(),
+        phi_names,
         res_name: None,
         done_name: None,
-        extra_internals: phi_names,
+        extra_internals,
         hoisted,
     })
 }
@@ -1112,7 +1303,24 @@ pub(in crate::folds) fn rebuild_loop_body(
             }
         }
         let binding = match hdr.last() {
-            Some(Leaf::Raw(Stmt::Declare { name, .. })) => name.clone(),
+            Some(Leaf::Raw(Stmt::Declare { name, value, .. })) => {
+                if let Expr::Iter {
+                    op: IterOp::NextPropName,
+                    obj,
+                    ..
+                } = value
+                    && let Expr::Temp {
+                        name: it_n,
+                        value: it_v,
+                    } = obj.as_ref()
+                {
+                    roots.entry(it_n.clone()).or_insert_with(|| Expr::Temp {
+                        name: it_n.clone(),
+                        value: *it_v,
+                    });
+                }
+                name.clone()
+            }
             _ => return None,
         };
         let mut out: Vec<SNode> = body.to_vec();
@@ -1363,6 +1571,27 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
             _ => break,
         }
     }
+    let mut flag_decl: Option<String> = None;
+    if tail >= 3
+        && let Leaf::Raw(Stmt::Declare {
+            name: fname,
+            value: Expr::Lit(Lit::Bool(false)),
+            ..
+        }) = &pre[tail - 1]
+        && matches!(
+            &pre[tail - 3],
+            Leaf::Raw(Stmt::Declare {
+                value: Expr::Iter {
+                    op: IterOp::GetAsyncIterator,
+                    ..
+                },
+                ..
+            })
+        )
+    {
+        flag_decl = Some(fname.clone());
+        tail -= 1;
+    }
     if tail < 2 {
         return None;
     }
@@ -1418,8 +1647,8 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
         return None;
     }
 
-    // ── Header: phi decls, `res = next_phi.call(iter_phi)`, the
-    // folded dispatch's `tmp = await res` (REQUIRED — for-await awaits
+    // ── Header: [phi decls], `res = next.call(it)` (directly or via phis),
+    // the folded dispatch's `tmp = await res` (REQUIRED — for-await awaits
     // the `next()` result; a driver without it is not this shape),
     // elided guards, `done = tmp.done` — and nothing else.
     let mut h = 0;
@@ -1429,9 +1658,6 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
         phi_names.push(name.clone());
         phi_vids.insert(name.clone(), *value_id);
         h += 1;
-    }
-    if phi_names.is_empty() {
-        return None;
     }
     // Every trailing pre-loop assign must target a header phi (the
     // trim consumes them all — an assign to anything else would be
@@ -1454,13 +1680,27 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
         })) if args.is_empty() => {
             let callee = temp_name(callee)?.to_string();
             let recv = temp_name(recv)?.to_string();
-            if !phi_names.contains(&callee) || !phi_names.contains(&recv) {
-                return None;
-            }
             (res.clone(), callee, recv)
         }
         _ => return None,
     };
+    let next_ok = if phi_names.contains(&next_phi) {
+        assigns
+            .iter()
+            .any(|(t, v)| *t == next_phi && temp_name(v) == Some(next_name.as_str()))
+    } else {
+        next_phi == next_name
+    };
+    let recv_ok = if phi_names.contains(&recv_phi) {
+        assigns
+            .iter()
+            .any(|(t, v)| *t == recv_phi && temp_name(v) == Some(it_name.as_str()))
+    } else {
+        recv_phi == it_name
+    };
+    if !next_ok || !recv_ok {
+        return None;
+    }
     h += 1;
     while matches!(hdr.get(h), Some(Leaf::Raw(Stmt::Elided { .. }))) {
         h += 1;
@@ -1493,16 +1733,6 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
     if h != hdr.len() {
         return None;
     }
-    // The pre-loop assigns wire `next` and `it` into the call's phis.
-    if !assigns
-        .iter()
-        .any(|(t, v)| *t == next_phi && temp_name(v) == Some(next_name.as_str()))
-        || !assigns
-            .iter()
-            .any(|(t, v)| *t == recv_phi && temp_name(v) == Some(it_name.as_str()))
-    {
-        return None;
-    }
 
     // ── The dispatch: a POSITIVE done test.
     let mut e = cond;
@@ -1527,14 +1757,20 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
         return None;
     }
 
-    // ── The done arm: the absorbed post-loop tail, then the exit
-    // break (trailing empty runs tolerated).
+    // ── The done arm: the absorbed post-loop tail, followed by an
+    // unlabeled exit `break` (or already diverging via `return`/`throw`
+    // with no escaping breaks).
     let mut tail_nodes = then.clone();
     while matches!(tail_nodes.last(), Some(SNode::Stmts(run)) if run.is_empty()) {
         tail_nodes.pop();
     }
-    if !matches!(tail_nodes.pop(), Some(SNode::Break { label: None })) {
-        return None;
+    if matches!(tail_nodes.last(), Some(SNode::Break { label: None })) {
+        tail_nodes.pop();
+    } else {
+        let tf = seq_flow(&tail_nodes);
+        if !tf.diverges || tf.live_break || subtree_has_labeled_jump(&tail_nodes) {
+            return None;
+        }
     }
     tail_nodes.retain(|n| !matches!(n, SNode::Stmts(run) if run.is_empty()));
 
@@ -1696,6 +1932,9 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
     }
     let mut internals: Vec<String> = phi_names.clone();
     internals.extend([it_name.clone(), next_name, res_name, await_name, done_name]);
+    if let Some(f) = flag_decl {
+        internals.push(f);
+    }
     internals.retain(|n| *n != binding);
     if nodes_use_any(&body_nodes, &internals)
         || nodes_use_any(&tail_nodes, &internals)
@@ -1844,7 +2083,7 @@ pub(in crate::folds) fn subst_temp_in_nodes(nodes: &mut [SNode], vid: ValueId, r
                     subst_temp_in_expr(cond, vid, replacement);
                     stack.push(body);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -2099,7 +2338,7 @@ pub(in crate::folds) fn nodes_use_any(nodes: &[SNode], names: &[String]) -> bool
                     }
                     stack.push(body);
                 }
-                SNode::Labeled { body, .. } => stack.push(body),
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
                 SNode::Try {
                     body,
                     catches,
@@ -2187,6 +2426,18 @@ pub(in crate::folds) fn walk_cleanup(
         grew = false;
         collect_aliases(nodes, &mut aliases, &mut grew);
     }
+    // Temps holding `.return` method references so only `ret.call(iter)` /
+    // `iter.return()` calls are accepted as iterator-cleanup calls.
+    // Pre-collected across the handler subtree so check order never depends
+    // on workstack traversal order.
+    let mut return_fn_temps: BTreeSet<String> = BTreeSet::new();
+    walk_leaves(nodes, &mut |l| {
+        if let Leaf::Raw(Stmt::Declare { name, value, .. }) = l
+            && expr_has_return_load(value)
+        {
+            return_fn_temps.insert(name.clone());
+        }
+    });
     let mut stack: Vec<&[SNode]> = vec![nodes];
     while let Some(seq) = stack.pop() {
         for n in seq {
@@ -2200,35 +2451,90 @@ pub(in crate::folds) fn walk_cleanup(
                             {
                                 *rethrow = true;
                             }
-                            Leaf::Raw(Stmt::Throw(_)) => *bad = true,
-                            Leaf::Raw(Stmt::Declare { value, .. })
-                                if expr_has_return_load(value) =>
-                            {
-                                *return_load = true;
+                            Leaf::Raw(Stmt::Throw(_)) | Leaf::Raw(Stmt::Return(_)) => {
+                                *bad = true;
                             }
-                            Leaf::Raw(
+                            Leaf::Raw(Stmt::Declare { name, value, .. }) => {
+                                if expr_has_return_load(value) {
+                                    *return_load = true;
+                                    return_fn_temps.insert(name.clone());
+                                }
+                                if !cleanup_expr_ok(value, &return_fn_temps) {
+                                    *bad = true;
+                                }
+                            }
+                            Leaf::Raw(Stmt::Expr(e)) => {
+                                if expr_has_return_load(e) {
+                                    *return_load = true;
+                                }
+                                if !cleanup_expr_ok(e, &return_fn_temps) {
+                                    *bad = true;
+                                }
+                            }
+                            Leaf::Assign { .. }
+                            | Leaf::Decl { .. }
+                            | Leaf::Destructure { .. }
+                            | Leaf::Raw(
                                 Stmt::StoreProp { .. }
                                 | Stmt::StoreIndex { .. }
                                 | Stmt::StoreDyn { .. }
+                                | Stmt::DefineMethod { .. }
                                 | Stmt::StorePrivate { .. }
                                 | Stmt::StoreSuper { .. }
                                 | Stmt::LexStore { .. }
                                 | Stmt::GlobalStore { .. }
-                                | Stmt::ModuleStore { .. },
+                                | Stmt::ModuleStore { .. }
+                                | Stmt::Fallback { .. }
+                                | Stmt::Debugger,
                             ) => *bad = true,
                             _ => {}
                         }
                     }
                 }
                 SNode::If {
-                    then, otherwise, ..
+                    cond,
+                    then,
+                    otherwise,
                 } => {
+                    if !cleanup_expr_ok(cond, &return_fn_temps) {
+                        *bad = true;
+                    }
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::While { body, .. }
-                | SNode::DoWhile { body, .. }
-                | SNode::Labeled { body, .. } => stack.push(body),
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond
+                        && !cleanup_expr_ok(c, &return_fn_temps)
+                    {
+                        *bad = true;
+                    }
+                    stack.push(body);
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    if !cleanup_expr_ok(cond, &return_fn_temps) {
+                        *bad = true;
+                    }
+                    stack.push(body);
+                }
+                SNode::Labeled { body, .. } | SNode::Block(body) => stack.push(body),
+                SNode::ForOf { iter, body, .. } => {
+                    *bad = true;
+                    let _ = iter;
+                    stack.push(body);
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    *bad = true;
+                    let _ = obj;
+                    stack.push(body);
+                }
+                SNode::Switch { disc, cases } => {
+                    if !cleanup_expr_ok(disc, &return_fn_temps) {
+                        *bad = true;
+                    }
+                    for c in cases.iter().rev() {
+                        stack.push(&c.body);
+                    }
+                }
                 SNode::Try {
                     body,
                     catches,
@@ -2243,10 +2549,45 @@ pub(in crate::folds) fn walk_cleanup(
                     }
                     stack.push(body);
                 }
-                _ => {}
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
     }
+}
+
+fn cleanup_expr_ok(root: &Expr, return_fn_temps: &BTreeSet<String>) -> bool {
+    let mut stack = vec![root];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Call { callee, .. } => {
+                let is_cleanup_call = match callee.as_ref() {
+                    Expr::Temp { name, .. } => return_fn_temps.contains(name),
+                    Expr::PropName { object, name, .. } => {
+                        name == "return"
+                            || (name == "call"
+                                && temp_name(object).is_some_and(|nm| return_fn_temps.contains(nm)))
+                    }
+                    Expr::PropDyn { key, .. } | Expr::PropIndex { index: key, .. } => {
+                        matches!(key.as_ref(), Expr::Lit(Lit::String(s)) if s == "return")
+                    }
+                    _ => false,
+                };
+                if !is_cleanup_call {
+                    return false;
+                }
+            }
+            Expr::Delete { .. } | Expr::DynamicImport { .. } | Expr::Fallback { .. } => {
+                return false;
+            }
+            Expr::Iter {
+                op: crate::expr::IterOp::Throw,
+                ..
+            } => return false,
+            _ => {}
+        }
+        stack.extend(expr_children(cur));
+    }
+    true
 }
 
 /// Grow the rethrow-alias set through phi/declare copies.
@@ -2280,7 +2621,8 @@ pub(in crate::folds) fn collect_aliases(
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::While { body, .. }
+                SNode::Block(body)
+                | SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. } => stack.push(body),
                 SNode::Try {

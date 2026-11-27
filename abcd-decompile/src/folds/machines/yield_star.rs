@@ -66,12 +66,20 @@ pub(in crate::folds) struct YsLoop {
     pub(in crate::folds) rt: (ValueId, String),
     /// Loop phi: the resumption value (`received`).
     pub(in crate::folds) rv: (ValueId, String),
-    /// Loop phi: the delegate iterator.
+    /// Delegate iterator temp (header phi or outer declare).
     pub(in crate::folds) it: (ValueId, String),
-    /// Loop phi: the generator object.
+    /// Whether `it` is a loop-header phi (`false` when Braun eliminated its self-phi).
+    pub(in crate::folds) it_in_phis: bool,
+    /// Generator object temp (header phi or outer declare).
     pub(in crate::folds) g: (ValueId, String),
-    /// Loop phi: the close-attempt flag.
+    /// Whether `g` is a loop-header phi.
+    pub(in crate::folds) g_in_phis: bool,
+    /// Close-attempt flag temp (header phi or outer `false` declare).
     pub(in crate::folds) flag: (ValueId, String),
+    /// Whether `flag` is a loop-header phi.
+    pub(in crate::folds) flag_in_phis: bool,
+    /// The temp assigned to the method phi in the `NEXT(2.0)` arm.
+    pub(in crate::folds) next_method_val: Option<ValueId>,
     /// The `exitReturn` phi tested by the completion dispatch.
     pub(in crate::folds) exit_phi: (ValueId, String),
     /// The completion-value binding + continuation (async: extracted
@@ -351,6 +359,63 @@ pub(in crate::folds) fn ys_prop(e: &Expr, name: &str) -> Option<ValueId> {
     (n == name).then(|| temp_value(object))?
 }
 
+fn ys_temp_pair(e: &Expr) -> Option<(ValueId, String)> {
+    match e {
+        Expr::Temp { value, name } => Some((*value, name.clone())),
+        _ => None,
+    }
+}
+
+fn ys_prop_temp(e: &Expr, name: &str) -> Option<(ValueId, String)> {
+    let Expr::PropName {
+        object, name: n, ..
+    } = e
+    else {
+        return None;
+    };
+    (n == name).then(|| ys_temp_pair(object))?
+}
+
+fn ys_flag_test_pair(cond: &Expr) -> Option<((ValueId, String), bool)> {
+    let mut e = cond;
+    let mut positive = true;
+    loop {
+        match e {
+            Expr::Unary {
+                op: UnOp::IsFalse | UnOp::JumpEqz,
+                operand,
+            } => {
+                positive = !positive;
+                e = operand;
+            }
+            Expr::Unary {
+                op: UnOp::IsTrue | UnOp::JumpNez,
+                operand,
+            } => e = operand,
+            _ => break,
+        }
+    }
+    Some((ys_temp_pair(e)?, positive))
+}
+
+fn ys_unwrap_labeled_arm<'a>(arm: &[&'a SNode]) -> (Option<&'a str>, Vec<&'a SNode>) {
+    if let [SNode::Labeled { label, body }] = arm {
+        (Some(label.as_str()), ys_sig(body))
+    } else {
+        (None, arm.to_vec())
+    }
+}
+
+fn ys_assign_arm_node<'a>(tsig: &[&'a SNode], arm_label: Option<&str>) -> Option<&'a SNode> {
+    match tsig {
+        [assigns] => Some(*assigns),
+        [assigns, SNode::Break { label: Some(lbl) }] if arm_label == Some(lbl.as_str()) => {
+            Some(*assigns)
+        }
+        _ => None,
+    }
+}
+
 /// A Declare leaf with the given value shape; returns (name, id).
 pub(in crate::folds) fn ys_declare_of(l: &Leaf) -> Option<(&str, ValueId, &Expr)> {
     let Leaf::Raw(Stmt::Declare {
@@ -471,18 +536,15 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
         (arm_b, arm_a)
     };
 
-    // ── RETURN arm: extract the iterator phi, the exitReturn phi,
+    // ── RETURN arm: extract the iterator temp, the exitReturn phi,
     // and the received-value phi (the DirectReturn temp) ──
     let rasig = ys_sig(ret_arm);
-    let Some((it_id, exit_phi, rv_id)) = ys_match_return_arm(&rasig, &phis, call_block, async_)
+    let Some(((it_id, it_name), exit_phi, rv_id)) =
+        ys_match_return_arm(&rasig, &phis, call_block, async_)
     else {
         ys_trace("loop:return-arm");
         return None;
     };
-    let it_name = phis
-        .iter()
-        .find(|(_, v)| **v == it_id)
-        .map(|(n, _)| n.clone())?;
     // Async: the received-value phi comes from the call's argument in
     // the tail (the RETURN arm's DirectReturn is the awaited
     // completion machinery, not a plain `return received`).
@@ -494,39 +556,74 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
             .map(|(n, _)| n.clone())?
     };
     let exit_name = exit_phi.1.clone();
+    let next_method_val = {
+        let SNode::Stmts(nrun) = &first else {
+            return None;
+        };
+        let mut mv = None;
+        for l in nrun {
+            if let Leaf::Raw(Stmt::PhiAssign {
+                target,
+                value,
+                exceptional: false,
+                ..
+            }) = l
+                && *target != exit_name
+            {
+                mv = temp_value(value);
+            }
+        }
+        mv
+    };
 
     // ── THROW arm: `throw` method lookup + the close machinery ──
-    let Some(flag_id) = ys_match_throw_arm(
+    let extra_phis: BTreeMap<String, ValueId> = if async_ && phis.len() <= 2 {
+        BTreeMap::new()
+    } else {
+        phis.iter()
+            .filter(|(_, v)| **v != rt_id && (async_ || **v != rv_id))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    };
+    let Some((flag_id, flag_name)) = ys_match_throw_arm_pair(
         &ys_sig(throw_arm),
         it_id,
         &exit_name,
         exit_decl,
         call_block,
-        &phis,
+        &extra_phis,
     ) else {
         ys_trace("loop:throw-arm");
         return None;
     };
-    let flag_name = phis
-        .iter()
-        .find(|(_, v)| **v == flag_id)
-        .map(|(n, _)| n.clone())?;
 
-    let out = if async_ {
+    let mut out = if async_ {
         ys_match_loop_tail_async(
-            &sig, &phis, rt_id, it_id, exit_phi, rt_name, rv_name, it_name, flag_name,
+            &sig, &phis, rt_id, it_id, exit_decl, flag_id, exit_phi, rt_name, rv_name, it_name,
+            flag_name,
         )
     } else {
         ys_match_loop_tail_sync(
-            &sig, &phis, rt_id, it_id, rv_id, exit_decl, exit_phi, rt_name, rv_name, it_name,
-            flag_name,
+            &sig, &phis, rt_id, it_id, rv_id, exit_decl, flag_id, exit_phi, rt_name, rv_name,
+            it_name, flag_name,
         )
     };
-    if out.is_none() {
+    if let Some(lp) = &mut out {
+        lp.next_method_val = next_method_val;
+        // Every header phi in `phis` must be accounted for among the matched
+        // YieldStar loop roles `{rt, rv, it, g, flag}`.
+        let roles = [lp.rt.0, lp.rv.0, lp.it.0, lp.g.0, lp.flag.0];
+        if !phis.values().all(|v| roles.contains(v)) {
+            ys_trace("loop:unaccounted-phi");
+            return None;
+        }
+    } else {
         ys_trace("loop:tail");
     }
     out
 }
+
+pub(in crate::folds) type YsReturnArmMatch = ((ValueId, String), (ValueId, String), ValueId);
 
 /// The RETURN completion arm (sync shape; async shares the head):
 ///
@@ -534,20 +631,21 @@ pub(in crate::folds) fn ys_match_loop(w: &SNode, async_: bool) -> Option<YsLoop>
 ///   if (retM !== undefined) { assigns → B_call incl. exitPhi ← T }
 ///   else { break }, return received]`
 ///
-/// Returns (it, exitPhi, received).
+/// Returns ((it, itName), exitPhi, received).
 pub(in crate::folds) fn ys_match_return_arm(
     arm: &[&SNode],
     phis: &BTreeMap<String, ValueId>,
     call_block: abcd_ir::BlockId,
     async_: bool,
-) -> Option<(ValueId, (ValueId, String), ValueId)> {
+) -> Option<YsReturnArmMatch> {
     let in_phis = |id: &ValueId| phis.values().any(|v| v == id);
-    let mut it_id = None;
+    let (arm_label, arm_nodes) = ys_unwrap_labeled_arm(arm);
+    let mut it_info: Option<((ValueId, String), ValueId)> = None;
     let mut true_decl = None;
     let mut exit_phi = None;
     let mut rv_id = None;
     let mut saw_break_if = false;
-    for (idx, n) in arm.iter().enumerate() {
+    for (idx, n) in arm_nodes.iter().enumerate() {
         match n {
             SNode::Stmts(run) => {
                 // The decl run: [phis…, T = true, retM = it.return].
@@ -556,10 +654,8 @@ pub(in crate::folds) fn ys_match_return_arm(
                         if matches!(value, Expr::Lit(Lit::Bool(true))) {
                             true_decl = Some(id);
                         }
-                        if let Some(base) = ys_prop(value, "return")
-                            && in_phis(&base)
-                        {
-                            it_id = Some((base, id));
+                        if let Some(base) = ys_prop_temp(value, "return") {
+                            it_info = Some((base, id));
                         }
                     }
                 }
@@ -599,7 +695,7 @@ pub(in crate::folds) fn ys_match_return_arm(
                     ys_trace("ret-arm:undefined-test");
                     return None;
                 };
-                if Some(t) != it_id.map(|(_, m)| m) {
+                if Some(t) != it_info.as_ref().map(|(_, m)| *m) {
                     ys_trace("ret-arm:method-id");
                     return None;
                 }
@@ -609,7 +705,7 @@ pub(in crate::folds) fn ys_match_return_arm(
                     (otherwise, then)
                 };
                 let tsig = ys_sig(assign_arm);
-                let [assigns] = tsig.as_slice() else {
+                let Some(assigns) = ys_assign_arm_node(&tsig, arm_label) else {
                     ys_trace("ret-arm:then-shape");
                     return None;
                 };
@@ -656,28 +752,35 @@ pub(in crate::folds) fn ys_match_return_arm(
         return None;
     }
     if async_ {
-        // The async RETURN arm awaits the resume value and completes
-        // via the AsyncGeneratorResolve machinery (d-P14 shapes,
-        // partially folded) — the head anchors above (true decl,
-        // it.return lookup, the undefined test with the B_call
-        // assigns incl. the exitReturn link, the break) pin it; the
-        // received phi comes from the tail match instead.
         let _ = rv_id;
-        Some((it_id?.0, exit_phi?, ValueId::new(u32::MAX)))
+        Some((it_info?.0, exit_phi?, ValueId::new(u32::MAX)))
     } else {
-        Some((it_id?.0, exit_phi?, rv_id?))
+        Some((it_info?.0, exit_phi?, rv_id?))
     }
 }
 
-/// The THROW completion arm:
-///
-/// `[throwM = it.throw; eqM = throwM == undefined],
-///  if (!eqM) { assigns → B_call incl. exitPhi ← exitDecl } ,
-///  if (flag) { close-already machinery } else { close-try machinery }`
-///
-/// Returns the flag phi. The close machinery itself is opaque (fixed
-/// vendor IteratorClose + ThrowNotExists shape) but must contain the
-/// elided ThrowNotExists guard.
+/// Extract the close-attempt flag `(id, name)` from a labeled close wrapper
+/// (`A$k: { L$m: { if (!flag) { … } } throw ReferenceError(…); }`).
+fn ys_labeled_close_flag(n: &SNode) -> Option<(ValueId, String)> {
+    if !ys_contains_throw_not_exists(std::slice::from_ref(n)) {
+        return None;
+    }
+    let mut cur = n;
+    loop {
+        match cur {
+            SNode::Labeled { body, .. } => {
+                cur = *ys_sig(body).first()?;
+            }
+            SNode::If { cond, .. } => {
+                let (pair, _) = ys_flag_test_pair(cond)?;
+                return Some(pair);
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(in crate::folds) fn ys_match_throw_arm(
     arm: &[&SNode],
     it: ValueId,
@@ -686,11 +789,51 @@ pub(in crate::folds) fn ys_match_throw_arm(
     call_block: abcd_ir::BlockId,
     phis: &BTreeMap<String, ValueId>,
 ) -> Option<ValueId> {
+    ys_match_throw_arm_pair(arm, it, exit_name, exit_decl, call_block, phis).map(|(id, _)| id)
+}
+
+/// The THROW completion arm:
+///
+/// `[throwM = it.throw; (eqM = throwM == undefined)?],
+///  if (!eqM | throwM == undefined) { … } ,
+///  if (flag | !flag) { close machinery }` (possibly wrapped in Ramsey `A$k` / `L$m`)
+///
+/// Returns `(flag_id, flag_name)`.
+fn ys_match_throw_arm_pair(
+    arm: &[&SNode],
+    it: ValueId,
+    exit_name: &str,
+    exit_decl: ValueId,
+    call_block: abcd_ir::BlockId,
+    phis: &BTreeMap<String, ValueId>,
+) -> Option<(ValueId, String)> {
+    let flag_ok = |t: ValueId| phis.is_empty() || phis.values().any(|v| *v == t);
+    let (arm_label, arm_nodes) = ys_unwrap_labeled_arm(arm);
     let mut throw_m = None;
     let mut eq_m = None;
+    let mut saw_method_if = false;
     let mut flag = None;
     let mut saw_close_if = false;
-    for n in arm {
+    let check_assign_arm = |assign_arm: &[SNode]| -> Option<()> {
+        let tsig = ys_sig(assign_arm);
+        let assigns = ys_assign_arm_node(&tsig, arm_label)?;
+        if ys_assign_run(assigns) != Some(call_block) {
+            return None;
+        }
+        let SNode::Stmts(arun) = assigns else {
+            return None;
+        };
+        arun.iter()
+            .any(|l| {
+                matches!(
+                    l,
+                    Leaf::Raw(Stmt::PhiAssign { target, value, .. })
+                        if target == exit_name && temp_value(value) == Some(exit_decl)
+                )
+            })
+            .then_some(())
+    };
+    for n in arm_nodes {
         match n {
             SNode::Stmts(run) => {
                 for l in run {
@@ -719,34 +862,35 @@ pub(in crate::folds) fn ys_match_throw_arm(
                 then,
                 otherwise,
             } => {
-                if let Some((t, positive)) = ys_flag_test(cond) {
+                if let Some((t, defined)) = ys_undefined_test(cond)
+                    && Some(t) == throw_m
+                {
+                    let (assign_arm, other_arm) = if defined {
+                        (then, otherwise)
+                    } else {
+                        (otherwise, then)
+                    };
+                    check_assign_arm(assign_arm)?;
+                    let osig = ys_sig(other_arm);
+                    let other_ok = if defined {
+                        osig.is_empty()
+                    } else {
+                        matches!(osig.as_slice(), [] | [SNode::Break { .. }])
+                    };
+                    if !other_ok {
+                        return None;
+                    }
+                    saw_method_if = true;
+                    continue;
+                }
+                if let Some(((t, t_name), positive)) = ys_flag_test_pair(cond) {
                     if Some(t) == eq_m {
-                        // `!eqM`: `then = [assigns]`, `otherwise = []`.
-                        // `eqM` (R3-M1): `then = [] | [Break]`, `otherwise = [assigns]`.
                         let (assign_arm, other_arm) = if !positive {
                             (then, otherwise)
                         } else {
                             (otherwise, then)
                         };
-                        let tsig = ys_sig(assign_arm);
-                        let [assigns] = tsig.as_slice() else {
-                            return None;
-                        };
-                        if ys_assign_run(assigns) != Some(call_block) {
-                            return None;
-                        }
-                        let SNode::Stmts(arun) = assigns else {
-                            return None;
-                        };
-                        if !arun.iter().any(|l| {
-                            matches!(
-                                l,
-                                Leaf::Raw(Stmt::PhiAssign { target, value, .. })
-                                    if target == exit_name && temp_value(value) == Some(exit_decl)
-                            )
-                        }) {
-                            return None;
-                        }
+                        check_assign_arm(assign_arm)?;
                         let osig = ys_sig(other_arm);
                         let other_ok = if !positive {
                             osig.is_empty()
@@ -756,29 +900,33 @@ pub(in crate::folds) fn ys_match_throw_arm(
                         if !other_ok {
                             return None;
                         }
+                        saw_method_if = true;
                         continue;
                     }
-                    if phis.values().any(|v| *v == t) && positive {
-                        // `if (flag) { … } else { … }` — the close
-                        // machinery; ThrowNotExists must be in there.
-                        flag = Some(t);
+                    if flag_ok(t)
+                        && (ys_contains_throw_not_exists(then)
+                            || ys_contains_throw_not_exists(otherwise))
+                    {
+                        flag = Some((t, t_name));
                         saw_close_if = true;
-                        if !ys_contains_throw_not_exists(then)
-                            && !ys_contains_throw_not_exists(otherwise)
-                        {
-                            return None;
-                        }
                         continue;
                     }
                 }
                 return None;
             }
+            SNode::Labeled { .. } if !saw_close_if => {
+                let pair = ys_labeled_close_flag(n)?;
+                if !flag_ok(pair.0) {
+                    return None;
+                }
+                flag = Some(pair);
+                saw_close_if = true;
+            }
             _ => return None,
         }
     }
     throw_m?;
-    eq_m?;
-    if !saw_close_if {
+    if !saw_method_if || !saw_close_if {
         return None;
     }
     flag
@@ -816,7 +964,8 @@ fn ys_contains_throw_not_exists(nodes: &[SNode]) -> bool {
                     stack.push(otherwise);
                     stack.push(then);
                 }
-                SNode::While { body, .. }
+                SNode::Block(body)
+                | SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }
@@ -864,7 +1013,8 @@ fn ys_match_sync_suspend_loopback(
     phis: &BTreeMap<String, ValueId>,
     rt_name: &str,
     rv_name: &str,
-) -> Option<ValueId> {
+) -> Option<(ValueId, String)> {
+    let _ = phis;
     let check_loopback = |lrun: &[Leaf], g_id: ValueId, resume: ValueId| -> Option<()> {
         let wrapped = SNode::Stmts(lrun.to_vec());
         let _header_block = ys_assign_run(&wrapped)?;
@@ -917,12 +1067,12 @@ fn ys_match_sync_suspend_loopback(
             else {
                 return None;
             };
-            let g_id = temp_value(genobj).filter(|g| phis.values().any(|v| v == g))?;
+            let (g_id, g_name) = ys_temp_pair(genobj)?;
             if check_loopback(lrun, g_id, *resume).is_none() {
                 ys_trace("sync-tail:loopback-anchors");
                 return None;
             }
-            Some(g_id)
+            Some((g_id, g_name))
         }
         [SNode::Stmts(crun)] => {
             let crun_sig: Vec<Leaf> = crun
@@ -953,12 +1103,12 @@ fn ys_match_sync_suspend_loopback(
             else {
                 return None;
             };
-            let g_id = temp_value(genobj).filter(|g| phis.values().any(|v| v == g))?;
+            let (g_id, g_name) = ys_temp_pair(genobj)?;
             if check_loopback(lrun, g_id, *resume).is_none() {
                 ys_trace("sync-tail:loopback-anchors");
                 return None;
             }
-            Some(g_id)
+            Some((g_id, g_name))
         }
         _ => {
             ys_trace("sync-tail:suspend-run");
@@ -980,6 +1130,7 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
     it: ValueId,
     rv: ValueId,
     exit_decl: ValueId,
+    flag_id: ValueId,
     exit_phi: (ValueId, String),
     rt_name: String,
     rv_name: String,
@@ -1058,7 +1209,7 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
     if ys_flag_test(cond) != Some((done, true)) {
         return None;
     }
-    let (g_id, bind, continuation, in_loop_exit) = match sig {
+    let ((g_id, g_name), bind, continuation, in_loop_exit) = match sig {
         [_, _, _, _, suspend, loopback, SNode::Continue { .. }] => {
             let [SNode::Break { .. }] = ys_sig(then).as_slice() else {
                 return None;
@@ -1066,14 +1217,14 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
             if !ys_sig(otherwise).is_empty() {
                 return None;
             }
-            let g_id = ys_match_sync_suspend_loopback(
+            let g_pair = ys_match_sync_suspend_loopback(
                 &[*suspend, *loopback],
                 res,
                 phis,
                 &rt_name,
                 &rv_name,
             )?;
-            (g_id, None, Vec::new(), false)
+            (g_pair, None, Vec::new(), false)
         }
         [_, _, _, _] => {
             // R3-M1 in-loop completion: `if (done) { exit_if; break; } else { suspend+loopback; continue; }`.
@@ -1086,28 +1237,25 @@ pub(in crate::folds) fn ys_match_loop_tail_sync(
             let [next_runs @ .., SNode::Continue { .. }] = nsig.as_slice() else {
                 return None;
             };
-            let g_id = ys_match_sync_suspend_loopback(next_runs, res, phis, &rt_name, &rv_name)?;
-            (g_id, bind, continuation, true)
+            let g_pair = ys_match_sync_suspend_loopback(next_runs, res, phis, &rt_name, &rv_name)?;
+            (g_pair, bind, continuation, true)
         }
         _ => return None,
     };
     let _ = exit_decl;
+    let it_in_phis = phis.values().any(|v| *v == it);
+    let g_in_phis = phis.values().any(|v| *v == g_id);
+    let flag_in_phis = phis.values().any(|v| *v == flag_id);
     Some(YsLoop {
         rt: (rt, rt_name),
         rv: (rv, rv_name),
         it: (it, it_name),
-        g: (
-            g_id,
-            phis.iter()
-                .find(|(_, v)| **v == g_id)
-                .map(|(n, _)| n.clone())?,
-        ),
-        flag: (
-            phis.iter()
-                .find(|(n, _)| **n == flag_name)
-                .map(|(_, v)| *v)?,
-            flag_name,
-        ),
+        it_in_phis,
+        g: (g_id, g_name),
+        g_in_phis,
+        flag: (flag_id, flag_name),
+        flag_in_phis,
+        next_method_val: None,
         exit_phi,
         bind,
         continuation,
@@ -1128,136 +1276,206 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     phis: &BTreeMap<String, ValueId>,
     rt: ValueId,
     it: ValueId,
+    exit_decl: ValueId,
+    flag_id: ValueId,
     exit_phi: (ValueId, String),
     rt_name: String,
     rv_name: String,
     it_name: String,
     flag_name: String,
 ) -> Option<YsLoop> {
-    // [header, dispatch, precall, await-dispatch]
-    let [_, _, precall, await_if] = sig else {
-        ys_trace("a-tail:skeleton");
-        return None;
-    };
+    let precall = *sig.get(2)?;
     let pre_phis = ys_phi_decls(precall)?;
     let exit_id = pre_phis.get(&exit_phi.1).copied()?;
     let exit_phi = (exit_id, exit_phi.1);
     let SNode::Stmts(prun) = precall else {
         return None;
     };
-    // [phis…, res = methodPhi.call(iter, received), aw = await res
-    //  (uncaught), yield aw, resume1 = ResumeGenerator(g)]
     let tail: Vec<&Leaf> = prun[pre_phis.len()..]
         .iter()
         .filter(|l| !ys_skip_plumbing_leaf(l))
         .collect();
-    let [
-        Leaf::Raw(Stmt::Declare {
-            value: Expr::Call {
-                callee, this, args, ..
-            },
-            value_id: res,
-            ..
-        }),
-        Leaf::Raw(Stmt::Declare {
-            value:
-                Expr::Await {
-                    value: aw_val,
-                    uncaught: true,
-                },
-            value_id: aw,
-            ..
-        }),
-        Leaf::Raw(Stmt::Expr(Expr::Yield { value: yval })),
-        Leaf::Raw(Stmt::Declare {
-            value: drv1,
-            value_id: resume1,
-            ..
-        }),
-    ] = tail.as_slice()
-    else {
-        ys_trace("a-tail:precall-shape");
-        return None;
-    };
-    if !pre_phis.values().any(|v| temp_value(callee) == Some(*v)) {
-        ys_trace("a-tail:callee");
-        return None;
-    }
-    let Expr::Temp { value: this_t, .. } = this.as_deref()? else {
-        return None;
-    };
-    if *this_t != it {
-        return None;
-    }
-    let [Expr::Temp { value: arg, .. }] = args.as_slice() else {
-        return None;
-    };
-    let rv = *arg;
-    if !phis.values().any(|v| *v == rv) {
-        return None;
-    }
-    let rv_name = phis
-        .iter()
-        .find(|(_, v)| **v == rv)
-        .map(|(n, _)| n.clone())
-        .unwrap_or(rv_name);
-    if temp_value(aw_val) != Some(*res) || temp_value(yval) != Some(*aw) {
-        return None;
-    }
-    let Expr::GeneratorDriver {
-        resume: true,
-        genobj,
-    } = drv1
-    else {
-        ys_trace("a-tail:drv1");
-        return None;
-    };
-    let Some(g_id) = temp_value(genobj).filter(|g| phis.values().any(|v| v == g)) else {
-        ys_trace("a-tail:g");
-        return None;
-    };
 
-    // The await's THROW-only dispatch: `if (GetResumeMode(g) != THROW)
-    // { continuation } else { throw resume1; unreachable; break }`.
-    let SNode::If {
-        cond,
-        then,
-        otherwise,
-    } = await_if
-    else {
-        return None;
-    };
-    let Some(cont_arm) = ys_async_throw_dispatch_arms(cond, then, otherwise, g_id, *resume1) else {
-        ys_trace("a-tail:throw-dispatch");
-        return None;
-    };
-
-    // Continuation: [elided ThrowIfNotObject, done = resume1.done],
-    // then the done test.
-    let csig = ys_sig(cont_arm);
-    let [done_run, done_if] = csig.as_slice() else {
-        ys_trace("a-tail:continuation");
-        return None;
-    };
-    let SNode::Stmts(drun) = done_run else {
-        return None;
-    };
-    let mut done = None;
-    for l in drun {
-        match l {
-            Leaf::Raw(Stmt::Elided { op, .. }) if *op == "ThrowIfNotObject" => {}
-            l if ys_skip_plumbing_leaf(l) => {}
+    // Pre-call + done-test extraction supports both:
+    // 1. Unfolded pre-call await (`[_, _, precall, await_if]` where `g` was a loop phi);
+    // 2. Folded pre-call await (`[_, _, precall, done_run, done_if]` or
+    //    `[_, _, precall_with_done, done_if]` when `async_generator_machine_fold`
+    //    already folded `const resume1 = await res`).
+    let (rv, rv_name, resume1, done, done_if, pre_g): (
+        ValueId,
+        String,
+        ValueId,
+        ValueId,
+        &SNode,
+        Option<(ValueId, String)>,
+    ) = match tail.as_slice() {
+        [
             Leaf::Raw(Stmt::Declare {
-                value, value_id, ..
-            }) if ys_prop(value, "done") == Some(*resume1) => {
-                done = Some(*value_id);
+                value: Expr::Call {
+                    callee, this, args, ..
+                },
+                value_id: res,
+                ..
+            }),
+            Leaf::Raw(Stmt::Declare {
+                value:
+                    Expr::Await {
+                        value: aw_val,
+                        uncaught: true,
+                    },
+                value_id: aw,
+                ..
+            }),
+            Leaf::Raw(Stmt::Expr(Expr::Yield { value: yval })),
+            Leaf::Raw(Stmt::Declare {
+                value: drv1,
+                value_id: resume1,
+                ..
+            }),
+        ] => {
+            let [_, _, _, await_if] = sig else {
+                ys_trace("a-tail:skeleton");
+                return None;
+            };
+            if !pre_phis.values().any(|v| temp_value(callee) == Some(*v)) {
+                ys_trace("a-tail:callee");
+                return None;
             }
-            _ => return None,
+            let Expr::Temp { value: this_t, .. } = this.as_deref()? else {
+                return None;
+            };
+            if *this_t != it {
+                return None;
+            }
+            let [Expr::Temp { value: arg, .. }] = args.as_slice() else {
+                return None;
+            };
+            let rv = *arg;
+            if !phis.values().any(|v| *v == rv) {
+                return None;
+            }
+            let rv_name = phis
+                .iter()
+                .find(|(_, v)| **v == rv)
+                .map(|(n, _)| n.clone())
+                .unwrap_or(rv_name);
+            if temp_value(aw_val) != Some(*res) || temp_value(yval) != Some(*aw) {
+                return None;
+            }
+            let Expr::GeneratorDriver {
+                resume: true,
+                genobj,
+            } = drv1
+            else {
+                ys_trace("a-tail:drv1");
+                return None;
+            };
+            let (g_id, g_name) = ys_temp_pair(genobj)?;
+            let SNode::If {
+                cond,
+                then,
+                otherwise,
+            } = await_if
+            else {
+                return None;
+            };
+            let Some(cont_arm) =
+                ys_async_throw_dispatch_arms(cond, then, otherwise, g_id, *resume1)
+            else {
+                ys_trace("a-tail:throw-dispatch");
+                return None;
+            };
+            let csig = ys_sig(cont_arm);
+            let [done_run, done_if] = csig.as_slice() else {
+                ys_trace("a-tail:continuation");
+                return None;
+            };
+            let SNode::Stmts(drun) = done_run else {
+                return None;
+            };
+            let mut done = None;
+            for l in drun {
+                match l {
+                    Leaf::Raw(Stmt::Elided { op, .. }) if *op == "ThrowIfNotObject" => {}
+                    l if ys_skip_plumbing_leaf(l) => {}
+                    Leaf::Raw(Stmt::Declare {
+                        value, value_id, ..
+                    }) if ys_prop(value, "done") == Some(*resume1) => {
+                        done = Some(*value_id);
+                    }
+                    _ => return None,
+                }
+            }
+            let done = done?;
+            (rv, rv_name, *resume1, done, *done_if, Some((g_id, g_name)))
         }
-    }
-    let Some(done) = done else {
-        ys_trace("a-tail:done-decl");
-        return None;
+        [
+            Leaf::Raw(Stmt::Declare {
+                value: Expr::Call {
+                    callee, this, args, ..
+                },
+                value_id: res,
+                ..
+            }),
+            Leaf::Raw(Stmt::Declare {
+                value: Expr::Await { value: aw_val, .. },
+                value_id: resume1,
+                ..
+            }),
+            rest_tail @ ..,
+        ] => {
+            if !pre_phis.values().any(|v| temp_value(callee) == Some(*v)) {
+                return None;
+            }
+            let Expr::Temp { value: this_t, .. } = this.as_deref()? else {
+                return None;
+            };
+            if *this_t != it {
+                return None;
+            }
+            let [Expr::Temp { value: arg, .. }] = args.as_slice() else {
+                return None;
+            };
+            let rv = *arg;
+            if !phis.values().any(|v| *v == rv) || temp_value(aw_val) != Some(*res) {
+                return None;
+            }
+            let rv_name = phis
+                .iter()
+                .find(|(_, v)| **v == rv)
+                .map(|(n, _)| n.clone())
+                .unwrap_or(rv_name);
+            let (done_leaves, done_if): (Vec<&Leaf>, &SNode) = match sig {
+                [_, _, _, SNode::Stmts(drun), done_if @ SNode::If { .. }]
+                    if rest_tail.is_empty() =>
+                {
+                    (drun.iter().collect(), *done_if)
+                }
+                [_, _, _, done_if @ SNode::If { .. }] if !rest_tail.is_empty() => {
+                    (rest_tail.to_vec(), *done_if)
+                }
+                _ => return None,
+            };
+            let mut done = None;
+            for l in done_leaves {
+                match l {
+                    Leaf::Raw(Stmt::Elided { op, .. }) if *op == "ThrowIfNotObject" => {}
+                    l if ys_skip_plumbing_leaf(l) => {}
+                    Leaf::Raw(Stmt::Declare {
+                        value, value_id, ..
+                    }) if ys_prop(value, "done") == Some(*resume1) => {
+                        done = Some(*value_id);
+                    }
+                    _ => return None,
+                }
+            }
+            let done = done?;
+            (rv, rv_name, *resume1, done, done_if, None)
+        }
+        _ => {
+            ys_trace("a-tail:precall-shape");
+            return None;
+        }
     };
     let SNode::If {
         cond: dcond,
@@ -1305,7 +1523,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
         ys_trace("a-tail:bind");
         return None;
     };
-    if ys_prop(bind_val, "value") != Some(*resume1) {
+    if ys_prop(bind_val, "value") != Some(resume1) {
         return None;
     }
     let mut continuation: Vec<SNode> = Vec::new();
@@ -1331,7 +1549,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     else {
         return None;
     };
-    if ys_prop(rv_val, "value") != Some(*resume1)
+    if ys_prop(rv_val, "value") != Some(resume1)
         || temp_value(ret_e) != Some(*rvid)
         || !tail
             .iter()
@@ -1341,14 +1559,42 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
     }
 
     // ── not-done arm: value/await/AsyncGeneratorYield + resumption ──
-    if ys_match_async_yield(
-        &ys_sig(next_arm),
+    let next_sig = ys_sig(next_arm);
+    let (g_id, g_name) = match pre_g {
+        Some(pair) => pair,
+        None => {
+            let SNode::Stmts(head) = *next_sig.first()? else {
+                return None;
+            };
+            let head_sig: Vec<&Leaf> = head.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
+            let [
+                _,
+                _,
+                _,
+                Leaf::Raw(Stmt::Declare {
+                    value:
+                        Expr::GeneratorDriver {
+                            resume: true,
+                            genobj,
+                        },
+                    ..
+                }),
+            ] = head_sig.as_slice()
+            else {
+                return None;
+            };
+            ys_temp_pair(genobj)?
+        }
+    };
+    if ys_match_async_yield_with_false(
+        &next_sig,
         g_id,
-        *resume1,
+        resume1,
         rt,
         rv,
         &rt_name,
         &rv_name,
+        &[exit_decl, flag_id],
     )
     .is_none()
     {
@@ -1356,22 +1602,19 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
         return None;
     }
 
+    let it_in_phis = phis.values().any(|v| *v == it);
+    let g_in_phis = phis.values().any(|v| *v == g_id);
+    let flag_in_phis = phis.values().any(|v| *v == flag_id);
     Some(YsLoop {
         rt: (rt, rt_name),
         rv: (rv, rv_name),
         it: (it, it_name),
-        g: (
-            g_id,
-            phis.iter()
-                .find(|(_, v)| **v == g_id)
-                .map(|(n, _)| n.clone())?,
-        ),
-        flag: (
-            phis.iter()
-                .find(|(n, _)| **n == flag_name)
-                .map(|(_, v)| *v)?,
-            flag_name,
-        ),
+        it_in_phis,
+        g: (g_id, g_name),
+        g_in_phis,
+        flag: (flag_id, flag_name),
+        flag_in_phis,
+        next_method_val: None,
         exit_phi,
         bind: Some((bind_name.to_string(), bind_id)),
         continuation,
@@ -1381,7 +1624,7 @@ pub(in crate::folds) fn ys_match_loop_tail_async(
 
 /// Polarity-aware async THROW-only dispatch on an inline `GetResumeMode(g)`:
 /// returns the continuation arm slice when the THROW(1) arm matches
-/// `[throw resume; unreachable; break]`.
+/// `[throw resume; unreachable; break?]`.
 fn ys_async_throw_dispatch_arms<'a>(
     cond: &Expr,
     then: &'a [SNode],
@@ -1421,8 +1664,9 @@ fn ys_async_throw_dispatch_arms<'a>(
         (otherwise, then)
     };
     let osig = ys_sig(throw_arm);
-    let [SNode::Stmts(trun), SNode::Break { .. }] = osig.as_slice() else {
-        return None;
+    let trun = match osig.as_slice() {
+        [SNode::Stmts(trun)] | [SNode::Stmts(trun), SNode::Break { .. }] => trun,
+        _ => return None,
     };
     let tsig: Vec<&Leaf> = trun.iter().filter(|l| !ys_skip_plumbing_leaf(l)).collect();
     let [Leaf::Raw(Stmt::Throw(e)), Leaf::Raw(Stmt::Unreachable)] = tsig.as_slice() else {
@@ -1447,7 +1691,11 @@ pub(in crate::folds) fn ys_async_throw_dispatch(
 /// resumption re-entry (NEXT: loop back with the mode/value; RETURN:
 /// await the resume value, then re-enter with RETURN; the await's own
 /// THROW re-enters with THROW).
-pub(in crate::folds) fn ys_match_async_yield(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "async yield matcher threads SSA ids, loop-back names, and known false-literal temps"
+)]
+fn ys_match_async_yield_with_false(
     arm: &[&SNode],
     g: ValueId,
     resume1: ValueId,
@@ -1455,6 +1703,7 @@ pub(in crate::folds) fn ys_match_async_yield(
     rv: ValueId,
     rt_name: &str,
     rv_name: &str,
+    extra_false: &[ValueId],
 ) -> Option<()> {
     let [SNode::Stmts(head), mode_if] = arm else {
         ys_trace("ay:skeleton");
@@ -1547,7 +1796,8 @@ pub(in crate::folds) fn ys_match_async_yield(
             } if temp_value(ag_g) == Some(g)
                 && temp_value(ag_v) == Some(*res2)
                 && (matches!(ag_d.as_ref(), Expr::Lit(Lit::Bool(false)))
-                    || false_id.is_some_and(|fid| temp_value(ag_d) == Some(fid)))
+                    || false_id.is_some_and(|fid| temp_value(ag_d) == Some(fid))
+                    || extra_false.iter().any(|&fid| temp_value(ag_d) == Some(fid)))
         )
     };
     if let Some(Leaf::Raw(Stmt::Expr(e))) = pair_leaves.first().copied()
@@ -1886,20 +2136,38 @@ pub(in crate::folds) fn ys_match_exit(
 /// must be `iter = GetIterator(obj)` (async: GetAsyncIterator) and
 /// `next = iter.next`. Returns (delegate obj expr, iter id, next id,
 /// prefix leaves).
+#[cfg(test)]
 pub(in crate::folds) fn ys_match_setup(
     n: &SNode,
     async_: bool,
     uses: &BTreeMap<ValueId, usize>,
 ) -> Option<(Expr, ValueId, ValueId, Vec<Leaf>)> {
+    ys_match_setup_with_flag(n, async_, uses, None)
+}
+
+fn ys_match_setup_with_flag(
+    n: &SNode,
+    async_: bool,
+    uses: &BTreeMap<ValueId, usize>,
+    want_flag: Option<ValueId>,
+) -> Option<(Expr, ValueId, ValueId, Vec<Leaf>)> {
     let SNode::Stmts(run) = n else {
         return None;
     };
-    let sig_indices: Vec<usize> = run
+    let mut sig_indices: Vec<usize> = run
         .iter()
         .enumerate()
         .filter(|(_, l)| !ys_skip_plumbing_leaf(l))
         .map(|(idx, _)| idx)
         .collect();
+    if let Some(fid) = want_flag {
+        let flag_idx = *sig_indices.last()?;
+        let (_, decl_id, decl_val) = ys_declare_of(&run[flag_idx])?;
+        if decl_id != fid || !matches!(decl_val, Expr::Lit(Lit::Bool(false))) {
+            return None;
+        }
+        sig_indices.pop();
+    }
     if sig_indices.len() < 2 {
         return None;
     }
@@ -1954,9 +2222,8 @@ pub(in crate::folds) fn ys_match_setup(
 }
 
 /// The phi-init run: all phi assigns; the non-exceptional ones go to
-/// one block and must set mode ← NEXT(2.0), received ← undefined,
-/// flag ← false, iter ← the iterator temp, genobj ← its source, and
-/// exactly one method ← the next temp.
+/// one block and must set mode ← NEXT(2.0) and received ← undefined,
+/// plus any loop-header phis still present for flag / iter / genobj / next.
 pub(in crate::folds) fn ys_match_init(
     n: &SNode,
     lp: &YsLoop,
@@ -2006,17 +2273,17 @@ pub(in crate::folds) fn ys_match_init(
                 return None;
             }
             saw_rv = true;
-        } else if *target == lp.flag.1 {
+        } else if lp.flag_in_phis && *target == lp.flag.1 {
             if !matches!(value, Expr::Lit(Lit::Bool(false))) {
                 return None;
             }
             saw_flag = true;
-        } else if *target == lp.it.1 {
+        } else if lp.it_in_phis && *target == lp.it.1 {
             if temp_value(value) != Some(iter) {
                 return None;
             }
             saw_it = true;
-        } else if *target == lp.g.1 {
+        } else if lp.g_in_phis && *target == lp.g.1 {
             saw_g = true;
         } else if temp_value(value) == Some(next) {
             saw_next += 1;
@@ -2024,7 +2291,15 @@ pub(in crate::folds) fn ys_match_init(
             return None;
         }
     }
-    (saw_rt && saw_rv && saw_flag && saw_it && saw_g && saw_next == 1).then_some(())
+    let flag_ok = if lp.flag_in_phis { saw_flag } else { true };
+    let it_ok = if lp.it_in_phis {
+        saw_it
+    } else {
+        lp.it.0 == iter
+    };
+    let g_ok = if lp.g_in_phis { saw_g } else { true };
+    let next_ok = saw_next == 1 || (saw_next == 0 && lp.next_method_val == Some(next));
+    (saw_rt && saw_rv && flag_ok && it_ok && g_ok && next_ok).then_some(())
 }
 
 // ── apply ──────────────────────────────────────────────────────────
@@ -2047,7 +2322,7 @@ pub(in crate::folds) fn ys_stmt(lp: &YsLoop, delegate: Expr) -> SNode {
     SNode::Stmts(vec![leaf])
 }
 
-/// Arrangement A: bare siblings `[…, setup, init, While, exit?]`.
+/// Arrangement A: bare siblings `[…, setup, Honest*, init, Honest*, While, exit?]`.
 pub(in crate::folds) fn ys_apply_bare(
     nodes: &mut Vec<SNode>,
     i: usize,
@@ -2059,17 +2334,38 @@ pub(in crate::folds) fn ys_apply_bare(
         ys_trace("loop");
         return false;
     };
-    if i < 2 {
+    let prev_sig_idx = |from: usize| -> Option<usize> {
+        let mut j = from;
+        while j > 0 {
+            j -= 1;
+            if !matches!(&nodes[j], SNode::Honest(_)) && !ys_is_exc_run(&nodes[j]) {
+                return Some(j);
+            }
+        }
+        None
+    };
+    let Some(init_idx) = prev_sig_idx(i) else {
         return false;
-    }
-    let Some((delegate, iter, next, prefix)) = ys_match_setup(&nodes[i - 2], async_, uses) else {
+    };
+    let Some(setup_idx) = prev_sig_idx(init_idx) else {
+        return false;
+    };
+    let want_flag = (!lp.flag_in_phis).then_some(lp.flag.0);
+    let Some((delegate, iter, next, prefix)) =
+        ys_match_setup_with_flag(&nodes[setup_idx], async_, uses, want_flag)
+    else {
         ys_trace("setup");
         return false;
     };
-    if ys_match_init(&nodes[i - 1], &lp, iter, next).is_none() {
+    if ys_match_init(&nodes[init_idx], &lp, iter, next).is_none() {
         ys_trace("init");
         return false;
     }
+    let kept_honest: Vec<SNode> = nodes[setup_idx + 1..i]
+        .iter()
+        .filter(|n| matches!(n, SNode::Honest(_)))
+        .cloned()
+        .collect();
     if !async_ && !lp.in_loop_exit {
         // The sync completion dispatch must be the next sibling.
         let Some(res) = ys_sync_res(&nodes[i]) else {
@@ -2087,17 +2383,19 @@ pub(in crate::folds) fn ys_apply_bare(
         if !prefix.is_empty() {
             new.push(SNode::Stmts(prefix));
         }
+        new.extend(kept_honest);
         new.push(ys_stmt(&lp, delegate));
         new.extend(lp.continuation);
-        nodes.splice(i - 2..i + 2, new);
+        nodes.splice(setup_idx..i + 2, new);
     } else {
         let mut new: Vec<SNode> = Vec::new();
         if !prefix.is_empty() {
             new.push(SNode::Stmts(prefix));
         }
+        new.extend(kept_honest);
         new.push(ys_stmt(&lp, delegate));
         new.extend(lp.continuation);
-        nodes.splice(i - 2..i + 1, new);
+        nodes.splice(setup_idx..i + 1, new);
     }
     stats.yield_star_sites += 1;
     if lp.bind.is_some() {
@@ -2198,7 +2496,9 @@ pub(in crate::folds) fn ys_apply_fragments(
     if ssig.len() < 2 {
         return false;
     }
-    let Some((delegate, iter, next, prefix)) = ys_match_setup(ssig[ssig.len() - 2], async_, uses)
+    let want_flag = (!lp.flag_in_phis).then_some(lp.flag.0);
+    let Some((delegate, iter, next, prefix)) =
+        ys_match_setup_with_flag(ssig[ssig.len() - 2], async_, uses, want_flag)
     else {
         ys_trace("frag:setup");
         return false;

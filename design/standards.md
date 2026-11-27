@@ -20,9 +20,10 @@ This document establishes the binding architectural, algorithmic, safety, and te
 ## 2. Layering & Library Purity
 
 1. **Strict One-Way Dependency Ring**:
-   - `abcd-ir` has **zero** internal workspace dependencies and **zero** container/ISA concepts (no file byte offsets, no ULEB/register width encodings, no raw pool indices).
-   - `abcd-opt` and `abcd-analysis` depend **only** on `abcd-ir` in `[dependencies]`.
-   - `abcd-taint` and `abcd-decompile` depend **only** on `abcd-ir` and `abcd-analysis` in `[dependencies]`.
+   - `abcd-isa` has **zero** internal workspace runtime dependencies (`#![forbid(unsafe_code)]`; `abcd-isa-sys` is linked solely under `[dev-dependencies]` for C++ differential oracle tests).
+   - `abcd-ir` has **zero** internal workspace dependencies and **zero** container/ISA concepts (no file byte offsets, no ULEB/register width encodings, no raw pool indices), owning canonical CFG traversal (`block_succs`, `inst_succs`, `compute_rpo`, `ExceptionHandlerMap`) and Semi-NCA `DomTree`.
+   - `abcd-opt` and `abcd-analysis` depend **only** on `abcd-ir` in `[dependencies]`; `abcd-lower` depends **only** on `abcd-ir`, `abcd-file`, and `abcd-isa` (never `abcd-analysis`).
+   - `abcd-taint` and `abcd-decompile` depend **only** on `abcd-ir` and `abcd-analysis` in `[dependencies]` (decompiler region/try structuring lives in `abcd-decompile::structure::regions`).
    - Container/bytecode crates (`abcd-file`, `abcd-isa`, `abcd-hap`) may be pulled by IR/analysis crates **only** under `[dev-dependencies]` for integration tests.
 2. **Global Allocator Isolation**:
    - Library crates (`abcd-isa*`, `abcd-file*`, `abcd-hap`, `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`) **never** declare `#[global_allocator]`.
@@ -36,10 +37,10 @@ This document establishes the binding architectural, algorithmic, safety, and te
 
 ## 3. Algorithmic Complexity, Stack Safety & Memory Discipline
 
-1. **Absolute Ban on Input-Depth Call-Stack Recursion**:
-   - Real-world obfuscated/bundled `.abc` files and `test262` fixtures exceed 500+ levels of CFG, expression, literal-array, and try/catch nesting; thread stacks on Windows, musl, and worker pools can be as small as 256 KiB–1 MiB.
-   - **Rule**: No function in any crate may recurse on call-stack depth proportional to input data (CFG traversal, dominator/region trees, AST folding/printing, literal/annotation graphs, alias/call-graph walks, or nested `.app`/`.hap` archives).
-   - Use explicit heap-allocated workstacks (`Vec<Frame>`) paired with visited/active cycle guards, backed by `256 KiB` small-stack regression tests (`std::thread::Builder::new().stack_size(256 * 1024)`).
+1. **Absolute Workspace-Wide Ban on Recursion**:
+   - Real-world obfuscated/bundled `.abc` files and `test262` fixtures exceed 500+ levels of CFG, expression, literal-array, annotation, and try/catch nesting; thread stacks on Windows, musl, and worker pools can be as small as 256 KiB–1 MiB.
+   - **Rule**: Zero direct call-stack recursion, zero mutual function-call cycles, and zero compiler-derived recursive traits (`Drop`, `Clone`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Debug`) on recursive types are permitted anywhere in `abcd-rs` (`abcd-*/src/**/*.rs`, `abcd-*-sys/bridge/**`, `vendor/shim/**`, and `scripts/*.py`).
+   - Use explicit heap-allocated workstacks (`Vec<Frame>`) paired with visited/active cycle guards, enforced statically by `[workspace.lints.rust] unconditional_recursion = "deny"` and `tests/zero_recursion_gate.rs` (iterative Tarjan SCC over intra-crate call and type-containment graphs), plus `256 KiB` small-stack regression tests (`std::thread::Builder::new().stack_size(256 * 1024)`).
 2. **Linear / Near-Linear Scaling**:
    - Commercial `--merge-abc` bundles exceed `20+ MB`, `58,000+` functions, and `94,000+` symbols.
    - **Rule**: Never scan module-wide tables (`O(|Module|)`) inside per-function, per-block, or per-instruction loops. Pre-index module tables once (`O(|Module|)`), and use dense `Vec` / flat `BitSet` storage indexed by newtype IDs (`BlockId`, `ValueId`, `InstId`, `FuncId`) on hot paths.

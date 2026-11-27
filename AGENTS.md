@@ -21,10 +21,10 @@ For binding architectural rules and historical design rulings, read:
 
 | Layer | Crates | Allowed Workspace Dependencies |
 | :--- | :--- | :--- |
-| **FFI & Container Base** | `abcd-isa-sys`, `abcd-isa`, `abcd-file-sys`, `abcd-file`, `abcd-hap` | `abcd-isa` → `abcd-isa-sys`; `abcd-file` → `abcd-file-sys`, `abcd-isa`; `abcd-hap` → *(none)* |
+| **FFI & Container Base** | `abcd-isa-sys`, `abcd-isa`, `abcd-file-sys`, `abcd-file`, `abcd-hap` | `abcd-isa` → *(none — `abcd-isa-sys` in `[dev-dependencies]` only)*; `abcd-file` → `abcd-file-sys`, `abcd-isa`; `abcd-hap` → *(none)* |
 | **Semantic SSA IR** | `abcd-ir` | *(none — zero internal workspace dependencies)* |
 | **IR Passes & Analysis** | `abcd-opt`, `abcd-analysis`, `abcd-taint`, `abcd-decompile` | `abcd-opt`, `abcd-analysis` → `abcd-ir`; `abcd-taint`, `abcd-decompile` → `abcd-ir`, `abcd-analysis` |
-| **Format Converters** | `abcd-lift`, `abcd-lower` | `abcd-lift` → `abcd-file`, `abcd-ir`, `abcd-isa`; `abcd-lower` → `abcd-ir`, `abcd-analysis`, `abcd-file`, `abcd-isa` |
+| **Format Converters** | `abcd-lift`, `abcd-lower` | `abcd-lift` → `abcd-file`, `abcd-ir`, `abcd-isa`; `abcd-lower` → `abcd-ir`, `abcd-file`, `abcd-isa` |
 | **CLI & Integration** | `abcd-cli`, root `abcd-rs` (`tests/*`) | Top-level consumers; `abcd-cli` is the **only** crate permitted to set `#[global_allocator]` |
 
 ### Multi-Agent Coordination Rule
@@ -35,7 +35,7 @@ For binding architectural rules and historical design rulings, read:
 
 ## 3. Mandatory Engineering Invariants
 
-1. **Zero Input-Depth Recursion**: Never write call-stack recursion bounded by input size or nesting depth (CFG/dominator/region walks, AST folds/printers, literal/annotation graphs, call/alias chains, nested containers). Always use explicit heap workstacks with cycle guards and `256 KiB`-stack regression tests.
+1. **Absolute Ban on Recursion (Zero Direct, Mutual, or Derived-Trait Recursion)**: Never write direct call-stack recursion, mutual function-call cycles, or compiler-derived recursive traits (`Drop`, `Clone`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Debug`) on recursive types anywhere in `abcd-rs` (Rust crates, C/C++ bridges/shims, and `scripts/*.py`). Always use explicit heap workstacks with cycle guards, enforced by `unconditional_recursion = "deny"`, `tests/zero_recursion_gate.rs`, and `256 KiB`-stack regression tests.
 2. **Bit-Exact Determinism (`N20`)**: Never iterate `HashMap` or `HashSet` directly to assign IDs, emit bytecodes/constants/relocations, or order reports. Use dense index order, bitsets, insertion-ordered tables, or explicit sorting.
 3. **Error Honesty & Zero Panics**:
    - Non-test library code enforces `#![cfg_attr(not(test), deny(clippy::unwrap_used))]`. Malformed untrusted inputs must return typed `Result::Err`, never panic or abort.

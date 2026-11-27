@@ -194,29 +194,15 @@ struct FlowToml {
     to: String,
 }
 
-/// Parse one endpoint string. Field-chain endpoints are rejected here
-/// (see the module docs): the strings a config file can carry cannot
-/// name module-interned `FieldKey::Named` symbols.
+/// Parse one endpoint string via [`abcd_taint::Endpoint::parse`]. Field-chain
+/// endpoints remain rejected in TOML because module-independent config files
+/// cannot name module-interned `FieldKey::Named` symbols.
 fn endpoint(text: &str) -> Result<Endpoint, CliError> {
-    if text == "base" {
-        return Ok(Endpoint::Base);
-    }
-    if text == "return" {
-        return Ok(Endpoint::Return);
-    }
-    if let Some(rest) = text.strip_prefix("param:")
-        && let Ok(i) = rest.parse::<u16>()
-    {
-        return Ok(Endpoint::Param(i));
-    }
-    if let Some(rest) = text.strip_prefix("any_param_from:")
-        && let Ok(i) = rest.parse::<u16>()
-    {
-        return Ok(Endpoint::AnyParamFrom(i));
-    }
-    Err(CliError::User(format!(
-        "invalid summary endpoint {text:?} (expected \"param:N\", \"any_param_from:N\", \"base\", or \"return\")"
-    )))
+    Endpoint::parse(text).map_err(|_| {
+        CliError::User(format!(
+            "invalid summary endpoint {text:?} (expected \"param:N\", \"any_param_from:N\", \"base\", or \"return\")"
+        ))
+    })
 }
 
 impl FlowToml {
@@ -226,7 +212,7 @@ impl FlowToml {
     fn endpoints(&self) -> Result<(Endpoint, Endpoint), CliError> {
         let from = endpoint(&self.from)?;
         let to = endpoint(&self.to)?;
-        if from == Endpoint::Return {
+        if !from.is_valid_flow_source() {
             return Err(CliError::User(format!(
                 "invalid flow {:?} -> {:?}: \"return\" is never a flow source",
                 self.from, self.to

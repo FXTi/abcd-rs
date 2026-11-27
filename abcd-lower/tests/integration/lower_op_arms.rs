@@ -713,9 +713,8 @@ fn iterator_return_emits_closeiterator() {
 
 // ── Exception arms (isel.rs:1937-1943, 1969-1971) ───────────────────────
 
-/// `Op::ThrowUndefinedIfHole` → `throw.undefinedifhole v_name, v_value`
-/// (two register operands, no acc traffic). The corpus TDZ checks always
-/// use the with-name form, so this two-register form is corpus-dark.
+/// `Op::ThrowUndefinedIfHole` → `throw.undefinedifhole v_value, v_name`
+/// (two register operands, no acc traffic; `isa.yaml` `v1 = value, v2 = name`).
 #[test]
 fn throw_undefined_if_hole_emits_two_register_form() {
     const NAME: i64 = 11;
@@ -739,7 +738,7 @@ fn throw_undefined_if_hole_emits_two_register_form() {
             name: NAME,
             value: VALUE
         },
-        "v1 = name value, v2 = checked value (bytecodes: {:?})",
+        "v1 = checked value, v2 = name value (bytecodes: {:?})",
         result.bytecodes
     );
 }
@@ -768,10 +767,11 @@ fn throw_delete_super_property_emits_vendor_opcode() {
 
 // ── Call arms (isel.rs:2176, 2286, 2288) ────────────────────────────────
 
-/// A `super(...spread)` call with an EMPTY argument list (hand-built;
-/// `select_call` falls back to `Reg(0)` when `args.is_empty()`).
+/// `CallKind::SuperSpread` requires `this = None` and 1 spread-array arg;
+/// an invalid empty-arg shape returns `LowerError::UnsupportedInstruction`
+/// instead of silently substituting `Reg(0)`.
 #[test]
-fn super_spread_with_empty_args_falls_back_to_reg0() {
+fn super_spread_validates_shape_and_lowers_spread_array() {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     {
@@ -785,13 +785,35 @@ fn super_spread_with_empty_args_falls_back_to_reg0() {
         });
         b.emit_void(Op::Return { value: Some(c) });
     }
-    let result = lower_function(&module, func).expect("supercallspread must lower");
+    assert!(
+        matches!(
+            lower_function(&module, func),
+            Err(abcd_lower::LowerError::UnsupportedInstruction { .. })
+        ),
+        "empty super-spread must return UnsupportedInstruction"
+    );
+
+    let mut module2 = Module::new();
+    let func2 = V2Builder::create_function(&mut module2, "g", FunctionKind::Function);
+    {
+        let mut b = V2Builder::new(&mut module2, func2);
+        let callee = b.create_param();
+        let arr = b.create_param();
+        let c = b.emit_val(Op::Call {
+            callee,
+            this: None,
+            args: vec![arr],
+            kind: CallKind::SuperSpread,
+        });
+        b.emit_void(Op::Return { value: Some(c) });
+    }
+    let result = lower_function(&module2, func2).expect("valid supercallspread must lower");
     assert!(
         result
             .bytecodes
             .iter()
-            .any(|bc| matches!(bc, Bytecode::Supercallspread(_, Reg(0)))),
-        "an empty super-spread encodes the dead Reg(0) operand: {:?}",
+            .any(|bc| matches!(bc, Bytecode::Supercallspread(_, Reg(1)))),
+        "expected supercallspread reading spread array in v1: {:?}",
         result.bytecodes
     );
 }
