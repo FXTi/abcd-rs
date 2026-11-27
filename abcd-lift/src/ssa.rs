@@ -624,17 +624,9 @@ impl SsaBuilder {
         }
 
         if !self.alias.is_empty() {
-            let num_regions = module.functions[func_id.index()].try_regions.len();
-            for ri in 0..num_regions {
-                let num_catches = module.functions[func_id.index()].try_regions[ri]
-                    .catches
-                    .len();
-                for ci in 0..num_catches {
-                    let old_exc =
-                        module.functions[func_id.index()].try_regions[ri].catches[ci].exception;
-                    let new_exc = self.resolve_alias(old_exc);
-                    module.functions[func_id.index()].try_regions[ri].catches[ci].exception =
-                        new_exc;
+            for region in &mut module.functions[func_id.index()].try_regions {
+                for catch in &mut region.catches {
+                    catch.exception = self.resolve_alias(catch.exception);
                 }
             }
         }
