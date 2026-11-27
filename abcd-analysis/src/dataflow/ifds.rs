@@ -843,7 +843,10 @@ impl EdgeCsr {
     #[inline]
     fn indices_at(&self, node: InstId) -> &[u32] {
         let idx = node.index();
-        let Some(&end) = self.offsets.get(idx + 1) else {
+        let Some(end_idx) = idx.checked_add(1) else {
+            return &[];
+        };
+        let Some(&end) = self.offsets.get(end_idx) else {
             return &[];
         };
         let start = self.offsets[idx];

@@ -517,6 +517,7 @@ pub fn analyze_with_links_and_roots(
     let EnvAnalysisOut {
         env_stack_at,
         env_sites,
+        const_method_refs,
         rounds: env_rounds,
         capped: env_capped,
     } = env_analysis(module, config.max_env_depth, config.step_budget, &mut steps);
@@ -580,7 +581,15 @@ pub fn analyze_with_links_and_roots(
             max_dyn_hop,
         }
     });
-    let mut engine = Pta::new(module, links, base, config, &env_stack_at, slice_init);
+    let mut engine = Pta::new(
+        module,
+        links,
+        base,
+        config,
+        &env_stack_at,
+        slice_init,
+        const_method_refs,
+    );
     engine.run(roots, &mut steps);
     let (graph, answer_slot, answer_entries, singletons, stats) =
         engine.into_solved(env_rounds, root_sliced, roots);

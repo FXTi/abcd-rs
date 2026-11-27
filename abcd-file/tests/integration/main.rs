@@ -38,6 +38,7 @@ mod module_records;
 mod nested_literal_arrays;
 mod output_version;
 mod param_annotations;
+mod pass3_reader_hardening;
 mod phase05_fixes;
 mod proto_queries;
 mod round1_regressions;

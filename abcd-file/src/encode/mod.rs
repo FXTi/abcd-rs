@@ -197,6 +197,9 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
         b.class_set_access_flags(cls_h, cls.access_flags);
         b.class_set_source_lang(cls_h, cls.source_lang);
 
+        let class_has_source_file = cls
+            .source_file
+            .is_some_and(|sf| !pool.resolve(sf).unwrap_or("").is_empty());
         if let Some(sf) = cls.source_file {
             let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, sf)?;
             b.class_set_source_file(cls_h, sh);
@@ -357,6 +360,7 @@ pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8
                         pool,
                         m_h,
                         dbg,
+                        class_has_source_file,
                         &byte_offsets,
                         code_bytes.len() as u32,
                     )?;
@@ -1395,12 +1399,17 @@ struct LnpEvent {
     kind: LnpEventKind,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "debug encoder threads builder, string pool/handles, class source_file flag, and instruction PCs"
+)]
 fn encode_debug_info(
     b: &mut Builder,
     string_handles: &mut [Option<StringHandle>],
     pool: &StringPool,
     method_h: MethodHandle,
     dbg: &MethodDebugInfo,
+    class_has_source_file: bool,
     byte_offsets: &[u32],
     code_len: u32,
 ) -> Result<(), Error> {
@@ -1419,12 +1428,18 @@ fn encode_debug_info(
     let first_line = dbg.line_table.first().map_or(0, |e| e.line);
     let debug_h = b.create_debug_info(lnp, first_line);
 
+    let mut emitted_set_file = false;
     if let Some(sf) = dbg.source_file {
         let sf_str = pool.resolve(sf).unwrap_or("");
         if !sf_str.is_empty() {
             let sh = get_or_add_string_id(b, string_handles, pool, sf)?;
             b.lnp_emit_set_file(lnp, debug_h, sh);
+            emitted_set_file = true;
         }
+    }
+    if !emitted_set_file && !class_has_source_file {
+        let empty_sh = b.add_string("");
+        b.lnp_emit_set_file(lnp, debug_h, empty_sh);
     }
     if let Some(sc) = dbg.source_code {
         let sc_str = pool.resolve(sc).unwrap_or("");
@@ -1575,7 +1590,7 @@ fn encode_debug_info(
 
     // Re-check zero-length `[pc, pc)` locals where `start_pc == end_pc < final_unclosed_pc`:
     // ensure no `EndLocal` precedes its matching `StartLocal` on an unstarted register.
-    let mut active_regs: Vec<i32> = Vec::new();
+    let mut active_regs: HashMap<i32, usize> = HashMap::new();
     let mut deferred_same_pc_ends: Vec<i32> = Vec::new();
     let mut cur_pc: u32 = 0;
     let mut prev_line: u32 = first_line;
@@ -1592,13 +1607,13 @@ fn encode_debug_info(
         for ev in &events[idx..group_end] {
             match ev.kind {
                 LnpEventKind::EndLocal { reg } => {
-                    if let Some(pos) = active_regs.iter().rposition(|&r| r == reg) {
+                    if let Some(cnt) = active_regs.get_mut(&reg).filter(|c| **c > 0) {
+                        *cnt -= 1;
                         if group_pc > cur_pc {
                             b.lnp_emit_advance_pc(lnp, debug_h, group_pc - cur_pc);
                             cur_pc = group_pc;
                         }
                         b.lnp_emit_end_local(lnp, reg);
-                        active_regs.remove(pos);
                     } else {
                         deferred_same_pc_ends.push(reg);
                     }
@@ -1630,18 +1645,18 @@ fn encode_debug_info(
                     } else {
                         b.lnp_emit_start_local(lnp, debug_h, reg, name, type_name);
                     }
-                    active_regs.push(reg);
+                    *active_regs.entry(reg).or_insert(0) += 1;
                 }
             }
         }
         for &reg in &deferred_same_pc_ends {
-            if let Some(pos) = active_regs.iter().rposition(|&r| r == reg) {
+            if let Some(cnt) = active_regs.get_mut(&reg).filter(|c| **c > 0) {
+                *cnt -= 1;
                 if group_pc > cur_pc {
                     b.lnp_emit_advance_pc(lnp, debug_h, group_pc - cur_pc);
                     cur_pc = group_pc;
                 }
                 b.lnp_emit_end_local(lnp, reg);
-                active_regs.remove(pos);
             }
         }
 

@@ -77,11 +77,27 @@ pub struct LayoutResult {
     pub ic_size: u32,
 }
 
-/// Lay out blocks and resolve jump targets.
+/// Lay out blocks and resolve jump targets from a borrowed [`IselResult`].
+///
+/// Prefer [`layout_owned`] on hot lowering paths so per-block bytecode buffers
+/// and entity traces move in-place without cloning (`#103`).
 pub fn layout(
     module: &Module,
     func_id: FuncId,
     isel: &IselResult,
+    alloc: &RegAlloc,
+    rpo: &[BlockId],
+) -> Result<LayoutResult, LowerError> {
+    layout_owned(module, func_id, isel.clone(), alloc, rpo)
+}
+
+/// Lay out blocks and resolve jump targets, consuming [`IselResult`] by value
+/// so per-block bytecode vectors move directly into the layout buffer without
+/// cloning (`#103`).
+pub fn layout_owned(
+    module: &Module,
+    func_id: FuncId,
+    mut isel: IselResult,
     alloc: &RegAlloc,
     rpo: &[BlockId],
 ) -> Result<LayoutResult, LowerError> {
@@ -161,12 +177,13 @@ pub fn layout(
         }
     }
 
-    // Step 2: Place copies on their edges, invert boolean CondBranch when
-    // `true_dest` falls through (`R3-X1`), and elide fallthrough `Jmp`s (`R3-A7`).
+    // Step 2: Move per-block bytecode buffers directly from `isel.block_codes`
+    // (`0` clones!), place copies on their edges, invert boolean CondBranch
+    // when `true_dest` falls through (`R3-X1`), and elide fallthrough `Jmp`s (`R3-A7`).
     let mut block_codes: HashMap<BlockId, Vec<Bytecode>> =
         HashMap::with_capacity(isel.block_codes.len());
-    for (bb, codes) in &isel.block_codes {
-        block_codes.insert(*bb, codes.clone());
+    for (bb, codes) in isel.block_codes {
+        block_codes.insert(bb, codes);
     }
     let mut copy_shift: HashMap<BlockId, (usize, usize)> = HashMap::new();
 
@@ -265,17 +282,34 @@ pub fn layout(
         }
     }
 
-    // Step 3: Flatten blocks in RPO order, then trampolines, recording spans & inst PCs.
-    let mut flat: Vec<Bytecode> = Vec::new();
+    // Step 3: Drain/move blocks in RPO order (`0` clones!), then trampolines,
+    // recording spans & inst PCs. Single-block functions with no trampolines
+    // reuse the entry block's `Vec<Bytecode>` allocation verbatim.
+    let single_block_reuse = rpo.len() == 1 && trampolines.is_empty();
+    let total_bytecodes: usize = if single_block_reuse {
+        0
+    } else {
+        rpo.iter()
+            .filter_map(|bb| block_codes.get(bb))
+            .map(Vec::len)
+            .sum::<usize>()
+            + trampolines.iter().map(|(_, c)| c.len()).sum::<usize>()
+    };
+    let mut flat: Vec<Bytecode> = Vec::with_capacity(total_bytecodes);
     let mut block_spans: HashMap<BlockId, (usize, usize)> = HashMap::with_capacity(rpo.len());
     let mut jump_targets: HashMap<u32, usize> =
         HashMap::with_capacity(rpo.len() + trampolines.len() + isel.internal_labels.len());
-    let mut inst_pcs: HashMap<InstId, u32> = HashMap::new();
+    let total_inst_pcs: usize = isel.block_inst_pcs.values().map(Vec::len).sum();
+    let mut inst_pcs: HashMap<InstId, u32> = HashMap::with_capacity(total_inst_pcs);
 
     for &bb in rpo {
         let start = flat.len();
-        if let Some(codes) = block_codes.get(&bb) {
-            flat.extend(codes.iter().cloned());
+        if let Some(mut codes) = block_codes.remove(&bb) {
+            if single_block_reuse && flat.is_empty() {
+                flat = codes;
+            } else {
+                flat.append(&mut codes);
+            }
         }
         let end = flat.len();
         if end == start {
@@ -288,9 +322,9 @@ pub fn layout(
         let prol_len = isel.handler_prologue_len.get(&bb).copied().unwrap_or(0);
         jump_targets.insert(bb.0, (start + prol_len).min(end - 1));
 
-        if let Some(local_pcs) = isel.block_inst_pcs.get(&bb) {
+        if let Some(local_pcs) = isel.block_inst_pcs.remove(&bb) {
             let shift = copy_shift.get(&bb).copied();
-            for &(iid, local_pc) in local_pcs {
+            for (iid, local_pc) in local_pcs {
                 let adjusted = match shift {
                     Some((insert_pos, copy_len)) if local_pc >= insert_pos => local_pc + copy_len,
                     _ => local_pc,
@@ -308,9 +342,9 @@ pub fn layout(
             jump_targets.insert(lbl, start + adjusted);
         }
     }
-    for (key, codes) in &trampolines {
+    for (key, mut codes) in trampolines {
         jump_targets.insert(key.0, flat.len());
-        flat.extend(codes.iter().cloned());
+        flat.append(&mut codes);
     }
 
     // Step 4: Resolve jump targets; unresolved labels fail loudly (R3-M3).
@@ -326,7 +360,7 @@ pub fn layout(
         try_blocks,
         inst_pcs,
         num_regs: alloc.num_regs,
-        entity_traces: isel.entity_traces.clone(),
+        entity_traces: isel.entity_traces,
         ic_size: isel.ic_size,
     })
 }

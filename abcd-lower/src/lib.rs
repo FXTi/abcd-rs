@@ -289,17 +289,17 @@ pub fn lower_function_with_options(
     let rpo = regalloc::compute_rpo(module, func_id);
 
     // Step 3: Instruction selection.
-    let isel_result =
+    let mut isel_result =
         isel::select_with_options(module, func_id, &alloc, &rpo, &suppression, options)?;
-    if let Some(message) = isel_result.unsupported.clone() {
+    if let Some(message) = isel_result.unsupported.take() {
         return Err(LowerError::UnsupportedInstruction {
             func: func_id,
             message,
         });
     }
 
-    // Step 4: Layout and jump resolution.
-    layout::layout(module, func_id, &isel_result, &alloc, &rpo)
+    // Step 4: Layout and jump resolution (consumes `isel_result` in-place).
+    layout::layout_owned(module, func_id, isel_result, &alloc, &rpo)
 }
 
 #[cfg(test)]

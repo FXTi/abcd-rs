@@ -279,7 +279,26 @@ impl<'m> TaintProblem<'m> {
             tried.push(n.clone());
         }
         let class = match found {
-            Some((name, exclusive)) => SiteClass::Summary { name, exclusive },
+            Some((name, exclusive)) => {
+                let effective_exclusive = if has_body {
+                    exclusive
+                        && !self.call_resolution_incomplete(call)
+                        && callees.iter().all(|&f| {
+                            callees.len() == 1
+                                || self
+                                    .module
+                                    .func(f)
+                                    .and_then(|fd| self.module.sym.resolve(fd.name))
+                                    == Some(name.as_str())
+                        })
+                } else {
+                    exclusive
+                };
+                SiteClass::Summary {
+                    name,
+                    exclusive: effective_exclusive,
+                }
+            }
             None => {
                 if has_body {
                     SiteClass::BodyStep
@@ -300,6 +319,28 @@ impl<'m> TaintProblem<'m> {
             }
         };
         (class, tried)
+    }
+
+    /// Whether a concrete body `callee` at `call` is suppressed by an `exclusive`
+    /// user summary (either site-wide when all targets are covered, or specifically
+    /// for `callee` when `callee`'s own function name matches the winning summary).
+    pub(super) fn suppress_body_for_exclusive_summary(&self, call: InstId, callee: FuncId) -> bool {
+        let SiteClass::Summary { name, exclusive } = self.classify(call) else {
+            return false;
+        };
+        if exclusive {
+            return true;
+        }
+        let argc = match self.module.inst(call).map(|i| &i.op) {
+            Some(Op::Call { args, .. }) => args.len(),
+            _ => return false,
+        };
+        self.module
+            .func(callee)
+            .and_then(|fd| self.module.sym.resolve(fd.name))
+            == Some(name.as_str())
+            && !self.registry.is_builtin_hit(&name, argc)
+            && self.registry.peek(&name, argc).is_some_and(|s| s.exclusive)
     }
 
     /// Prototype-resolution path: `recv.m(...)` → the
@@ -408,11 +449,6 @@ impl<'m> TaintProblem<'m> {
             None | Some(ValueDef::Param(_) | ValueDef::Const(_)) => return true,
             Some(ValueDef::Inst(_) | ValueDef::ExceptionParam(_)) => {}
         }
-        let idx = v.index();
-        let cached = self.value_keep_flag.borrow().get(idx).copied().unwrap_or(0);
-        if cached == 1 {
-            return false;
-        }
         let func_idx = fid.index();
         let has_func_entry = self
             .func_alias_loads
@@ -427,6 +463,25 @@ impl<'m> TaintProblem<'m> {
             if let Some(slot) = self.func_alias_loads.borrow_mut().get_mut(func_idx) {
                 *slot = Some(Box::new(built));
             }
+        }
+        let root = crate::names::peel_movs_fast(self.module, v);
+        {
+            let fal_borrow = self.func_alias_loads.borrow();
+            let Some(Some(fal)) = fal_borrow.get(func_idx) else {
+                return true;
+            };
+            if let Some(group) = fal.mov_group(root) {
+                if self.liveness.any_live_at_loc(fid, loc, group) {
+                    return true;
+                }
+            } else if root != v && self.liveness.any_live_at_loc(fid, loc, &[root]) {
+                return true;
+            }
+        }
+        let idx = v.index();
+        let cached = self.value_keep_flag.borrow().get(idx).copied().unwrap_or(0);
+        if cached == 1 {
+            return false;
         }
         if cached == 2
             && let Some(entry) = self.value_alias_loads.borrow().get(&v)
@@ -600,9 +655,7 @@ impl<'m> TaintProblem<'m> {
 
     #[inline]
     pub(super) fn suppress_empty_heap_wildcard(&self) -> bool {
-        !self.in_path_replay
-            && matches!(*self.oracle.borrow(), Oracle::Rung2(..))
-            && self.links.has_multi_record_esm()
+        false
     }
 
     pub(super) fn ensure_caller_ancestors(&self, caller: FuncId) {

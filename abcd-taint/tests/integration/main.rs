@@ -4,6 +4,7 @@ mod common;
 
 mod flow_arms;
 mod gap_names_mov_phi;
+mod issue105_regressions;
 mod issue94_remediations;
 mod mechanisms;
 mod prototype_arms;

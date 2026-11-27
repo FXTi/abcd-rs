@@ -213,10 +213,11 @@ pub const fn is_sccp_lattice_const(c: &Const) -> bool {
     )
 }
 
-/// Resolve a constant directly carried by `val` (`ValueDef::Const` or
-/// `Op::LoadConst`).
+/// Borrow a constant directly carried by `val` (`ValueDef::Const` or
+/// `Op::LoadConst`) without cloning composite literal buffers.
 #[must_use]
-pub fn const_of_value(module: &Module, val: ValueId) -> Option<Const> {
+#[inline]
+pub fn const_ref_of_value(module: &Module, val: ValueId) -> Option<&Const> {
     let cid: ConstId = match module.value(val)?.def {
         ValueDef::Const(c) => c,
         ValueDef::Inst(inst) => match &module.inst(inst)?.op {
@@ -225,7 +226,14 @@ pub fn const_of_value(module: &Module, val: ValueId) -> Option<Const> {
         },
         _ => return None,
     };
-    module.consts.get(cid).cloned()
+    module.consts.get(cid)
+}
+
+/// Resolve a constant directly carried by `val` (`ValueDef::Const` or
+/// `Op::LoadConst`).
+#[must_use]
+pub fn const_of_value(module: &Module, val: ValueId) -> Option<Const> {
+    const_ref_of_value(module, val).cloned()
 }
 
 /// ECMA-262 `ToNumber` over primitive scalar constants (`Number`, `Float32`,

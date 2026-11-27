@@ -24,11 +24,11 @@ use std::sync::Arc;
 use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
 use abcd_ir::function::DebugData;
-use abcd_ir::id::{BlockId, ClassId, ConstId, FuncId, InstId, ValueId};
+use abcd_ir::id::{BlockId, ClassId, FuncId, InstId, ValueId};
 use abcd_ir::module::{EsModule, ExportDecl, ImportDecl, Module};
 use abcd_ir::op::{ModuleVarKind, Op};
 
-use crate::consts::sym_str;
+use crate::consts::{ConstMethodRefCache, sym_str};
 use crate::legalize::sanitize;
 
 /// Per-record ES module slot bindings for `--split-modules` (#26 Phase 2):
@@ -86,11 +86,14 @@ pub struct DecompileIndex {
     /// `(level, slot)` → closure bodies stored via `PutLexVar` anywhere in
     /// the module.
     pub lex_closure_stores: HashMap<(u16, u16), BTreeSet<FuncId>>,
+    /// Memoized `ConstId` → sorted `MethodRef` [`FuncId`]s (`#103` `P3-DEC-1`).
+    pub(crate) const_method_refs: ConstMethodRefCache,
 }
 
 impl DecompileIndex {
     /// Build all module-wide decompile lookup tables in one linear pass.
     pub fn build(module: &Module) -> Self {
+        let const_method_refs = ConstMethodRefCache::build(module);
         let mut parents = vec![None; module.functions.len()];
         for (fi, f) in module.functions.iter().enumerate() {
             let p = FuncId::new(fi as u32);
@@ -102,18 +105,18 @@ impl DecompileIndex {
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    for child in defined_children(module, &inst.op) {
+                    for_each_defined_child(&const_method_refs, &inst.op, |child| {
                         if child != p
                             && let Some(slot) = parents.get_mut(child.index())
                         {
                             slot.get_or_insert(p);
                         }
-                    }
+                    });
                 }
             }
         }
 
-        let seed_chains = precompute_seed_chains(module, &parents);
+        let seed_chains = precompute_seed_chains(module, &parents, &const_method_refs);
 
         let mut class_ctors = HashSet::new();
         for inst in &module.insts {
@@ -153,9 +156,10 @@ impl DecompileIndex {
             parents,
             seed_chains,
             slot_names: module_slot_names(module),
-            per_class_env: has_esm.then(|| build_per_class_module_envs(module)),
+            per_class_env: has_esm.then(|| build_per_class_module_envs(module, &const_method_refs)),
             class_ctors,
             lex_closure_stores,
+            const_method_refs,
         }
     }
 
@@ -164,7 +168,7 @@ impl DecompileIndex {
     pub fn build_split(module: &Module) -> Self {
         let mut base = Self::build(module);
         if base.per_class_env.is_none() {
-            base.per_class_env = Some(build_per_class_module_envs(module));
+            base.per_class_env = Some(build_per_class_module_envs(module, &base.const_method_refs));
         }
         base
     }
@@ -192,6 +196,7 @@ impl DecompileIndex {
 fn precompute_seed_chains(
     module: &Module,
     parents: &[Option<FuncId>],
+    method_refs: &ConstMethodRefCache,
 ) -> Vec<Option<Arc<[EnvFrame]>>> {
     let n = module.functions.len();
     let mut is_parent = vec![false; n];
@@ -230,7 +235,7 @@ fn precompute_seed_chains(
                 .get(pi)
                 .and_then(Option::as_deref)
                 .unwrap_or(&[]);
-            let scopes = NameScopes::build_seeded(module, p, seed, true);
+            let scopes = NameScopes::build_seeded(module, p, seed, Some(method_refs));
             for (child, chain) in scopes.defines {
                 let ci = child.index();
                 if ci < n && parents[ci] == Some(p) && state[ci] != 2 && !chain.is_empty() {
@@ -322,10 +327,11 @@ impl NameScopes {
         index: Option<&DecompileIndex>,
     ) -> Self {
         match index {
-            Some(idx) => Self::build_seeded(module, func_id, idx.seed_of(func_id), false),
+            Some(idx) => Self::build_seeded(module, func_id, idx.seed_of(func_id), None),
             None => {
-                let seed = Self::inherited_chain(module, func_id);
-                Self::build_seeded(module, func_id, &seed, false)
+                let method_refs = ConstMethodRefCache::build(module);
+                let seed = Self::inherited_chain(module, func_id, &method_refs);
+                Self::build_seeded(module, func_id, &seed, None)
             }
         }
     }
@@ -334,12 +340,16 @@ impl NameScopes {
     /// available: iterative ancestor collection with a cycle guard (malformed
     /// mutually nested functions degrade to no seed), walked top-down with zero
     /// call-stack recursion.
-    fn inherited_chain(module: &Module, func: FuncId) -> Arc<[EnvFrame]> {
+    fn inherited_chain(
+        module: &Module,
+        func: FuncId,
+        method_refs: &ConstMethodRefCache,
+    ) -> Arc<[EnvFrame]> {
         let mut chain: Vec<(FuncId, FuncId)> = Vec::new();
         let mut visited: HashSet<FuncId> = HashSet::new();
         visited.insert(func);
         let mut cur = func;
-        while let Some(parent) = parent_of(module, cur) {
+        while let Some(parent) = parent_of(module, method_refs, cur) {
             if !visited.insert(parent) {
                 break;
             }
@@ -348,7 +358,7 @@ impl NameScopes {
         }
         let mut seed: Arc<[EnvFrame]> = Arc::from([]);
         for &(child, parent) in chain.iter().rev() {
-            let mut scopes = Self::build_seeded(module, parent, &seed, true);
+            let mut scopes = Self::build_seeded(module, parent, &seed, Some(method_refs));
             seed = scopes
                 .defines
                 .remove(&child)
@@ -363,7 +373,7 @@ impl NameScopes {
         module: &Module,
         func_id: FuncId,
         seed: &[EnvFrame],
-        record_defines: bool,
+        record_defines: Option<&ConstMethodRefCache>,
     ) -> Self {
         let seed_len = seed.len();
         let mut scopes = NameScopes {
@@ -440,61 +450,33 @@ fn common_prefix(a: &[Arc<EnvFrame>], b: &[Arc<EnvFrame>]) -> Vec<Arc<EnvFrame>>
     a[..n].to_vec()
 }
 
-/// The functions a define op gives a captured environment to:
+/// Invoke `f` for every [`FuncId`] to which `op` gives a captured environment:
 /// `DefineFunc`'s body, class ctors + member-buffer `MethodRef`s, and
 /// object-shape `MethodRef`s (all emitted inline at the site, so their
-/// captured chain is the site's env stack).
-fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
-    fn method_refs(module: &Module, root_cid: ConstId, out: &mut Vec<FuncId>) {
-        let mut visited: HashSet<ConstId> = HashSet::new();
-        if !visited.insert(root_cid) {
-            return;
-        }
-        let mut stack: Vec<ConstId> = vec![root_cid];
-        while let Some(cid) = stack.pop() {
-            let Some(c) = module.consts.get(cid) else {
-                continue;
-            };
-            match c {
-                Const::MethodRef { func, .. } => out.push(*func),
-                Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
-                    for &item_cid in items.iter().rev() {
-                        if visited.insert(item_cid) {
-                            stack.push(item_cid);
-                        }
-                    }
-                }
-                Const::ObjectLiteral { keys, values } => {
-                    for &child_cid in values.iter().rev().chain(keys.iter().rev()) {
-                        if visited.insert(child_cid) {
-                            stack.push(child_cid);
-                        }
-                    }
-                }
-                Const::LiteralBufferRef(inner) if visited.insert(*inner) => {
-                    stack.push(*inner);
-                }
-                _ => {}
+/// captured chain is the site's env stack), resolved in `O(1)` via `method_refs`.
+#[inline]
+fn for_each_defined_child(method_refs: &ConstMethodRefCache, op: &Op, mut f: impl FnMut(FuncId)) {
+    match op {
+        Op::DefineFunc { body, .. } => f(*body),
+        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+            f(cls.ctor);
+            for &m in method_refs.get(cls.members) {
+                f(m);
             }
         }
-    }
-    let mut out = Vec::new();
-    match op {
-        Op::DefineFunc { body, .. } => out.push(*body),
-        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
-            out.push(cls.ctor);
-            method_refs(module, cls.members, &mut out);
+        Op::AllocObject { shape } => {
+            for &m in method_refs.get(*shape) {
+                f(m);
+            }
         }
-        Op::AllocObject { shape } => method_refs(module, *shape, &mut out),
         _ => {}
     }
-    out
 }
 
 /// The first function (in module order) whose body defines `func`
 /// (its capture parent). `None` for the entry and for functions whose
 /// define site is unreachable/absent — they get no seed.
-fn parent_of(module: &Module, func: FuncId) -> Option<FuncId> {
+fn parent_of(module: &Module, method_refs: &ConstMethodRefCache, func: FuncId) -> Option<FuncId> {
     for i in 0..module.functions.len() {
         let p = FuncId::new(i as u32);
         if p == func {
@@ -511,7 +493,13 @@ fn parent_of(module: &Module, func: FuncId) -> Option<FuncId> {
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
-                if defined_children(module, &inst.op).contains(&func) {
+                let mut found = false;
+                for_each_defined_child(method_refs, &inst.op, |child| {
+                    if child == func {
+                        found = true;
+                    }
+                });
+                if found {
                     return Some(p);
                 }
             }
@@ -534,14 +522,14 @@ fn step_inst(
     stack: &mut Vec<Arc<EnvFrame>>,
     cached_arc: &mut Option<Arc<[EnvFrame]>>,
     seed_len: usize,
-    record_defines: bool,
+    record_defines: Option<&ConstMethodRefCache>,
     op: &Op,
     iid: InstId,
     scopes: &mut NameScopes,
 ) {
     // Record the captured chain for defined children BEFORE the op's
     // own effect (define ops do not push/pop the chain).
-    if record_defines
+    if let Some(method_refs) = record_defines
         && matches!(
             op,
             Op::DefineFunc { .. }
@@ -550,7 +538,7 @@ fn step_inst(
                 | Op::AllocObject { .. }
         )
     {
-        for child in defined_children(module, op) {
+        for_each_defined_child(method_refs, op, |child| {
             scopes.defines.entry(child).or_insert_with(|| {
                 if stack.is_empty() {
                     Arc::from([])
@@ -564,7 +552,7 @@ fn step_inst(
                         .clone()
                 }
             });
-        }
+        });
     }
     match op {
         Op::NewLexEnv { num_vars, .. } => {
@@ -953,7 +941,10 @@ pub fn namespace_fallback(index: u32) -> String {
     format!("ns{index}")
 }
 
-fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModuleEnv> {
+fn build_per_class_module_envs(
+    module: &Module,
+    method_refs: &ConstMethodRefCache,
+) -> HashMap<ClassId, RecordModuleEnv> {
     let mut out = HashMap::with_capacity(module.classes.len());
     let any_class_has_esm = module.classes.iter().any(|c| c.es_module.is_some());
     let standalone_esm = if !module.imports.is_empty()
@@ -1041,9 +1032,9 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    for child in defined_children(module, &inst.op) {
+                    for_each_defined_child(method_refs, &inst.op, |child| {
                         inner_defined_fns.insert(child);
-                    }
+                    });
                     inspect_op(&inst.op, is_main_fn);
                 }
             }
@@ -1064,6 +1055,14 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
         }
 
         if let Some(esm) = esm {
+            let mut req_slots_by_spec: HashMap<abcd_ir::Sym, Vec<u32>> =
+                HashMap::with_capacity(esm.module_requests.len());
+            for (ridx, req) in esm.module_requests.iter().enumerate() {
+                req_slots_by_spec
+                    .entry(req.specifier)
+                    .or_default()
+                    .push(ridx as u32);
+            }
             let mut imp_legal = crate::legalize::Legalizer::new();
             let mut ext_idx = 0u32;
             for imp in &esm.imports {
@@ -1084,16 +1083,13 @@ fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModule
                         let local = imp_legal.mint_avoiding(&raw, &module_top_bindings);
                         taken.insert(local.clone());
                         env.import_locals.push(local.clone());
-                        let mut matched_req = false;
-                        for (ridx, req) in esm.module_requests.iter().enumerate() {
-                            if req.specifier == *module_request {
-                                env.namespace_slots.insert(ridx as u32, local.clone());
-                                matched_req = true;
+                        if let Some(rindices) = req_slots_by_spec.get(module_request) {
+                            for &ridx in rindices {
+                                env.namespace_slots.insert(ridx, local.clone());
                             }
-                        }
-                        // Synthetic IR modules that populate `imports` without
-                        // `module_requests` still bind slot 0 when unambiguous.
-                        if !matched_req && esm.module_requests.is_empty() {
+                        } else if esm.module_requests.is_empty() {
+                            // Synthetic IR modules that populate `imports` without
+                            // `module_requests` still bind slot 0 when unambiguous.
                             env.namespace_slots.entry(0).or_insert(local);
                         }
                     }

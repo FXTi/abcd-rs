@@ -19,8 +19,8 @@ use abcd_ir::{BlockId, Const, FuncId, InstId, Module, Op};
 
 use crate::FuncPass;
 use crate::const_eval::{
-    block_phis, const_of_value, eval_binary_op, eval_compare_op, eval_truthiness, eval_unary_op,
-    fold_cond_branch_to_jump, has_static_ty,
+    block_phis, const_ref_of_value, eval_binary_op, eval_compare_op, eval_truthiness,
+    eval_unary_op, fold_cond_branch_to_jump, has_static_ty,
 };
 
 /// The peephole pass: local constant folding and branch simplification.
@@ -69,18 +69,18 @@ fn try_fold(module: &Module, inst_id: InstId) -> Option<Const> {
     inst.result?;
     match &inst.op {
         Op::BinaryOp { op, left, right } => {
-            let lc = const_of_value(module, *left)?;
-            let rc = const_of_value(module, *right)?;
-            eval_binary_op(*op, &lc, &rc)
+            let lc = const_ref_of_value(module, *left)?;
+            let rc = const_ref_of_value(module, *right)?;
+            eval_binary_op(*op, lc, rc)
         }
         Op::Compare { op, left, right } => {
-            let lc = const_of_value(module, *left)?;
-            let rc = const_of_value(module, *right)?;
-            eval_compare_op(&module.sym, *op, &lc, &rc)
+            let lc = const_ref_of_value(module, *left)?;
+            let rc = const_ref_of_value(module, *right)?;
+            eval_compare_op(&module.sym, *op, lc, rc)
         }
         Op::UnaryOp { op, operand } => {
-            let oc = const_of_value(module, *operand);
-            eval_unary_op(module, *op, *operand, oc.as_ref())
+            let oc = const_ref_of_value(module, *operand);
+            eval_unary_op(module, *op, *operand, oc)
         }
         _ => None,
     }
@@ -103,8 +103,8 @@ fn try_fold_cond_branch(module: &mut Module, entry: BlockId, bb: BlockId, inst_i
     if true_dest == false_dest {
         return fold_cond_branch_to_jump(module, bb, inst_id, true_dest, false_dest);
     }
-    let known_const = const_of_value(module, cond);
-    let Some(is_true) = eval_truthiness(module, cond, known_const.as_ref()) else {
+    let known_const = const_ref_of_value(module, cond);
+    let Some(is_true) = eval_truthiness(module, cond, known_const) else {
         return false;
     };
     let target = if is_true { true_dest } else { false_dest };

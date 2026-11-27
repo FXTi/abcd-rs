@@ -41,6 +41,9 @@ This document establishes the binding architectural, algorithmic, safety, and te
    - No library crate—and no C/C++ translation unit or shim linked into `abcd-isa-sys` or `abcd-file-sys`—may write to `stdout` or `stderr`. Only `abcd-cli` owns terminal and `--json` output streams (`0` = success, `1` = CLI/user error, `2` = input/processing error).
 4. **Single-Point IR Queries**:
    - Passes, analyses, verifiers, and emitters must query instruction semantics through canonical single-point methods on [`abcd_ir::Op`] (`operands`, `operands_mut`, `effects`, `has_result`, `is_terminator`, `arity`) rather than maintaining ad-hoc opcode match lists that silently drift when `Op` evolves.
+5. **Fix at the Canonical Owning Layer (No Downstream Shadow Workarounds)**:
+   - Every invariant, semantic recovery pass, and program-wide index must live in the lowest crate in the dependency ring that owns its domain: container decoding in `abcd-file`, bytecode-to-SSA CFG/exception lifting in `abcd-lift`, SSA/CFG/dominator queries in `abcd-ir`, general IR simplifications in `abcd-opt`, and reusable call-graph / class-hierarchy / points-to / IFDS engines in `abcd-analysis`.
+   - Downstream consumers (`abcd-taint`, `abcd-decompile`, `abcd-cli`) must **never** accumulate shadow re-implementations, local CFG repair heuristics, or ad-hoc type/alias workarounds to compensate for an upstream gap. When a downstream symptom traces to an upstream crate, fix it in the owning upstream crate (or track it as an explicit upstream issue).
 
 ---
 

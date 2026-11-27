@@ -1030,3 +1030,471 @@ fn rewrite_file_owned_and_lazy_span_base_file_are_byte_identical_across_batches(
     assert_eq!(rw_strings, owned_strings);
     assert_eq!(rw_strings, lazy_strings);
 }
+
+/// Deep shared diamond `ConstId` literal DAG (`depth = 48 >= 40`, `2^48`
+/// unmemoized paths over `O(depth)` `ConstPool` entries) lowers, relocates via
+/// `EntityResolver` / `lower_module_bodies`, and rewrites with newly
+/// synthesized outer diamond layers in `O(|ConstPool|)` time on a `256 KiB`
+/// stack, while a `depth = 48` diamond rooted over an invalid element fails
+/// instantaneously with `LowerError::UntraceableEntity` (`#103` `P3-LOWER-1`).
+#[test]
+fn deep_diamond_const_shape_dag_lowers_and_rewrites_in_linear_pool_time() {
+    let handle = std::thread::Builder::new()
+        .name("diamond-48-lit-256k".into())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            const DEPTH: usize = 48;
+
+            let mut m = Module::new();
+            let g_desc = m.sym.intern("L_GLOBAL;");
+            let mut g_cls = ClassData::new(g_desc, g_desc);
+            g_cls.modifiers = Modifiers::PUBLIC;
+            m.classes.push(g_cls);
+
+            let key_a = m.sym.intern("left");
+            let key_b = m.sym.intern("right");
+            let c_ka = m.consts.intern(Const::String(key_a));
+            let c_kb = m.consts.intern(Const::String(key_b));
+            let c_leaf = m.consts.intern(Const::Int32(1337));
+
+            // Level 0..=DEPTH diamond DAG alternating `ArrayLiteral([cur, cur])`
+            // and `ObjectLiteral { keys: [left, right], values: [cur, cur] }`.
+            // Total paths from `cur` to `c_leaf` = `2^49 > 5.6e14`, while
+            // `ConstPool` holds only `DEPTH + 4` constants!
+            let mut cur = m.consts.push_array(vec![c_leaf, c_leaf]);
+            for lvl in 0..DEPTH {
+                cur = if lvl % 2 == 0 {
+                    m.consts.push_object(vec![c_ka, c_kb], vec![cur, cur])
+                } else {
+                    m.consts.push_array(vec![cur, cur])
+                };
+            }
+            let base_root = cur;
+
+            // Multiple functions referencing `base_root` repeatedly.
+            for fi in 0..4usize {
+                let fname = m.sym.intern(&format!("diamond_fn_{fi}"));
+                let fid = FuncId::new(m.functions.len() as u32);
+                let bb = abcd_ir::BlockId::new(m.blocks.len() as u32);
+                m.blocks.push(Block::default());
+                let mut fdata = FunctionData::new(ClassId::new(0), fname, IrFunctionKind::Function);
+                fdata.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+                fdata.blocks.push(bb);
+                m.classes[0].methods.push(fid);
+
+                let mut last_val = None;
+                for _ in 0..3 {
+                    let vid = ValueId::new(m.values.len() as u32);
+                    let iid = InstId::new(m.insts.len() as u32);
+                    m.values.push(Value {
+                        def: ValueDef::Inst(iid),
+                        ty: Ty::Any,
+                    });
+                    m.insts.push(Inst {
+                        op: Op::AllocArray {
+                            shape: Some(base_root),
+                        },
+                        result: Some(vid),
+                        block: bb,
+                        loc: None,
+                    });
+                    m.blocks[bb.index()].insts.push(iid);
+                    last_val = Some(vid);
+                }
+                let ret_iid = InstId::new(m.insts.len() as u32);
+                m.insts.push(Inst {
+                    op: Op::Return { value: last_val },
+                    result: None,
+                    block: bb,
+                    loc: None,
+                });
+                m.blocks[bb.index()].insts.push(ret_iid);
+                m.functions.push(fdata);
+            }
+            assert!(verify_module(&m).is_ok());
+
+            // 1. Standalone `lower_module` materializes exactly `DEPTH + 1` literal arrays.
+            let base_file =
+                lower_module(&m, Version::new(12, 0, 6, 0)).expect("lower_module diamond 48");
+            assert_eq!(base_file.literal_arrays.len(), DEPTH + 1);
+            let encoded = abcd_file::encode(&base_file).expect("encode diamond 48");
+            let decoded = abcd_file::decode(&encoded).expect("decode diamond 48");
+
+            // 2. `EntityResolver` & `lower_module_bodies` resolve every `ConstId` in `O(1)`.
+            let resolver = crate::method_body::EntityResolver::new(&m, &decoded);
+            assert!(resolver.literal_array_idx(base_root).is_some());
+            let bodies =
+                crate::method_body::lower_module_bodies(&m, &decoded, LowerOptions::default())
+                    .expect("lower_module_bodies diamond 48");
+            assert_eq!(bodies.len(), 4);
+            assert!(bodies.iter().all(Option::is_some));
+
+            // 3. Append two NEW synthesized diamond layers `synth_1`, `synth_2`
+            //    above `base_root` and reference `synth_2` repeatedly across all
+            //    4 functions: `rewrite_file` & `rewrite_file_owned` must NOT
+            //    re-walk `base_root` on every site and must reuse `base_root`'s
+            //    existing `LiteralArrayIdx` (`+2` new literal arrays total!).
+            let synth_1 = m.consts.push_array(vec![base_root, base_root]);
+            let synth_2 = m
+                .consts
+                .push_object(vec![c_ka, c_kb], vec![synth_1, synth_1]);
+            for fi in 0..4usize {
+                let bb = m.functions[fi].blocks[0];
+                for &iid in &m.blocks[bb.index()].insts {
+                    if let Op::AllocArray { shape } = &mut m.insts[iid.index()].op {
+                        *shape = Some(synth_2);
+                    }
+                }
+            }
+            let rw_ref =
+                rewrite_file(&m, &decoded, LowerOptions::default()).expect("rewrite_file diamond");
+            let rw_owned = rewrite_file_owned(&m, decoded.clone(), LowerOptions::default())
+                .expect("rewrite_file_owned diamond");
+            assert_eq!(rw_owned.literal_arrays.len(), DEPTH + 3);
+            assert_eq!(
+                abcd_file::encode(&rw_ref).expect("enc rw_ref"),
+                abcd_file::encode(&rw_owned).expect("enc rw_owned")
+            );
+
+            // 4. Negative `depth = 48` diamond DAG rooted over an invalid JS-literal
+            //    element (`Const::Int64`) fails in `O(depth)` across all entrypoints.
+            let mut bad = Module::new();
+            let bg = bad.sym.intern("L_GLOBAL;");
+            let mut bcls = ClassData::new(bg, bg);
+            bcls.modifiers = Modifiers::PUBLIC;
+            bcls.methods.push(FuncId::new(0));
+            bad.classes.push(bcls);
+            let bad_leaf = bad.consts.push(Const::Int64(99));
+            let mut bad_cur = bad.consts.push_array(vec![bad_leaf, bad_leaf]);
+            for _ in 0..DEPTH {
+                bad_cur = bad.consts.push_array(vec![bad_cur, bad_cur]);
+            }
+            let bfn_name = bad.sym.intern("bad_fn");
+            let mut bf = FunctionData::new(ClassId::new(0), bfn_name, IrFunctionKind::Function);
+            bf.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+            let bbb = abcd_ir::BlockId::new(0);
+            bad.blocks.push(Block::default());
+            bf.blocks.push(bbb);
+            let bval = ValueId::new(0);
+            bad.values.push(Value {
+                def: ValueDef::Inst(InstId::new(0)),
+                ty: Ty::Any,
+            });
+            bad.insts.push(Inst {
+                op: Op::AllocArray {
+                    shape: Some(bad_cur),
+                },
+                result: Some(bval),
+                block: bbb,
+                loc: None,
+            });
+            bad.insts.push(Inst {
+                op: Op::Return { value: Some(bval) },
+                result: None,
+                block: bbb,
+                loc: None,
+            });
+            bad.blocks[0].insts.extend([InstId::new(0), InstId::new(1)]);
+            bad.functions.push(bf);
+
+            assert!(matches!(
+                lower_module(&bad, Version::new(12, 0, 6, 0)),
+                Err(LowerError::UntraceableEntity {
+                    kind: EntityKind::LiteralarrayId,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                rewrite_file_owned(&bad, decoded.clone(), LowerOptions::default()),
+                Err(LowerError::UntraceableEntity {
+                    kind: EntityKind::LiteralarrayId,
+                    ..
+                })
+            ));
+            let bad_resolver = crate::method_body::EntityResolver::new(&bad, &decoded);
+            assert_eq!(bad_resolver.literal_array_idx(bad_cur), None);
+        })
+        .expect("spawn 256 KiB thread");
+    handle
+        .join()
+        .expect("depth-48 diamond ConstId DAG must lower in O(|ConstPool|) on 256 KiB stack");
+}
+
+/// `rewrite_file` / `rewrite_file_owned` pre-index existing class fields by
+/// `StringId` (`O(1)` lookup per field, `#103` `P3-LOWER-1`), preserving
+/// pre-existing field positions, initializers, and annotations across hundreds
+/// of fields while appending newly synthesized fields in deterministic order
+/// and remapping shifted `FieldIdx` annotation handles.
+#[test]
+fn rewrite_file_multi_field_class_merging_preserves_order_annotations_and_remaps() {
+    const EXISTING_COUNT: usize = 160;
+    const SYNTH_COUNT: usize = 160;
+
+    let mut strings = StringPool::new();
+    // Pre-intern `L_AAA;` before `LTarget;` so synthesizing `L_AAA;` with 3
+    // fields shifts every `FieldIdx` in `LTarget;` by `+3`.
+    let aaa_sid = strings.get_or_intern("L_AAA;");
+    let target_sid = strings.get_or_intern("LTarget;");
+    let ann_sid = strings.get_or_intern("LFieldAnn;");
+    let elem_sid = strings.get_or_intern("ref");
+    let fn_sid = strings.get_or_intern("func_main_0");
+
+    let mut existing_fields = Vec::with_capacity(EXISTING_COUNT);
+    for i in 0..EXISTING_COUNT {
+        let f_sid = strings.get_or_intern(format!("existing_{i}"));
+        existing_fields.push(Field {
+            name: f_sid,
+            offset: 0,
+            field_type: Type::I32,
+            access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(FieldValue::I32(i as i32)),
+            annotations: Annotations {
+                compile_time: vec![Annotation {
+                    class_descriptor: ann_sid,
+                    elements: vec![AnnotationElem {
+                        name: elem_sid,
+                        value: AnnotationValue::U32(10_000 + i as u32),
+                    }],
+                }],
+                runtime: Vec::new(),
+                compile_time_type: Vec::new(),
+                runtime_type: Vec::new(),
+            },
+        });
+    }
+    let tracked_existing_idx = 120usize;
+    let tracked_existing_name = existing_fields[tracked_existing_idx].name;
+
+    let mut classes = BTreeMap::new();
+    classes.insert(
+        ann_sid,
+        Class {
+            descriptor: ann_sid,
+            name: ann_sid,
+            access_flags: AccessFlags::PUBLIC | AccessFlags::ANNOTATION,
+            source_lang: FileSourceLang::EcmaScript,
+            source_file: None,
+            is_external: true,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            annotations: Annotations::default(),
+        },
+    );
+    classes.insert(
+        target_sid,
+        Class {
+            descriptor: target_sid,
+            name: target_sid,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: FileSourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: vec![Method {
+                name: fn_sid,
+                offset: 0,
+                access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+                function_kind: FileFunctionKind::Function,
+                source_lang: FileSourceLang::EcmaScript,
+                is_external: false,
+                return_type: Some(Type::Tagged),
+                arg_types: Vec::new(),
+                body: Some(MethodBody {
+                    num_vregs: 0,
+                    num_args: 0,
+                    code: MethodCode::Decoded(vec![abcd_isa::Bytecode::Returnundefined]),
+                    entities: abcd_file::MethodEntities::new(),
+                    try_blocks: Vec::new(),
+                    ic_size: None,
+                }),
+                annotations: Annotations {
+                    compile_time: vec![Annotation {
+                        class_descriptor: ann_sid,
+                        elements: vec![AnnotationElem {
+                            name: elem_sid,
+                            value: AnnotationValue::Enum {
+                                name: tracked_existing_name,
+                                field: Some(FieldIdx(tracked_existing_idx as u32)),
+                                offset: 0,
+                            },
+                        }],
+                    }],
+                    runtime: Vec::new(),
+                    compile_time_type: Vec::new(),
+                    runtime_type: Vec::new(),
+                },
+                param_annotations: ParamAnnotations::default(),
+                debug: None,
+            }],
+            fields: existing_fields,
+            annotations: Annotations::default(),
+        },
+    );
+
+    let base_file = File {
+        version: Version::new(12, 0, 6, 0),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings,
+        classes,
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    // Build IR `Module`:
+    // - Class 0: `LTarget;` merging all 160 existing fields (in reverse order!)
+    //   interleaved with 160 newly synthesized fields (with annotations) +
+    //   a duplicate reference to `synth_0`.
+    // - Class 1: `L_AAA;` (synthesized earlier-sorting class with 3 fields).
+    // - Class 2: `LFieldAnn;` (annotation class).
+    let mut m = Module::new();
+    let t_sym = m.sym.intern("LTarget;");
+    let a_sym = m.sym.intern("L_AAA;");
+    let ann_sym = m.sym.intern("LFieldAnn;");
+    let elem_sym = m.sym.intern("ref");
+    let fn_sym = m.sym.intern("func_main_0");
+
+    let mut t_cls = ClassData::new(t_sym, t_sym);
+    t_cls.modifiers = Modifiers::PUBLIC;
+    t_cls.methods.push(FuncId::new(0));
+
+    let ann_cid = ClassId::new(2);
+    for i in 0..EXISTING_COUNT {
+        // Reverse order for existing fields so `field_map` exercises random-access lookup.
+        let rev = EXISTING_COUNT - 1 - i;
+        let ex_sym = m.sym.intern(&format!("existing_{rev}"));
+        t_cls.fields.push(FieldData {
+            name: ex_sym,
+            ty: Ty::Static(StaticTy::I32),
+            modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+            initial_value: Some(m.consts.intern(Const::Int32(999_999))),
+            annotations: Vec::new(),
+        });
+
+        let sy_sym = m.sym.intern(&format!("synth_{i}"));
+        let sy_val = m.consts.intern(Const::Int32(50_000 + i as u32));
+        t_cls.fields.push(FieldData {
+            name: sy_sym,
+            ty: Ty::Static(StaticTy::I32),
+            modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+            initial_value: Some(sy_val),
+            annotations: vec![abcd_ir::Annotation {
+                class: ann_cid,
+                elements: vec![(elem_sym, AnnValue::Const(sy_val))],
+            }],
+        });
+    }
+    // Duplicate synthesized field entry must map to the first-inserted `synth_0`
+    // slot without appending a second duplicate `Field` in `out.classes`.
+    let dup_sym = m.sym.intern("synth_0");
+    t_cls.fields.push(FieldData {
+        name: dup_sym,
+        ty: Ty::Static(StaticTy::I32),
+        modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+        initial_value: None,
+        annotations: Vec::new(),
+    });
+    m.classes.push(t_cls);
+
+    let mut a_cls = ClassData::new(a_sym, a_sym);
+    a_cls.modifiers = Modifiers::PUBLIC;
+    for k in 0..3usize {
+        let af_sym = m.sym.intern(&format!("aaa_field_{k}"));
+        a_cls.fields.push(FieldData {
+            name: af_sym,
+            ty: Ty::Static(StaticTy::I32),
+            modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+            initial_value: Some(m.consts.intern(Const::Int32(k as u32))),
+            annotations: Vec::new(),
+        });
+    }
+    m.classes.push(a_cls);
+
+    let mut ann_cls = ClassData::new(ann_sym, ann_sym);
+    ann_cls.modifiers = Modifiers::PUBLIC.union(Modifiers::ANNOTATION);
+    m.classes.push(ann_cls);
+
+    let mut f0 = FunctionData::new(ClassId::new(0), fn_sym, IrFunctionKind::Function);
+    f0.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+    let b0 = abcd_ir::BlockId::new(0);
+    m.blocks.push(Block::default());
+    f0.blocks.push(b0);
+    m.insts.push(Inst {
+        op: Op::Return { value: None },
+        result: None,
+        block: b0,
+        loc: None,
+    });
+    m.blocks[0].insts.push(InstId::new(0));
+    m.functions.push(f0);
+
+    let rw_ref = rewrite_file(&m, &base_file, LowerOptions::default()).expect("rewrite_file");
+    let rw_owned =
+        rewrite_file_owned(&m, base_file, LowerOptions::default()).expect("rewrite_file_owned");
+
+    let enc_ref = abcd_file::encode(&rw_ref).expect("encode rw_ref");
+    let enc_owned = abcd_file::encode(&rw_owned).expect("encode rw_owned");
+    assert_eq!(enc_ref, enc_owned);
+
+    let out_aaa = &rw_owned.classes[&aaa_sid];
+    assert_eq!(out_aaa.fields.len(), 3);
+
+    let out_target = &rw_owned.classes[&target_sid];
+    assert_eq!(out_target.fields.len(), EXISTING_COUNT + SYNTH_COUNT);
+
+    // Existing fields `0..EXISTING_COUNT` retained exact original order,
+    // initial values (`i`), and base annotations (`10_000 + i`).
+    for i in 0..EXISTING_COUNT {
+        let f = &out_target.fields[i];
+        assert_eq!(
+            rw_owned.strings.as_str(f.name),
+            Some(format!("existing_{i}").as_str())
+        );
+        assert_eq!(f.initial_value, Some(FieldValue::I32(i as i32)));
+        assert_eq!(
+            f.annotations.compile_time[0].elements[0].value,
+            AnnotationValue::U32(10_000 + i as u32)
+        );
+    }
+
+    // Synthesized fields `EXISTING_COUNT..EXISTING_COUNT + SYNTH_COUNT` appended
+    // in exact declaration order with synthesized initializers and annotations.
+    for i in 0..SYNTH_COUNT {
+        let f = &out_target.fields[EXISTING_COUNT + i];
+        assert_eq!(
+            rw_owned.strings.as_str(f.name),
+            Some(format!("synth_{i}").as_str())
+        );
+        assert_eq!(
+            f.initial_value,
+            Some(FieldValue::I32((50_000 + i as u32) as i32))
+        );
+        assert_eq!(
+            f.annotations.compile_time[0].elements[0].value,
+            AnnotationValue::U32(50_000 + i as u32)
+        );
+    }
+
+    // Pre-existing `FieldIdx(120)` in `func_main_0`'s annotation shifted by `+3`
+    // because `L_AAA;` (`StringId(0) < target_sid`) inserted 3 fields ahead of `LTarget;`.
+    assert_eq!(
+        out_target.methods[0].annotations.compile_time[0].elements[0].value,
+        AnnotationValue::Enum {
+            name: tracked_existing_name,
+            field: Some(FieldIdx((tracked_existing_idx + 3) as u32)),
+            offset: 0,
+        }
+    );
+
+    let decoded = abcd_file::decode(&enc_owned).expect("decode multi-field rewritten file");
+    let dec_t_sid = decoded.strings.get("LTarget;").unwrap();
+    assert_eq!(
+        decoded.classes[&dec_t_sid].fields.len(),
+        EXISTING_COUNT + SYNTH_COUNT
+    );
+}

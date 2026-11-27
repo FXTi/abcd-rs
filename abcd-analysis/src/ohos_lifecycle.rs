@@ -700,6 +700,26 @@ pub fn discover_components(
         // methods (`proto.onCreate = ...`, `proto.initialRender = ...`) join
         // the component's method table.
         let mut class_defs: Vec<(ValueId, FuncId, Option<ValueId>, ConstId)> = Vec::new();
+        let mut class_def_vals: std::collections::HashSet<ValueId> =
+            std::collections::HashSet::new();
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(Inst {
+                    op: Op::DefineClass(cls) | Op::DefineSendableClass(cls),
+                    result: Some(res),
+                    ..
+                }) = module.inst(iid)
+                {
+                    class_defs.push((*res, cls.ctor, cls.heritage, cls.members));
+                    class_def_vals.insert(*res);
+                }
+            }
+        }
+        if class_defs.is_empty() {
+            continue;
+        }
+
         let mut proto_to_cls: BTreeMap<ValueId, ValueId> = BTreeMap::new();
         let mut extra_methods: BTreeMap<ValueId, Vec<(String, FuncId)>> = BTreeMap::new();
 
@@ -710,14 +730,9 @@ pub fn discover_components(
                     continue;
                 };
                 match &inst.op {
-                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
-                        if let Some(res) = inst.result {
-                            class_defs.push((res, cls.ctor, cls.heritage, cls.members));
-                        }
-                    }
                     Op::LoadProp { object, name } if sym_str(module, *name) == "prototype" => {
                         let root = peel_mov(module, *object);
-                        if class_defs.iter().any(|(cv, _, _, _)| *cv == root)
+                        if class_def_vals.contains(&root)
                             && let Some(res) = inst.result
                         {
                             proto_to_cls.insert(res, root);
@@ -733,7 +748,7 @@ pub fn discover_components(
                         name,
                         value,
                         ..
-                    } => {
+                    } if !proto_to_cls.is_empty() => {
                         let root_obj = peel_mov(module, *object);
                         if let Some(&cls_val) = proto_to_cls.get(&root_obj)
                             && let Some(mfid) = peel_closure_func(module, *value)
@@ -749,7 +764,7 @@ pub fn discover_components(
                     }
                     Op::DefineMethod {
                         object, name, func, ..
-                    } => {
+                    } if !proto_to_cls.is_empty() => {
                         let root_obj = peel_mov(module, *object);
                         if let Some(&cls_val) = proto_to_cls.get(&root_obj)
                             && let Some(mfid) = peel_closure_func(module, *func)

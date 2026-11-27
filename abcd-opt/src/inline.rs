@@ -25,10 +25,13 @@
 //!   inline-cache capacities as well as [`InlinePolicy`] instruction caps.
 //! - **Linear call-site pre-indexing & batched substitution**: candidate sites
 //!   and caller IC counts are collected in a single pre-pass per caller, callee
-//!   summaries are memoized once per [`FuncId`], and call-result replacements +
-//!   `DebugData` pruning apply in one linear pass per modified caller.
+//!   summaries and `ConstPool` `MethodRef` DAGs are memoized across the module
+//!   (evicting modified callers on splice, `#103`), and call-result
+//!   replacements + `DebugData` pruning apply in one linear pass per modified
+//!   caller.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use abcd_ir::{
     BlockId, CallKind, Const, ConstId, Dialect, Edge, EdgeKind, FrameSlots, FuncId, FunctionKind,
@@ -189,6 +192,8 @@ struct CalleeSummary {
 /// Module-wide caches shared across one [`inline_module`] run.
 struct InlineCtx {
     undef_cid: ConstId,
+    empty_funcs: Rc<[FuncId]>,
+    const_method_refs_cache: HashMap<ConstId, Rc<[FuncId]>>,
     env_reads_cache: HashMap<FuncId, bool>,
     callee_cache: HashMap<FuncId, CalleeSummary>,
 }
@@ -198,6 +203,8 @@ pub fn inline_module(module: &mut Module, policy: &InlinePolicy) -> InlineReport
     let mut report = InlineReport::default();
     let mut ctx = InlineCtx {
         undef_cid: module.consts.intern(Const::Undefined),
+        empty_funcs: Rc::from([]),
+        const_method_refs_cache: HashMap::new(),
         env_reads_cache: HashMap::new(),
         callee_cache: HashMap::new(),
     };
@@ -419,6 +426,8 @@ fn inline_func(
             replace_uses_map_in_func(module, caller, &call_result_subst);
         }
         let _ = prune_func_debug_data(module, caller);
+        ctx.callee_cache.remove(&caller);
+        ctx.env_reads_cache.remove(&caller);
     }
 }
 
@@ -487,36 +496,233 @@ fn resolve_closure_operand_func(module: &Module, start: ValueId) -> Option<FuncI
     None
 }
 
-/// Iteratively walk a [`ConstId`] tree (`ArrayLiteral`, `TypedArrayLiteral`,
-/// `ObjectLiteral`, `LiteralBufferRef`) and push every reachable
-/// [`Const::MethodRef`]'s [`FuncId`] into `out_funcs`.
+#[inline]
+const fn is_composite_const(konst: &Const) -> bool {
+    matches!(
+        konst,
+        Const::LiteralBufferRef(_)
+            | Const::ArrayLiteral(_)
+            | Const::TypedArrayLiteral { .. }
+            | Const::ObjectLiteral { .. }
+    )
+}
+
+fn push_composite_const_children(konst: &Const, out: &mut Vec<ConstId>) {
+    match konst {
+        Const::LiteralBufferRef(inner) => out.push(*inner),
+        Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+            out.extend_from_slice(items);
+        }
+        Const::ObjectLiteral { keys, values } => {
+            out.extend_from_slice(keys);
+            out.extend_from_slice(values);
+        }
+        _ => {}
+    }
+}
+
+/// Iteratively evaluate and memoize every [`Const::MethodRef`] [`FuncId`]
+/// reachable from `root_cid` (`ArrayLiteral`, `TypedArrayLiteral`,
+/// `ObjectLiteral`, `LiteralBufferRef`) across the module (`#103`).
+///
+/// Scalar constants return in `O(1)` without touching any hash table or heap
+/// allocation; composite literal DAGs are evaluated once in iterative
+/// post-order (`O(|ConstPool|)` total across the module), with a cycle-safe
+/// fallback for malformed cyclic `ConstPool` inputs.
 fn collect_method_refs_from_const(
     module: &Module,
     root_cid: ConstId,
-    visited_consts: &mut HashSet<ConstId>,
+    ctx: &mut InlineCtx,
+    local_seen_consts: &mut HashSet<ConstId>,
     out_funcs: &mut Vec<FuncId>,
 ) {
-    let mut worklist = vec![root_cid];
+    let Some(root_konst) = module.consts.get(root_cid) else {
+        return;
+    };
+    match root_konst {
+        Const::MethodRef { func, .. } => {
+            if local_seen_consts.insert(root_cid) {
+                out_funcs.push(*func);
+            }
+            return;
+        }
+        k if is_composite_const(k) => {}
+        _ => return,
+    }
+    if !local_seen_consts.insert(root_cid) {
+        return;
+    }
+    if let Some(cached) = ctx.const_method_refs_cache.get(&root_cid) {
+        out_funcs.extend_from_slice(cached);
+        return;
+    }
+
+    let mut stack: Vec<(ConstId, bool)> = vec![(root_cid, false)];
+    let mut in_progress: HashSet<ConstId> = HashSet::new();
+    let mut cycle_tainted: HashSet<ConstId> = HashSet::new();
+    let mut children_buf: Vec<ConstId> = Vec::new();
+
+    while let Some((cid, expanded)) = stack.pop() {
+        if ctx.const_method_refs_cache.contains_key(&cid) {
+            if expanded {
+                in_progress.remove(&cid);
+            }
+            continue;
+        }
+        if !expanded {
+            if !in_progress.insert(cid) {
+                continue;
+            }
+            stack.push((cid, true));
+            let Some(konst) = module.consts.get(cid) else {
+                continue;
+            };
+            children_buf.clear();
+            push_composite_const_children(konst, &mut children_buf);
+            for &child in children_buf.iter().rev() {
+                if ctx.const_method_refs_cache.contains_key(&child) {
+                    continue;
+                }
+                if in_progress.contains(&child) {
+                    cycle_tainted.insert(cid);
+                    continue;
+                }
+                if module.consts.get(child).is_some_and(is_composite_const) {
+                    stack.push((child, false));
+                }
+            }
+        } else {
+            in_progress.remove(&cid);
+            let Some(konst) = module.consts.get(cid) else {
+                ctx.const_method_refs_cache
+                    .insert(cid, Rc::clone(&ctx.empty_funcs));
+                continue;
+            };
+            children_buf.clear();
+            push_composite_const_children(konst, &mut children_buf);
+
+            let mut tainted = cycle_tainted.contains(&cid);
+            let mut direct_count = 0usize;
+            let mut single_child: Option<(ConstId, Rc<[FuncId]>)> = None;
+            let mut multi_child = false;
+
+            for &child in &children_buf {
+                if in_progress.contains(&child) || cycle_tainted.contains(&child) {
+                    tainted = true;
+                    break;
+                }
+                match module.consts.get(child) {
+                    Some(Const::MethodRef { .. }) => {
+                        direct_count += 1;
+                    }
+                    Some(k) if is_composite_const(k) => {
+                        if let Some(rc) = ctx.const_method_refs_cache.get(&child)
+                            && !rc.is_empty()
+                        {
+                            match &single_child {
+                                None if !multi_child => {
+                                    single_child = Some((child, Rc::clone(rc)));
+                                }
+                                Some((prev_cid, _)) if *prev_cid == child => {}
+                                _ => {
+                                    single_child = None;
+                                    multi_child = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if tainted {
+                cycle_tainted.insert(cid);
+                continue;
+            }
+
+            let resolved: Rc<[FuncId]> = if direct_count == 0 && !multi_child {
+                single_child.map_or_else(|| Rc::clone(&ctx.empty_funcs), |(_, rc)| rc)
+            } else {
+                let mut funcs: Vec<FuncId> = Vec::new();
+                let mut seen: HashSet<FuncId> = HashSet::new();
+                for &child in &children_buf {
+                    match module.consts.get(child) {
+                        Some(Const::MethodRef { func, .. }) => {
+                            if seen.insert(*func) {
+                                funcs.push(*func);
+                            }
+                        }
+                        Some(k) if is_composite_const(k) => {
+                            if let Some(rc) = ctx.const_method_refs_cache.get(&child) {
+                                for &f in rc.iter() {
+                                    if seen.insert(f) {
+                                        funcs.push(f);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if funcs.is_empty() {
+                    Rc::clone(&ctx.empty_funcs)
+                } else {
+                    Rc::from(funcs)
+                }
+            };
+            ctx.const_method_refs_cache.insert(cid, resolved);
+        }
+    }
+
+    if let Some(cached) = ctx.const_method_refs_cache.get(&root_cid) {
+        out_funcs.extend_from_slice(cached);
+        return;
+    }
+
+    // Defensive fallback for malformed cyclic `ConstPool` graphs: collect all
+    // reachable `MethodRef`s from `root_cid` iteratively with a visited guard.
+    let mut visited: HashSet<ConstId> = HashSet::new();
+    let mut seen_funcs: HashSet<FuncId> = HashSet::new();
+    let mut funcs: Vec<FuncId> = Vec::new();
+    let mut worklist: Vec<ConstId> = vec![root_cid];
     while let Some(cid) = worklist.pop() {
-        if !visited_consts.insert(cid) {
+        if let Some(cached) = ctx.const_method_refs_cache.get(&cid) {
+            for &f in cached.iter() {
+                if seen_funcs.insert(f) {
+                    funcs.push(f);
+                }
+            }
+            continue;
+        }
+        if !visited.insert(cid) {
             continue;
         }
         let Some(konst) = module.consts.get(cid) else {
             continue;
         };
         match konst {
-            Const::MethodRef { func, .. } => out_funcs.push(*func),
-            Const::LiteralBufferRef(inner) => worklist.push(*inner),
-            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
-                worklist.extend(items.iter().copied());
+            Const::MethodRef { func, .. } => {
+                if seen_funcs.insert(*func) {
+                    funcs.push(*func);
+                }
             }
-            Const::ObjectLiteral { keys, values } => {
-                worklist.extend(keys.iter().copied());
-                worklist.extend(values.iter().copied());
+            k if is_composite_const(k) => {
+                children_buf.clear();
+                push_composite_const_children(k, &mut children_buf);
+                for &child in children_buf.iter().rev() {
+                    worklist.push(child);
+                }
             }
             _ => {}
         }
     }
+    let rc: Rc<[FuncId]> = if funcs.is_empty() {
+        Rc::clone(&ctx.empty_funcs)
+    } else {
+        Rc::from(funcs)
+    };
+    out_funcs.extend_from_slice(&rc);
+    ctx.const_method_refs_cache.insert(root_cid, rc);
 }
 
 /// Collect all nested [`FuncId`]s referenced directly or via `ConstPool`
@@ -525,16 +731,17 @@ fn collect_method_refs_from_const(
 fn collect_nested_funcs_from_op(
     module: &Module,
     op: &Op,
-    visited_consts: &mut HashSet<ConstId>,
+    ctx: &mut InlineCtx,
+    local_seen_consts: &mut HashSet<ConstId>,
     out_funcs: &mut Vec<FuncId>,
 ) -> bool {
     op.for_each_func_id(|fid| out_funcs.push(fid));
     op.for_each_const_id(|cid| {
-        collect_method_refs_from_const(module, cid, visited_consts, out_funcs);
+        collect_method_refs_from_const(module, cid, ctx, local_seen_consts, out_funcs);
     });
     op.for_each_operand(|v| {
         if let Some(ValueDef::Const(cid)) = module.value(v).map(|val| val.def) {
-            collect_method_refs_from_const(module, cid, visited_consts, out_funcs);
+            collect_method_refs_from_const(module, cid, ctx, local_seen_consts, out_funcs);
         }
     });
     match op {
@@ -721,6 +928,7 @@ fn summarize_callee(module: &Module, ctx: &mut InlineCtx, callee: FuncId) -> Opt
             if !collect_nested_funcs_from_op(
                 module,
                 &inst.op,
+                ctx,
                 &mut visited_consts,
                 &mut nested_roots,
             ) {
@@ -752,8 +960,7 @@ fn summarize_callee(module: &Module, ctx: &mut InlineCtx, callee: FuncId) -> Opt
     }
 
     if body_skip.is_none()
-        && (unresolved_closure
-            || nested_definitions_read_outer_env(module, &nested_roots, &mut ctx.env_reads_cache))
+        && (unresolved_closure || nested_definitions_read_outer_env(module, &nested_roots, ctx))
     {
         body_skip = Some(SkipReason::CalleeDefinesClosure);
     }
@@ -827,30 +1034,9 @@ fn check_site_eligibility(
         return Err(SkipReason::CalleeTooLarge);
     }
     if summary.has_module_ops && summary.class_id != caller_class {
-        // Cross-class module ops are checked in declaration order alongside body_skip:
-        // re-verify if an earlier instruction in `callee` had a higher-priority skip.
-        if let Some(func) = module.func(callee) {
-            for &bb in &func.blocks {
-                if let Some(block) = module.block(bb) {
-                    for &iid in &block.insts {
-                        if let Some(inst) = module.inst(iid) {
-                            if let Some(reason) = forbidden_op(&inst.op) {
-                                return Err(reason);
-                            }
-                            if matches!(
-                                inst.op,
-                                Op::LoadModuleVar { .. }
-                                    | Op::StoreModuleVar { .. }
-                                    | Op::GetModuleNamespace { .. }
-                                    | Op::DynamicImport { .. }
-                            ) {
-                                return Err(SkipReason::CalleeForeignValue);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // `'scan` in `summarize_callee` halts immediately on the first
+        // `forbidden_op` or foreign operand/block, so `has_module_ops == true`
+        // guarantees a module op preceded any later `forbidden_op`.
         return Err(SkipReason::CalleeForeignValue);
     }
     if let Some(skip) = summary.base_skip {
@@ -923,14 +1109,14 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
 
 /// Iterative transitive check over nested function, class, method, and literal
 /// `MethodRef` definitions to determine whether any nested body observes or
-/// mutates the lexical environment captured from the callee (`#93`).
+/// mutates the lexical environment captured from the callee (`#93`, `#103`).
 fn nested_definitions_read_outer_env(
     module: &Module,
     roots: &[FuncId],
-    cache: &mut HashMap<FuncId, bool>,
+    ctx: &mut InlineCtx,
 ) -> bool {
     for &root in roots {
-        if let Some(&cached) = cache.get(&root) {
+        if let Some(cached) = ctx.env_reads_cache.get(&root).copied() {
             if cached {
                 return true;
             }
@@ -941,9 +1127,10 @@ fn nested_definitions_read_outer_env(
         let mut visited_consts: HashSet<ConstId> = HashSet::new();
         let mut stack: Vec<FuncId> = vec![root];
         let mut reads = false;
+        let mut trigger_fid: Option<FuncId> = None;
 
         while let Some(fid) = stack.pop() {
-            if let Some(&known) = cache.get(&fid) {
+            if let Some(known) = ctx.env_reads_cache.get(&fid).copied() {
                 if known {
                     reads = true;
                     break;
@@ -980,15 +1167,18 @@ fn nested_definitions_read_outer_env(
                             | Op::NotifyConcurrentResult { .. }
                     ) {
                         reads = true;
+                        trigger_fid = Some(fid);
                         break;
                     }
                     if !collect_nested_funcs_from_op(
                         module,
                         &inst.op,
+                        ctx,
                         &mut visited_consts,
                         &mut stack,
                     ) {
                         reads = true;
+                        trigger_fid = Some(fid);
                         break;
                     }
                 }
@@ -1001,10 +1191,13 @@ fn nested_definitions_read_outer_env(
             }
         }
 
-        cache.insert(root, reads);
+        ctx.env_reads_cache.insert(root, reads);
+        if let Some(tf) = trigger_fid {
+            ctx.env_reads_cache.insert(tf, true);
+        }
         if !reads {
             for v in visited_order {
-                cache.insert(v, false);
+                ctx.env_reads_cache.insert(v, false);
             }
         } else {
             return true;
@@ -1683,5 +1876,70 @@ mod tests {
             assert_eq!(reason.label(), want, "{reason:?}");
             assert!(seen.insert(want), "labels are unique: {want}");
         }
+    }
+
+    #[test]
+    fn const_method_refs_memoizes_dags_and_handles_cyclic_constpool() {
+        let mut module = Module::new();
+        let f_a = FuncId::new(10);
+        let f_b = FuncId::new(20);
+        let c_num = module.consts.push(Const::number(1.0));
+        let mr_a = module.consts.push(Const::method_ref(f_a));
+        let mr_b = module.consts.push(Const::method_ref(f_b));
+
+        // Acyclic diamond DAG: root -> [mid, mid], mid -> [mr_a, c_num, mr_b, mr_a].
+        let mid = module
+            .consts
+            .push(Const::ArrayLiteral(vec![mr_a, c_num, mr_b, mr_a]));
+        let root = module.consts.push(Const::ArrayLiteral(vec![mid, mid]));
+
+        // Malformed cyclic ConstPool: cyc0 -> [cyc1, mr_b], cyc1 -> [cyc0].
+        let cyc0_pred = ConstId::new(root.index() as u32 + 1);
+        let cyc1_pred = ConstId::new(root.index() as u32 + 2);
+        let cyc0 = module
+            .consts
+            .push(Const::ArrayLiteral(vec![cyc1_pred, mr_b]));
+        let cyc1 = module.consts.push(Const::ArrayLiteral(vec![cyc0]));
+        assert_eq!(cyc0, cyc0_pred);
+        assert_eq!(cyc1, cyc1_pred);
+
+        let mut ctx = InlineCtx {
+            undef_cid: module.consts.intern(Const::Undefined),
+            empty_funcs: Rc::from([]),
+            const_method_refs_cache: HashMap::new(),
+            env_reads_cache: HashMap::new(),
+            callee_cache: HashMap::new(),
+        };
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        collect_method_refs_from_const(&module, c_num, &mut ctx, &mut seen, &mut out);
+        assert!(out.is_empty());
+        assert!(
+            ctx.const_method_refs_cache.is_empty(),
+            "scalar consts must bypass HashMap allocation"
+        );
+
+        collect_method_refs_from_const(&module, root, &mut ctx, &mut seen, &mut out);
+        assert_eq!(out, vec![f_a, f_b]);
+        assert_eq!(
+            ctx.const_method_refs_cache.get(&mid).map(|r| r.as_ref()),
+            Some([f_a, f_b].as_slice())
+        );
+        assert_eq!(
+            ctx.const_method_refs_cache.get(&root).map(|r| r.as_ref()),
+            Some([f_a, f_b].as_slice())
+        );
+
+        // Query cyc0 first, then cyc1: neither may cache an incomplete cycle-cut subset.
+        let mut seen_cyc0 = HashSet::new();
+        let mut out_cyc0 = Vec::new();
+        collect_method_refs_from_const(&module, cyc0, &mut ctx, &mut seen_cyc0, &mut out_cyc0);
+        assert_eq!(out_cyc0, vec![f_b]);
+
+        let mut seen_cyc1 = HashSet::new();
+        let mut out_cyc1 = Vec::new();
+        collect_method_refs_from_const(&module, cyc1, &mut ctx, &mut seen_cyc1, &mut out_cyc1);
+        assert_eq!(out_cyc1, vec![f_b]);
     }
 }

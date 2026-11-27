@@ -65,7 +65,7 @@ mod ssa;
 mod translate;
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use abcd_file::{File, Method, MethodBody};
 use abcd_ir::{
@@ -326,14 +326,10 @@ pub(crate) trait LiftBackend<'f> {
     fn backend_this_param_index(&self, fd: &FunctionData) -> Option<usize>;
     fn backend_is_const_bool(&self, cid: ConstId) -> bool;
 
-    fn backend_active_module_tables(
+    fn backend_legacy_module_slots(
         &self,
         class_id: ClassId,
-    ) -> Option<(
-        &[abcd_ir::ImportDecl],
-        &[abcd_ir::ExportDecl],
-        &[abcd_ir::ModuleRequest],
-    )>;
+    ) -> Option<&metadata::LegacyModuleSlotIndex>;
 
     fn backend_record_legacy_modvar_fallback(&mut self, inst_id: InstId, sym: Sym);
     fn backend_lookup_scope_names(
@@ -371,9 +367,12 @@ pub(crate) struct Lifter<'f> {
     pub(crate) module_datas: Vec<&'f abcd_file::ModuleData>,
     /// `moduleRequestPhaseIdx` blobs, in class/field iteration order.
     pub(crate) module_phases: Vec<&'f abcd_file::ModuleRequestPhase>,
-    /// `_ESScopeNamesRecord` fields: (source-file name, scope-names
-    /// constant), in class/field iteration order.
-    pub(crate) scope_name_fields: Vec<(Sym, ConstId)>,
+    /// `_ESScopeNamesRecord` fields: `source_file -> scope_names` (first-wins, `#103`).
+    pub(crate) scope_name_fields: HashMap<Sym, ConstId>,
+    /// Per-class `O(1)` legacy `0.0.0.2` module-var slot index (`#103`).
+    pub(crate) class_module_slots: Vec<OnceLock<Box<metadata::LegacyModuleSlotIndex>>>,
+    /// Standalone `_ESModuleRecord` `O(1)` legacy `0.0.0.2` slot index (`#103`).
+    pub(crate) standalone_module_slots: OnceLock<Box<metadata::LegacyModuleSlotIndex>>,
 }
 
 impl<'f> Lifter<'f> {
@@ -396,7 +395,9 @@ impl<'f> Lifter<'f> {
             source_code_cache: HashMap::new(),
             module_datas: Vec::new(),
             module_phases: Vec::new(),
-            scope_name_fields: Vec::new(),
+            scope_name_fields: HashMap::new(),
+            class_module_slots: Vec::new(),
+            standalone_module_slots: OnceLock::new(),
         }
     }
 
@@ -441,6 +442,7 @@ impl<'f> Lifter<'f> {
         self.module
             .classes
             .push(abcd_ir::ClassData::new(descriptor, descriptor));
+        self.class_module_slots.push(OnceLock::new());
         self.class_to_id.insert(sid, cid);
         Some(cid)
     }
@@ -549,33 +551,20 @@ impl<'f> LiftBackend<'f> for Lifter<'f> {
         matches!(self.module.consts.get(cid), Some(Const::Bool(_)))
     }
 
-    fn backend_active_module_tables(
+    #[inline]
+    fn backend_legacy_module_slots(
         &self,
         class_id: ClassId,
-    ) -> Option<(
-        &[abcd_ir::ImportDecl],
-        &[abcd_ir::ExportDecl],
-        &[abcd_ir::ModuleRequest],
-    )> {
-        if let Some(esm) = self
-            .module
-            .classes
-            .get(class_id.index())
-            .and_then(|c| c.es_module.as_ref())
-        {
-            return Some((&esm.imports, &esm.exports, &esm.module_requests));
-        }
-        if !self.module.imports.is_empty()
-            || !self.module.exports.is_empty()
-            || !self.module.module_requests.is_empty()
-        {
-            return Some((
-                &self.module.imports,
-                &self.module.exports,
-                &self.module.module_requests,
-            ));
-        }
-        None
+    ) -> Option<&metadata::LegacyModuleSlotIndex> {
+        metadata::resolve_legacy_module_slots(
+            class_id,
+            &self.module.classes,
+            &self.class_module_slots,
+            &self.module.imports,
+            &self.module.exports,
+            &self.module.module_requests,
+            &self.standalone_module_slots,
+        )
     }
 
     #[inline]
@@ -590,14 +579,7 @@ impl<'f> LiftBackend<'f> for Lifter<'f> {
             .classes
             .get(class_id.index())
             .and_then(|c| c.scope_names)
-            .or_else(|| {
-                source_file.and_then(|sf| {
-                    self.scope_name_fields
-                        .iter()
-                        .find(|(name, _)| *name == sf)
-                        .map(|(_, c)| *c)
-                })
-            })
+            .or_else(|| source_file.and_then(|sf| self.scope_name_fields.get(&sf).copied()))
     }
 
     fn backend_resolve_source_code(&mut self, sid: abcd_file::StringId) -> Option<Arc<str>> {
@@ -669,6 +651,7 @@ fn lift_file_impl(
     }
     lf.method_names.reserve_exact(total_methods);
     lf.class_to_id.reserve(total_classes);
+    lf.class_module_slots.reserve(total_classes);
     lf.field_ids.reserve_exact(total_fields);
     if !use_parallel {
         let est_blocks = total_methods.saturating_mul(5);
@@ -705,6 +688,7 @@ fn lift_file_impl(
         lf.module
             .classes
             .push(abcd_ir::ClassData::new(descriptor, descriptor));
+        lf.class_module_slots.push(OnceLock::new());
         for method in &class.methods {
             let name = lf
                 .sym_of_file_sid(method.name)
@@ -1128,18 +1112,23 @@ fn build_try_regions<'f, B: LiftBackend<'f>>(
 
     for try_block in &body.try_blocks {
         let try_start = try_block.start as usize;
-        let try_end = (try_block.start + try_block.len) as usize;
+        let try_end = try_start.saturating_add(try_block.len as usize);
 
-        // All IR blocks overlapping the try region are protected.
-        let mut protected = Vec::new();
-        for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
-            if raw_block.start < try_end
-                && raw_block.end > try_start
-                && let Some(&ir_block) = block_map.get(bi)
-            {
-                protected.push(ir_block);
-            }
-        }
+        // All IR blocks overlapping `[try_start, try_end)` are protected (`O(log B + |protected|)`).
+        let first_bi = raw_cfg.blocks.partition_point(|b| b.end <= try_start);
+        let end_bi = raw_cfg.blocks.partition_point(|b| b.start < try_end);
+        let protected = if first_bi < end_bi {
+            block_map
+                .get(first_bi..end_bi)
+                .map(<[BlockId]>::to_vec)
+                .unwrap_or_else(|| {
+                    (first_bi..end_bi)
+                        .filter_map(|bi| block_map.get(bi).copied())
+                        .collect()
+                })
+        } else {
+            Vec::new()
+        };
 
         let mut catches = Vec::with_capacity(try_block.catches.len());
         for c in &try_block.catches {

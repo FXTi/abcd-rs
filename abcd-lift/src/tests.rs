@@ -787,3 +787,448 @@ fn decode_lazy_method_spans_lift_identically_to_eager_decode() {
     assert_eq!(modules_structurally_eq(&m_eager, &m_lazy_seq), Ok(()));
     assert_eq!(modules_structurally_eq(&m_eager, &m_lazy_par), Ok(()));
 }
+
+#[test]
+fn legacy_module_slots_scope_names_and_local_vars_seq_vs_parallel_parity() {
+    // Exercises `#103` pre-indexed tables across sequential and Rayon parallel paths:
+    // 1. Standalone `_ESModuleRecord` + `_ESScopeNamesRecord` (including duplicate
+    //    `source_file` field names where first-occurrence wins!).
+    // 2. Class with `--merge-abc` `EsModule` shared across multiple methods (testing
+    //    concurrent `OnceLock<Box<LegacyModuleSlotIndex>>` initialization + hits).
+    // 3. Class with an EMPTY `--merge-abc` `EsModule` (`requests: [], records: []`)
+    //    which MUST NOT fall back to standalone `_ESModuleRecord` slots!
+    // 4. `debug.local_vars` with duplicate `(name, ty, scope)` entries AND same-`name`
+    //    entries carrying distinct `scope` / `ty` (`O(L)` `HashSet` deduplication).
+    let mut s = StringPool::new();
+    let esm_rec_desc = s.get_or_intern(abcd_file::ES_MODULE_RECORD_DESCRIPTOR);
+    let scope_rec_desc = s.get_or_intern(abcd_file::ES_SCOPE_NAMES_RECORD_DESCRIPTOR);
+    let cls_standalone_desc = s.get_or_intern("Lpkg/UsesStandalone;");
+    let cls_merged_desc = s.get_or_intern("Lpkg/UsesMerged;");
+    let cls_empty_esm_desc = s.get_or_intern("Lpkg/UsesEmptyEsm;");
+
+    let mod_field = s.get_or_intern(abcd_file::MODULE_RECORD_IDX_FIELD);
+    let standalone_mod_field = s.get_or_intern("standalone.js");
+    let sf_one = s.get_or_intern("standalone_one.ts");
+    let sf_two = s.get_or_intern("standalone_two.ts");
+    let scope_s0 = s.get_or_intern("scopeZero");
+    let scope_s1 = s.get_or_intern("scopeOneShadow");
+    let scope_s2 = s.get_or_intern("scopeTwo");
+
+    let st_req = s.get_or_intern("./standalone_dep");
+    let st_imp_local = s.get_or_intern("stImpLocal");
+    let st_imp_pub = s.get_or_intern("stImpPub");
+    let st_exp_local = s.get_or_intern("stExpLocal");
+    let st_exp_pub = s.get_or_intern("stExpPub");
+
+    let mg_req0 = s.get_or_intern("./mg0");
+    let mg_req1 = s.get_or_intern("./mg1");
+    let mg_ns1 = s.get_or_intern("mgNs1");
+    let mg_imp0 = s.get_or_intern("mgImp0");
+    let mg_collide = s.get_or_intern("mgCollide"); // imp0 import_name (0) AND imp1 local_name (1); exp0 export_name (0) AND exp1 local_name (1)
+    let mg_other = s.get_or_intern("mgOther");
+    let mg_exp0 = s.get_or_intern("mgExp0");
+
+    let fn0 = s.get_or_intern("f0");
+    let fn1 = s.get_or_intern("f1");
+    let loc_x = s.get_or_intern("x");
+    let i32_sig = s.get_or_intern("i32");
+    let f64_sig = s.get_or_intern("f64");
+
+    let lit_arrays = vec![
+        LiteralArray::new(vec![LiteralValue::String(scope_s0)]),
+        LiteralArray::new(vec![LiteralValue::String(scope_s1)]),
+        LiteralArray::new(vec![LiteralValue::String(scope_s2)]),
+    ];
+
+    let esm_rec_cls = abcd_file::Class {
+        descriptor: esm_rec_desc,
+        name: esm_rec_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: vec![Field {
+            name: standalone_mod_field,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(FieldValue::ModuleData(ModuleData {
+                source_offset: 0,
+                requests: vec![st_req],
+                records: vec![
+                    ModuleRecord::RegularImport {
+                        local_name: st_imp_local,
+                        import_name: st_imp_pub,
+                        module_request_idx: 0,
+                    },
+                    ModuleRecord::LocalExport {
+                        local_name: st_exp_local,
+                        export_name: st_exp_pub,
+                    },
+                ],
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+
+    // Standalone `_ESScopeNamesRecord` with duplicate `sf_one` field (`lit[0]` must beat `lit[1]`).
+    let scope_rec_cls = abcd_file::Class {
+        descriptor: scope_rec_desc,
+        name: scope_rec_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: vec![
+            Field {
+                name: sf_one,
+                offset: 0,
+                field_type: Type::U32,
+                access_flags: AccessFlags::STATIC,
+                is_external: false,
+                initial_value: Some(FieldValue::literal_array_ref(LiteralArrayIdx(0))),
+                annotations: Default::default(),
+            },
+            Field {
+                name: sf_one,
+                offset: 4,
+                field_type: Type::U32,
+                access_flags: AccessFlags::STATIC,
+                is_external: false,
+                initial_value: Some(FieldValue::literal_array_ref(LiteralArrayIdx(1))),
+                annotations: Default::default(),
+            },
+            Field {
+                name: sf_two,
+                offset: 8,
+                field_type: Type::U32,
+                access_flags: AccessFlags::STATIC,
+                is_external: false,
+                initial_value: Some(FieldValue::literal_array_ref(LiteralArrayIdx(2))),
+                annotations: Default::default(),
+            },
+        ],
+        annotations: Default::default(),
+    };
+
+    // Method in `cls_standalone` resolving `stImpPub` (`import_name` fallback -> 0),
+    // `stExpPub` (`export_name` fallback -> 0), `st_req` (0), standalone `sf_one` scope,
+    // and deduplicating `debug.local_vars`.
+    let m_st_0 = Method {
+        name: fn0,
+        offset: 0x100,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: FileSourceLang::TypeScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(MethodBody {
+            num_vregs: 1,
+            num_args: 0,
+            code: MethodCode::Decoded(vec![
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // 0
+                Bytecode::DeprecatedStmodulevar(EntityId(1)),         // 1
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(2)),  // 2
+                Bytecode::Return,                                     // 3
+            ]),
+            entities: HashMap::from([
+                ((EntityKind::StringId, 0), EntityRef::string(st_imp_pub)),
+                ((EntityKind::StringId, 1), EntityRef::string(st_exp_pub)),
+                ((EntityKind::StringId, 2), EntityRef::string(st_req)),
+            ])
+            .into(),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: Some(MethodDebugInfo {
+            source_file: Some(sf_one),
+            source_code: None,
+            line_table: vec![LineEntry { index: 0, line: 1 }],
+            column_table: Vec::new(),
+            local_vars: vec![
+                // [0] `x: i32` over `[0..1]`
+                LocalVarInfo {
+                    name: loc_x,
+                    type_name: i32_sig,
+                    type_signature: i32_sig,
+                    reg_number: 0,
+                    start: 0,
+                    end: 1,
+                },
+                // [1] Exact duplicate of [0] -> deduplicated!
+                LocalVarInfo {
+                    name: loc_x,
+                    type_name: i32_sig,
+                    type_signature: i32_sig,
+                    reg_number: 0,
+                    start: 0,
+                    end: 1,
+                },
+                // [2] Same name `x` & type `i32`, DIFFERENT scope `[2..3]` -> preserved!
+                LocalVarInfo {
+                    name: loc_x,
+                    type_name: i32_sig,
+                    type_signature: i32_sig,
+                    reg_number: 0,
+                    start: 2,
+                    end: 3,
+                },
+                // [3] Same name `x` & scope `[0..1]`, DIFFERENT type `f64` -> preserved!
+                LocalVarInfo {
+                    name: loc_x,
+                    type_name: f64_sig,
+                    type_signature: f64_sig,
+                    reg_number: 0,
+                    start: 0,
+                    end: 1,
+                },
+            ],
+            params: Vec::new(),
+        }),
+    };
+
+    let m_st_1 = Method {
+        name: fn1,
+        offset: 0x180,
+        debug: Some(MethodDebugInfo {
+            source_file: Some(sf_two),
+            source_code: None,
+            line_table: vec![LineEntry { index: 0, line: 2 }],
+            column_table: Vec::new(),
+            local_vars: Vec::new(),
+            params: Vec::new(),
+        }),
+        ..m_st_0.clone()
+    };
+
+    let cls_standalone = abcd_file::Class {
+        descriptor: cls_standalone_desc,
+        name: cls_standalone_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::TypeScript,
+        source_file: Some(sf_one),
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![m_st_0, m_st_1],
+        fields: Vec::new(),
+        annotations: Default::default(),
+    };
+
+    let make_merged_method = |name, off| Method {
+        name,
+        offset: off,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: FileSourceLang::EcmaScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            code: MethodCode::Decoded(vec![
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // External `mgCollide` -> slot 1
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(1)), // Local `mgCollide` -> slot 1
+                Bytecode::DeprecatedStmodulevar(EntityId(0)),         // Store `mgCollide` -> slot 1
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(1)),  // Namespace `mgNs1` -> slot 1
+                Bytecode::Return,
+            ]),
+            entities: HashMap::from([
+                ((EntityKind::StringId, 0), EntityRef::string(mg_collide)),
+                ((EntityKind::StringId, 1), EntityRef::string(mg_ns1)),
+            ])
+            .into(),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    };
+
+    let cls_merged = abcd_file::Class {
+        descriptor: cls_merged_desc,
+        name: cls_merged_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![
+            make_merged_method(fn0, 0x200),
+            make_merged_method(fn1, 0x280),
+        ],
+        fields: vec![Field {
+            name: mod_field,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(FieldValue::ModuleData(ModuleData {
+                source_offset: 0,
+                requests: vec![mg_req0, mg_req1],
+                records: vec![
+                    ModuleRecord::RegularImport {
+                        local_name: mg_imp0,
+                        import_name: mg_collide,
+                        module_request_idx: 0,
+                    },
+                    ModuleRecord::NamespaceImport {
+                        local_name: mg_ns1,
+                        module_request_idx: 1,
+                    },
+                    ModuleRecord::RegularImport {
+                        local_name: mg_collide,
+                        import_name: mg_other,
+                        module_request_idx: 1,
+                    },
+                    ModuleRecord::LocalExport {
+                        local_name: mg_exp0,
+                        export_name: mg_collide,
+                    },
+                    ModuleRecord::LocalExport {
+                        local_name: mg_collide,
+                        export_name: mg_other,
+                    },
+                ],
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+
+    // Empty `EsModule` class: `stImpLocal` MUST NOT fall back to standalone `_ESModuleRecord`!
+    let cls_empty_esm = abcd_file::Class {
+        descriptor: cls_empty_esm_desc,
+        name: cls_empty_esm_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![Method {
+            name: fn0,
+            offset: 0x300,
+            access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+            function_kind: FileFunctionKind::Function,
+            source_lang: FileSourceLang::EcmaScript,
+            is_external: false,
+            return_type: None,
+            arg_types: Vec::new(),
+            body: Some(MethodBody {
+                num_vregs: 0,
+                num_args: 0,
+                code: MethodCode::Decoded(vec![
+                    Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)),
+                    Bytecode::Return,
+                ]),
+                entities: HashMap::from([(
+                    (EntityKind::StringId, 0),
+                    EntityRef::string(st_imp_local),
+                )])
+                .into(),
+                try_blocks: Vec::new(),
+                ic_size: None,
+            }),
+            annotations: Default::default(),
+            param_annotations: Default::default(),
+            debug: None,
+        }],
+        fields: vec![Field {
+            name: mod_field,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(FieldValue::ModuleData(ModuleData {
+                source_offset: 0,
+                requests: Vec::new(),
+                records: Vec::new(),
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+
+    let file = File {
+        version: Version::new(0, 0, 0, 2),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings: s,
+        classes: [
+            (esm_rec_desc, esm_rec_cls),
+            (scope_rec_desc, scope_rec_cls),
+            (cls_standalone_desc, cls_standalone),
+            (cls_merged_desc, cls_merged),
+            (cls_empty_esm_desc, cls_empty_esm),
+        ]
+        .into_iter()
+        .collect(),
+        literal_arrays: lit_arrays,
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let seq = lift_file_with_options(
+        &file,
+        &LiftOptions {
+            retain_tail_capacity: false,
+            parallel: false,
+        },
+    )
+    .expect("sequential lift succeeds");
+    assert!(abcd_ir::verify_module(&seq).errors.is_empty());
+
+    // Check local_vars deduplication on `m_st_0` (`functions[0]`): 3 distinct `LocalName`s!
+    let dbg0 = seq.functions[0].debug.as_ref().expect("m_st_0 debug");
+    assert_eq!(dbg0.local_names.len(), 3);
+    assert_ne!(dbg0.local_names[0].scope, dbg0.local_names[1].scope);
+    assert_ne!(dbg0.local_names[0].ty, dbg0.local_names[2].ty);
+
+    // Check first-wins standalone `_ESScopeNamesRecord` lookup (`scopeZero`, not `scopeOneShadow`).
+    let scope_cid = dbg0.scope_names.expect("standalone scope_names");
+    let s0_sym = seq.sym.get("scopeZero").expect("scopeZero interned");
+    let s0_const = seq.consts.lookup(&abcd_ir::Const::String(s0_sym)).unwrap();
+    assert_eq!(
+        seq.consts.get(scope_cid),
+        Some(&abcd_ir::Const::ArrayLiteral(vec![s0_const]))
+    );
+
+    // Check empty `EsModule` isolation (`functions[4]` falls back to `stImpLocal` Sym.0, NOT 0!).
+    let st_imp_sym = seq.sym.get("stImpLocal").expect("stImpLocal interned");
+    assert_ne!(st_imp_sym.raw(), 0);
+    let empty_esm_op =
+        &seq.insts[seq.blocks[seq.functions[4].blocks[0].index()].insts[0].index()].op;
+    assert!(matches!(
+        empty_esm_op,
+        abcd_ir::Op::LoadModuleVar { index, kind: abcd_ir::ModuleVarKind::External }
+            if *index == st_imp_sym.raw()
+    ));
+
+    for threads in [1usize, 2, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(256 * 1024)
+            .build()
+            .unwrap();
+        let par = pool
+            .install(|| lift_file_forced_parallel(&file, false))
+            .expect("forced-parallel lift succeeds");
+        assert!(abcd_ir::verify_module(&par).errors.is_empty());
+        assert_eq!(modules_structurally_eq(&seq, &par), Ok(()));
+    }
+}

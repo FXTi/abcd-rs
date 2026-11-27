@@ -3,6 +3,7 @@
     reason = "emit unit tests import sibling submodule items via wildcard"
 )]
 use super::{decl::*, expr::*, *};
+use abcd_ir::Const;
 use abcd_ir::function::{Block, FunctionData, Inst, Value};
 use abcd_ir::id::{BlockId, ClassId, InstId, ValueId};
 use abcd_ir::module::ClassData;
@@ -888,6 +889,397 @@ fn escaped_temps_leaf_arms() {
         SNode::Honest("note".to_string()),
     ];
     assert!(escaped_temps(&nodes).is_empty());
+}
+
+// ── P3-DEC-1 (#103): shared diamond ConstId DAG & ESM pre-indexing ──
+
+#[test]
+fn p3_dec1_shared_diamond_const_dag_depth_48_method_refs_memoized_o_const_pool() {
+    use abcd_ir::consts::TypedArrayTag;
+    use std::sync::Arc;
+
+    let mut m = mk_module();
+    let leaf_m0 = add_fn(&mut m, "leaf_m0");
+    let leaf_m1 = add_fn(&mut m, "leaf_m1");
+
+    let mut leaf_get_insts = Vec::new();
+    for leaf in [leaf_m0, leaf_m1] {
+        let _this = add_param(&mut m, leaf);
+        let lb = entry_of(&m, leaf);
+        let get_v = emit_val(
+            &mut m,
+            lb,
+            Op::GetLexVar {
+                level: 0,
+                slot: 0,
+                kind: abcd_ir::LexEnvKind::Plain,
+            },
+        );
+        let ValueDef::Inst(get_iid) = m.values[get_v.index()].def else {
+            panic!("inst-defined GetLexVar");
+        };
+        leaf_get_insts.push((leaf, get_iid));
+        push_inst(&mut m, lb, Op::Return { value: Some(get_v) });
+    }
+
+    // Build a 48-level shared diamond ConstId DAG (`2^48` virtual paths) over
+    // two `MethodRef` leaves, mixing `ObjectLiteral`, `ArrayLiteral`,
+    // `TypedArrayLiteral`, and `LiteralBufferRef`.
+    let k0_sym = m.sym.intern("m0");
+    let k1_sym = m.sym.intern("m1");
+    let k0 = m.consts.intern(Const::String(k0_sym));
+    let k1 = m.consts.intern(Const::String(k1_sym));
+    let mr0 = m.consts.intern(Const::method_ref(leaf_m0));
+    let mr1 = m.consts.intern(Const::method_ref(leaf_m1));
+    let mut cur = m.consts.push_object(vec![k0, k1], vec![mr0, mr1]);
+    let base_dag = cur;
+
+    for depth in 0..48 {
+        cur = match depth % 4 {
+            0 => m.consts.push_array(vec![cur, cur]),
+            1 => m.consts.push(Const::TypedArrayLiteral {
+                tag: TypedArrayTag::I32,
+                items: vec![cur, cur],
+            }),
+            2 => m.consts.push_object(vec![k0, k1], vec![cur, cur]),
+            _ => {
+                let pair = m.consts.push_array(vec![cur, cur]);
+                m.consts.push(Const::LiteralBufferRef(pair))
+            }
+        };
+    }
+
+    // Reference `cur` across 128 sites (`AllocObject`, `DefineClass`, `AllocArray`)
+    // inside a parent function that pushes a named lexical frame.
+    let main = add_fn(&mut m, "func_main_0");
+    m.classes[0].methods.push(main);
+    let _this = add_param(&mut m, main);
+    let mb = entry_of(&m, main);
+    let cap_sym = m.sym.intern("capturedDagBinding");
+    let cap_cid = m.consts.intern(Const::String(cap_sym));
+    let scope_arr = m.consts.push_array(vec![cap_cid]);
+    let _ = emit_val(
+        &mut m,
+        mb,
+        Op::NewLexEnvWithName {
+            num_vars: 1,
+            scope_names: scope_arr,
+        },
+    );
+
+    let mut ctors = Vec::new();
+    for i in 0..64 {
+        let _ = emit_val(&mut m, mb, Op::AllocObject { shape: cur });
+        let _ = emit_val(&mut m, mb, Op::AllocArray { shape: Some(cur) });
+        if i < 16 {
+            let ctor = add_ret_fn(&mut m, &format!("DagClass{i}"));
+            ctors.push(ctor);
+            let _ = emit_val(
+                &mut m,
+                mb,
+                Op::DefineClass(Box::new(abcd_ir::DefineClassData {
+                    ctor,
+                    heritage: None,
+                    members: cur,
+                    member_attrs: Vec::new(),
+                    count: 0,
+                })),
+            );
+        }
+    }
+    push_inst(&mut m, mb, Op::Return { value: None });
+
+    let start = std::time::Instant::now();
+    let cache = ConstMethodRefCache::build(&m);
+    assert_eq!(cache.get(cur), &[leaf_m0, leaf_m1]);
+    assert!(
+        Arc::ptr_eq(cache.arc_of(base_dag).unwrap(), cache.arc_of(cur).unwrap()),
+        "diamond DAG levels must share the same Arc<[FuncId]>"
+    );
+
+    let index = DecompileIndex::build(&m);
+    for (leaf, get_iid) in leaf_get_insts {
+        let scopes = crate::names::NameScopes::build_with_index(&m, leaf, Some(&index));
+        assert_eq!(scopes.name_of(get_iid), Some("capturedDagBinding"));
+    }
+
+    let consumed = consumed_functions(&m);
+    assert!(consumed.contains(&leaf_m0));
+    assert!(consumed.contains(&leaf_m1));
+    for &ctor in &ctors {
+        assert!(consumed.contains(&ctor));
+    }
+    assert!(!consumed.contains(&main));
+
+    let out_a = decompile_module(&m, &EmitOptions::default());
+    let out_b = decompile_module(&m, &EmitOptions::default());
+    let split_out = crate::decompile_module_split(&m, &EmitOptions::default());
+    let elapsed = start.elapsed();
+
+    assert_eq!(out_a.text, out_b.text);
+    assert_eq!(out_a.stats, out_b.stats);
+    assert_eq!(split_out.files.len(), 1);
+    assert!(
+        elapsed.as_secs_f64() < 2.0,
+        "O(|ConstPool|) memoized decompile on depth-48 diamond DAG took too long: {elapsed:?}"
+    );
+}
+
+#[test]
+fn p3_dec1_esm_preindexed_multi_import_multi_export_deterministic_parity() {
+    use abcd_ir::module::{EsModule, Modifiers, ModuleRequest};
+    use abcd_ir::op::ModuleVarKind;
+
+    let mut m = Module::new();
+    let cls_sym = m.sym.intern("L_GLOBAL;");
+    let mut cls = ClassData::new(cls_sym, cls_sym);
+    cls.source_file = Some(m.sym.intern("entry.js"));
+    m.classes.push(cls);
+
+    let req_a = m.sym.intern("./alpha");
+    let req_side = m.sym.intern("./side-effect");
+    let req_reexp = m.sym.intern("./reexport-only");
+    let req_star = m.sym.intern("./star-mod");
+    let req_orphan = m.sym.intern("./orphan-tail");
+
+    // Include duplicate `req_a` in `module_requests` to verify dedup + exact order.
+    m.module_requests = vec![
+        ModuleRequest {
+            specifier: req_side,
+            lazy: false,
+        },
+        ModuleRequest {
+            specifier: req_a,
+            lazy: false,
+        },
+        ModuleRequest {
+            specifier: req_a,
+            lazy: false,
+        },
+        ModuleRequest {
+            specifier: req_reexp,
+            lazy: false,
+        },
+        ModuleRequest {
+            specifier: req_star,
+            lazy: false,
+        },
+    ];
+
+    let s_default = m.sym.intern("default");
+    let s_def_a = m.sym.intern("defA");
+    let s_ns_a = m.sym.intern("nsA");
+    let s_collide = m.sym.intern("hoistedFn");
+    let s_kebab = m.sym.intern("kebab-imp");
+    let s_kebab_loc = m.sym.intern("kebabImp");
+    let s_orphan_imp = m.sym.intern("tailVal");
+
+    m.imports = vec![
+        ImportDecl::Regular {
+            local_name: s_orphan_imp,
+            import_name: s_orphan_imp,
+            module_request: req_orphan,
+        },
+        ImportDecl::Regular {
+            local_name: s_def_a,
+            import_name: s_default,
+            module_request: req_a,
+        },
+        ImportDecl::Namespace {
+            local_name: s_ns_a,
+            module_request: req_a,
+        },
+        ImportDecl::Regular {
+            local_name: s_collide,
+            import_name: s_collide,
+            module_request: req_a,
+        },
+        ImportDecl::Regular {
+            local_name: s_kebab_loc,
+            import_name: s_kebab,
+            module_request: req_a,
+        },
+    ];
+
+    let def_impl = add_ret_fn(&mut m, "#*#MyDefaultFn");
+    let hoisted_top = add_ret_fn(&mut m, "hoistedFn");
+    m.func_mut(hoisted_top).unwrap().modifiers |= Modifiers::STATIC;
+    m.classes[0].methods.push(def_impl);
+    m.classes[0].methods.push(hoisted_top);
+
+    let main = add_fn(&mut m, "func_main_0");
+    m.func_mut(main).unwrap().modifiers |= Modifiers::STATIC;
+    m.classes[0].methods.push(main);
+    let mb = entry_of(&m, main);
+    let _this = add_param(&mut m, main);
+
+    // Bind slot 0 via named `DefineFunc` (`MyDefaultFn`) so `*default*` export resolves to it.
+    let df = emit_val(
+        &mut m,
+        mb,
+        Op::DefineFunc {
+            body: def_impl,
+            captures: Vec::new(),
+            length: 0,
+        },
+    );
+    let cl = emit_val(&mut m, mb, Op::AllocClosure { func: df });
+    push_inst(
+        &mut m,
+        mb,
+        Op::StoreModuleVar {
+            index: 0,
+            value: cl,
+        },
+    );
+
+    // Read external slots and namespace slot, and store 64 local export slots.
+    let _ext0 = emit_val(
+        &mut m,
+        mb,
+        Op::LoadModuleVar {
+            index: 1,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let _ns = emit_val(&mut m, mb, Op::GetModuleNamespace { index: 1 });
+
+    let star_default_tag = m.sym.intern("*default*");
+    m.exports.push(ExportDecl::Local {
+        local_name: star_default_tag,
+        export_name: s_default,
+    });
+
+    for idx in 1..=64u32 {
+        let name_str = format!("expVal{idx}");
+        let sym = m.sym.intern(&name_str);
+        let cid = m.consts.push(Const::Int32(idx));
+        let v = emit_val(&mut m, mb, Op::LoadConst(cid));
+        push_inst(
+            &mut m,
+            mb,
+            Op::StoreModuleVar {
+                index: idx,
+                value: v,
+            },
+        );
+        let lv = emit_val(
+            &mut m,
+            mb,
+            Op::LoadModuleVar {
+                index: idx,
+                kind: ModuleVarKind::Local,
+            },
+        );
+        push_inst(
+            &mut m,
+            mb,
+            Op::ThrowUndefinedIfHoleWithName {
+                name: sym,
+                value: lv,
+            },
+        );
+        m.exports.push(ExportDecl::Local {
+            local_name: sym,
+            export_name: sym,
+        });
+        if idx == 1 {
+            let alias = m.sym.intern("expVal1Alias");
+            m.exports.push(ExportDecl::Local {
+                local_name: sym,
+                export_name: alias,
+            });
+            let quoted = m.sym.intern("exp-val-1");
+            m.exports.push(ExportDecl::Local {
+                local_name: sym,
+                export_name: quoted,
+            });
+        }
+    }
+
+    // Untouched local export (no bytecode instructions touch its slot).
+    let untouched = m.sym.intern("untouchedLocal");
+    m.exports.push(ExportDecl::Local {
+        local_name: untouched,
+        export_name: untouched,
+    });
+
+    let re_in = m.sym.intern("orig");
+    let re_out = m.sym.intern("reexported");
+    m.exports.push(ExportDecl::Indirect {
+        export_name: re_out,
+        import_name: re_in,
+        module_request: req_reexp,
+    });
+    m.exports.push(ExportDecl::Star {
+        module_request: req_star,
+    });
+    push_inst(&mut m, mb, Op::Return { value: None });
+
+    m.classes[0].es_module = Some(EsModule {
+        imports: m.imports.clone(),
+        exports: m.exports.clone(),
+        module_requests: m.module_requests.clone(),
+    });
+
+    let mod_a = decompile_module(&m, &EmitOptions::default());
+    let mod_b = decompile_module(&m, &EmitOptions::default());
+    assert_eq!(mod_a.text, mod_b.text);
+
+    // Verify exact `module_requests` import ordering + orphan trailing import,
+    // and verify `req_reexp` / `req_star` do NOT emit spurious side-effect imports.
+    let expected_imports = concat!(
+        "import \"./side-effect\";\n",
+        "import defA from \"./alpha\";\n",
+        "import * as nsA from \"./alpha\";\n",
+        "import { hoistedFn as hoistedFn$1 } from \"./alpha\";\n",
+        "import { \"kebab-imp\" as kebabImp } from \"./alpha\";\n",
+        "import { tailVal } from \"./orphan-tail\";\n",
+    );
+    assert!(
+        mod_a.text.contains(expected_imports),
+        "imports order mismatch:\n{}",
+        mod_a.text
+    );
+    assert!(!mod_a.text.contains("import \"./reexport-only\";"));
+    assert!(!mod_a.text.contains("import \"./star-mod\";"));
+    assert!(!mod_a.text.contains("let _default_;"));
+
+    // Verify `*default*` resolved to `MyDefaultFn`, plus duplicate/aliased/quoted/indirect/star exports.
+    assert!(
+        mod_a.text.contains(concat!(
+            "export { MyDefaultFn as default };\n",
+            "export { expVal1 };\n",
+            "export { expVal1 as expVal1Alias };\n",
+            "export { expVal1 as \"exp-val-1\" };\n",
+        )),
+        "exports mismatch:\n{}",
+        mod_a.text
+    );
+    assert!(mod_a.text.contains("export { expVal64 };\n"));
+    assert!(mod_a.text.contains("export { untouchedLocal };\n"));
+    assert!(mod_a.text.contains(
+        "export { orig as reexported } from \"./reexport-only\";\nexport * from \"./star-mod\";\n"
+    ));
+
+    // Verify `--split-modules` parity and untouched local export predeclaration.
+    let split_a = crate::decompile_module_split(&m, &EmitOptions::default());
+    let split_b = crate::decompile_module_split(&m, &EmitOptions::default());
+    assert_eq!(split_a.files, split_b.files);
+    assert_eq!(split_a.files.len(), 1);
+    let sf = &split_a.files[0];
+    assert!(
+        sf.text.contains(expected_imports),
+        "split imports:\n{}",
+        sf.text
+    );
+    assert!(
+        sf.text.contains("let untouchedLocal;\n"),
+        "split untouched local:\n{}",
+        sf.text
+    );
+    assert!(sf.text.contains("export { MyDefaultFn as default };\n"));
+    assert!(sf.text.contains("export { expVal64 };\n"));
 }
 
 // ── Streaming, batching, orphan equivalence & 256 KiB stack tests (#33) ──

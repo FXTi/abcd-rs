@@ -423,9 +423,16 @@ pub(in crate::emit) fn collect_private_names_with_index(
     func: FuncId,
     out: &mut BTreeSet<String>,
 ) {
+    let owned_cache;
+    let method_refs = match index {
+        Some(idx) => &idx.const_method_refs,
+        None => {
+            owned_cache = crate::consts::ConstMethodRefCache::build(module);
+            &owned_cache
+        }
+    };
     let mut visited: HashSet<FuncId> = HashSet::new();
     let mut stack: Vec<FuncId> = vec![func];
-    let mut shape_refs = BTreeSet::new();
 
     while let Some(fid) = stack.pop() {
         if !visited.insert(fid) {
@@ -467,9 +474,7 @@ pub(in crate::emit) fn collect_private_names_with_index(
                         stack.push(*body);
                     }
                     Op::AllocObject { shape } => {
-                        shape_refs.clear();
-                        collect_method_refs(module, *shape, &mut shape_refs);
-                        stack.extend(shape_refs.iter().copied());
+                        stack.extend_from_slice(method_refs.get(*shape));
                     }
                     _ => {}
                 }

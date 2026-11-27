@@ -397,6 +397,7 @@ pub(crate) struct AbcReader<'a> {
     header: RawHeader,
     file_type: sys::FileType,
     index_regions: Vec<IndexRegion>,
+    regions_disjoint_sorted: bool,
 }
 
 impl<'a> AbcReader<'a> {
@@ -474,6 +475,19 @@ impl<'a> AbcReader<'a> {
             index_regions.push(reg);
         }
 
+        let mut sorted_regions: Vec<IndexRegion> = index_regions
+            .iter()
+            .copied()
+            .filter(|r| r.start < r.end)
+            .collect();
+        sorted_regions.sort_by_key(|r| r.start);
+        let regions_disjoint_sorted = sorted_regions.windows(2).all(|w| w[0].end <= w[1].start);
+        let index_regions = if regions_disjoint_sorted {
+            sorted_regions
+        } else {
+            index_regions
+        };
+
         let file_type = if Dialect::is_static_version(version) {
             sys::FileType::Static
         } else {
@@ -485,6 +499,7 @@ impl<'a> AbcReader<'a> {
             header,
             file_type,
             index_regions,
+            regions_disjoint_sorted,
         })
     }
 
@@ -662,6 +677,13 @@ impl<'a> AbcReader<'a> {
 
     #[inline]
     fn find_region(&self, entity_off: u32) -> Option<&IndexRegion> {
+        if self.regions_disjoint_sorted {
+            let idx = self
+                .index_regions
+                .partition_point(|r| r.start <= entity_off);
+            let cand = self.index_regions.get(idx.checked_sub(1)?)?;
+            return (entity_off < cand.end).then_some(cand);
+        }
         self.index_regions
             .iter()
             .find(|r| r.start <= entity_off && entity_off < r.end)

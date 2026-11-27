@@ -2,11 +2,33 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use abcd_file_sys as sys;
 
 use crate::error::Error;
 use crate::file::{AbcReader, RawMethod, read_sleb128_i32, read_uleb128};
 use crate::types::TypeId;
+
+pub(crate) const MAX_LNP_BUDGET: usize = 32_000_000;
+
+#[inline]
+pub(crate) fn initial_lnp_budget(file_size: u32) -> usize {
+    (file_size as usize)
+        .max(65_536)
+        .saturating_mul(8)
+        .min(MAX_LNP_BUDGET)
+}
+
+#[inline]
+fn consume_lnp_budget(lnp_budget: &mut usize, debug_off: u32) -> Result<(), Error> {
+    let rem = lnp_budget.checked_sub(1).ok_or_else(|| Error::Malformed {
+        field: "line_number_program",
+        context: format!("method debug info at {debug_off:#x} exceeded file-wide LNP budget"),
+    })?;
+    *lnp_budget = rem;
+    Ok(())
+}
 
 /// Line number entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -100,8 +122,8 @@ pub(crate) fn decode_debug_cstr<'a>(
 }
 
 pub(crate) trait DebugSink {
-    fn set_source_file(&mut self, s: RawDebugStr<'_>);
-    fn set_source_code(&mut self, s: RawDebugStr<'_>);
+    fn set_source_file(&mut self, s: RawDebugStr<'_>) -> Result<(), Error>;
+    fn set_source_code(&mut self, s: RawDebugStr<'_>) -> Result<(), Error>;
     fn push_line(&mut self, pc_offset: u32, line: u32);
     fn push_column(&mut self, pc_offset: u32, column: u32);
     fn start_local(
@@ -111,10 +133,10 @@ pub(crate) trait DebugSink {
         type_name: RawDebugStr<'_>,
         type_sig: Option<RawDebugStr<'_>>,
         pc_offset: u32,
-    );
+    ) -> Result<(), Error>;
     fn end_local(&mut self, reg_number: i32, pc_offset: u32) -> Result<(), Error>;
     fn finish_locals(&mut self, final_pc_offset: u32);
-    fn push_param(&mut self, name: RawDebugStr<'_>, sig: RawDebugStr<'_>);
+    fn push_param(&mut self, name: RawDebugStr<'_>, sig: RawDebugStr<'_>) -> Result<(), Error>;
 }
 
 pub(crate) struct ModelDebugSink<'s> {
@@ -124,6 +146,7 @@ pub(crate) struct ModelDebugSink<'s> {
     line_table: Vec<LineEntry>,
     column_table: Vec<ColumnEntry>,
     local_vars: Vec<LocalVarInfo>,
+    last_by_reg: HashMap<i32, usize>,
     params: Vec<ParamInfo>,
 }
 
@@ -136,30 +159,47 @@ impl<'s> ModelDebugSink<'s> {
             line_table: Vec::new(),
             column_table: Vec::new(),
             local_vars: Vec::new(),
+            last_by_reg: HashMap::new(),
             params: Vec::new(),
         }
     }
 
     #[inline]
-    fn intern_required(&mut self, s: RawDebugStr<'_>) -> crate::StringId {
+    fn intern_str(&mut self, text: &str) -> Result<crate::StringId, Error> {
+        self.strings
+            .try_get_or_intern(text)
+            .map_err(|e| Error::Malformed {
+                field: "string_pool",
+                context: e.to_string(),
+            })
+    }
+
+    #[inline]
+    fn intern_required(&mut self, s: RawDebugStr<'_>) -> Result<crate::StringId, Error> {
         match s {
-            RawDebugStr::Empty => self.strings.get_or_intern(""),
-            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text) => {
-                self.strings.get_or_intern(text)
-            }
-            RawDebugStr::Owned(text) => self.strings.get_or_intern(&text),
+            RawDebugStr::Empty => self.intern_str(""),
+            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text) => self.intern_str(text),
+            RawDebugStr::Owned(text) => self.intern_str(&text),
         }
     }
 
     #[inline]
-    fn intern_optional(&mut self, s: RawDebugStr<'_>) -> Option<crate::StringId> {
+    fn intern_optional(&mut self, s: RawDebugStr<'_>) -> Result<Option<crate::StringId>, Error> {
         match s {
-            RawDebugStr::Empty => None,
+            RawDebugStr::Empty => Ok(None),
             RawDebugStr::Static(text) | RawDebugStr::Borrowed(text) => {
-                Some(self.strings.get_or_intern(text))
+                if text.is_empty() {
+                    Ok(None)
+                } else {
+                    self.intern_str(text).map(Some)
+                }
             }
             RawDebugStr::Owned(text) => {
-                (!text.is_empty()).then(|| self.strings.get_or_intern(&text))
+                if text.is_empty() {
+                    Ok(None)
+                } else {
+                    self.intern_str(&text).map(Some)
+                }
             }
         }
     }
@@ -194,12 +234,14 @@ impl<'s> ModelDebugSink<'s> {
 }
 
 impl DebugSink for ModelDebugSink<'_> {
-    fn set_source_file(&mut self, s: RawDebugStr<'_>) {
-        self.source_file = self.intern_optional(s);
+    fn set_source_file(&mut self, s: RawDebugStr<'_>) -> Result<(), Error> {
+        self.source_file = self.intern_optional(s)?;
+        Ok(())
     }
 
-    fn set_source_code(&mut self, s: RawDebugStr<'_>) {
-        self.source_code = self.intern_optional(s);
+    fn set_source_code(&mut self, s: RawDebugStr<'_>) -> Result<(), Error> {
+        self.source_code = self.intern_optional(s)?;
+        Ok(())
     }
 
     fn push_line(&mut self, pc_offset: u32, line: u32) {
@@ -223,13 +265,14 @@ impl DebugSink for ModelDebugSink<'_> {
         type_name: RawDebugStr<'_>,
         type_sig: Option<RawDebugStr<'_>>,
         pc_offset: u32,
-    ) {
-        let name_sid = self.intern_required(name);
-        let type_sid = self.intern_required(type_name);
+    ) -> Result<(), Error> {
+        let name_sid = self.intern_required(name)?;
+        let type_sid = self.intern_required(type_name)?;
         let sig_sid = match type_sig {
-            Some(sig) => self.intern_required(sig),
+            Some(sig) => self.intern_required(sig)?,
             None => type_sid,
         };
+        let idx = self.local_vars.len();
         self.local_vars.push(LocalVarInfo {
             name: name_sid,
             type_name: type_sid,
@@ -238,13 +281,15 @@ impl DebugSink for ModelDebugSink<'_> {
             start: pc_offset,
             end: 0,
         });
+        self.last_by_reg.insert(reg_number, idx);
+        Ok(())
     }
 
     fn end_local(&mut self, reg_number: i32, pc_offset: u32) -> Result<(), Error> {
         let idx = self
-            .local_vars
-            .iter()
-            .rposition(|v| v.reg_number == reg_number)
+            .last_by_reg
+            .get(&reg_number)
+            .copied()
             .ok_or(Error::DebugInfoExtraction)?;
         self.local_vars[idx].end = pc_offset;
         Ok(())
@@ -258,19 +303,24 @@ impl DebugSink for ModelDebugSink<'_> {
         }
     }
 
-    fn push_param(&mut self, name: RawDebugStr<'_>, sig: RawDebugStr<'_>) {
-        let name_sid = self.intern_required(name);
-        let sig_sid = self.intern_required(sig);
+    fn push_param(&mut self, name: RawDebugStr<'_>, sig: RawDebugStr<'_>) -> Result<(), Error> {
+        let name_sid = self.intern_required(name)?;
+        let sig_sid = self.intern_required(sig)?;
         self.params.push(ParamInfo {
             name: name_sid,
             signature: sig_sid,
         });
+        Ok(())
     }
 }
 
 /// Decode a single `DebugInfoItem` + its `LineNumberProgramItem` directly from
 /// `reader` with exact parity against upstream `DebugInfoExtractor` and zero
 /// C++ FFI handles (`D2`, `#49`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "debug item decoder threads class context, method descriptor, sink, and file-wide LNP budget"
+)]
 pub(crate) fn decode_method_debug_item<S: DebugSink>(
     reader: &AbcReader<'_>,
     class_id: u32,
@@ -278,6 +328,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
     method: &RawMethod,
     code_size: u32,
     debug_off: u32,
+    lnp_budget: &mut usize,
     sink: &mut S,
 ) -> Result<(), Error> {
     let mut sp = reader
@@ -320,21 +371,22 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
         let mut first_param = true;
 
         for _ in 0..num_params {
+            consume_lnp_budget(lnp_budget, debug_off)?;
             let param_id = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)?;
             if param_id > header_size && !has_valid_proto {
                 let name = decode_debug_cstr(reader, param_id)?;
-                sink.push_param(name, RawDebugStr::Static("A"));
+                sink.push_param(name, RawDebugStr::Static("A"))?;
                 continue;
             }
             if param_id <= header_size {
                 first_param = false;
-                sink.push_param(RawDebugStr::Empty, RawDebugStr::Empty);
+                sink.push_param(RawDebugStr::Empty, RawDebugStr::Empty)?;
                 continue;
             }
             let name = decode_debug_cstr(reader, param_id)?;
             if first_param && !is_static {
                 let sig = decode_debug_cstr(reader, class_id)?;
-                sink.push_param(name, sig);
+                sink.push_param(name, sig)?;
             } else {
                 if idx_arg >= proto_num_args {
                     return Err(Error::DebugInfoExtraction);
@@ -353,11 +405,11 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
                         .ok_or(Error::DebugInfoExtraction)?;
                     idx_ref += 1;
                     let sig = decode_debug_cstr(reader, ref_off)?;
-                    sink.push_param(name, sig);
+                    sink.push_param(name, sig)?;
                 } else {
                     let sig =
                         primitive_type_signature(arg_tid).ok_or(Error::DebugInfoExtraction)?;
-                    sink.push_param(name, RawDebugStr::Static(sig));
+                    sink.push_param(name, RawDebugStr::Static(sig))?;
                 }
             }
             first_param = false;
@@ -398,6 +450,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
         }
         Ok(())
     };
+    consume_lnp_budget(lnp_budget, debug_off)?;
     sink.push_line(0, line_start);
 
     loop {
@@ -408,12 +461,14 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             0x00 => break, // END_SEQUENCE
             0x01 => {
                 // ADVANCE_PC
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let pc_diff = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 address = address.wrapping_add(pc_diff);
                 res = true;
             }
             0x02 => {
                 // ADVANCE_LINE
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let line_diff = read_sleb128_i32(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 line = line.wrapping_add(line_diff as u32);
                 res = true;
@@ -421,17 +476,19 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             0x03 => {
                 // START_LOCAL
                 check_row_cap(&mut emitted_rows)?;
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 let name_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 let type_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 let name = decode_debug_cstr(reader, name_id)?;
                 let type_name = decode_debug_cstr(reader, type_id)?;
-                sink.start_local(reg, name, type_name, None, address);
+                sink.start_local(reg, name, type_name, None, address)?;
                 res = true;
             }
             0x04 => {
                 // START_LOCAL_EXTENDED
                 check_row_cap(&mut emitted_rows)?;
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 let name_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 let type_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
@@ -439,11 +496,12 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
                 let name = decode_debug_cstr(reader, name_id)?;
                 let type_name = decode_debug_cstr(reader, type_id)?;
                 let sig_name = decode_debug_cstr(reader, sig_id)?;
-                sink.start_local(reg, name, type_name, Some(sig_name), address);
+                sink.start_local(reg, name, type_name, Some(sig_name), address)?;
                 res = true;
             }
             0x05 => {
                 // END_LOCAL
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 sink.end_local(reg, address)?;
                 res = true;
@@ -458,17 +516,20 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             0x09 => {
                 // SET_FILE
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 file_off = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 res = true;
             }
             0x0a => {
                 // SET_SOURCE_CODE
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 source_code_off = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 res = true;
             }
             0x0b => {
                 // SET_COLUMN
                 check_row_cap(&mut emitted_rows)?;
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let column = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 sink.push_column(address, column);
                 res = true;
@@ -476,6 +537,7 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             _ => {
                 // Special opcode (>= 0x0c): LINE_BASE = -4, LINE_RANGE = 15.
                 check_row_cap(&mut emitted_rows)?;
+                consume_lnp_budget(lnp_budget, debug_off)?;
                 let adjust = i32::from(opcode - 0x0c);
                 let pc_off = (adjust / 15) as u32;
                 let line_off = (adjust % 15) - 4;
@@ -494,10 +556,10 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
 
     // N55: GetFile() reads GetStringData(file_), throwing if !file_.IsValid().
     let sf = decode_debug_cstr(reader, file_off)?;
-    sink.set_source_file(sf);
+    sink.set_source_file(sf)?;
     if source_code_off > header_size {
         let sc = decode_debug_cstr(reader, source_code_off)?;
-        sink.set_source_code(sc);
+        sink.set_source_code(sc)?;
     }
     Ok(())
 }

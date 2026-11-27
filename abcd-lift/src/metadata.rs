@@ -21,6 +21,9 @@
 //!   to specifier syms; `moduleRequestPhaseIdx` blobs → per-request
 //!   lazy flags on [`ModuleRequest`].
 
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
 use abcd_file::{
     self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord,
     ModuleRequestPhase, Type,
@@ -34,6 +37,178 @@ use abcd_ir::{
 use crate::resolve;
 use crate::translate::FnLift;
 use crate::{IrArenas, LiftBackend, LiftError, Lifter};
+
+/// Pre-indexed `O(1)` lookup tables for legacy `0.0.0.2` module-var and
+/// module-namespace bytecodes (`#103`, `D8`).
+#[derive(Debug, Default)]
+pub(crate) struct LegacyModuleSlotIndex {
+    /// `ExportDecl::Local`: direct `local_name -> distinct_slot` (highest
+    /// priority) plus first-occurrence `export_name -> distinct_slot` fallback.
+    pub(crate) local_slots: HashMap<Sym, u32>,
+    /// `ImportDecl::Regular`: direct `local_name -> ext_slot` (highest
+    /// priority) plus first-occurrence `import_name -> ext_slot` fallback.
+    pub(crate) external_slots: HashMap<Sym, u32>,
+    /// `ModuleRequest::specifier -> req_idx` (highest priority) plus
+    /// `ImportDecl::Namespace::local_name -> req_idx` fallback.
+    pub(crate) namespace_slots: HashMap<Sym, u32>,
+}
+
+impl LegacyModuleSlotIndex {
+    /// Build `O(1)` legacy slot maps in `O(E + I + R)` from an `EsModule` or
+    /// standalone module declaration set, preserving exact priority rules:
+    /// direct `local_name` / `specifier` matches always beat `export_name` /
+    /// `import_name` / namespace-alias fallbacks, and earlier fallback
+    /// declarations win ties.
+    pub(crate) fn from_tables(
+        imports: &[ImportDecl],
+        exports: &[ExportDecl],
+        requests: &[ModuleRequest],
+    ) -> Self {
+        let local_exp_count = exports
+            .iter()
+            .filter(|e| matches!(e, ExportDecl::Local { .. }))
+            .count();
+        let mut local_slots = if local_exp_count == 0 {
+            HashMap::new()
+        } else {
+            HashMap::with_capacity(local_exp_count.saturating_mul(2))
+        };
+        if local_exp_count > 0 {
+            let mut next_local_slot = 0u32;
+            for exp in exports {
+                if let ExportDecl::Local { local_name, .. } = exp {
+                    local_slots.entry(*local_name).or_insert_with(|| {
+                        let slot = next_local_slot;
+                        next_local_slot += 1;
+                        slot
+                    });
+                }
+            }
+            for exp in exports {
+                if let ExportDecl::Local {
+                    export_name,
+                    local_name,
+                } = exp
+                    && let Some(&slot) = local_slots.get(local_name)
+                {
+                    local_slots.entry(*export_name).or_insert(slot);
+                }
+            }
+        }
+
+        let reg_imp_count = imports
+            .iter()
+            .filter(|i| matches!(i, ImportDecl::Regular { .. }))
+            .count();
+        let mut external_slots = if reg_imp_count == 0 {
+            HashMap::new()
+        } else {
+            HashMap::with_capacity(reg_imp_count.saturating_mul(2))
+        };
+        if reg_imp_count > 0 {
+            let mut ext_slot = 0u32;
+            for imp in imports {
+                if let ImportDecl::Regular { local_name, .. } = imp {
+                    external_slots.entry(*local_name).or_insert(ext_slot);
+                    ext_slot += 1;
+                }
+            }
+            let mut ext_slot = 0u32;
+            for imp in imports {
+                if let ImportDecl::Regular { import_name, .. } = imp {
+                    external_slots.entry(*import_name).or_insert(ext_slot);
+                    ext_slot += 1;
+                }
+            }
+        }
+
+        let ns_imp_count = imports
+            .iter()
+            .filter(|i| matches!(i, ImportDecl::Namespace { .. }))
+            .count();
+        let mut namespace_slots = if requests.is_empty() {
+            HashMap::new()
+        } else {
+            HashMap::with_capacity(requests.len().saturating_add(ns_imp_count))
+        };
+        if !requests.is_empty() {
+            for (idx, req) in requests.iter().enumerate() {
+                namespace_slots.entry(req.specifier).or_insert(idx as u32);
+            }
+            if ns_imp_count > 0 {
+                let mut ns_aliases = Vec::with_capacity(ns_imp_count);
+                for imp in imports {
+                    if let ImportDecl::Namespace {
+                        local_name,
+                        module_request,
+                    } = imp
+                        && let Some(&req_idx) = namespace_slots.get(module_request)
+                    {
+                        ns_aliases.push((*local_name, req_idx));
+                    }
+                }
+                for (local_name, req_idx) in ns_aliases {
+                    namespace_slots.entry(local_name).or_insert(req_idx);
+                }
+            }
+        }
+
+        Self {
+            local_slots,
+            external_slots,
+            namespace_slots,
+        }
+    }
+}
+
+/// Resolve or lazily initialize the active [`LegacyModuleSlotIndex`] for `class_id`
+/// (enclosing `ClassData::es_module` first, falling back to non-empty standalone
+/// module tables; `OnceLock` builds each class index at most once in `O(E + I + R)`
+/// across sequential and parallel lifting while incurring zero allocation on
+/// modern `.abc` files with no legacy module-var opcodes).
+pub(crate) fn resolve_legacy_module_slots<'a>(
+    class_id: ClassId,
+    classes: &'a [ClassData],
+    class_slots: &'a [OnceLock<Box<LegacyModuleSlotIndex>>],
+    standalone_imports: &'a [ImportDecl],
+    standalone_exports: &'a [ExportDecl],
+    standalone_requests: &'a [ModuleRequest],
+    standalone_slots: &'a OnceLock<Box<LegacyModuleSlotIndex>>,
+) -> Option<&'a LegacyModuleSlotIndex> {
+    if let Some(esm) = classes
+        .get(class_id.index())
+        .and_then(|c| c.es_module.as_ref())
+        && let Some(cell) = class_slots.get(class_id.index())
+    {
+        return Some(
+            cell.get_or_init(|| {
+                Box::new(LegacyModuleSlotIndex::from_tables(
+                    &esm.imports,
+                    &esm.exports,
+                    &esm.module_requests,
+                ))
+            })
+            .as_ref(),
+        );
+    }
+    if !standalone_imports.is_empty()
+        || !standalone_exports.is_empty()
+        || !standalone_requests.is_empty()
+    {
+        return Some(
+            standalone_slots
+                .get_or_init(|| {
+                    Box::new(LegacyModuleSlotIndex::from_tables(
+                        standalone_imports,
+                        standalone_exports,
+                        standalone_requests,
+                    ))
+                })
+                .as_ref(),
+        );
+    }
+    None
+}
 
 /// Map file access flags to the semantic modifier set (JVM-legacy bits
 /// with no JS/TS meaning are dropped — documented).
@@ -292,7 +467,7 @@ fn lift_field<'f>(
             {
                 let konst = resolve::const_for_literal_array(lf, index.0)?;
                 if is_standalone_scope_record {
-                    lf.scope_name_fields.push((name, konst));
+                    lf.scope_name_fields.entry(name).or_insert(konst);
                 } else {
                     *class_scope_names = Some(konst);
                 }
@@ -656,8 +831,11 @@ pub(crate) fn finish_debug<'f, B: LiftBackend<'f>>(
 
     // Local names with their #5 scope extents mapped onto lifted
     // instructions via binary search (`R3-A4`: `start` = first lifted inst
-    // at-or-after `lv.start`; `end` = last lifted inst at-or-before `lv.end`).
-    let mut local_names: Vec<LocalName> = Vec::new();
+    // at-or-after `lv.start`; `end` = last lifted inst at-or-before `lv.end`),
+    // deduplicated in `O(L)` while preserving encounter order (`#103`, `N20`).
+    type LocalNameKey = (Sym, Option<Ty>, Option<(abcd_ir::InstId, abcd_ir::InstId)>);
+    let mut local_names: Vec<LocalName> = Vec::with_capacity(debug.local_vars.len());
+    let mut seen_locals: HashSet<LocalNameKey> = HashSet::with_capacity(debug.local_vars.len());
     for lv in &debug.local_vars {
         let Some(name) = fx.lf.backend_sym_of_file_sid(lv.name) else {
             continue;
@@ -672,9 +850,8 @@ pub(crate) fn finish_debug<'f, B: LiftBackend<'f>>(
         } else {
             None
         };
-        let entry = LocalName { name, ty, scope };
-        if !local_names.contains(&entry) {
-            local_names.push(entry);
+        if seen_locals.insert((name, ty.clone(), scope.map(|s| (s.start, s.end)))) {
+            local_names.push(LocalName { name, ty, scope });
         }
     }
 

@@ -41,8 +41,9 @@
 //! mismatch is a release-active [`LowerError::EntityOperandMismatch`] (`R3-M9`).
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 
 use abcd_file::{
     CatchBlock, EntityRef, File, LiteralArrayIdx, LiteralValue, MethodBody, MethodCode,
@@ -212,34 +213,34 @@ enum FlatLitElem {
     LitNull(u8),
     Array(ShapeId),
     LiteralBufferRef(ShapeId),
-    ArrayU1(Vec<bool>),
-    ArrayU8(Vec<u8>),
-    ArrayI8(Vec<i8>),
-    ArrayU16(Vec<u16>),
-    ArrayI16(Vec<i16>),
-    ArrayU32(Vec<u32>),
-    ArrayI32(Vec<i32>),
-    ArrayU64(Vec<u64>),
-    ArrayI64(Vec<i64>),
-    ArrayF32(Vec<u32>),
-    ArrayF64(Vec<u64>),
-    ArrayString(Vec<Sym>),
+    ArrayU1(Arc<[bool]>),
+    ArrayU8(Arc<[u8]>),
+    ArrayI8(Arc<[i8]>),
+    ArrayU16(Arc<[u16]>),
+    ArrayI16(Arc<[i16]>),
+    ArrayU32(Arc<[u32]>),
+    ArrayI32(Arc<[i32]>),
+    ArrayU64(Arc<[u64]>),
+    ArrayI64(Arc<[i64]>),
+    ArrayF32(Arc<[u32]>),
+    ArrayF64(Arc<[u64]>),
+    ArrayString(Arc<[Sym]>),
 }
 
 /// Detached reverse entity index over a base [`File`]'s initial string, method,
-/// and literal-array tables (`#72`, `#84`).
+/// and literal-array tables (`#72`, `#84`, `#103`).
 ///
 /// Stores only `u32` `StringId` indices (borrowed against the append-only
 /// [`StringPool`] at lookup time), optional wire `source_offset` provenance,
-/// method count, and flat hash-consed literal shapes so `rewrite_file_owned`
-/// can mutate `File` in-place (`Arc::strong_count == 1` on `StringPool`) and
-/// drop old `MethodBody` buffers before lowering begins.
+/// method count, and a module-wide `ConstId -> Option<LiteralArrayIdx>` table
+/// precomputed iteratively in `O(|LiteralArrays| + |ConstPool|)` so every
+/// literal-shape lookup resolves in `O(1)` worst-case time while dropping
+/// intermediate `Vec<FlatLitElem>` interner allocations upfront.
 pub(crate) struct BaseEntityIndex {
     string_index: StringMutf8Index,
     string_source_offsets: HashMap<StringId, u32>,
     method_count: usize,
-    shape_interner: HashMap<Vec<FlatLitElem>, ShapeId>,
-    shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx>,
+    const_to_min_index: Vec<Option<LiteralArrayIdx>>,
 }
 
 impl BaseEntityIndex {
@@ -267,36 +268,41 @@ impl BaseEntityIndex {
         }
 
         let num_lits = file.literal_arrays.len();
-        let mut shape_interner: HashMap<Vec<FlatLitElem>, ShapeId> =
-            HashMap::with_capacity(num_lits);
-        let mut shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx> =
-            HashMap::with_capacity(num_lits);
-        // `0` = unvisited, `1` = active on workstack, `2` = finished (`resolved` holds result).
-        let mut state: Vec<u8> = vec![0; num_lits];
-        let mut resolved: Vec<Option<ShapeId>> = vec![None; num_lits];
+        let const_to_min_index = if num_lits == 0 || module.consts.is_empty() {
+            Vec::new()
+        } else {
+            let mut shape_interner: HashMap<Vec<FlatLitElem>, ShapeId> =
+                HashMap::with_capacity(num_lits);
+            let mut shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx> =
+                HashMap::with_capacity(num_lits);
+            // `0` = unvisited, `1` = active on workstack, `2` = finished (`resolved` holds result).
+            let mut state: Vec<u8> = vec![0; num_lits];
+            let mut resolved: Vec<Option<ShapeId>> = vec![None; num_lits];
 
-        for idx in 0..num_lits as u32 {
-            if let Some(shape_id) = intern_file_literal_array(
-                module,
-                file,
-                method_count,
-                &mut state,
-                &mut resolved,
-                &mut shape_interner,
-                idx,
-            ) {
-                shape_to_min_index
-                    .entry(shape_id)
-                    .or_insert(LiteralArrayIdx(idx));
+            for idx in 0..num_lits as u32 {
+                if let Some(shape_id) = intern_file_literal_array(
+                    module,
+                    file,
+                    method_count,
+                    &mut state,
+                    &mut resolved,
+                    &mut shape_interner,
+                    idx,
+                ) {
+                    shape_to_min_index
+                        .entry(shape_id)
+                        .or_insert(LiteralArrayIdx(idx));
+                }
             }
-        }
+
+            build_const_literal_index(module, &shape_interner, &shape_to_min_index)
+        };
 
         Self {
             string_index,
             string_source_offsets,
             method_count,
-            shape_interner,
-            shape_to_min_index,
+            const_to_min_index,
         }
     }
 
@@ -327,28 +333,23 @@ impl BaseEntityIndex {
         (func.index() < self.method_count).then_some(EntityRef::Method(MethodIdx(func.0)))
     }
 
-    pub(crate) fn literal_array_idx(
-        &self,
-        module: &Module,
-        shape: ConstId,
-    ) -> Option<LiteralArrayIdx> {
-        let shape_id = canonicalize_const_shape(module, &self.shape_interner, shape)?;
-        self.shape_to_min_index.get(&shape_id).copied()
-    }
-
-    pub(crate) fn literal_array_ref(&self, module: &Module, shape: ConstId) -> Option<EntityRef> {
-        self.literal_array_idx(module, shape)
-            .map(EntityRef::LiteralArray)
+    #[inline]
+    pub(crate) fn literal_array_idx(&self, shape: ConstId) -> Option<LiteralArrayIdx> {
+        self.const_to_min_index
+            .get(shape.index())
+            .copied()
+            .flatten()
     }
 }
 
 /// Module-scoped reverse entity resolver: IR identities → [`EntityRef`]
-/// handles (`design/ir.md` §5, `ADR-10`, `#50` `R3-D2`, `#72`).
+/// handles (`design/ir.md` §5, `ADR-10`, `#50` `R3-D2`, `#72`, `#103`).
 ///
 /// Built once per `(Module, File)` pair and safe to share across threads
-/// (`Sync`). Lookups run in `O(1)` amortized time for strings and methods (with
-/// zero per-string heap allocations for borrowed MUTF-8 entries) and
-/// `O(shape_size)` iterative bottom-up hash-consing for literal shapes.
+/// (`Sync`). Lookups run in `O(1)` amortized time for strings (with zero
+/// per-string heap allocations for borrowed MUTF-8 entries) and `O(1)`
+/// worst-case array indexing for methods and pre-memoized `ConstId` literal
+/// shapes.
 pub struct EntityResolver<'a> {
     module: &'a Module,
     file: &'a File,
@@ -479,7 +480,7 @@ impl<'a> EntityResolver<'a> {
 
     /// [`ConstId`] (a literal shape) → smallest matching [`LiteralArrayIdx`] in `file`.
     pub(crate) fn literal_array_idx(&self, shape: ConstId) -> Option<LiteralArrayIdx> {
-        self.index.literal_array_idx(self.module, shape)
+        self.index.literal_array_idx(shape)
     }
 
     /// [`ConstId`] (a literal shape) → [`EntityRef::LiteralArray`].
@@ -539,7 +540,7 @@ impl<'a> EntityResolver<'a> {
 #[derive(Clone, Copy)]
 enum NestedShapeWrap {
     Array,
-    BufferRef { wrapper_cid: ConstId },
+    BufferRef { wrapper_usize: usize },
 }
 
 enum ConstShapeCursor<'m> {
@@ -592,7 +593,7 @@ impl<'m> ConstShapeCursor<'m> {
 }
 
 struct ConstShapeFrame<'m> {
-    cid: ConstId,
+    cid_usize: usize,
     parent_wrap: Option<NestedShapeWrap>,
     cursor: ConstShapeCursor<'m>,
     items: Vec<FlatLitElem>,
@@ -624,7 +625,7 @@ fn const_typed_array_elems(
                 };
                 out.push(b);
             }
-            Some(FlatLitElem::ArrayU1(out))
+            Some(FlatLitElem::ArrayU1(out.into()))
         }
         TypedArrayTag::U8 => {
             let mut out = Vec::with_capacity(items.len());
@@ -638,7 +639,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayU8(out))
+            Some(FlatLitElem::ArrayU8(out.into()))
         }
         TypedArrayTag::I8 => {
             let mut out = Vec::with_capacity(items.len());
@@ -651,7 +652,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayI8(out))
+            Some(FlatLitElem::ArrayI8(out.into()))
         }
         TypedArrayTag::U16 => {
             let mut out = Vec::with_capacity(items.len());
@@ -665,7 +666,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayU16(out))
+            Some(FlatLitElem::ArrayU16(out.into()))
         }
         TypedArrayTag::I16 => {
             let mut out = Vec::with_capacity(items.len());
@@ -678,7 +679,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayI16(out))
+            Some(FlatLitElem::ArrayI16(out.into()))
         }
         TypedArrayTag::U32 => {
             let mut out = Vec::with_capacity(items.len());
@@ -692,7 +693,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayU32(out))
+            Some(FlatLitElem::ArrayU32(out.into()))
         }
         TypedArrayTag::I32 => {
             let mut out = Vec::with_capacity(items.len());
@@ -705,7 +706,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayI32(out))
+            Some(FlatLitElem::ArrayI32(out.into()))
         }
         TypedArrayTag::U64 => {
             let mut out = Vec::with_capacity(items.len());
@@ -719,7 +720,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayU64(out))
+            Some(FlatLitElem::ArrayU64(out.into()))
         }
         TypedArrayTag::I64 => {
             let mut out = Vec::with_capacity(items.len());
@@ -733,7 +734,7 @@ fn const_typed_array_elems(
                 };
                 out.push(v);
             }
-            Some(FlatLitElem::ArrayI64(out))
+            Some(FlatLitElem::ArrayI64(out.into()))
         }
         TypedArrayTag::F32 => {
             let mut out = Vec::with_capacity(items.len());
@@ -745,7 +746,7 @@ fn const_typed_array_elems(
                 };
                 out.push(bits);
             }
-            Some(FlatLitElem::ArrayF32(out))
+            Some(FlatLitElem::ArrayF32(out.into()))
         }
         TypedArrayTag::F64 => {
             let mut out = Vec::with_capacity(items.len());
@@ -757,7 +758,7 @@ fn const_typed_array_elems(
                 };
                 out.push(bits);
             }
-            Some(FlatLitElem::ArrayF64(out))
+            Some(FlatLitElem::ArrayF64(out.into()))
         }
         TypedArrayTag::String => {
             let mut out = Vec::with_capacity(items.len());
@@ -767,38 +768,184 @@ fn const_typed_array_elems(
                 };
                 out.push(*sym);
             }
-            Some(FlatLitElem::ArrayString(out))
+            Some(FlatLitElem::ArrayString(out.into()))
         }
     }
 }
 
-/// Iteratively dereference a pooled literal shape into its hash-consed
-/// [`ShapeId`] inside `interner`, rejecting dangling child [`ConstId`]s,
-/// non-shape/unsupported elements, and `ConstId` cycles in `O(1)` call stack.
-fn canonicalize_const_shape(
+fn get_or_compute_inline_typed_array(
+    module: &Module,
+    inline_typed: &mut HashMap<ConstId, Option<FlatLitElem>>,
+    cid: ConstId,
+    tag: TypedArrayTag,
+    items: &[ConstId],
+) -> Option<FlatLitElem> {
+    if let Some(cached) = inline_typed.get(&cid) {
+        return cached.clone();
+    }
+    let computed = const_typed_array_elems(module, tag, items);
+    inline_typed.insert(cid, computed.clone());
+    computed
+}
+
+fn finish_const_wrappers(
+    state: &mut [u8],
+    resolved: &mut [Option<ShapeId>],
+    wrappers: &[usize],
+    val: Option<ShapeId>,
+) {
+    for &u in wrappers {
+        state[u] = 2;
+        resolved[u] = val;
+    }
+}
+
+fn abort_const_stack(
+    state: &mut [u8],
+    resolved: &mut [Option<ShapeId>],
+    wrappers: &[usize],
+    cur: ConstShapeFrame<'_>,
+    stack: Vec<ConstShapeFrame<'_>>,
+) {
+    state[cur.cid_usize] = 2;
+    resolved[cur.cid_usize] = None;
+    if let Some(NestedShapeWrap::BufferRef { wrapper_usize }) = cur.parent_wrap {
+        state[wrapper_usize] = 2;
+        resolved[wrapper_usize] = None;
+    }
+    for f in stack {
+        state[f.cid_usize] = 2;
+        resolved[f.cid_usize] = None;
+        if let Some(NestedShapeWrap::BufferRef { wrapper_usize }) = f.parent_wrap {
+            state[wrapper_usize] = 2;
+            resolved[wrapper_usize] = None;
+        }
+    }
+    finish_const_wrappers(state, resolved, wrappers, None);
+}
+
+/// Precompute `ConstId -> Option<LiteralArrayIdx>` across `0..module.consts.len()`
+/// in `O(|ConstPool|)` total time and `O(1)` call stack (`#103`), visiting each
+/// `ConstId` and `ConstId -> ConstId` edge at most once even on deep diamond DAGs.
+fn build_const_literal_index(
     module: &Module,
     interner: &HashMap<Vec<FlatLitElem>, ShapeId>,
+    shape_to_min_index: &HashMap<ShapeId, LiteralArrayIdx>,
+) -> Vec<Option<LiteralArrayIdx>> {
+    if shape_to_min_index.is_empty() {
+        return Vec::new();
+    }
+    let num_consts = module.consts.len();
+    // `0` = unvisited, `1` = active on workstack (cycle guard), `2` = finished.
+    let mut state: Vec<u8> = vec![0; num_consts];
+    let mut resolved: Vec<Option<ShapeId>> = vec![None; num_consts];
+    let mut inline_typed: HashMap<ConstId, Option<FlatLitElem>> = HashMap::new();
+
+    for idx in 0..num_consts {
+        if state[idx] == 0 {
+            let _ = resolve_const_shape_id(
+                module,
+                interner,
+                &mut state,
+                &mut resolved,
+                &mut inline_typed,
+                ConstId::new(idx as u32),
+            );
+        }
+    }
+
+    resolved
+        .into_iter()
+        .map(|opt_sid| opt_sid.and_then(|sid| shape_to_min_index.get(&sid).copied()))
+        .collect()
+}
+
+/// Iteratively dereference a pooled literal shape into its hash-consed
+/// [`ShapeId`] inside `interner`, memoizing both `Some(ShapeId)` and `None`
+/// across `state` / `resolved` so shared diamond `ConstId` DAGs never re-walk
+/// subgraphs (`O(1)` call stack, `#103`).
+fn resolve_const_shape_id(
+    module: &Module,
+    interner: &HashMap<Vec<FlatLitElem>, ShapeId>,
+    state: &mut [u8],
+    resolved: &mut [Option<ShapeId>],
+    inline_typed: &mut HashMap<ConstId, Option<FlatLitElem>>,
     root: ConstId,
 ) -> Option<ShapeId> {
-    let mut active: HashSet<ConstId> = HashSet::new();
+    let root_usize = root.index();
+    let (Some(first_const), Some(&first_state)) = (module.consts.get(root), state.get(root_usize))
+    else {
+        return None;
+    };
+    match first_state {
+        2 => return resolved[root_usize],
+        1 => return None,
+        _ => {}
+    }
+    if !matches!(
+        first_const,
+        Const::ArrayLiteral(_)
+            | Const::ObjectLiteral { .. }
+            | Const::TypedArrayLiteral { .. }
+            | Const::LiteralBufferRef(_)
+    ) {
+        state[root_usize] = 2;
+        resolved[root_usize] = None;
+        return None;
+    }
+
+    let mut wrapper_chain: Vec<usize> = Vec::new();
     let mut actual_root = root;
     let root_const = loop {
-        if !active.insert(actual_root) {
+        let cur_usize = actual_root.index();
+        let (Some(c), Some(&cur_state)) = (module.consts.get(actual_root), state.get(cur_usize))
+        else {
+            finish_const_wrappers(state, resolved, &wrapper_chain, None);
             return None;
+        };
+        match cur_state {
+            2 => {
+                let res = resolved[cur_usize];
+                finish_const_wrappers(state, resolved, &wrapper_chain, res);
+                return res;
+            }
+            1 => {
+                finish_const_wrappers(state, resolved, &wrapper_chain, None);
+                return None;
+            }
+            _ => {}
         }
-        match module.consts.get(actual_root)? {
-            Const::LiteralBufferRef(inner) => actual_root = *inner,
+        match c {
+            Const::LiteralBufferRef(inner) => {
+                state[cur_usize] = 1;
+                wrapper_chain.push(cur_usize);
+                actual_root = *inner;
+            }
             other => break other,
         }
     };
+
+    let actual_usize = actual_root.index();
     if let Const::TypedArrayLiteral { tag, items } = root_const {
-        let elem = const_typed_array_elems(module, *tag, items)?;
-        return interner.get(&vec![elem]).copied();
+        let elem_opt =
+            get_or_compute_inline_typed_array(module, inline_typed, actual_root, *tag, items);
+        let res = elem_opt.and_then(|elem| interner.get(&vec![elem]).copied());
+        state[actual_usize] = 2;
+        resolved[actual_usize] = res;
+        finish_const_wrappers(state, resolved, &wrapper_chain, res);
+        return res;
     }
-    let (root_cursor, root_cap) = ConstShapeCursor::from_const(root_const)?;
-    let mut memo: HashMap<ConstId, ShapeId> = HashMap::new();
+
+    let Some((root_cursor, root_cap)) = ConstShapeCursor::from_const(root_const) else {
+        state[actual_usize] = 2;
+        resolved[actual_usize] = None;
+        finish_const_wrappers(state, resolved, &wrapper_chain, None);
+        return None;
+    };
+
+    state[actual_usize] = 1;
     let mut stack = vec![ConstShapeFrame {
-        cid: actual_root,
+        cid_usize: actual_usize,
         parent_wrap: None,
         cursor: root_cursor,
         items: Vec::with_capacity(root_cap),
@@ -806,25 +953,63 @@ fn canonicalize_const_shape(
 
     'outer: while let Some(mut frame) = stack.pop() {
         while let Some(child_cid) = frame.cursor.next_id() {
-            let child_const = module.consts.get(child_cid)?;
+            let child_usize = child_cid.index();
+            let Some(child_const) = module.consts.get(child_cid) else {
+                abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                return None;
+            };
             if let Const::TypedArrayLiteral { tag, items } = child_const {
-                frame
-                    .items
-                    .push(const_typed_array_elems(module, *tag, items)?);
+                let Some(elem) =
+                    get_or_compute_inline_typed_array(module, inline_typed, child_cid, *tag, items)
+                else {
+                    abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                    return None;
+                };
+                frame.items.push(elem);
                 continue;
             }
+
             let nested = match child_const {
                 Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {
                     Some((child_cid, child_const, NestedShapeWrap::Array))
                 }
                 Const::LiteralBufferRef(inner_cid) => {
-                    if active.contains(&child_cid) {
+                    if state[child_usize] == 1 {
+                        abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
                         return None;
                     }
-                    let inner_const = module.consts.get(*inner_cid)?;
+                    let Some(inner_const) = module.consts.get(*inner_cid) else {
+                        state[child_usize] = 2;
+                        resolved[child_usize] = None;
+                        abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                        return None;
+                    };
+                    let inner_usize = inner_cid.index();
                     if let Const::TypedArrayLiteral { tag, items } = inner_const {
-                        let elem = const_typed_array_elems(module, *tag, items)?;
-                        let child_id = *interner.get(&vec![elem])?;
+                        let id_opt = match state[inner_usize] {
+                            2 => resolved[inner_usize],
+                            1 => None,
+                            _ => {
+                                let elem_opt = get_or_compute_inline_typed_array(
+                                    module,
+                                    inline_typed,
+                                    *inner_cid,
+                                    *tag,
+                                    items,
+                                );
+                                let computed =
+                                    elem_opt.and_then(|elem| interner.get(&vec![elem]).copied());
+                                state[inner_usize] = 2;
+                                resolved[inner_usize] = computed;
+                                computed
+                            }
+                        };
+                        state[child_usize] = 2;
+                        resolved[child_usize] = id_opt;
+                        let Some(child_id) = id_opt else {
+                            abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                            return None;
+                        };
                         frame.items.push(FlatLitElem::LiteralBufferRef(child_id));
                         continue;
                     }
@@ -832,13 +1017,14 @@ fn canonicalize_const_shape(
                         inner_const,
                         Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
                     ) {
+                        abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
                         return None;
                     }
                     Some((
                         *inner_cid,
                         inner_const,
                         NestedShapeWrap::BufferRef {
-                            wrapper_cid: child_cid,
+                            wrapper_usize: child_usize,
                         },
                     ))
                 }
@@ -846,21 +1032,52 @@ fn canonicalize_const_shape(
             };
 
             if let Some((target_cid, target_const, wrap)) = nested {
-                if active.contains(&target_cid) {
+                let target_usize = target_cid.index();
+                match state[target_usize] {
+                    2 => {
+                        let Some(cached_id) = resolved[target_usize] else {
+                            if let NestedShapeWrap::BufferRef { wrapper_usize } = wrap {
+                                state[wrapper_usize] = 2;
+                                resolved[wrapper_usize] = None;
+                            }
+                            abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                            return None;
+                        };
+                        if let NestedShapeWrap::BufferRef { wrapper_usize } = wrap {
+                            state[wrapper_usize] = 2;
+                            resolved[wrapper_usize] = Some(cached_id);
+                        }
+                        frame.items.push(wrap_flat_elem(wrap, cached_id));
+                        continue;
+                    }
+                    1 => {
+                        if let NestedShapeWrap::BufferRef { wrapper_usize } = wrap {
+                            state[wrapper_usize] = 2;
+                            resolved[wrapper_usize] = None;
+                        }
+                        abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                        return None;
+                    }
+                    _ => {}
+                }
+                let Some((child_cursor, child_cap)) = ConstShapeCursor::from_const(target_const)
+                else {
+                    state[target_usize] = 2;
+                    resolved[target_usize] = None;
+                    if let NestedShapeWrap::BufferRef { wrapper_usize } = wrap {
+                        state[wrapper_usize] = 2;
+                        resolved[wrapper_usize] = None;
+                    }
+                    abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
                     return None;
+                };
+                if let NestedShapeWrap::BufferRef { wrapper_usize } = wrap {
+                    state[wrapper_usize] = 1;
                 }
-                if let Some(&cached_id) = memo.get(&target_cid) {
-                    frame.items.push(wrap_flat_elem(wrap, cached_id));
-                    continue;
-                }
-                let (child_cursor, child_cap) = ConstShapeCursor::from_const(target_const)?;
-                if let NestedShapeWrap::BufferRef { wrapper_cid } = wrap {
-                    active.insert(wrapper_cid);
-                }
-                active.insert(target_cid);
+                state[target_usize] = 1;
                 stack.push(frame);
                 stack.push(ConstShapeFrame {
-                    cid: target_cid,
+                    cid_usize: target_usize,
                     parent_wrap: Some(wrap),
                     cursor: child_cursor,
                     items: Vec::with_capacity(child_cap),
@@ -893,21 +1110,29 @@ fn canonicalize_const_shape(
                 | Const::ArrayLiteral(_)
                 | Const::TypedArrayLiteral { .. }
                 | Const::ObjectLiteral { .. }
-                | Const::LiteralBufferRef(_) => return None,
+                | Const::LiteralBufferRef(_) => {
+                    abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+                    return None;
+                }
             };
             frame.items.push(scalar);
         }
 
-        active.remove(&frame.cid);
-        if let Some(NestedShapeWrap::BufferRef { wrapper_cid }) = frame.parent_wrap {
-            active.remove(&wrapper_cid);
+        let Some(&shape_id) = interner.get(&frame.items) else {
+            abort_const_stack(state, resolved, &wrapper_chain, frame, stack);
+            return None;
+        };
+        state[frame.cid_usize] = 2;
+        resolved[frame.cid_usize] = Some(shape_id);
+        if let Some(NestedShapeWrap::BufferRef { wrapper_usize }) = frame.parent_wrap {
+            state[wrapper_usize] = 2;
+            resolved[wrapper_usize] = Some(shape_id);
         }
-        let shape_id = *interner.get(&frame.items)?;
-        memo.insert(frame.cid, shape_id);
         if let Some(parent) = stack.last_mut() {
             let wrap = frame.parent_wrap.unwrap_or(NestedShapeWrap::Array);
             parent.items.push(wrap_flat_elem(wrap, shape_id));
         } else {
+            finish_const_wrappers(state, resolved, &wrapper_chain, Some(shape_id));
             return Some(shape_id);
         }
     }
@@ -1081,27 +1306,27 @@ fn scalar_literal_value_elem(
         LiteralValue::Getter(midx) => method_elem(*midx, LitMethodKind::Getter),
         LiteralValue::Setter(midx) => method_elem(*midx, LitMethodKind::Setter),
         LiteralValue::NullValue(n) => Some(FlatLitElem::LitNull(*n)),
-        LiteralValue::ArrayU1(vals) => Some(FlatLitElem::ArrayU1(vals.clone())),
-        LiteralValue::ArrayU8(vals) => Some(FlatLitElem::ArrayU8(vals.clone())),
-        LiteralValue::ArrayI8(vals) => Some(FlatLitElem::ArrayI8(vals.clone())),
-        LiteralValue::ArrayU16(vals) => Some(FlatLitElem::ArrayU16(vals.clone())),
-        LiteralValue::ArrayI16(vals) => Some(FlatLitElem::ArrayI16(vals.clone())),
-        LiteralValue::ArrayU32(vals) => Some(FlatLitElem::ArrayU32(vals.clone())),
-        LiteralValue::ArrayI32(vals) => Some(FlatLitElem::ArrayI32(vals.clone())),
-        LiteralValue::ArrayU64(vals) => Some(FlatLitElem::ArrayU64(vals.clone())),
-        LiteralValue::ArrayI64(vals) => Some(FlatLitElem::ArrayI64(vals.clone())),
+        LiteralValue::ArrayU1(vals) => Some(FlatLitElem::ArrayU1(vals.as_slice().into())),
+        LiteralValue::ArrayU8(vals) => Some(FlatLitElem::ArrayU8(vals.as_slice().into())),
+        LiteralValue::ArrayI8(vals) => Some(FlatLitElem::ArrayI8(vals.as_slice().into())),
+        LiteralValue::ArrayU16(vals) => Some(FlatLitElem::ArrayU16(vals.as_slice().into())),
+        LiteralValue::ArrayI16(vals) => Some(FlatLitElem::ArrayI16(vals.as_slice().into())),
+        LiteralValue::ArrayU32(vals) => Some(FlatLitElem::ArrayU32(vals.as_slice().into())),
+        LiteralValue::ArrayI32(vals) => Some(FlatLitElem::ArrayI32(vals.as_slice().into())),
+        LiteralValue::ArrayU64(vals) => Some(FlatLitElem::ArrayU64(vals.as_slice().into())),
+        LiteralValue::ArrayI64(vals) => Some(FlatLitElem::ArrayI64(vals.as_slice().into())),
         LiteralValue::ArrayF32(vals) => Some(FlatLitElem::ArrayF32(
-            vals.iter().map(|f| f.to_bits()).collect(),
+            vals.iter().map(|f| f.to_bits()).collect::<Vec<_>>().into(),
         )),
         LiteralValue::ArrayF64(vals) => Some(FlatLitElem::ArrayF64(
-            vals.iter().map(|f| f.to_bits()).collect(),
+            vals.iter().map(|f| f.to_bits()).collect::<Vec<_>>().into(),
         )),
         LiteralValue::ArrayString(sids) => {
             let mut syms = Vec::with_capacity(sids.len());
             for &sid in sids {
                 syms.push(lookup_sym_in_module(module, file, sid)?);
             }
-            Some(FlatLitElem::ArrayString(syms))
+            Some(FlatLitElem::ArrayString(syms.into()))
         }
         LiteralValue::LiteralArray(_) | LiteralValue::LiteralBufferIndex(_) => None,
     }

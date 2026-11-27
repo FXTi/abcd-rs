@@ -250,12 +250,58 @@ impl ModuleLinkTable {
             lookup_candidates(&candidates)
         };
 
+        let mut exports_by_class: BTreeMap<ClassId, ClassExportIndex<'_>> = BTreeMap::new();
+        for (&cid, esm) in &esm_by_class {
+            let mut idx = ClassExportIndex::default();
+            for exp in &esm.exports {
+                match exp {
+                    ExportDecl::Local {
+                        local_name,
+                        export_name,
+                    } => {
+                        let ename = sym_str(module, *export_name);
+                        if !ename.is_empty() && ename != "default" {
+                            idx.non_default_names.push(ename);
+                        }
+                        idx.direct
+                            .entry(ename)
+                            .or_default()
+                            .push(DirectExport::Local {
+                                local_name: *local_name,
+                            });
+                    }
+                    ExportDecl::Indirect {
+                        export_name,
+                        import_name,
+                        module_request,
+                    } => {
+                        let ename = sym_str(module, *export_name);
+                        if !ename.is_empty() && ename != "default" {
+                            idx.non_default_names.push(ename);
+                        }
+                        let resolved_target = resolve_spec(cid, *module_request);
+                        idx.direct
+                            .entry(ename)
+                            .or_default()
+                            .push(DirectExport::Indirect {
+                                import_name: *import_name,
+                                module_request: *module_request,
+                                resolved_target,
+                            });
+                    }
+                    ExportDecl::Star { module_request } => {
+                        idx.stars.push(resolve_spec(cid, *module_request));
+                    }
+                }
+            }
+            exports_by_class.insert(cid, idx);
+        }
+
         let ctx = ExportResolveCtx {
             module,
-            esm_by_class: &esm_by_class,
+            exports_by_class: &exports_by_class,
             json_by_class: &json_by_class,
             local_name_to_slot: &local_name_to_slot,
-            resolve_spec: &resolve_spec,
             star_names_memo: std::cell::RefCell::new(HashMap::new()),
             export_memo: std::cell::RefCell::new(HashMap::new()),
         };
@@ -583,20 +629,34 @@ struct ExpandedExportNode {
     edges: Vec<((ClassId, String), ExportEdgeKind)>,
 }
 
-struct ExportResolveCtx<'a, F> {
+enum DirectExport {
+    Local {
+        local_name: Sym,
+    },
+    Indirect {
+        import_name: Sym,
+        module_request: Sym,
+        resolved_target: Option<ClassId>,
+    },
+}
+
+#[derive(Default)]
+struct ClassExportIndex<'a> {
+    direct: HashMap<&'a str, Vec<DirectExport>>,
+    non_default_names: Vec<&'a str>,
+    stars: Vec<Option<ClassId>>,
+}
+
+struct ExportResolveCtx<'a> {
     module: &'a Module,
-    esm_by_class: &'a BTreeMap<ClassId, EsModule>,
+    exports_by_class: &'a BTreeMap<ClassId, ClassExportIndex<'a>>,
     json_by_class: &'a BTreeMap<ClassId, ConstId>,
     local_name_to_slot: &'a BTreeMap<ClassId, HashMap<String, u32>>,
-    resolve_spec: &'a F,
     star_names_memo: std::cell::RefCell<HashMap<ClassId, (BTreeSet<String>, bool)>>,
     export_memo: std::cell::RefCell<HashMap<(ClassId, String), MemoExportEntry>>,
 }
 
-impl<'a, F> ExportResolveCtx<'a, F>
-where
-    F: Fn(ClassId, Sym) -> Option<ClassId>,
-{
+impl<'a> ExportResolveCtx<'a> {
     fn resolve_export_cached(
         &self,
         root_cid: ClassId,
@@ -618,18 +678,13 @@ where
 
     fn collect_exported_names_cached(&self, root_cid: ClassId) -> (BTreeSet<String>, bool) {
         let (mut out, has_ext_star) = self.star_exported_names_cached(root_cid);
-        if self.json_by_class.contains_key(&root_cid) {
+        if self.json_by_class.contains_key(&root_cid)
+            || self
+                .exports_by_class
+                .get(&root_cid)
+                .is_some_and(|idx| idx.direct.contains_key("default"))
+        {
             out.insert("default".to_owned());
-        }
-        if let Some(esm) = self.esm_by_class.get(&root_cid) {
-            for exp in &esm.exports {
-                if let ExportDecl::Local { export_name, .. }
-                | ExportDecl::Indirect { export_name, .. } = exp
-                    && sym_str(self.module, *export_name) == "default"
-                {
-                    out.insert("default".to_owned());
-                }
-            }
         }
         (out, has_ext_star)
     }
@@ -660,23 +715,15 @@ where
             let mut local_names = BTreeSet::new();
             let mut children = Vec::new();
             let mut local_ext_star = false;
-            if let Some(esm) = self.esm_by_class.get(&cid) {
-                for exp in &esm.exports {
-                    match exp {
-                        ExportDecl::Local { export_name, .. }
-                        | ExportDecl::Indirect { export_name, .. } => {
-                            let s = sym_str(self.module, *export_name);
-                            if !s.is_empty() && s != "default" {
-                                local_names.insert(s.to_owned());
-                            }
-                        }
-                        ExportDecl::Star { module_request } => {
-                            if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                                children.push(next_cid);
-                            } else {
-                                local_ext_star = true;
-                            }
-                        }
+            if let Some(idx) = self.exports_by_class.get(&cid) {
+                for &ename in &idx.non_default_names {
+                    local_names.insert(ename.to_owned());
+                }
+                for &star_target in &idx.stars {
+                    if let Some(next_cid) = star_target {
+                        children.push(next_cid);
+                    } else {
+                        local_ext_star = true;
                     }
                 }
             }
@@ -785,67 +832,61 @@ where
             base.json_consts.push(jc);
             return ExpandedExportNode { base, edges };
         }
-        let Some(esm) = self.esm_by_class.get(&cid) else {
+        let Some(idx) = self.exports_by_class.get(&cid) else {
             base.direct_unresolved = true;
             return ExpandedExportNode { base, edges };
         };
 
-        let mut matched_direct = false;
-        for exp in &esm.exports {
-            match exp {
-                ExportDecl::Local {
-                    local_name,
-                    export_name: ename,
-                } if sym_str(self.module, *ename) == export_name => {
-                    matched_direct = true;
-                    let lname = sym_str(self.module, *local_name);
-                    if let Some(&slot) =
-                        self.local_name_to_slot.get(&cid).and_then(|m| m.get(lname))
-                    {
-                        let sr = ModuleSlotRef {
-                            class_id: cid,
-                            slot,
-                        };
-                        if !base.slots.contains(&sr) {
-                            base.slots.push(sr);
-                        }
-                    } else {
-                        base.direct_unresolved = true;
-                    }
-                }
-                ExportDecl::Indirect {
-                    export_name: ename,
-                    import_name,
-                    module_request,
-                } if sym_str(self.module, *ename) == export_name => {
-                    matched_direct = true;
-                    let iname = sym_str(self.module, *import_name);
-                    if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                        if iname == "*" {
-                            // `export * as ns from "./sub"` re-exports `next_cid`'s
-                            // module namespace object — preserve namespace identity
-                            // instead of flattening exports into bare slots (`#82`).
-                            if !base.namespace_classes.contains(&next_cid) {
-                                base.namespace_classes.push(next_cid);
+        if let Some(decls) = idx.direct.get(export_name) {
+            for decl in decls {
+                match decl {
+                    DirectExport::Local { local_name } => {
+                        let lname = sym_str(self.module, *local_name);
+                        if let Some(&slot) =
+                            self.local_name_to_slot.get(&cid).and_then(|m| m.get(lname))
+                        {
+                            let sr = ModuleSlotRef {
+                                class_id: cid,
+                                slot,
+                            };
+                            if !base.slots.contains(&sr) {
+                                base.slots.push(sr);
                             }
                         } else {
-                            edges.push(((next_cid, iname.to_owned()), ExportEdgeKind::Indirect));
+                            base.direct_unresolved = true;
                         }
-                    } else {
-                        base.direct_unresolved = true;
-                        let pair = (*module_request, *import_name);
-                        if !base.external_imports.contains(&pair) {
-                            base.external_imports.push(pair);
+                    }
+                    DirectExport::Indirect {
+                        import_name,
+                        module_request,
+                        resolved_target,
+                    } => {
+                        let iname = sym_str(self.module, *import_name);
+                        if let Some(next_cid) = *resolved_target {
+                            if iname == "*" {
+                                // `export * as ns from "./sub"` re-exports `next_cid`'s
+                                // module namespace object — preserve namespace identity
+                                // instead of flattening exports into bare slots (`#82`).
+                                if !base.namespace_classes.contains(&next_cid) {
+                                    base.namespace_classes.push(next_cid);
+                                }
+                            } else {
+                                edges
+                                    .push(((next_cid, iname.to_owned()), ExportEdgeKind::Indirect));
+                            }
+                        } else {
+                            base.direct_unresolved = true;
+                            let pair = (*module_request, *import_name);
+                            if !base.external_imports.contains(&pair) {
+                                base.external_imports.push(pair);
+                            }
                         }
                     }
                 }
-                _ => {}
             }
-        }
-
-        if matched_direct {
             return ExpandedExportNode { base, edges };
         }
+
         if export_name == "default" {
             base.direct_unresolved = true;
             return ExpandedExportNode { base, edges };
@@ -853,13 +894,11 @@ where
 
         // ECMA-262 §16.2.1.6.2: `export * from` forwards non-`default` bindings;
         // external star targets (`has_external_star`) propagate monotonically (`|=`).
-        for exp in &esm.exports {
-            if let ExportDecl::Star { module_request } = exp {
-                if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                    edges.push(((next_cid, export_name.to_owned()), ExportEdgeKind::Star));
-                } else {
-                    base.has_external_star = true;
-                }
+        for &star_target in &idx.stars {
+            if let Some(next_cid) = star_target {
+                edges.push(((next_cid, export_name.to_owned()), ExportEdgeKind::Star));
+            } else {
+                base.has_external_star = true;
             }
         }
 

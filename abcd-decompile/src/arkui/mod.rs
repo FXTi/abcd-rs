@@ -1018,6 +1018,14 @@ pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncI
     let mut fstack: Vec<(FuncId, bool)> = vec![(root_func, true)];
     let mut candidates: Vec<ClassCand> = Vec::new();
     let empty_env = BTreeMap::new();
+    let owned_cache;
+    let method_refs = match em.index {
+        Some(idx) => &idx.const_method_refs,
+        None => {
+            owned_cache = crate::consts::ConstMethodRefCache::build(em.module);
+            &owned_cache
+        }
+    };
 
     while let Some((fid, is_top)) = fstack.pop() {
         if !visited_funcs.insert(fid) || em.module.func(fid).is_none() {
@@ -1054,7 +1062,7 @@ pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncI
                                 });
                             }
                             for e in crate::folds::leaf_exprs(l) {
-                                collect_inline_funcs_from_expr(em.module, e, &mut fstack);
+                                collect_inline_funcs_from_expr(method_refs, e, &mut fstack);
                             }
                         }
                     }
@@ -1064,26 +1072,26 @@ pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncI
                         then,
                         otherwise,
                     } => {
-                        collect_inline_funcs_from_expr(em.module, cond, &mut fstack);
+                        collect_inline_funcs_from_expr(method_refs, cond, &mut fstack);
                         nstack.push(otherwise);
                         nstack.push(then);
                     }
                     SNode::While { cond, body: b, .. } => {
                         if let Some(c) = cond {
-                            collect_inline_funcs_from_expr(em.module, c, &mut fstack);
+                            collect_inline_funcs_from_expr(method_refs, c, &mut fstack);
                         }
                         nstack.push(b);
                     }
                     SNode::DoWhile { body: b, cond, .. } => {
-                        collect_inline_funcs_from_expr(em.module, cond, &mut fstack);
+                        collect_inline_funcs_from_expr(method_refs, cond, &mut fstack);
                         nstack.push(b);
                     }
                     SNode::ForOf { iter, body: b, .. } => {
-                        collect_inline_funcs_from_expr(em.module, iter, &mut fstack);
+                        collect_inline_funcs_from_expr(method_refs, iter, &mut fstack);
                         nstack.push(b);
                     }
                     SNode::ForIn { obj, body: b, .. } => {
-                        collect_inline_funcs_from_expr(em.module, obj, &mut fstack);
+                        collect_inline_funcs_from_expr(method_refs, obj, &mut fstack);
                         nstack.push(b);
                     }
                     SNode::Try {
@@ -1101,10 +1109,10 @@ pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncI
                         nstack.push(b);
                     }
                     SNode::Switch { disc, cases } => {
-                        collect_inline_funcs_from_expr(em.module, disc, &mut fstack);
+                        collect_inline_funcs_from_expr(method_refs, disc, &mut fstack);
                         for c in cases.iter().rev() {
                             for t in &c.tests {
-                                collect_inline_funcs_from_expr(em.module, t, &mut fstack);
+                                collect_inline_funcs_from_expr(method_refs, t, &mut fstack);
                             }
                             nstack.push(&c.body);
                         }
@@ -1157,20 +1165,17 @@ pub(crate) fn precompute_arkui_components(em: &mut Emitter<'_>, root_func: FuncI
 }
 
 pub(super) fn collect_inline_funcs_from_expr(
-    module: &abcd_ir::Module,
+    method_refs: &crate::consts::ConstMethodRefCache,
     root: &Expr,
     out: &mut Vec<(FuncId, bool)>,
 ) {
     let mut estack = vec![root];
-    let mut mrefs = BTreeSet::new();
     while let Some(cur) = estack.pop() {
         match cur {
             Expr::Closure { body, .. } => out.push((*body, false)),
             Expr::Class { ctor, members, .. } => {
                 out.push((*ctor, false));
-                mrefs.clear();
-                crate::emit::collect_method_refs(module, *members, &mut mrefs);
-                for &m in &mrefs {
+                for &m in method_refs.get(*members) {
                     out.push((m, false));
                 }
             }

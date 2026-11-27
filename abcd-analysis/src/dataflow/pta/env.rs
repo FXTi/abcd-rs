@@ -7,7 +7,7 @@ use abcd_ir::{FuncId, InstId, Module, Op};
 
 use crate::dataflow::heap::AllocSiteSet;
 
-use super::scan::{callable_body, closure_body, collect_const_method_refs};
+use super::scan::{ConstMethodRefMemo, callable_body, closure_body};
 
 /// The rung-2 answer to a lexical-environment query: the environment
 /// objects a `GetLexVar`/`PutLexVar` at `level` may denote.
@@ -150,6 +150,7 @@ struct EnvFuncCfg {
 pub(super) struct EnvAnalysisOut {
     pub(super) env_stack_at: Vec<Arc<EnvState>>,
     pub(super) env_sites: Vec<bool>,
+    pub(super) const_method_refs: ConstMethodRefMemo,
     pub(super) rounds: usize,
     pub(super) capped: bool,
 }
@@ -168,6 +169,7 @@ pub(super) fn env_analysis(
     let mut inst_reached = vec![false; module.insts.len()];
     let mut inst_owner: Vec<Option<usize>> = vec![None; module.insts.len()];
     let mut capture_points: BTreeMap<FuncId, BTreeSet<InstId>> = BTreeMap::new();
+    let mut const_method_refs = ConstMethodRefMemo::default();
     let mut func_cfgs: Vec<EnvFuncCfg> = Vec::with_capacity(module.functions.len());
 
     for (fi, f) in module.functions.iter().enumerate() {
@@ -298,17 +300,17 @@ pub(super) fn env_analysis(
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         capture_points.entry(cls.ctor).or_default().insert(iid);
-                        for mfid in collect_const_method_refs(module, cls.members) {
+                        for &mfid in const_method_refs.get(module, cls.members) {
                             capture_points.entry(mfid).or_default().insert(iid);
                         }
                     }
                     Op::AllocObject { shape } => {
-                        for mfid in collect_const_method_refs(module, *shape) {
+                        for &mfid in const_method_refs.get(module, *shape) {
                             capture_points.entry(mfid).or_default().insert(iid);
                         }
                     }
                     Op::AllocArray { shape: Some(shape) } => {
-                        for mfid in collect_const_method_refs(module, *shape) {
+                        for &mfid in const_method_refs.get(module, *shape) {
                             capture_points.entry(mfid).or_default().insert(iid);
                         }
                     }
@@ -475,6 +477,7 @@ pub(super) fn env_analysis(
                         return EnvAnalysisOut {
                             env_stack_at: func_stacks,
                             env_sites,
+                            const_method_refs,
                             rounds,
                             capped: true,
                         };
@@ -492,6 +495,7 @@ pub(super) fn env_analysis(
                         return EnvAnalysisOut {
                             env_stack_at: func_stacks,
                             env_sites,
+                            const_method_refs,
                             rounds,
                             capped: true,
                         };
@@ -517,6 +521,7 @@ pub(super) fn env_analysis(
                         return EnvAnalysisOut {
                             env_stack_at: func_stacks,
                             env_sites,
+                            const_method_refs,
                             rounds,
                             capped: true,
                         };
@@ -562,6 +567,7 @@ pub(super) fn env_analysis(
                 return EnvAnalysisOut {
                     env_stack_at: func_stacks,
                     env_sites,
+                    const_method_refs,
                     rounds,
                     capped: false,
                 };

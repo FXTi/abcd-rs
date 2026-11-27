@@ -1063,6 +1063,12 @@ pub(in crate::structure) fn subst_expr(e: &mut Expr, name: &str, value: &Expr) {
 /// (`istrue`/`isfalse`/logical-not and NaN-safe equality comparisons — `D4`:
 /// relational `<`/`<=`/`>`/`>=` are NOT flipped because `!(NaN < 1)` is `true`
 /// while `NaN >= 1` is `false`).
+///
+/// Intentional JS readability contract (`ADR-21` `R5-D1`, pinned by
+/// `emit/tests/batch_and_stack.rs:561-652`): `UnOp::JumpNez` and `UnOp::JumpEqz`
+/// flip symmetrically here and render as idiomatic JS truthiness/falsiness,
+/// while `abcd-ir`, `abcd-lift`, `abcd-opt`, and `abcd-lower` preserve exact
+/// `R3-X1` raw VM `jeqz`/`jnez` semantics for optimization and binary rewriting.
 pub fn negate(e: &Expr) -> Expr {
     match e {
         Expr::Unary {
@@ -1079,6 +1085,11 @@ pub fn negate(e: &Expr) -> Expr {
             op: UnOp::IsTrue,
             operand: operand.clone(),
         },
+        // Intentional `ADR-21` `R5-D1` JS readability contract (pinned by
+        // `emit/tests/batch_and_stack.rs:561-652`): render `JumpNez(p)` /
+        // `JumpEqz(p)` as idiomatic JS truthiness/falsiness (`!!p` / `!p` and
+        // `if (p)` / `if (!p)`), while `abcd-ir`, `abcd-lift`, `abcd-opt`, and
+        // `abcd-lower` preserve exact `R3-X1` raw VM `jeqz`/`jnez` semantics.
         Expr::Unary {
             op: UnOp::JumpNez,
             operand,

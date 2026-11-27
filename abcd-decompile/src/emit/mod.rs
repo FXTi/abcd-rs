@@ -48,10 +48,12 @@ use abcd_ir::function::Loc;
 use abcd_ir::module::{ExportDecl, FunctionKind, ImportDecl, Module, Signature};
 use abcd_ir::op::{BinOp, CallKind, CmpOp, UnOp};
 use abcd_ir::ty::{DynPrim, StaticTy, Ty};
-use abcd_ir::{Const, FuncId, Op, ValueDef};
+use abcd_ir::{FuncId, Op, ValueDef};
 use rayon::prelude::*;
 
-use crate::consts::{lit_of, render_lit_m, render_pool_string, render_sym_string, sym_str};
+use crate::consts::{
+    ConstMethodRefCache, lit_of, render_lit_m, render_pool_string, render_sym_string, sym_str,
+};
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::folds::{self, FoldStats};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
@@ -225,9 +227,9 @@ pub(crate) fn decompile_module_to_writer_with_limits<W: Write>(
 ) -> std::io::Result<DecompileStats> {
     // Consumed functions: closure bodies, class ctors, and every
     // MethodRef in the const pool (emitted inline, never top-level).
-    let consumed = consumed_functions(module);
-    let inst_weights = precompute_func_inst_weights(module);
     let index = DecompileIndex::build(module);
+    let consumed = consumed_functions_cached(module, &index.const_method_refs);
+    let inst_weights = precompute_func_inst_weights(module);
     let orphan_names = collect_module_orphan_lexenv_names(module, &index);
 
     let mut em = Emitter {
@@ -398,8 +400,13 @@ pub(crate) fn decompile_module_to_writer_with_limits<W: Write>(
     let mut fn_buf = String::new();
     let mut cursor = 0usize;
     while cursor < top_funcs.len() {
-        let (take, batch_fids) =
-            next_bounded_top_batch(module, &inst_weights, &top_funcs[cursor..], limits);
+        let (take, batch_fids) = next_bounded_top_batch_cached(
+            module,
+            &index.const_method_refs,
+            &inst_weights,
+            &top_funcs[cursor..],
+            limits,
+        );
         let chunk = &top_funcs[cursor..cursor + take];
         cursor += take;
         let prepared_batch: Vec<(FuncId, PreparedFunc)> = batch_fids
@@ -464,18 +471,14 @@ pub(crate) fn decompile_module_to_writer_with_limits<W: Write>(
     // Exports (1:1 enum mapping). The local side is a module-scope
     // binding (resolved G2 slot names included); the `as` side is a
     // ModuleExportName — an IdentifierName, reserved words legal.
+    let export_index = ExportLocalIndex::build(module, &module.exports, record_env);
     for exp in &module.exports {
         match exp {
             ExportDecl::Local {
                 local_name,
                 export_name,
             } => {
-                let local = resolve_export_local_ident(
-                    module,
-                    &module.exports,
-                    record_env,
-                    &sym_str(module, *local_name),
-                );
+                let local = export_index.resolve(&sym_str(module, *local_name));
                 let export = module_facing_name(module, &sym_str(module, *export_name));
                 if local == export {
                     writeln!(out, "export {{ {local} }};")?;
@@ -568,25 +571,28 @@ pub(crate) fn emit_esm_imports(
             }
         };
 
+    let mut imports_by_req: HashMap<abcd_ir::Sym, Vec<usize>> =
+        HashMap::with_capacity(imports.len());
+    for (imp_idx, imp) in imports.iter().enumerate() {
+        let req_sym = match imp {
+            ImportDecl::Regular { module_request, .. }
+            | ImportDecl::Namespace { module_request, .. } => *module_request,
+        };
+        imports_by_req.entry(req_sym).or_default().push(imp_idx);
+    }
+
     let mut emitted_imp = vec![false; imports.len()];
     let mut seen_req_specs = HashSet::new();
     for req in module_requests {
         if !seen_req_specs.insert(req.specifier) {
             continue;
         }
-        let mut matched_any = false;
-        for (imp_idx, imp) in imports.iter().enumerate() {
-            let req_sym = match imp {
-                ImportDecl::Regular { module_request, .. }
-                | ImportDecl::Namespace { module_request, .. } => *module_request,
-            };
-            if req_sym == req.specifier {
-                matched_any = true;
+        if let Some(indices) = imports_by_req.get(&req.specifier) {
+            for &imp_idx in indices {
                 emitted_imp[imp_idx] = true;
-                emit_one_import(imp_idx, imp, fn_names, out);
+                emit_one_import(imp_idx, &imports[imp_idx], fn_names, out);
             }
-        }
-        if !matched_any && !indirect_or_star.contains(&req.specifier) {
+        } else if !indirect_or_star.contains(&req.specifier) {
             let spec = resolve_spec(req.specifier);
             out.push_str(&format!("import {spec};\n"));
         }
@@ -612,43 +618,78 @@ pub(crate) fn module_facing_name(module: &Module, raw: &str) -> String {
     }
 }
 
-/// Resolve an `ExportDecl::Local` binding's emitted identifier: when `raw_local`
-/// is a compiler-synthetic default export tag (such as `*default*`) whose local
-/// module slot already resolved to a concrete binding in `record_env`, bind the
-/// export clause to that resolved slot identifier instead of declaring a second
-/// uninitialized `let _default_;`.
-pub(crate) fn resolve_export_local_ident(
-    module: &Module,
-    exports: &[ExportDecl],
-    record_env: Option<&crate::names::RecordModuleEnv>,
-    raw_local: &str,
-) -> String {
-    let sanitized = sanitize(raw_local);
-    let Some(env) = record_env else {
-        return sanitized;
-    };
-    if env.local_slots.values().any(|v| v == &sanitized) {
-        return sanitized;
-    }
-    let mut distinct_locals = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut all_sanitized = BTreeSet::new();
-    for exp in exports {
-        if let ExportDecl::Local { local_name, .. } = exp {
-            let r = sym_str(module, *local_name);
-            all_sanitized.insert(sanitize(&r));
-            if seen.insert(r.clone()) {
-                distinct_locals.push(r);
+/// Pre-indexed `ExportDecl::Local` lookup table for one `EsModule` record
+/// (`#103` `P3-DEC-1`), resolving each local export binding in `O(1)` amortized
+/// (`O(|exports| + |local_slots|)` total) while preserving exact deterministic
+/// emission order (`N20`).
+///
+/// When `raw_local` is a compiler-synthetic default export tag (such as
+/// `*default*`) whose local module slot already resolved to a concrete binding
+/// in `record_env`, resolves the export clause to that slot identifier instead
+/// of declaring a second uninitialized `let _default_;`.
+pub(crate) struct ExportLocalIndex<'a> {
+    env: Option<&'a crate::names::RecordModuleEnv>,
+    env_local_names: HashSet<&'a str>,
+    slot_by_raw_local: HashMap<String, u32>,
+    all_sanitized: HashSet<String>,
+}
+
+impl<'a> ExportLocalIndex<'a> {
+    pub(crate) fn build(
+        module: &Module,
+        exports: &[ExportDecl],
+        record_env: Option<&'a crate::names::RecordModuleEnv>,
+    ) -> Self {
+        let Some(env) = record_env else {
+            return Self {
+                env: None,
+                env_local_names: HashSet::new(),
+                slot_by_raw_local: HashMap::new(),
+                all_sanitized: HashSet::new(),
+            };
+        };
+        let env_local_names: HashSet<&'a str> =
+            env.local_slots.values().map(String::as_str).collect();
+        let mut slot_by_raw_local: HashMap<String, u32> = HashMap::new();
+        let mut all_sanitized: HashSet<String> = HashSet::new();
+        let mut next_slot: usize = 0;
+        for exp in exports {
+            if let ExportDecl::Local { local_name, .. } = exp {
+                let r = sym_str(module, *local_name);
+                all_sanitized.insert(sanitize(&r));
+                if let std::collections::hash_map::Entry::Vacant(e) = slot_by_raw_local.entry(r) {
+                    if let Ok(slot_u32) = u32::try_from(next_slot) {
+                        e.insert(slot_u32);
+                    }
+                    next_slot = next_slot.saturating_add(1);
+                }
             }
         }
+        Self {
+            env: Some(env),
+            env_local_names,
+            slot_by_raw_local,
+            all_sanitized,
+        }
     }
-    if let Some(slot_idx) = distinct_locals.iter().position(|r| r == raw_local)
-        && let Some(resolved) = env.local_slots.get(&(slot_idx as u32))
-        && !all_sanitized.contains(resolved)
-    {
-        return resolved.clone();
+
+    #[inline]
+    pub(crate) fn resolve(&self, raw_local: &str) -> String {
+        let sanitized = sanitize(raw_local);
+        let Some(env) = self.env else {
+            return sanitized;
+        };
+        if self.env_local_names.contains(sanitized.as_str()) {
+            return sanitized;
+        }
+        if let Some(&slot_idx) = self.slot_by_raw_local.get(raw_local)
+            && let Some(resolved) = env.local_slots.get(&slot_idx)
+            && !self.all_sanitized.contains(resolved.as_str())
+        {
+            return resolved.clone();
+        }
+        sanitized
     }
-    sanitized
 }
 
 /// The functions a module emits INLINE (closure bodies, class ctors,
@@ -657,6 +698,14 @@ pub(crate) fn resolve_export_local_ident(
 /// unreachable mutual `DefineFunc` cycles keep a deterministic cycle-entry
 /// root top-level so no function is ever dropped (`#87.5`).
 pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId> {
+    let method_refs = ConstMethodRefCache::build(module);
+    consumed_functions_cached(module, &method_refs)
+}
+
+pub(crate) fn consumed_functions_cached(
+    module: &Module,
+    method_refs: &ConstMethodRefCache,
+) -> std::collections::BTreeSet<FuncId> {
     let n = module.functions.len();
     let mut block_owner: std::collections::HashMap<abcd_ir::BlockId, FuncId> =
         std::collections::HashMap::new();
@@ -669,33 +718,37 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
 
     let mut edges: Vec<BTreeSet<FuncId>> = vec![BTreeSet::new(); n];
     let mut orphan_consumed: BTreeSet<FuncId> = BTreeSet::new();
-    let mut tmp_refs: BTreeSet<FuncId> = BTreeSet::new();
 
-    for inst in &module.insts {
-        tmp_refs.clear();
-        match &inst.op {
-            Op::DefineFunc { body, .. } => {
-                tmp_refs.insert(*body);
-            }
-            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
-                tmp_refs.insert(cls.ctor);
-                collect_method_refs(module, cls.members, &mut tmp_refs);
-            }
-            Op::AllocObject { shape } => {
-                collect_method_refs(module, *shape, &mut tmp_refs);
-            }
-            _ => continue,
-        }
-        if let Some(&owner) = block_owner.get(&inst.block) {
-            for &target in &tmp_refs {
-                if target != owner && target.index() < n {
-                    edges[owner.index()].insert(target);
-                } else if target.index() >= n {
-                    orphan_consumed.insert(target);
-                }
+    let mut record_target = |owner: Option<FuncId>, target: FuncId| {
+        if let Some(own) = owner {
+            if target != own && target.index() < n {
+                edges[own.index()].insert(target);
+            } else if target.index() >= n {
+                orphan_consumed.insert(target);
             }
         } else {
-            orphan_consumed.extend(tmp_refs.iter().copied());
+            orphan_consumed.insert(target);
+        }
+    };
+
+    for inst in &module.insts {
+        let owner = block_owner.get(&inst.block).copied();
+        match &inst.op {
+            Op::DefineFunc { body, .. } => {
+                record_target(owner, *body);
+            }
+            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                record_target(owner, cls.ctor);
+                for &target in method_refs.get(cls.members) {
+                    record_target(owner, target);
+                }
+            }
+            Op::AllocObject { shape } => {
+                for &target in method_refs.get(*shape) {
+                    record_target(owner, target);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -756,46 +809,20 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
     consumed
 }
 
-/// Walk a pooled constant graph (iteratively via an explicit heap workstack and
-/// visited-`ConstId` cycle guard) for `MethodRef` functions.
+/// Test-only helper delegating single-root `MethodRef` extraction to
+/// [`ConstMethodRefCache`].
+#[cfg(test)]
 pub(crate) fn collect_method_refs(
     module: &Module,
     root_cid: abcd_ir::ConstId,
     out: &mut BTreeSet<FuncId>,
 ) {
-    let mut visited: HashSet<abcd_ir::ConstId> = HashSet::new();
-    if !visited.insert(root_cid) {
-        return;
-    }
-    let mut stack: Vec<abcd_ir::ConstId> = vec![root_cid];
-    while let Some(cid) = stack.pop() {
-        let Some(c) = module.consts.get(cid) else {
-            continue;
-        };
-        match c {
-            Const::MethodRef { func, .. } => {
-                out.insert(*func);
-            }
-            Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
-                for &i in items.iter().rev() {
-                    if visited.insert(i) {
-                        stack.push(i);
-                    }
-                }
-            }
-            Const::ObjectLiteral { keys, values } => {
-                for &i in values.iter().rev().chain(keys.iter().rev()) {
-                    if visited.insert(i) {
-                        stack.push(i);
-                    }
-                }
-            }
-            Const::LiteralBufferRef(inner) if visited.insert(*inner) => {
-                stack.push(*inner);
-            }
-            _ => {}
-        }
-    }
+    out.extend(
+        ConstMethodRefCache::build(module)
+            .get(root_cid)
+            .iter()
+            .copied(),
+    );
 }
 
 /// Compute the instruction weight of `fid` (`sum` of `block.insts.len().max(1)`
@@ -837,8 +864,9 @@ fn cached_inst_weight(inst_weights: &[u32], fid: FuncId) -> usize {
 /// and `visited.len() > limits.max_funcs || *batch_inst_weight > limits.max_insts`,
 /// rolls back every [`FuncId`] added by this call, restores `*batch_inst_weight`,
 /// and returns `false` (leaving `visited` and `*batch_inst_weight` untouched).
-pub(crate) fn try_extend_batch_funcs(
+pub(crate) fn try_extend_batch_funcs_cached(
     module: &Module,
+    method_refs: &ConstMethodRefCache,
     inst_weights: &[u32],
     roots: &[FuncId],
     visited: &mut BTreeSet<FuncId>,
@@ -849,7 +877,6 @@ pub(crate) fn try_extend_batch_funcs(
     let mut added_weight = 0usize;
     let mut added: Vec<FuncId> = Vec::new();
     let mut stack: Vec<FuncId> = Vec::new();
-    let mut inline_refs = BTreeSet::new();
 
     let exceeds = |visited_len: usize, cur_weight: usize| -> bool {
         abort_over.is_some_and(|lim| visited_len > lim.max_funcs || cur_weight > lim.max_insts)
@@ -899,9 +926,7 @@ pub(crate) fn try_extend_batch_funcs(
                             added_weight = added_weight
                                 .saturating_add(cached_inst_weight(inst_weights, cls.ctor));
                         }
-                        inline_refs.clear();
-                        collect_method_refs(module, cls.members, &mut inline_refs);
-                        for &m in &inline_refs {
+                        for &m in method_refs.get(cls.members) {
                             if visited.insert(m) {
                                 added.push(m);
                                 stack.push(m);
@@ -911,9 +936,7 @@ pub(crate) fn try_extend_batch_funcs(
                         }
                     }
                     Op::AllocObject { shape } => {
-                        inline_refs.clear();
-                        collect_method_refs(module, *shape, &mut inline_refs);
-                        for &m in &inline_refs {
+                        for &m in method_refs.get(*shape) {
                             if visited.insert(m) {
                                 added.push(m);
                                 stack.push(m);
@@ -939,15 +962,38 @@ pub(crate) fn try_extend_batch_funcs(
     true
 }
 
+#[cfg(test)]
+pub(crate) fn try_extend_batch_funcs(
+    module: &Module,
+    inst_weights: &[u32],
+    roots: &[FuncId],
+    visited: &mut BTreeSet<FuncId>,
+    batch_inst_weight: &mut usize,
+    abort_over: Option<BatchLimits>,
+) -> bool {
+    let method_refs = ConstMethodRefCache::build(module);
+    try_extend_batch_funcs_cached(
+        module,
+        &method_refs,
+        inst_weights,
+        roots,
+        visited,
+        batch_inst_weight,
+        abort_over,
+    )
+}
+
 /// Collect `roots` plus every inline [`FuncId`] transitively referenced from
 /// them in deterministic ascending [`FuncId`] order.
 #[cfg(test)]
 pub(crate) fn collect_batch_funcs(module: &Module, roots: &[FuncId]) -> Vec<FuncId> {
+    let method_refs = ConstMethodRefCache::build(module);
     let inst_weights = precompute_func_inst_weights(module);
     let mut visited = BTreeSet::new();
     let mut weight = 0usize;
-    let _ = try_extend_batch_funcs(
+    let _ = try_extend_batch_funcs_cached(
         module,
+        &method_refs,
         &inst_weights,
         roots,
         &mut visited,
@@ -962,8 +1008,9 @@ pub(crate) fn collect_batch_funcs(module: &Module, roots: &[FuncId]) -> Vec<Func
 /// within `limits` (`max_insts` and `max_funcs`), always taking at least
 /// `top_funcs[0]` even if that single root + its transitive inline closures
 /// exceed `limits`, returning `(take, batch_fids)`.
-pub(crate) fn next_bounded_top_batch(
+pub(crate) fn next_bounded_top_batch_cached(
     module: &Module,
+    method_refs: &ConstMethodRefCache,
     inst_weights: &[u32],
     top_funcs: &[FuncId],
     limits: BatchLimits,
@@ -973,8 +1020,9 @@ pub(crate) fn next_bounded_top_batch(
     let mut take = 0usize;
     for (idx, &root) in top_funcs.iter().enumerate() {
         let cap = (idx > 0).then_some(limits);
-        if !try_extend_batch_funcs(
+        if !try_extend_batch_funcs_cached(
             module,
+            method_refs,
             inst_weights,
             &[root],
             &mut visited,
@@ -989,6 +1037,17 @@ pub(crate) fn next_bounded_top_batch(
         }
     }
     (take, visited.into_iter().collect())
+}
+
+#[cfg(test)]
+pub(crate) fn next_bounded_top_batch(
+    module: &Module,
+    inst_weights: &[u32],
+    top_funcs: &[FuncId],
+    limits: BatchLimits,
+) -> (usize, Vec<FuncId>) {
+    let method_refs = ConstMethodRefCache::build(module);
+    next_bounded_top_batch_cached(module, &method_refs, inst_weights, top_funcs, limits)
 }
 
 pub(crate) struct Emitter<'m> {

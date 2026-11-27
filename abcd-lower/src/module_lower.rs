@@ -125,6 +125,7 @@ pub fn rewrite_file_owned(
     let mut field_slots: Vec<Vec<(StringId, usize)>> = Vec::with_capacity(module.classes.len());
     let mut synth_field_flags: Vec<Vec<bool>> = Vec::with_capacity(module.classes.len());
     let mut synth_scope_name_slots: Vec<(StringId, usize, ConstId)> = Vec::new();
+    let mut class_field_indices: HashMap<StringId, HashMap<StringId, usize>> = HashMap::new();
 
     for (ci, cls_data) in module.classes.iter().enumerate() {
         let desc_sid = class_desc_sids[ci];
@@ -167,29 +168,39 @@ pub fn rewrite_file_owned(
 
         let mut cls_field_slots = Vec::with_capacity(cls_data.fields.len());
         let mut cls_synth_flags = Vec::with_capacity(cls_data.fields.len());
-        for fdata in &cls_data.fields {
-            let f_sid = intern_sym(&module.sym, &mut out.strings, fdata.name).ok_or(
-                LowerError::UntraceableEntity {
-                    func: FuncId::new(0),
-                    kind: EntityKind::StringId,
-                    raw: fdata.name.0,
-                },
-            )?;
-            let existing_pos = out
+        if !cls_data.fields.is_empty() {
+            let existing_fields = out
                 .classes
                 .get(&desc_sid)
-                .and_then(|c| c.fields.iter().position(|ef| ef.name == f_sid));
-            if let Some(pos) = existing_pos {
-                cls_field_slots.push((desc_sid, pos));
-                cls_synth_flags.push(false);
-            } else {
-                let shell =
-                    build_field_shell(module, fdata, f_sid, &class_desc_sids, &mut out.strings);
-                let cls = out.classes.get_mut(&desc_sid).expect("inserted above");
-                let pos = cls.fields.len();
-                cls.fields.push(shell);
-                cls_field_slots.push((desc_sid, pos));
-                cls_synth_flags.push(true);
+                .map_or(&[][..], |c| c.fields.as_slice());
+            let field_map = class_field_indices.entry(desc_sid).or_insert_with(|| {
+                let mut map = HashMap::with_capacity(existing_fields.len() + cls_data.fields.len());
+                for (idx, ef) in existing_fields.iter().enumerate() {
+                    map.entry(ef.name).or_insert(idx);
+                }
+                map
+            });
+            for fdata in &cls_data.fields {
+                let f_sid = intern_sym(&module.sym, &mut out.strings, fdata.name).ok_or(
+                    LowerError::UntraceableEntity {
+                        func: FuncId::new(0),
+                        kind: EntityKind::StringId,
+                        raw: fdata.name.0,
+                    },
+                )?;
+                if let Some(&pos) = field_map.get(&f_sid) {
+                    cls_field_slots.push((desc_sid, pos));
+                    cls_synth_flags.push(false);
+                } else {
+                    let shell =
+                        build_field_shell(module, fdata, f_sid, &class_desc_sids, &mut out.strings);
+                    let cls = out.classes.get_mut(&desc_sid).expect("inserted above");
+                    let pos = cls.fields.len();
+                    cls.fields.push(shell);
+                    field_map.insert(f_sid, pos);
+                    cls_field_slots.push((desc_sid, pos));
+                    cls_synth_flags.push(true);
+                }
             }
         }
         field_slots.push(cls_field_slots);
@@ -209,6 +220,9 @@ pub fn rewrite_file_owned(
                     initial_value: None,
                     annotations: Annotations::default(),
                 });
+                if let Some(field_map) = class_field_indices.get_mut(&desc_sid) {
+                    field_map.entry(sn_name).or_insert(slot_idx);
+                }
                 synth_scope_name_slots.push((desc_sid, slot_idx, sn_cid));
             }
             if let Some(es_mod) = &cls_data.es_module {
@@ -227,6 +241,7 @@ pub fn rewrite_file_owned(
                         .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD)
                 });
                 let cls = out.classes.get_mut(&desc_sid).expect("inserted above");
+                let mr_idx = cls.fields.len();
                 cls.fields.push(Field {
                     name: mr_name,
                     offset: 0,
@@ -236,7 +251,11 @@ pub fn rewrite_file_owned(
                     initial_value: Some(FieldValue::ModuleData(md)),
                     annotations: Annotations::default(),
                 });
+                if let Some(field_map) = class_field_indices.get_mut(&desc_sid) {
+                    field_map.entry(mr_name).or_insert(mr_idx);
+                }
                 if let (Some(ph), Some(pname)) = (phase_opt, pname_opt) {
+                    let ph_idx = cls.fields.len();
                     cls.fields.push(Field {
                         name: pname,
                         offset: 0,
@@ -246,6 +265,9 @@ pub fn rewrite_file_owned(
                         initial_value: Some(FieldValue::ModuleRequestPhase(ph)),
                         annotations: Annotations::default(),
                     });
+                    if let Some(field_map) = class_field_indices.get_mut(&desc_sid) {
+                        field_map.entry(pname).or_insert(ph_idx);
+                    }
                 }
             }
         }
@@ -399,16 +421,20 @@ pub fn rewrite_file_owned(
             literal_arrays,
             ..
         } = &mut out;
-        let mut materializer =
-            Materializer::new(module, strings, literal_arrays, &func_to_method_idx);
+        let mut materializer = Materializer::new(
+            module,
+            strings,
+            literal_arrays,
+            &func_to_method_idx,
+            Some(&base_index),
+        );
         for batch in build_lower_batches(module) {
             let lowered_batch = lower_batch_parallel(module, batch.clone(), options);
             for (offset, item_res) in lowered_batch.into_iter().enumerate() {
                 let fi = batch.start + offset;
                 if let Some((layout, dbg_tables)) = item_res? {
                     let func_id = FuncId::new(fi as u32);
-                    let body =
-                        materializer.build_method_body_owned(func_id, layout, Some(&base_index))?;
+                    let body = materializer.build_method_body_owned(func_id, layout)?;
                     body_ic_sizes[fi] = body.ic_size;
                     prepared_debug[fi] = dbg_tables;
                     let (desc_sid, mi) = func_slots[fi];
@@ -806,14 +832,14 @@ pub fn lower_module_with_options(
             ..
         } = &mut file;
         let mut materializer =
-            Materializer::new(module, strings, literal_arrays, &func_to_method_idx);
+            Materializer::new(module, strings, literal_arrays, &func_to_method_idx, None);
         for batch in build_lower_batches(module) {
             let lowered_batch = lower_batch_parallel(module, batch.clone(), options);
             for (offset, item_res) in lowered_batch.into_iter().enumerate() {
                 let fi = batch.start + offset;
                 if let Some((layout, dbg_tables)) = item_res? {
                     let func_id = FuncId::new(fi as u32);
-                    let body = materializer.build_method_body_owned(func_id, layout, None)?;
+                    let body = materializer.build_method_body_owned(func_id, layout)?;
                     body_ic_sizes[fi] = body.ic_size;
                     let (desc_sid, mi) = func_slots[fi];
                     if let Some(cls) = classes.get_mut(&desc_sid)

@@ -1179,6 +1179,8 @@ fn analyze_closure_callability(
         }
     }
 
+    let mut visited_consts: HashSet<ConstId> = HashSet::new();
+
     for (fi, fd) in module.functions.iter().enumerate() {
         let fid = FuncId::new(fi as u32);
         for &b in &fd.blocks {
@@ -1192,19 +1194,24 @@ fn analyze_closure_callability(
                         if let Some(slot) = escaped.get_mut(cls.ctor.index()) {
                             *slot = true;
                         }
-                        mark_const_pool_funcs(module, cls.members, &mut escaped);
+                        mark_const_pool_funcs(
+                            module,
+                            cls.members,
+                            &mut escaped,
+                            &mut visited_consts,
+                        );
                         if let Some(res) = inst.result {
                             val_closed_only[res.index()] = false;
                         }
                     }
                     Op::AllocObject { shape } => {
-                        mark_const_pool_funcs(module, *shape, &mut escaped);
+                        mark_const_pool_funcs(module, *shape, &mut escaped, &mut visited_consts);
                         if let Some(res) = inst.result {
                             val_closed_only[res.index()] = false;
                         }
                     }
                     Op::AllocArray { shape: Some(shape) } => {
-                        mark_const_pool_funcs(module, *shape, &mut escaped);
+                        mark_const_pool_funcs(module, *shape, &mut escaped, &mut visited_consts);
                         if let Some(res) = inst.result {
                             val_closed_only[res.index()] = false;
                         }
@@ -1394,8 +1401,12 @@ fn mark_value_funcs_escaped(v: ValueId, val_funcs: &[BTreeSet<FuncId>], escaped:
     }
 }
 
-fn mark_const_pool_funcs(module: &Module, root: ConstId, escaped: &mut [bool]) {
-    let mut visited = HashSet::new();
+pub(crate) fn mark_const_pool_funcs(
+    module: &Module,
+    root: ConstId,
+    escaped: &mut [bool],
+    visited: &mut HashSet<ConstId>,
+) {
     let mut stack = vec![root];
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid) {
@@ -1561,6 +1572,28 @@ impl<'m> Rung0AliasOracle<'m> {
             module,
             memo: std::cell::RefCell::new(HashMap::new()),
             singletons: OnceLock::new(),
+        }
+    }
+
+    /// An oracle over `module` with [`SingletonSiteClassifier`] pre-initialized
+    /// from prebuilt `links`, `graph`, and optional lifecycle `harness_func`
+    /// (never rebuilding [`ModuleLinkTable`]; `#104`).
+    #[must_use]
+    pub fn with_links_and_graph(
+        module: &'m Module,
+        links: &ModuleLinkTable,
+        graph: &CallGraph,
+        harness_func: Option<FuncId>,
+    ) -> Self {
+        Self {
+            module,
+            memo: std::cell::RefCell::new(HashMap::new()),
+            singletons: OnceLock::from(SingletonSiteClassifier::build_with_links(
+                module,
+                links,
+                graph,
+                harness_func,
+            )),
         }
     }
 

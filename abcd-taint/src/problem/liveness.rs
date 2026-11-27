@@ -450,6 +450,19 @@ impl LocalLiveness {
         let live = fl.is_live_at_loc(loc, v);
         Some((fid, loc, live))
     }
+
+    pub(super) fn any_live_at_loc(
+        &self,
+        fid: FuncId,
+        loc: InstLivenessLoc,
+        vals: &[ValueId],
+    ) -> bool {
+        let funcs_borrow = self.funcs.borrow();
+        let Some(Some(fl)) = funcs_borrow.get(fid.index()) else {
+            return true;
+        };
+        vals.iter().any(|&u| fl.is_live_at_loc(loc, u))
+    }
 }
 
 pub(super) struct ValueAliasLoads {
@@ -463,14 +476,16 @@ struct AliasLoadSite {
     object: ValueId,
 }
 
-/// Per-function reachability index over property loads whose `object` has
-/// non-empty `site_info_at` allocation sites (built lazily at most once per
-/// function when a dead local taint fact is tested for pruning).
+/// Per-function reachability index over object/container reads whose operand has
+/// non-empty `site_info_at` allocation sites, plus pre-indexed `peel_movs` alias
+/// groups (built lazily at most once per function when a dead local taint fact is
+/// tested for pruning).
 pub(super) struct FuncAliasLoads {
     loads: Vec<AliasLoadSite>,
     words_per_block: usize,
     reach_out_words: Vec<u64>,
     site_to_loads: HashMap<InstId, Vec<u32>>,
+    mov_groups: HashMap<ValueId, Box<[ValueId]>>,
 }
 
 impl FuncAliasLoads {
@@ -480,7 +495,13 @@ impl FuncAliasLoads {
             words_per_block: 0,
             reach_out_words: Vec::new(),
             site_to_loads: HashMap::new(),
+            mov_groups: HashMap::new(),
         }
+    }
+
+    #[inline]
+    pub(super) fn mov_group(&self, root: ValueId) -> Option<&[ValueId]> {
+        self.mov_groups.get(&root).map(Box::as_ref)
     }
 
     pub(super) fn build(module: &Module, fid: FuncId, oracle: &Oracle) -> Self {
@@ -501,37 +522,93 @@ impl FuncAliasLoads {
 
         let mut loads = Vec::new();
         let mut site_to_loads: HashMap<InstId, Vec<u32>> = HashMap::new();
+        let mut raw_mov_groups: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut record_obj_use = |b_local: usize, pos: usize, iid: InstId, obj: ValueId| {
+            let obj_sites = oracle.site_info_at(obj, iid).sites;
+            if obj_sites.is_empty() {
+                return;
+            }
+            let load_idx = loads.len() as u32;
+            loads.push(AliasLoadSite {
+                block_local: b_local as u32,
+                pos: pos as u32,
+                object: obj,
+            });
+            for site in obj_sites.iter() {
+                site_to_loads.entry(site).or_default().push(load_idx);
+            }
+        };
+
         for (b_local, &b) in local_blocks.iter().enumerate() {
             let Some(bb) = module.block(b) else { continue };
             for (pos, &iid) in bb.insts.iter().enumerate() {
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
-                let (Op::LoadProp { object, .. }
-                | Op::LoadPropIdx { object, .. }
-                | Op::LoadPropDyn { object, .. }
-                | Op::LoadPrivate { obj: object, .. }) = &inst.op
-                else {
-                    continue;
-                };
-                let obj_sites = oracle.site_info_at(*object, iid).sites;
-                if obj_sites.is_empty() {
-                    continue;
-                }
-                let load_idx = loads.len() as u32;
-                loads.push(AliasLoadSite {
-                    block_local: b_local as u32,
-                    pos: pos as u32,
-                    object: *object,
-                });
-                for site in obj_sites.iter() {
-                    site_to_loads.entry(site).or_default().push(load_idx);
+                match &inst.op {
+                    Op::Mov { .. } => {
+                        if let Some(res) = inst.result {
+                            let root = crate::names::peel_movs_fast(module, res);
+                            if root != res {
+                                let grp = raw_mov_groups.entry(root).or_default();
+                                if grp.is_empty() {
+                                    grp.push(root);
+                                }
+                                if !grp.contains(&res) {
+                                    grp.push(res);
+                                }
+                            }
+                        }
+                    }
+                    Op::LoadProp { object: obj, .. }
+                    | Op::LoadPropIdx { object: obj, .. }
+                    | Op::LoadPropDyn { object: obj, .. }
+                    | Op::LoadPrivate { obj, .. }
+                    | Op::LoadSuper {
+                        this_value: obj, ..
+                    }
+                    | Op::CopyDataProps { src: obj, .. }
+                    | Op::ArraySpread { src: obj, .. }
+                    | Op::CreateObjectWithExcludedKeys { obj, .. } => {
+                        record_obj_use(b_local, pos, iid, *obj);
+                    }
+                    Op::Call { this, args, .. } => {
+                        let mut call_objs: Vec<ValueId> = Vec::new();
+                        if let Some(t) = *this {
+                            call_objs.push(t);
+                        }
+                        if let Some(bv) = call_base_value(module, inst)
+                            && !call_objs.contains(&bv)
+                        {
+                            call_objs.push(bv);
+                        }
+                        for &a in args {
+                            if !call_objs.contains(&a) {
+                                call_objs.push(a);
+                            }
+                        }
+                        for co in call_objs {
+                            record_obj_use(b_local, pos, iid, co);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
 
+        let mov_groups: HashMap<ValueId, Box<[ValueId]>> = raw_mov_groups
+            .into_iter()
+            .map(|(k, v)| (k, v.into_boxed_slice()))
+            .collect();
+
         if loads.is_empty() {
-            return Self::empty();
+            return Self {
+                loads: Vec::new(),
+                words_per_block: 0,
+                reach_out_words: Vec::new(),
+                site_to_loads: HashMap::new(),
+                mov_groups,
+            };
         }
 
         let num_blocks = local_blocks.len();
@@ -616,6 +693,7 @@ impl FuncAliasLoads {
             words_per_block: words,
             reach_out_words,
             site_to_loads,
+            mov_groups,
         }
     }
 

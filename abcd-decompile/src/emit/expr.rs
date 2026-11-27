@@ -864,6 +864,12 @@ impl<'m> Emitter<'m> {
         out: &mut String,
     ) {
         match op {
+            // Intentional `ADR-21` `R5-D1` JS readability contract (pinned by
+            // `emit/tests/batch_and_stack.rs:561-652`): `JumpNez(p)` / `JumpEqz(p)`
+            // render as idiomatic JS truthiness/falsiness (`!!p` / `!p`, peeled to
+            // `p` / `!p` in branch headers), while `abcd-ir`, `abcd-lift`,
+            // `abcd-opt`, and `abcd-lower` preserve exact `R3-X1` raw VM
+            // `jeqz`/`jnez` semantics for optimization and binary rewriting.
             UnOp::IsTrue | UnOp::JumpNez => {
                 out.push_str("!!");
                 tasks.push(PrintTask::Expr {

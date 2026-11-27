@@ -40,8 +40,8 @@ pub(super) struct ClosedHarvest {
     pub(super) obj_lit_method_funcs: FuncBitSet,
     pub(super) all_prop_calls: Vec<(InstId, Sym)>,
     pub(super) ctor_sym: Option<Sym>,
-    pub(super) obj_lits: HashMap<InstId, ClosedObjLitInfo>,
-    pub(super) lex_stores: HashMap<(u16, u16), Vec<(FuncId, ValueId)>>,
+    pub(super) obj_lits: BTreeMap<InstId, ClosedObjLitInfo>,
+    pub(super) lex_stores: BTreeMap<(u16, u16), Vec<(FuncId, ValueId)>>,
     pub(super) lex_explicit_readers: HashMap<(InstId, u16), Vec<(FuncId, ValueId)>>,
     pub(super) unsealed_lex_env_sites: HashSet<InstId>,
     pub(super) unmapped_lex_put_classes: HashSet<ClassId>,
@@ -101,8 +101,8 @@ impl ClosedHarvest {
         let mut method_owner: Vec<Option<(u32, bool)>> = vec![None; n_funcs];
         let mut method_sym_of: Vec<Option<Sym>> = vec![None; n_funcs];
         let mut ctor_owner: Vec<Option<u32>> = vec![None; n_funcs];
-        let mut obj_lits: HashMap<InstId, ClosedObjLitInfo> = HashMap::new();
-        let mut lex_stores: HashMap<(u16, u16), Vec<(FuncId, ValueId)>> = HashMap::new();
+        let mut obj_lits: BTreeMap<InstId, ClosedObjLitInfo> = BTreeMap::new();
+        let mut lex_stores: BTreeMap<(u16, u16), Vec<(FuncId, ValueId)>> = BTreeMap::new();
         let mut lex_explicit_readers: HashMap<(InstId, u16), Vec<(FuncId, ValueId)>> =
             HashMap::new();
         let mut unsealed_lex_env_sites: HashSet<InstId> = HashSet::new();
@@ -1757,371 +1757,320 @@ impl ClosedHarvest {
                             .inst_func(module, ciid)
                             .is_some_and(|cf| inst_mutator_funcs.get(cf.index()))
                     });
+                    let mut new_sites: Vec<(InstId, ValueId)> = Vec::new();
                     for &b in &fd.blocks {
                         let Some(bb) = module.block(b) else { continue };
                         for &iid in &bb.insts {
-                            if let Some(Op::Call {
-                                kind: CallKind::New,
-                                ..
-                            }) = module.inst(iid).map(|i| &i.op)
+                            let Some(inst) = module.inst(iid) else {
+                                continue;
+                            };
+                            if matches!(
+                                inst.op,
+                                Op::Call {
+                                    kind: CallKind::New,
+                                    ..
+                                }
+                            ) && let Some(rv) = inst.result
+                                && callgraph.callees_of_call_at(iid).iter().any(|&cf| {
+                                    ctor_owner
+                                        .get(cf.index())
+                                        .copied()
+                                        .flatten()
+                                        .and_then(|cidx| classes.get(cidx as usize))
+                                        .is_some_and(|cls| cls.class_inst_sealed)
+                                })
                             {
-                                let escapes_to_mut =
-                                    module.inst(iid).and_then(|i| i.result).is_some_and(|rv| {
-                                        let mut rv_aliases = HashSet::from([rv]);
-                                        let mut local_containers = HashSet::new();
-                                        let mut alias_changed = true;
-                                        while alias_changed {
-                                            alias_changed = false;
-                                            for &ab in &fd.blocks {
-                                                let Some(abb) = module.block(ab) else { continue };
-                                                for &ai in &abb.insts {
-                                                    let Some(ainst) = module.inst(ai) else {
-                                                        continue;
-                                                    };
-                                                    if let Some(ares) = ainst.result {
-                                                        let hits = match &ainst.op {
-                                                            Op::Mov { src } => {
-                                                                rv_aliases.contains(src)
+                                new_sites.push((iid, rv));
+                            }
+                        }
+                    }
+                    if new_sites.is_empty() {
+                        continue;
+                    }
+                    let mut uses_of: HashMap<ValueId, Vec<InstId>> = HashMap::new();
+                    for &ab in &fd.blocks {
+                        let Some(abb) = module.block(ab) else {
+                            continue;
+                        };
+                        for &ai in &abb.insts {
+                            let Some(ainst) = module.inst(ai) else {
+                                continue;
+                            };
+                            ainst.op.for_each_operand(|ov| {
+                                let list = uses_of.entry(ov).or_default();
+                                if list.last() != Some(&ai) {
+                                    list.push(ai);
+                                }
+                            });
+                        }
+                    }
+                    for (iid, rv) in new_sites {
+                        if !callgraph.callees_of_call_at(iid).iter().any(|&cf| {
+                            ctor_owner
+                                .get(cf.index())
+                                .copied()
+                                .flatten()
+                                .and_then(|cidx| classes.get(cidx as usize))
+                                .is_some_and(|cls| cls.class_inst_sealed)
+                        }) {
+                            continue;
+                        }
+                        let mut rv_aliases: HashSet<ValueId> = HashSet::from([rv]);
+                        let mut local_containers: HashSet<ValueId> = HashSet::new();
+                        let mut vq: VecDeque<ValueId> = VecDeque::from([rv]);
+                        while let Some(cur_v) = vq.pop_front() {
+                            let Some(u_list) = uses_of.get(&cur_v) else {
+                                continue;
+                            };
+                            for &ai in u_list {
+                                let Some(ainst) = module.inst(ai) else {
+                                    continue;
+                                };
+                                if let Some(ares) = ainst.result {
+                                    let hits = match &ainst.op {
+                                        Op::Mov { src } => rv_aliases.contains(src),
+                                        Op::Phi { entries } => {
+                                            entries.iter().any(|(_, inc)| rv_aliases.contains(inc))
+                                        }
+                                        Op::ArraySpread { src, .. } => rv_aliases.contains(src),
+                                        _ => false,
+                                    };
+                                    if hits && rv_aliases.insert(ares) {
+                                        vq.push_back(ares);
+                                    }
+                                }
+                                match &ainst.op {
+                                    Op::StoreProp { object, value, .. }
+                                    | Op::StoreOwnPropName { object, value, .. }
+                                    | Op::StorePropIdx { object, value, .. }
+                                    | Op::StoreOwnPropIdx { object, value, .. }
+                                    | Op::StorePropDyn { object, value, .. }
+                                    | Op::StoreOwnPropDyn { object, value, .. }
+                                    | Op::ArraySpread {
+                                        dst: object,
+                                        src: value,
+                                        ..
+                                    } if rv_aliases.contains(value)
+                                        && is_fresh_plain_alloc_val(module, *object) =>
+                                    {
+                                        let pobj = crate::names::peel_movs_fast(module, *object);
+                                        local_containers.insert(*object);
+                                        local_containers.insert(pobj);
+                                        if rv_aliases.insert(*object) {
+                                            vq.push_back(*object);
+                                        }
+                                        if rv_aliases.insert(pobj) {
+                                            vq.push_back(pobj);
+                                        }
+                                    }
+                                    Op::Call {
+                                        callee,
+                                        this: Some(t),
+                                        args,
+                                        ..
+                                    } if args.iter().any(|a| rv_aliases.contains(a))
+                                        && is_fresh_plain_alloc_val(module, *t) =>
+                                    {
+                                        let pcal = crate::names::peel_movs_fast(module, *callee);
+                                        if let Some(ValueDef::Inst(ci)) =
+                                            module.value(pcal).map(|v| v.def)
+                                            && let Some(Op::LoadProp { name, .. }) =
+                                                module.inst(ci).map(|i| &i.op)
+                                            && matches!(
+                                                module.sym.resolve(*name),
+                                                Some("push" | "unshift" | "splice")
+                                            )
+                                        {
+                                            let pt = crate::names::peel_movs_fast(module, *t);
+                                            local_containers.insert(*t);
+                                            local_containers.insert(pt);
+                                            if rv_aliases.insert(*t) {
+                                                vq.push_back(*t);
+                                            }
+                                            if rv_aliases.insert(pt) {
+                                                vq.push_back(pt);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let mut seen_ui: HashSet<InstId> = HashSet::new();
+                        let mut escapes_to_mut = false;
+                        'check_esc: for &av in &rv_aliases {
+                            let Some(u_list) = uses_of.get(&av) else {
+                                continue;
+                            };
+                            for &ui in u_list {
+                                if ui == iid || !seen_ui.insert(ui) {
+                                    continue;
+                                }
+                                let hit = match module.inst(ui).map(|ins| &ins.op) {
+                                    Some(Op::Call {
+                                        callee, this, args, ..
+                                    }) => {
+                                        let pcal = crate::names::peel_movs_fast(module, *callee);
+                                        if let Some(t) = *this
+                                            && local_containers.contains(&t)
+                                            && !rv_aliases.contains(callee)
+                                            && let Some(ValueDef::Inst(ci)) =
+                                                module.value(pcal).map(|v| v.def)
+                                            && let Some(Op::LoadProp { object, name }) =
+                                                module.inst(ci).map(|i| &i.op)
+                                            && local_containers.contains(
+                                                &crate::names::peel_movs_fast(module, *object),
+                                            )
+                                            && matches!(
+                                                module.sym.resolve(*name),
+                                                Some(
+                                                    "push"
+                                                        | "pop"
+                                                        | "shift"
+                                                        | "unshift"
+                                                        | "splice"
+                                                        | "slice"
+                                                        | "concat"
+                                                        | "includes"
+                                                        | "indexOf"
+                                                        | "join"
+                                                )
+                                            )
+                                        {
+                                            false
+                                        } else {
+                                            let passes_rv = rv_aliases.contains(callee)
+                                                || this.is_some_and(|t| rv_aliases.contains(&t))
+                                                || args.iter().any(|a| rv_aliases.contains(a));
+                                            if !passes_rv {
+                                                false
+                                            } else {
+                                                let is_refl_mut =
+                                                    match module.value(pcal).and_then(|v| {
+                                                        match v.def {
+                                                            ValueDef::Inst(ci) => {
+                                                                module.inst(ci).map(|i| &i.op)
                                                             }
-                                                            Op::Phi { entries } => entries
-                                                                .iter()
-                                                                .any(|(_, inc)| {
-                                                                    rv_aliases.contains(inc)
-                                                                }),
-                                                            Op::ArraySpread { src, .. } => {
-                                                                rv_aliases.contains(src)
-                                                            }
-                                                            _ => false,
-                                                        };
-                                                        if hits {
-                                                            alias_changed |=
-                                                                rv_aliases.insert(ares);
+                                                            _ => None,
                                                         }
-                                                    }
-                                                    match &ainst.op {
-                                                        Op::StoreProp { object, value, .. }
-                                                        | Op::StoreOwnPropName {
-                                                            object, value, ..
-                                                        }
-                                                        | Op::StorePropIdx {
-                                                            object, value, ..
-                                                        }
-                                                        | Op::StoreOwnPropIdx {
-                                                            object, value, ..
-                                                        }
-                                                        | Op::StorePropDyn {
-                                                            object, value, ..
-                                                        }
-                                                        | Op::StoreOwnPropDyn {
-                                                            object, value, ..
-                                                        }
-                                                        | Op::ArraySpread {
-                                                            dst: object,
-                                                            src: value,
-                                                            ..
-                                                        } if rv_aliases.contains(value)
-                                                            && is_fresh_plain_alloc_val(
-                                                                module, *object,
-                                                            ) =>
-                                                        {
-                                                            let pobj = crate::names::peel_movs_fast(
-                                                                module, *object,
-                                                            );
-                                                            local_containers.insert(*object);
-                                                            local_containers.insert(pobj);
-                                                            alias_changed |=
-                                                                rv_aliases.insert(*object);
-                                                            alias_changed |=
-                                                                rv_aliases.insert(pobj);
-                                                        }
-                                                        Op::Call {
-                                                            callee,
-                                                            this: Some(t),
-                                                            args,
-                                                            ..
-                                                        } if args
-                                                            .iter()
-                                                            .any(|a| rv_aliases.contains(a))
-                                                            && is_fresh_plain_alloc_val(
-                                                                module, *t,
-                                                            ) =>
-                                                        {
-                                                            let pcal = crate::names::peel_movs_fast(
-                                                                module, *callee,
-                                                            );
-                                                            if let Some(ValueDef::Inst(ci)) =
-                                                                module.value(pcal).map(|v| v.def)
-                                                                && let Some(Op::LoadProp {
-                                                                    name,
-                                                                    ..
-                                                                }) = module.inst(ci).map(|i| &i.op)
-                                                                && matches!(
-                                                                    module.sym.resolve(*name),
-                                                                    Some(
-                                                                        "push"
-                                                                            | "unshift"
-                                                                            | "splice"
-                                                                    )
+                                                    }) {
+                                                        Some(Op::LoadProp { name, .. })
+                                                            if matches!(
+                                                                module.sym.resolve(*name),
+                                                                Some(
+                                                                    "defineProperty"
+                                                                        | "defineProperties"
+                                                                        | "setPrototypeOf"
                                                                 )
-                                                            {
-                                                                let pt =
-                                                                    crate::names::peel_movs_fast(
-                                                                        module, *t,
-                                                                    );
-                                                                local_containers.insert(*t);
-                                                                local_containers.insert(pt);
-                                                                alias_changed |=
-                                                                    rv_aliases.insert(*t);
-                                                                alias_changed |=
-                                                                    rv_aliases.insert(pt);
-                                                            }
+                                                            ) =>
+                                                        {
+                                                            true
                                                         }
-                                                        _ => {}
+                                                        Some(Op::LoadProp { object, name })
+                                                            if matches!(
+                                                                module.sym.resolve(*name),
+                                                                Some("assign" | "set")
+                                                            ) && is_object_or_reflect_global(
+                                                                module, *object,
+                                                            ) =>
+                                                        {
+                                                            true
+                                                        }
+                                                        Some(Op::TryGetGlobal { name, .. })
+                                                            if module.sym.resolve(*name)
+                                                                == Some("Proxy") =>
+                                                        {
+                                                            true
+                                                        }
+                                                        _ => false,
+                                                    };
+                                                if is_refl_mut {
+                                                    true
+                                                } else {
+                                                    let cals = callgraph.callees_of_call_at(ui);
+                                                    if !cals.is_empty() {
+                                                        cals.iter().any(|&cf| {
+                                                            inst_mutator_funcs.get(cf.index())
+                                                        })
+                                                    } else {
+                                                        match module.value(pcal).and_then(|v| {
+                                                            match v.def {
+                                                                ValueDef::Inst(ci) => {
+                                                                    module.inst(ci).map(|i| &i.op)
+                                                                }
+                                                                _ => None,
+                                                            }
+                                                        }) {
+                                                            Some(Op::LoadProp { object, name }) => {
+                                                                !is_clean_external_base_val(
+                                                                    module,
+                                                                    links,
+                                                                    &global_written_syms,
+                                                                    fid,
+                                                                    *object,
+                                                                ) && mutator_prop_syms
+                                                                    .contains(name)
+                                                            }
+                                                            Some(Op::LoadModuleVar { .. }) => false,
+                                                            Some(Op::TryGetGlobal {
+                                                                name, ..
+                                                            }) if !global_written_syms
+                                                                .contains(name) =>
+                                                            {
+                                                                false
+                                                            }
+                                                            _ => inst_mutator_funcs.get(fi),
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                        fd.blocks.iter().any(|&ub| {
-                                            module.block(ub).is_some_and(|ubb| {
-                                                ubb.insts.iter().any(|&ui| {
-                                                    ui != iid
-                                                        && match module.inst(ui).map(|ins| &ins.op)
-                                                        {
-                                                            Some(Op::Call {
-                                                                callee,
-                                                                this,
-                                                                args,
-                                                                ..
-                                                            }) => {
-                                                                let pcal =
-                                                                    crate::names::peel_movs_fast(
-                                                                        module, *callee,
-                                                                    );
-                                                                // `localArr.push(rv)` is already folded into `rv_aliases`.
-                                                                if let Some(t) = *this
-                                                                    && local_containers.contains(&t)
-                                                                    && !rv_aliases.contains(callee)
-                                                                    && let Some(ValueDef::Inst(
-                                                                        ci,
-                                                                    )) = module
-                                                                        .value(pcal)
-                                                                        .map(|v| v.def)
-                                                                    && let Some(Op::LoadProp {
-                                                                        object,
-                                                                        name,
-                                                                    }) = module
-                                                                        .inst(ci)
-                                                                        .map(|i| &i.op)
-                                                                    && local_containers.contains(
-                                                                        &crate::names::peel_movs_fast(
-                                                                            module, *object,
-                                                                        ),
-                                                                    )
-                                                                    && matches!(
-                                                                        module.sym.resolve(*name),
-                                                                        Some(
-                                                                            "push"
-                                                                                | "pop"
-                                                                                | "shift"
-                                                                                | "unshift"
-                                                                                | "splice"
-                                                                                | "slice"
-                                                                                | "concat"
-                                                                                | "includes"
-                                                                                | "indexOf"
-                                                                                | "join"
-                                                                        )
-                                                                    )
-                                                                {
-                                                                    return false;
-                                                                }
-                                                                let passes_rv = rv_aliases
-                                                                    .contains(callee)
-                                                                    || this.is_some_and(|t| {
-                                                                        rv_aliases.contains(&t)
-                                                                    })
-                                                                    || args.iter().any(|a| {
-                                                                        rv_aliases.contains(a)
-                                                                    });
-                                                                if !passes_rv {
-                                                                    false
-                                                                } else {
-                                                                    let is_refl_mut = match module
-                                                                        .value(pcal)
-                                                                        .and_then(|v| match v.def {
-                                                                            ValueDef::Inst(ci) => {
-                                                                                module
-                                                                                    .inst(ci)
-                                                                                    .map(|i| &i.op)
-                                                                            }
-                                                                            _ => None,
-                                                                        }) {
-                                                                        Some(Op::LoadProp {
-                                                                            name,
-                                                                            ..
-                                                                        }) if matches!(
-                                                                            module
-                                                                                .sym
-                                                                                .resolve(*name),
-                                                                            Some(
-                                                                                "defineProperty"
-                                                                                    | "defineProperties"
-                                                                                    | "setPrototypeOf"
-                                                                            )
-                                                                        ) =>
-                                                                        {
-                                                                            true
-                                                                        }
-                                                                        Some(Op::LoadProp {
-                                                                            object,
-                                                                            name,
-                                                                        }) if matches!(
-                                                                            module
-                                                                                .sym
-                                                                                .resolve(*name),
-                                                                            Some("assign" | "set")
-                                                                        ) && is_object_or_reflect_global(
-                                                                            module, *object,
-                                                                        ) =>
-                                                                        {
-                                                                            true
-                                                                        }
-                                                                        Some(
-                                                                            Op::TryGetGlobal {
-                                                                                name,
-                                                                                ..
-                                                                            },
-                                                                        ) if module
-                                                                            .sym
-                                                                            .resolve(*name)
-                                                                            == Some("Proxy") =>
-                                                                        {
-                                                                            true
-                                                                        }
-                                                                        _ => false,
-                                                                    };
-                                                                    if is_refl_mut {
-                                                                        true
-                                                                    } else {
-                                                                        let cals = callgraph
-                                                                            .callees_of_call_at(ui);
-                                                                        if !cals.is_empty() {
-                                                                            cals.iter().any(|&cf| {
-                                                                                inst_mutator_funcs
-                                                                                    .get(cf.index())
-                                                                            })
-                                                                        } else {
-                                                                            match module
-                                                                                .value(pcal)
-                                                                                .and_then(|v| {
-                                                                                    match v.def {
-                                                                                        ValueDef::Inst(ci) => module.inst(ci).map(|i| &i.op),
-                                                                                        _ => None,
-                                                                                    }
-                                                                                }) {
-                                                                                Some(Op::LoadProp { object, name }) => {
-                                                                                    !is_clean_external_base_val(
-                                                                                        module,
-                                                                                        links,
-                                                                                        &global_written_syms,
-                                                                                        fid,
-                                                                                        *object,
-                                                                                    ) && mutator_prop_syms.contains(name)
-                                                                                }
-                                                                                Some(Op::LoadModuleVar { .. }) => false,
-                                                                                Some(Op::TryGetGlobal { name, .. })
-                                                                                    if !global_written_syms.contains(name) =>
-                                                                                {
-                                                                                    false
-                                                                                }
-                                                                                _ => inst_mutator_funcs.get(fi),
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            Some(
-                                                                Op::Return {
-                                                                    value: Some(ret_v),
-                                                                }
-                                                                | Op::AsyncResolve {
-                                                                    value: ret_v,
-                                                                    ..
-                                                                },
-                                                            ) if caller_in_mut_cone => {
-                                                                rv_aliases.contains(ret_v)
-                                                            }
-                                                            Some(
-                                                                Op::StoreGlobal { value, .. }
-                                                                | Op::StoreGlobalRecord {
-                                                                    value,
-                                                                    ..
-                                                                }
-                                                                | Op::TryStoreGlobal {
-                                                                    value, ..
-                                                                },
-                                                            ) => rv_aliases.contains(value),
-                                                            Some(
-                                                                Op::StorePropDyn {
-                                                                    object,
-                                                                    key,
-                                                                    value,
-                                                                }
-                                                                | Op::StoreOwnPropDyn {
-                                                                    object,
-                                                                    key,
-                                                                    value,
-                                                                    ..
-                                                                },
-                                                            ) => {
-                                                                if local_containers.contains(object)
-                                                                {
-                                                                    false
-                                                                } else if rv_aliases
-                                                                    .contains(object)
-                                                                {
-                                                                    classify_dyn_prop_key(
-                                                                        module, *key,
-                                                                    ) == FieldKey::AnyDynamic
-                                                                        && !gap::definitely_not_callable(
-                                                                            module, *value,
-                                                                        )
-                                                                } else {
-                                                                    rv_aliases.contains(value)
-                                                                        && !is_fresh_plain_alloc_val(
-                                                                            module, *object,
-                                                                        )
-                                                                }
-                                                            }
-                                                            Some(
-                                                                Op::CopyDataProps {
-                                                                    dst: object,
-                                                                    ..
-                                                                }
-                                                                | Op::DefineGetterSetterByValue {
-                                                                    obj: object,
-                                                                    ..
-                                                                }
-                                                                | Op::SetObjectWithProto {
-                                                                    obj: object,
-                                                                    ..
-                                                                },
-                                                            ) => rv_aliases.contains(object),
-                                                            _ => false,
-                                                        }
-                                                })
-                                            })
-                                        })
-                                    });
-                                if escapes_to_mut {
-                                    for &cf in callgraph.callees_of_call_at(iid) {
-                                        if let Some(cidx) =
-                                            ctor_owner.get(cf.index()).copied().flatten()
-                                            && let Some(cls) = classes.get_mut(cidx as usize)
-                                        {
-                                            cls.class_inst_sealed = false;
+                                    }
+                                    Some(
+                                        Op::Return { value: Some(ret_v) }
+                                        | Op::AsyncResolve { value: ret_v, .. },
+                                    ) if caller_in_mut_cone => rv_aliases.contains(ret_v),
+                                    Some(
+                                        Op::StoreGlobal { value, .. }
+                                        | Op::StoreGlobalRecord { value, .. }
+                                        | Op::TryStoreGlobal { value, .. },
+                                    ) => rv_aliases.contains(value),
+                                    Some(
+                                        Op::StorePropDyn { object, key, value }
+                                        | Op::StoreOwnPropDyn {
+                                            object, key, value, ..
+                                        },
+                                    ) => {
+                                        if local_containers.contains(object) {
+                                            false
+                                        } else if rv_aliases.contains(object) {
+                                            classify_dyn_prop_key(module, *key)
+                                                == FieldKey::AnyDynamic
+                                                && !gap::definitely_not_callable(module, *value)
+                                        } else {
+                                            rv_aliases.contains(value)
+                                                && !is_fresh_plain_alloc_val(module, *object)
                                         }
                                     }
+                                    Some(
+                                        Op::CopyDataProps { dst: object, .. }
+                                        | Op::DefineGetterSetterByValue { obj: object, .. }
+                                        | Op::SetObjectWithProto { obj: object, .. },
+                                    ) => rv_aliases.contains(object),
+                                    _ => false,
+                                };
+                                if hit {
+                                    escapes_to_mut = true;
+                                    break 'check_esc;
+                                }
+                            }
+                        }
+                        if escapes_to_mut {
+                            for &cf in callgraph.callees_of_call_at(iid) {
+                                if let Some(cidx) = ctor_owner.get(cf.index()).copied().flatten()
+                                    && let Some(cls) = classes.get_mut(cidx as usize)
+                                {
+                                    cls.class_inst_sealed = false;
                                 }
                             }
                         }

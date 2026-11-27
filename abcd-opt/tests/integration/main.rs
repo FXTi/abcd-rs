@@ -8,6 +8,7 @@ mod opt_empty_jump_phi_guard;
 mod opt_fold_int_conversion;
 mod opt_fold_operand_order;
 mod opt_inline;
+mod opt_inline_cache_eviction;
 mod opt_inline_e2e;
 mod opt_inline_red;
 mod opt_inline_skip_reasons;

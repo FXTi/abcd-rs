@@ -252,11 +252,11 @@ impl FuncPass for Sccp {
             let Some(&last) = module.block(bb).and_then(|b| b.insts.last()) else {
                 continue;
             };
-            let Some(Op::CondBranch {
+            let Some(&Op::CondBranch {
                 cond,
                 true_dest,
                 false_dest,
-            }) = module.inst(last).map(|i| i.op.clone())
+            }) = module.inst(last).map(|i| &i.op)
             else {
                 continue;
             };

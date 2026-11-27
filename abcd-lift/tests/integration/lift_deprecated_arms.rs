@@ -999,6 +999,248 @@ fn deprecated_ldmodulevar_polarity_and_es_module_slot_resolution() {
     assert!(matches!(lifted[3], Op::GetModuleNamespace { index: 1 }));
 }
 
+#[test]
+fn deprecated_module_var_slot_index_priority_and_deduplication() {
+    // Verifies `#103` `LegacyModuleSlotIndex` exact priority & deduplication rules:
+    // 1. Repeated `ExportDecl::Local` sharing `local_name` share one distinct slot (`0`),
+    //    so the next distinct `local_name` gets slot `1` (not `2`).
+    // 2. Direct `local_name` match ALWAYS beats an earlier `export_name` fallback,
+    //    and earlier `export_name` fallback wins ties when no `local_name` matches.
+    // 3. `ImportDecl::Regular` slots skip `ImportDecl::Namespace`; direct `local_name`
+    //    ALWAYS beats an earlier `import_name` fallback, and earlier `import_name` wins ties.
+    // 4. Direct `ModuleRequest::specifier` ALWAYS beats an `ImportDecl::Namespace`
+    //    `local_name` fallback when symbols collide.
+    let mut s = abcd_file::StringPool::default();
+    let rec_desc = s.get_or_intern("Lentry/priority;");
+    let mod_field = s.get_or_intern("moduleRecordIdx");
+    let fn_name = s.get_or_intern("func_main_0");
+
+    let req0 = s.get_or_intern("./req0");
+    let collide_ns = s.get_or_intern("./collide_ns"); // request 1 specifier AND ns local_name for req 0!
+    let ns_alias = s.get_or_intern("nsReq0");
+
+    let imp_loc0 = s.get_or_intern("impLoc0");
+    let collide_ext = s.get_or_intern("collideExt"); // imp0's import_name (slot 0) AND imp1's local_name (slot 1)!
+    let imp_other = s.get_or_intern("impOther");
+    let dup_imp = s.get_or_intern("dupImp"); // import_name on slot 2 AND slot 3
+    let imp_loc2 = s.get_or_intern("impLoc2");
+    let imp_loc3 = s.get_or_intern("impLoc3");
+
+    let exp_a = s.get_or_intern("expA"); // distinct local slot 0 (exported twice!)
+    let collide_loc = s.get_or_intern("collideLoc"); // exp0's export_name (slot 0) AND exp2's local_name (slot 1)!
+    let dup_pub = s.get_or_intern("dupPub"); // export_name on exp1 (slot 0) AND exp3 (slot 1)
+    let exp_other_pub = s.get_or_intern("expOtherPub");
+    let unmapped = s.get_or_intern("unmappedSym");
+
+    let method = abcd_file::Method {
+        name: fn_name,
+        offset: 0x100,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: abcd_file::FunctionKind::Function,
+        source_lang: abcd_file::SourceLang::EcmaScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(abcd_file::MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            code: abcd_file::MethodCode::Decoded(vec![
+                // [0] Local `collideLoc`: direct `local_name` (slot 1) beats earlier `export_name` (slot 0)
+                Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(1)),
+                // [1] Store `collideLoc`: direct `local_name` (slot 1) beats earlier `export_name` (slot 0)
+                Bytecode::DeprecatedStmodulevar(EntityId(0)),
+                // [2] Local `dupPub`: first `export_name` fallback (slot 0) beats later `export_name` (slot 1)
+                Bytecode::DeprecatedLdmodulevar(EntityId(1), Imm(1)),
+                // [3] External `collideExt`: direct `local_name` (slot 1) beats earlier `import_name` (slot 0)
+                Bytecode::DeprecatedLdmodulevar(EntityId(2), Imm(0)),
+                // [4] External `dupImp`: first `import_name` fallback (slot 2) beats later `import_name` (slot 3)
+                Bytecode::DeprecatedLdmodulevar(EntityId(3), Imm(0)),
+                // [5] Namespace `./collide_ns`: direct request specifier (slot 1) beats Namespace `local_name` (slot 0)
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(4)),
+                // [6] Namespace `nsReq0`: Namespace `local_name` resolves to request 0
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(5)),
+                // [7] Unmapped symbol falls back to `Sym.0`
+                Bytecode::DeprecatedLdmodulevar(EntityId(6), Imm(0)),
+                Bytecode::Return,
+            ]),
+            entities: std::collections::HashMap::from([
+                (
+                    (abcd_isa::EntityKind::StringId, 0),
+                    abcd_file::EntityRef::string(collide_loc),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 1),
+                    abcd_file::EntityRef::string(dup_pub),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 2),
+                    abcd_file::EntityRef::string(collide_ext),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 3),
+                    abcd_file::EntityRef::string(dup_imp),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 4),
+                    abcd_file::EntityRef::string(collide_ns),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 5),
+                    abcd_file::EntityRef::string(ns_alias),
+                ),
+                (
+                    (abcd_isa::EntityKind::StringId, 6),
+                    abcd_file::EntityRef::string(unmapped),
+                ),
+            ])
+            .into(),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    };
+
+    let cls = abcd_file::Class {
+        descriptor: rec_desc,
+        name: rec_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: abcd_file::SourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![method],
+        fields: vec![abcd_file::Field {
+            name: mod_field,
+            offset: 0,
+            field_type: Type::U32,
+            access_flags: AccessFlags::STATIC,
+            is_external: false,
+            initial_value: Some(abcd_file::FieldValue::ModuleData(abcd_file::ModuleData {
+                source_offset: 0,
+                requests: vec![req0, collide_ns],
+                records: vec![
+                    // Namespace imports interleaved with Regular imports:
+                    abcd_file::ModuleRecord::NamespaceImport {
+                        local_name: collide_ns,
+                        module_request_idx: 0,
+                    },
+                    // Regular slot 0:
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp_loc0,
+                        import_name: collide_ext,
+                        module_request_idx: 0,
+                    },
+                    abcd_file::ModuleRecord::NamespaceImport {
+                        local_name: ns_alias,
+                        module_request_idx: 0,
+                    },
+                    // Regular slot 1:
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: collide_ext,
+                        import_name: imp_other,
+                        module_request_idx: 1,
+                    },
+                    // Regular slot 2:
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp_loc2,
+                        import_name: dup_imp,
+                        module_request_idx: 0,
+                    },
+                    // Regular slot 3:
+                    abcd_file::ModuleRecord::RegularImport {
+                        local_name: imp_loc3,
+                        import_name: dup_imp,
+                        module_request_idx: 1,
+                    },
+                    // Local exports:
+                    // Distinct local 0 (`expA`) exported under `collideLoc` AND `dupPub`:
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp_a,
+                        export_name: collide_loc,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: exp_a,
+                        export_name: dup_pub,
+                    },
+                    // Indirect + Star exports must not perturb local slots:
+                    abcd_file::ModuleRecord::IndirectExport {
+                        export_name: imp_other,
+                        import_name: imp_other,
+                        module_request_idx: 0,
+                    },
+                    abcd_file::ModuleRecord::StarExport {
+                        module_request_idx: 1,
+                    },
+                    // Distinct local 1 (`collideLoc`, NOT slot 2!) exported under `expOtherPub` AND `dupPub`:
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: collide_loc,
+                        export_name: exp_other_pub,
+                    },
+                    abcd_file::ModuleRecord::LocalExport {
+                        local_name: collide_loc,
+                        export_name: dup_pub,
+                    },
+                ],
+            })),
+            annotations: Default::default(),
+        }],
+        annotations: Default::default(),
+    };
+
+    let file = abcd_file::File {
+        version: abcd_isa::Version::new(0, 0, 0, 2),
+        checksum: 0,
+        size: 0,
+        file_type: abcd_file::FileType::Dynamic,
+        strings: s,
+        classes: [(rec_desc, cls)].into_iter().collect(),
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let mut ir = lift_file(&file).expect("lift priority fixture");
+    verify_clean(&ir);
+    let unmapped_sym = ir.sym.intern("unmappedSym").0;
+    let lifted = ops(&ir);
+    assert!(matches!(
+        lifted[0],
+        Op::LoadModuleVar {
+            index: 1,
+            kind: abcd_ir::ModuleVarKind::Local
+        }
+    ));
+    assert!(matches!(lifted[1], Op::StoreModuleVar { index: 1, .. }));
+    assert!(matches!(
+        lifted[2],
+        Op::LoadModuleVar {
+            index: 0,
+            kind: abcd_ir::ModuleVarKind::Local
+        }
+    ));
+    assert!(matches!(
+        lifted[3],
+        Op::LoadModuleVar {
+            index: 1,
+            kind: abcd_ir::ModuleVarKind::External
+        }
+    ));
+    assert!(matches!(
+        lifted[4],
+        Op::LoadModuleVar {
+            index: 2,
+            kind: abcd_ir::ModuleVarKind::External
+        }
+    ));
+    assert!(matches!(lifted[5], Op::GetModuleNamespace { index: 1 }));
+    assert!(matches!(lifted[6], Op::GetModuleNamespace { index: 0 }));
+    assert!(
+        matches!(lifted[7], Op::LoadModuleVar { index, kind: abcd_ir::ModuleVarKind::External } if *index == unmapped_sym)
+    );
+}
+
 // ── deprecated.ldobjbyname → LoadProp (reg object) ───────────────────
 
 #[test]

@@ -2,7 +2,7 @@
 //! `inspect_summary_zeropadded`) backed by `CompactU32Set` and SipHash-keyed
 //! `SummaryStrings` (`#49`, `#77`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, RandomState};
 
 use abcd_file_sys as sys;
@@ -24,6 +24,7 @@ use super::{
     MODULE_RECORD_IDX_FIELD, MODULE_REQUEST_PHASE_FIELD, SCOPE_NAMES_FIELD,
     TYPE_SUMMARY_OFFSET_FIELD, check_supported_dialect, decode_function_kind_from_flags,
     decode_source_lang, is_plausible_literal_array_offset, legacy_literalarray_table,
+    probe_literal_array_valid,
 };
 
 // Lightweight Streaming Summary & Verifier (`inspect_summary`, `#77`)
@@ -482,6 +483,9 @@ fn inspect_summary_with_reader(
     let mut referenced_literal_offsets = CompactU32Set::default();
     let mut ann_nested_raw_targets: Vec<u32> = Vec::new();
     let mut ann_visiting: HashSet<u32> = HashSet::new();
+    let mut ann_verified = CompactU32Set::default();
+    let mut lnp_budget = crate::debug::initial_lnp_budget(size);
+    let mut lit_probe_cache: HashMap<u32, bool> = HashMap::new();
 
     for (class_off, parsed_opt) in staged_summary_classes {
         let Some((raw_cls, raw_fields, raw_methods)) = parsed_opt else {
@@ -547,6 +551,9 @@ fn inspect_summary_with_reader(
                 &mut referenced_literal_offsets,
                 &mut ann_nested_raw_targets,
                 &mut ann_visiting,
+                &mut ann_verified,
+                &mut lnp_budget,
+                &mut lit_probe_cache,
                 &mut cls_summary,
             )?;
         }
@@ -565,6 +572,8 @@ fn inspect_summary_with_reader(
                 &mut phase_blob_offsets,
                 &mut ann_nested_raw_targets,
                 &mut ann_visiting,
+                &mut ann_verified,
+                &mut lit_probe_cache,
             )?;
             cls_summary.fields += 1;
         }
@@ -583,6 +592,8 @@ fn inspect_summary_with_reader(
                     &mut strings,
                     &mut ann_nested_raw_targets,
                     &mut ann_visiting,
+                    &mut ann_verified,
+                    &mut lit_probe_cache,
                 )?;
             }
         }
@@ -616,6 +627,7 @@ fn inspect_summary_with_reader(
         &referenced_literal_offsets,
         &module_data_offsets,
         &phase_blob_offsets,
+        &mut lit_probe_cache,
     )?;
 
     let total_classes = classes.len();
@@ -690,6 +702,9 @@ fn inspect_method_item(
     referenced_literal_offsets: &mut CompactU32Set,
     ann_nested_raw_targets: &mut Vec<u32>,
     ann_visiting: &mut HashSet<u32>,
+    ann_verified: &mut CompactU32Set,
+    lnp_budget: &mut usize,
+    lit_probe_cache: &mut HashMap<u32, bool>,
     cls_summary: &mut ClassSummary,
 ) -> Result<(), Error> {
     let method_off = raw_m.offset;
@@ -746,6 +761,8 @@ fn inspect_method_item(
                 strings,
                 ann_nested_raw_targets,
                 ann_visiting,
+                ann_verified,
+                lit_probe_cache,
             )?;
         }
     }
@@ -760,9 +777,9 @@ fn inspect_method_item(
             raw_m,
             code_size,
             debug_off,
+            lnp_budget,
             &mut sink,
         )?;
-        sink.check_intern_err()?;
     }
 
     inspect_param_annotations(
@@ -772,6 +789,8 @@ fn inspect_method_item(
         strings,
         ann_nested_raw_targets,
         ann_visiting,
+        ann_verified,
+        lit_probe_cache,
     )?;
 
     cls_summary.methods += 1;
@@ -821,6 +840,8 @@ fn inspect_code_at(
         &raw_code,
         raw_insns.len() as u32,
         &decoded,
+        initial_entities,
+        strings,
     )?;
 
     let file_slice = reader.bytes();
@@ -967,6 +988,8 @@ fn validate_try_block_spans(
     raw_code: &crate::file::RawCode<'_>,
     code_byte_len: u32,
     decoded: &[(abcd_isa::Bytecode, u32)],
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings,
 ) -> Result<(), Error> {
     let check_pc = |pc: u32, field: &'static str, label: &str| -> Result<(), Error> {
         if pc == code_byte_len {
@@ -1001,11 +1024,15 @@ fn validate_try_block_spans(
         check_pc(tb.start_pc, "try_block", "try start")?;
         check_pc(end_pc, "try_block", "try end")?;
         for c in tb.catches {
-            if let Some(idx) = c.type_idx
-                && reader.resolve_class_index(method_off, idx).is_none()
-            {
-                return Err(Error::InvalidOffset(u32::from(idx)));
-            }
+            let type_class_off = match c.type_idx {
+                None => None,
+                Some(idx) => {
+                    let resolved = reader
+                        .resolve_class_index(method_off, idx)
+                        .ok_or(Error::InvalidOffset(u32::from(idx)))?;
+                    Some(resolved)
+                }
+            };
             let handler_end =
                 c.handler_pc
                     .checked_add(c.code_size)
@@ -1015,6 +1042,18 @@ fn validate_try_block_spans(
                     })?;
             check_pc(c.handler_pc, "catch_block", "catch handler")?;
             check_pc(handler_end, "catch_block", "catch end")?;
+            if let Some(class_off) = type_class_off
+                && !initial_entities.contains(class_off)
+                && !(reader.is_external(class_off)
+                    && strings.intern_offset_lossy(reader, class_off))
+            {
+                return Err(Error::Malformed {
+                    field: "catch_block",
+                    context: format!(
+                        "method at offset {method_off:#x}: catch type offset {class_off:#x} names no class"
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -1062,6 +1101,10 @@ fn inspect_proto_types(
     Ok(proto.num_args())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming param annotation inspector threads summary sets and verified annotation cache"
+)]
 fn inspect_param_annotations(
     reader: &AbcReader<'_>,
     raw_m: &RawMethod,
@@ -1069,6 +1112,8 @@ fn inspect_param_annotations(
     strings: &mut SummaryStrings,
     ann_nested_raw_targets: &mut Vec<u32>,
     ann_visiting: &mut HashSet<u32>,
+    ann_verified: &mut CompactU32Set,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<(), Error> {
     for item_off_opt in [
         raw_m.param_annotations_off,
@@ -1105,6 +1150,8 @@ fn inspect_param_annotations(
                 strings,
                 ann_nested_raw_targets,
                 ann_visiting,
+                ann_verified,
+                lit_probe_cache,
             )?;
         }
     }
@@ -1128,6 +1175,8 @@ fn inspect_field_item(
     phase_blob_offsets: &mut CompactU32Set,
     ann_nested_raw_targets: &mut Vec<u32>,
     ann_visiting: &mut HashSet<u32>,
+    ann_verified: &mut CompactU32Set,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<(), Error> {
     let field_off = raw_f.offset;
     let name_sym = if raw_f.name_off == ABSENT {
@@ -1175,7 +1224,7 @@ fn inspect_field_item(
             let offset = off as u32;
             if offset != 0 {
                 if initial_entities.contains(offset)
-                    || walk_raw_literal_array(reader, offset, |_| Ok(())).is_err()
+                    || !probe_literal_array_valid(reader, offset, lit_probe_cache)
                 {
                     return Err(Error::InvalidOffset(offset));
                 }
@@ -1247,6 +1296,8 @@ fn inspect_field_item(
                 strings,
                 ann_nested_raw_targets,
                 ann_visiting,
+                ann_verified,
+                lit_probe_cache,
             )?;
         }
     }
@@ -1376,6 +1427,10 @@ fn open_summary_ann_frame<'a>(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming annotation inspector threads summary sets, verified DAG cache, and literal probe cache"
+)]
 fn inspect_annotation_at(
     reader: &AbcReader<'_>,
     root_off: u32,
@@ -1383,10 +1438,45 @@ fn inspect_annotation_at(
     strings: &mut SummaryStrings,
     ann_nested_raw_targets: &mut Vec<u32>,
     visiting: &mut HashSet<u32>,
+    ann_verified: &mut CompactU32Set,
+    lit_probe_cache: &mut HashMap<u32, bool>,
+) -> Result<(), Error> {
+    visiting.clear();
+    if ann_verified.contains(root_off) {
+        return Ok(());
+    }
+    let res = inspect_annotation_at_inner(
+        reader,
+        root_off,
+        initial_entities,
+        strings,
+        ann_nested_raw_targets,
+        visiting,
+        ann_verified,
+        lit_probe_cache,
+    );
+    if res.is_err() {
+        visiting.clear();
+    }
+    res
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "inner iterative annotation inspector threads summary sets, verified DAG cache, and literal probe cache"
+)]
+fn inspect_annotation_at_inner(
+    reader: &AbcReader<'_>,
+    root_off: u32,
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings,
+    ann_nested_raw_targets: &mut Vec<u32>,
+    visiting: &mut HashSet<u32>,
+    ann_verified: &mut CompactU32Set,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<(), Error> {
     use sys::AnnotationValueType as AVT;
 
-    visiting.clear();
     let mut stack = vec![open_summary_ann_frame(
         reader,
         root_off,
@@ -1395,13 +1485,25 @@ fn inspect_annotation_at(
     )?];
 
     while let Some(frame) = stack.last_mut() {
-        if let Some(mut remaining) = frame.pending_array.take()
-            && let Some(next_off) = remaining.next()
-        {
-            frame.pending_array = Some(remaining);
-            let child = open_summary_ann_frame(reader, next_off, initial_entities, visiting)?;
-            stack.push(child);
-            continue;
+        if let Some(mut remaining) = frame.pending_array.take() {
+            let mut pending_child: Option<SummaryAnnFrame<'_>> = None;
+            for next_off in &mut remaining {
+                if !visiting.contains(&next_off) && ann_verified.contains(next_off) {
+                    continue;
+                }
+                frame.pending_array = Some(remaining);
+                pending_child = Some(open_summary_ann_frame(
+                    reader,
+                    next_off,
+                    initial_entities,
+                    visiting,
+                )?);
+                break;
+            }
+            if let Some(child) = pending_child {
+                stack.push(child);
+                continue;
+            }
         }
 
         let mut next_child: Option<SummaryAnnFrame<'_>> = None;
@@ -1463,6 +1565,9 @@ fn inspect_annotation_at(
                     resolve_foreign_entity_name_summary(reader, initial_entities, strings, val)?;
                 }
                 AVT::Annotation => {
+                    if !visiting.contains(&val) && ann_verified.contains(val) {
+                        continue;
+                    }
                     next_child = Some(open_summary_ann_frame(
                         reader,
                         val,
@@ -1491,24 +1596,36 @@ fn inspect_annotation_at(
                     }
                 }
                 AVT::LiteralArray => {
-                    inspect_checked_literal_array_at(reader, val, strings, ann_nested_raw_targets)?;
+                    inspect_checked_literal_array_at(
+                        reader,
+                        val,
+                        strings,
+                        ann_nested_raw_targets,
+                        lit_probe_cache,
+                    )?;
                 }
                 AVT::ArrayAnnotation => {
                     let (_, raw_values) =
-                        read_annotation_array_from_elem(reader, off, idx, raw_tag, val)?;
+                        read_annotation_array_from_elem(reader, off, idx, raw_tag, val, None)?;
                     let mut offsets_iter = raw_values
                         .into_iter()
                         .map(|v| v as u32)
                         .collect::<Vec<_>>()
                         .into_iter();
-                    if let Some(first_off) = offsets_iter.next() {
+                    for cand_off in &mut offsets_iter {
+                        if !visiting.contains(&cand_off) && ann_verified.contains(cand_off) {
+                            continue;
+                        }
                         frame.pending_array = Some(offsets_iter);
                         next_child = Some(open_summary_ann_frame(
                             reader,
-                            first_off,
+                            cand_off,
                             initial_entities,
                             visiting,
                         )?);
+                        break;
+                    }
+                    if next_child.is_some() {
                         break;
                     }
                 }
@@ -1530,7 +1647,7 @@ fn inspect_annotation_at(
                 | AVT::ArrayEnum
                 | AVT::ArrayMethodHandle => {
                     let (avt, raw_values) =
-                        read_annotation_array_from_elem(reader, off, idx, raw_tag, val)?;
+                        read_annotation_array_from_elem(reader, off, idx, raw_tag, val, None)?;
                     for raw in raw_values {
                         match avt {
                             AVT::ArrayU1
@@ -1599,6 +1716,7 @@ fn inspect_annotation_at(
             break;
         };
         visiting.remove(&finished.off);
+        ann_verified.insert(finished.off);
         if stack.is_empty() {
             return Ok(());
         }
@@ -1611,8 +1729,10 @@ fn inspect_checked_literal_array_at(
     offset: u32,
     strings: &mut SummaryStrings,
     nested_out: &mut Vec<u32>,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<(), Error> {
     let mut first_err: Option<Error> = None;
+    let mut buf_indices: Vec<u32> = Vec::new();
     let walk = walk_raw_literal_array(reader, offset, |elem| {
         if first_err.is_some() {
             return Ok(());
@@ -1627,6 +1747,9 @@ fn inspect_checked_literal_array_at(
             }
             RawLiteralElem::LiteralArray(off) => {
                 nested_out.push(off);
+            }
+            RawLiteralElem::LiteralBufferIndex(off) => {
+                buf_indices.push(off);
             }
             RawLiteralElem::TypedArray {
                 tag: crate::literal::LiteralTag::ArrayString,
@@ -1648,16 +1771,29 @@ fn inspect_checked_literal_array_at(
     });
 
     match walk {
-        Ok(()) => match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        },
-        Err(LiteralWalkError::UnknownTag(t)) => match first_err {
-            Some(e) => Err(e),
-            None => Err(Error::UnknownLiteralTag(t)),
-        },
-        Err(LiteralWalkError::Structural) => Err(Error::InvalidOffset(offset)),
+        Ok(()) => {
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+        }
+        Err(LiteralWalkError::UnknownTag(t)) => {
+            return Err(first_err.unwrap_or(Error::UnknownLiteralTag(t)));
+        }
+        Err(LiteralWalkError::Structural) => return Err(Error::InvalidOffset(offset)),
     }
+
+    let header_size = reader.header_size();
+    let file_size = reader.file_size();
+    for cand in buf_indices {
+        if cand != ABSENT
+            && cand >= header_size
+            && u64::from(cand) + 4 <= u64::from(file_size)
+            && probe_literal_array_valid(reader, cand, lit_probe_cache)
+        {
+            nested_out.push(cand);
+        }
+    }
+    Ok(())
 }
 
 fn count_literal_arrays_summary(
@@ -1667,6 +1803,7 @@ fn count_literal_arrays_summary(
     referenced_offsets: &CompactU32Set,
     module_data_offsets: &CompactU32Set,
     phase_blob_offsets: &CompactU32Set,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<usize, Error> {
     let mut offsets = Vec::new();
     let mut seen = CompactU32Set::default();
@@ -1705,7 +1842,13 @@ fn count_literal_arrays_summary(
         let mut batch_nested = Vec::new();
         for &off in &offsets[decoded..] {
             raw_nested.clear();
-            inspect_checked_literal_array_at(reader, off, strings, &mut raw_nested)?;
+            inspect_checked_literal_array_at(
+                reader,
+                off,
+                strings,
+                &mut raw_nested,
+                lit_probe_cache,
+            )?;
             for &target in &raw_nested {
                 if is_plausible_literal_array_offset(
                     target,
@@ -1733,78 +1876,59 @@ fn count_literal_arrays_summary(
 
 struct SummaryDebugSink<'s> {
     strings: &'s mut SummaryStrings,
-    started_regs: Vec<i32>,
-    intern_err: Option<Error>,
+    started_regs: HashSet<i32>,
 }
 
 impl<'s> SummaryDebugSink<'s> {
     fn new(strings: &'s mut SummaryStrings) -> Self {
         Self {
             strings,
-            started_regs: Vec::new(),
-            intern_err: None,
-        }
-    }
-
-    fn check_intern_err(self) -> Result<(), Error> {
-        match self.intern_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+            started_regs: HashSet::new(),
         }
     }
 
     #[inline]
-    fn intern_required(&mut self, s: crate::debug::RawDebugStr<'_>) {
-        if self.intern_err.is_some() {
-            return;
-        }
-        let res = match s {
-            crate::debug::RawDebugStr::Empty => self.strings.intern_utf8_str(""),
+    fn intern_required(&mut self, s: crate::debug::RawDebugStr<'_>) -> Result<(), Error> {
+        match s {
+            crate::debug::RawDebugStr::Empty => self.strings.intern_utf8_str("").map(|_| ()),
             crate::debug::RawDebugStr::Static(text) | crate::debug::RawDebugStr::Borrowed(text) => {
-                self.strings.intern_utf8_str(text)
+                self.strings.intern_utf8_str(text).map(|_| ())
             }
-            crate::debug::RawDebugStr::Owned(text) => self.strings.intern_utf8_str(&text),
-        };
-        if let Err(e) = res {
-            self.intern_err = Some(e);
+            crate::debug::RawDebugStr::Owned(text) => {
+                self.strings.intern_utf8_str(&text).map(|_| ())
+            }
         }
     }
 
     #[inline]
-    fn intern_optional(&mut self, s: crate::debug::RawDebugStr<'_>) {
-        if self.intern_err.is_some() {
-            return;
-        }
-        let res = match s {
-            crate::debug::RawDebugStr::Empty => Ok(SymId::Utf8(0)),
+    fn intern_optional(&mut self, s: crate::debug::RawDebugStr<'_>) -> Result<(), Error> {
+        match s {
+            crate::debug::RawDebugStr::Empty => Ok(()),
             crate::debug::RawDebugStr::Static(text) | crate::debug::RawDebugStr::Borrowed(text) => {
                 if text.is_empty() {
-                    Ok(SymId::Utf8(0))
+                    Ok(())
                 } else {
-                    self.strings.intern_utf8_str(text)
+                    self.strings.intern_utf8_str(text).map(|_| ())
                 }
             }
             crate::debug::RawDebugStr::Owned(text) => {
                 if text.is_empty() {
-                    Ok(SymId::Utf8(0))
+                    Ok(())
                 } else {
-                    self.strings.intern_utf8_str(&text)
+                    self.strings.intern_utf8_str(&text).map(|_| ())
                 }
             }
-        };
-        if let Err(e) = res {
-            self.intern_err = Some(e);
         }
     }
 }
 
 impl crate::debug::DebugSink for SummaryDebugSink<'_> {
-    fn set_source_file(&mut self, s: crate::debug::RawDebugStr<'_>) {
-        self.intern_optional(s);
+    fn set_source_file(&mut self, s: crate::debug::RawDebugStr<'_>) -> Result<(), Error> {
+        self.intern_optional(s)
     }
 
-    fn set_source_code(&mut self, s: crate::debug::RawDebugStr<'_>) {
-        self.intern_optional(s);
+    fn set_source_code(&mut self, s: crate::debug::RawDebugStr<'_>) -> Result<(), Error> {
+        self.intern_optional(s)
     }
 
     fn push_line(&mut self, _pc_offset: u32, _line: u32) {}
@@ -1818,13 +1942,14 @@ impl crate::debug::DebugSink for SummaryDebugSink<'_> {
         type_name: crate::debug::RawDebugStr<'_>,
         type_sig: Option<crate::debug::RawDebugStr<'_>>,
         _pc_offset: u32,
-    ) {
-        self.intern_required(name);
-        self.intern_required(type_name);
+    ) -> Result<(), Error> {
+        self.intern_required(name)?;
+        self.intern_required(type_name)?;
         if let Some(sig) = type_sig {
-            self.intern_required(sig);
+            self.intern_required(sig)?;
         }
-        self.started_regs.push(reg_number);
+        self.started_regs.insert(reg_number);
+        Ok(())
     }
 
     fn end_local(&mut self, reg_number: i32, _pc_offset: u32) -> Result<(), Error> {
@@ -1840,9 +1965,9 @@ impl crate::debug::DebugSink for SummaryDebugSink<'_> {
         &mut self,
         name: crate::debug::RawDebugStr<'_>,
         sig: crate::debug::RawDebugStr<'_>,
-    ) {
-        self.intern_required(name);
-        self.intern_required(sig);
+    ) -> Result<(), Error> {
+        self.intern_required(name)?;
+        self.intern_required(sig)
     }
 }
 

@@ -8,11 +8,12 @@
 //! shorter), and the non-finite values are mapped to their JS spellings
 //! (`NaN`, `Infinity`, `-Infinity`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use abcd_ir::consts::Const;
 use abcd_ir::module::Module;
-use abcd_ir::{ConstId, Sym};
+use abcd_ir::{ConstId, FuncId, Sym};
 
 use crate::expr::Lit;
 
@@ -287,6 +288,258 @@ fn const_to_lit_with_active(
         }
     }
     None
+}
+
+/// Module-wide memoized lookup table mapping each [`ConstId`] in `module.consts`
+/// to the sorted, deduplicated [`FuncId`]s reachable via nested [`Const::MethodRef`]
+/// entries (`#103` `P3-DEC-1`).
+///
+/// Built iteratively once per [`Module`] in `O(|ConstPool|)` time (single pass
+/// over append-only constant pools, plus iterative Tarjan SCC consolidation when
+/// forward or cyclic [`ConstId`] edges exist), sharing [`Arc<[FuncId]>`] slices
+/// across shared diamond DAGs so every `DefineClass` / `AllocObject` site
+/// resolves nested method references in `O(1)` time with zero per-site allocation.
+#[derive(Clone, Debug, Default)]
+pub struct ConstMethodRefCache {
+    entries: Vec<Option<Arc<[FuncId]>>>,
+}
+
+#[inline]
+fn for_each_const_child(c: &Const, mut f: impl FnMut(ConstId)) {
+    match c {
+        Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. } => {
+            for &cid in items {
+                f(cid);
+            }
+        }
+        Const::ObjectLiteral { keys, values } => {
+            for &cid in keys.iter().chain(values.iter()) {
+                f(cid);
+            }
+        }
+        Const::LiteralBufferRef(inner) => f(*inner),
+        _ => {}
+    }
+}
+
+#[derive(Default)]
+struct RefAccumulator {
+    single: Option<Arc<[FuncId]>>,
+    merged: Option<BTreeSet<FuncId>>,
+}
+
+impl RefAccumulator {
+    #[inline]
+    fn include(&mut self, child: Option<&Arc<[FuncId]>>) {
+        let Some(arc) = child else {
+            return;
+        };
+        if arc.is_empty() {
+            return;
+        }
+        if let Some(set) = &mut self.merged {
+            set.extend(arc.iter().copied());
+            return;
+        }
+        match &self.single {
+            None => self.single = Some(Arc::clone(arc)),
+            Some(cur) if Arc::ptr_eq(cur, arc) || cur.as_ref() == arc.as_ref() => {}
+            Some(cur) => {
+                let mut set: BTreeSet<FuncId> = cur.iter().copied().collect();
+                set.extend(arc.iter().copied());
+                self.merged = Some(set);
+            }
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> Option<Arc<[FuncId]>> {
+        if let Some(set) = self.merged {
+            let vec: Vec<FuncId> = set.into_iter().collect();
+            Some(Arc::from(vec))
+        } else {
+            self.single
+        }
+    }
+}
+
+impl ConstMethodRefCache {
+    /// Build the memoized [`ConstId`] → [`FuncId`] table for `module.consts`
+    /// iteratively in `O(|ConstPool|)` time with cycle safety.
+    #[must_use]
+    pub fn build(module: &Module) -> Self {
+        let n = module.consts.len();
+        let mut entries: Vec<Option<Arc<[FuncId]>>> = vec![None; n];
+        let mut done: Vec<bool> = vec![false; n];
+        let mut has_unresolved = false;
+
+        // Fast single-pass bottom-up sweep: resolves all scalar constants and
+        // every append-only composite constant whose children precede it (`cid < i`).
+        for i in 0..n {
+            let Some(c) = module.consts.get(ConstId::new(i as u32)) else {
+                done[i] = true;
+                continue;
+            };
+            match c {
+                Const::MethodRef { func, .. } => {
+                    entries[i] = Some(Arc::from([*func]));
+                    done[i] = true;
+                }
+                Const::ArrayLiteral(_)
+                | Const::TypedArrayLiteral { .. }
+                | Const::ObjectLiteral { .. }
+                | Const::LiteralBufferRef(_) => {
+                    let mut all_children_done = true;
+                    for_each_const_child(c, |child| {
+                        let ci = child.index();
+                        if ci < n && !done[ci] {
+                            all_children_done = false;
+                        }
+                    });
+                    if all_children_done {
+                        let mut acc = RefAccumulator::default();
+                        for_each_const_child(c, |child| {
+                            if let Some(slot) = entries.get(child.index()) {
+                                acc.include(slot.as_ref());
+                            }
+                        });
+                        entries[i] = acc.finish();
+                        done[i] = true;
+                    } else {
+                        has_unresolved = true;
+                    }
+                }
+                _ => {
+                    done[i] = true;
+                }
+            }
+        }
+
+        if !has_unresolved {
+            return Self { entries };
+        }
+
+        // Fallback for forward or cyclic `ConstId` edges: iterative Tarjan SCC
+        // over the remaining `!done[i]` composite nodes.
+        let mut dfn: Vec<u32> = vec![0; n];
+        let mut low: Vec<u32> = vec![0; n];
+        let mut on_stack: Vec<bool> = vec![false; n];
+        let mut scc_stack: Vec<usize> = Vec::new();
+        let mut scc_nodes: Vec<usize> = Vec::new();
+        let mut dfs_stack: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+        let mut timer: u32 = 0;
+
+        let collect_children = |idx: usize| -> Vec<usize> {
+            let mut out = Vec::new();
+            if let Some(c) = module.consts.get(ConstId::new(idx as u32)) {
+                for_each_const_child(c, |child| {
+                    let ci = child.index();
+                    if ci < n {
+                        out.push(ci);
+                    }
+                });
+            }
+            out
+        };
+
+        for start in 0..n {
+            if done[start] {
+                continue;
+            }
+            timer = timer.saturating_add(1);
+            dfn[start] = timer;
+            low[start] = timer;
+            on_stack[start] = true;
+            scc_stack.push(start);
+            dfs_stack.push((start, collect_children(start), 0));
+
+            while let Some((u, children, cursor)) = dfs_stack.last_mut() {
+                let u = *u;
+                if *cursor < children.len() {
+                    let v = children[*cursor];
+                    *cursor += 1;
+                    if done[v] {
+                        continue;
+                    }
+                    if dfn[v] == 0 {
+                        timer = timer.saturating_add(1);
+                        dfn[v] = timer;
+                        low[v] = timer;
+                        on_stack[v] = true;
+                        scc_stack.push(v);
+                        dfs_stack.push((v, collect_children(v), 0));
+                    } else if on_stack[v] && dfn[v] < low[u] {
+                        low[u] = dfn[v];
+                    }
+                } else {
+                    let (_, u_children, _) = dfs_stack.pop().unwrap_or_default();
+                    if let Some((parent, _, _)) = dfs_stack.last() {
+                        let p = *parent;
+                        if low[u] < low[p] {
+                            low[p] = low[u];
+                        }
+                    }
+                    if low[u] == dfn[u] {
+                        if scc_stack.last() == Some(&u) {
+                            scc_stack.pop();
+                            on_stack[u] = false;
+                            let mut acc = RefAccumulator::default();
+                            for &v in &u_children {
+                                if v != u && done[v] {
+                                    acc.include(entries[v].as_ref());
+                                }
+                            }
+                            entries[u] = acc.finish();
+                            done[u] = true;
+                        } else {
+                            scc_nodes.clear();
+                            while let Some(w) = scc_stack.pop() {
+                                on_stack[w] = false;
+                                scc_nodes.push(w);
+                                if w == u {
+                                    break;
+                                }
+                            }
+                            let mut acc = RefAccumulator::default();
+                            for &w in &scc_nodes {
+                                if let Some(c) = module.consts.get(ConstId::new(w as u32)) {
+                                    for_each_const_child(c, |child| {
+                                        let v = child.index();
+                                        if v < n && done[v] {
+                                            acc.include(entries[v].as_ref());
+                                        }
+                                    });
+                                }
+                            }
+                            let shared = acc.finish();
+                            for &w in &scc_nodes {
+                                entries[w] = shared.clone();
+                                done[w] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self { entries }
+    }
+
+    /// Return the sorted, deduplicated [`FuncId`]s reachable via [`Const::MethodRef`]
+    /// from `cid` in `O(1)` time (`&[]` when none or when `cid` is out of bounds).
+    #[inline]
+    #[must_use]
+    pub fn get(&self, cid: ConstId) -> &[FuncId] {
+        self.entries
+            .get(cid.index())
+            .and_then(Option::as_deref)
+            .unwrap_or(&[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arc_of(&self, cid: ConstId) -> Option<&Arc<[FuncId]>> {
+        self.entries.get(cid.index()).and_then(Option::as_ref)
+    }
 }
 
 /// Render an `f64` bit pattern as the shortest JS number literal that
@@ -1022,5 +1275,32 @@ mod tests {
                 .expect("spawn 256k thread");
             handle.join().expect("256k thread must not stack-overflow");
         });
+    }
+
+    #[test]
+    fn const_method_ref_cache_handles_forward_and_cyclic_edges() {
+        let mut m = Module::new();
+        // 0 -> [1, 3] (forward edges), 1 -> 2, 2 -> 0 (3-cycle), 3 -> MethodRef(7), 4 -> LiteralBufferRef(0)
+        let c0 = m
+            .consts
+            .push_array(vec![ConstId::new(1), ConstId::new(3), ConstId::new(999)]);
+        let c1 = m.consts.push(Const::LiteralBufferRef(ConstId::new(2)));
+        let c2 = m.consts.push_array(vec![ConstId::new(0), ConstId::new(5)]);
+        let c3 = m.consts.push(Const::method_ref(FuncId::new(7)));
+        let c4 = m.consts.push(Const::LiteralBufferRef(c0));
+        let c5 = m.consts.push(Const::method_ref(FuncId::new(3)));
+
+        let cache = ConstMethodRefCache::build(&m);
+        let want = &[FuncId::new(3), FuncId::new(7)];
+        for cid in [c0, c1, c2, c4] {
+            assert_eq!(cache.get(cid), want, "cid={cid:?}");
+        }
+        assert_eq!(cache.get(c3), &[FuncId::new(7)]);
+        assert_eq!(cache.get(c5), &[FuncId::new(3)]);
+        assert_eq!(cache.get(ConstId::new(999)), &[]);
+        assert!(Arc::ptr_eq(
+            cache.arc_of(c0).unwrap(),
+            cache.arc_of(c2).unwrap()
+        ));
     }
 }

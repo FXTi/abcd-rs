@@ -12,7 +12,9 @@ use crate::frame::frame_slots_of;
 use crate::module_link::ModuleLinkTable;
 
 use super::env::EnvState;
-use super::scan::{SliceInit, class_named_methods, is_super_call_kind};
+use super::scan::{
+    ConstMethodRefMemo, SliceInit, class_named_methods, is_numeric_prop_sym, is_super_call_kind,
+};
 use super::{
     Handler, MAX_SLICED_DYN_HOP, Obj, ObjLoc, PackedCtx, PackedFunc, PtaConfig, PtaStats, Ptr,
     Read, Slot,
@@ -88,8 +90,12 @@ pub(super) struct Pta<'m> {
     pub(super) lex_captured_mutated: HashSet<(InstId, u16)>,
     /// Instance methods `(method_sym, mfid)` per constructor `FuncId`.
     pub(super) ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>>,
+    /// Pass-wide `ConstPool` `MethodRef` reachability memo (`#104`).
+    pub(super) const_method_refs: ConstMethodRefMemo,
     /// Wired internal call edges `(call, caller ctx, callee)`.
     pub(super) wired: BTreeSet<(InstId, PackedCtx, FuncId)>,
+    /// Already-wired `New` / `NewSpread` `(call, caller ctx)` pairs per constructor `FuncId` (`#104`).
+    pub(super) wired_news_by_ctor: HashMap<FuncId, Vec<(InstId, PackedCtx)>>,
     /// PTA-resolved call targets `(call, caller ctx)` → bodies.
     pub(super) call_targets: BTreeMap<(InstId, PackedCtx), BTreeSet<FuncId>>,
     /// Call-site activations whose callee set contained `Unknown`.
@@ -115,6 +121,7 @@ impl<'m> Pta<'m> {
         config: &'m PtaConfig,
         env_stack_at: &'m [Arc<EnvState>],
         slice_init: Option<SliceInit>,
+        const_method_refs: ConstMethodRefMemo,
     ) -> Self {
         let (root_keep, slice_allow, func_hop, max_dyn_hop) = match slice_init {
             Some(s) => (
@@ -138,9 +145,13 @@ impl<'m> Pta<'m> {
         let mut ctor_inst_methods: HashMap<FuncId, Vec<(Sym, FuncId)>> = HashMap::new();
         let mut class_sites: HashSet<InstId> = HashSet::new();
         let mut variadic_sinks: HashMap<FuncId, Vec<(InstId, usize)>> = HashMap::new();
+        let mut lex_writers: BTreeMap<(InstId, u16), BTreeSet<FuncId>> = BTreeMap::new();
         let mut lex_captured_mutated: HashSet<(InstId, u16)> = HashSet::new();
 
         for (fi, fd) in module.functions.iter().enumerate() {
+            if fd.is_external {
+                continue;
+            }
             let fid = FuncId::new(fi as u32);
             for &b in &fd.blocks {
                 let Some(bb) = module.block(b) else { continue };
@@ -176,6 +187,10 @@ impl<'m> Pta<'m> {
                                 .and_then(|ch| ch.at_level(*level))
                             {
                                 for &env_site in &entry.sites {
+                                    lex_writers
+                                        .entry((env_site, *slot))
+                                        .or_default()
+                                        .insert(fid);
                                     if links.inst_func(module, env_site) != Some(fid) {
                                         lex_captured_mutated.insert((env_site, *slot));
                                     }
@@ -217,10 +232,12 @@ impl<'m> Pta<'m> {
             proto_syms,
             value_syms,
             variadic_sinks,
-            lex_writers: BTreeMap::new(),
+            lex_writers,
             lex_captured_mutated,
             ctor_inst_methods,
+            const_method_refs,
             wired: BTreeSet::new(),
+            wired_news_by_ctor: HashMap::new(),
             call_targets: BTreeMap::new(),
             call_unknown: BTreeSet::new(),
             hop_cut_calls: BTreeSet::new(),
@@ -359,12 +376,28 @@ impl<'m> Pta<'m> {
                                 for (rid, ro) in rearm.into_iter().rev() {
                                     self.fire_stack.push(FireStep::Fire(rid, ro));
                                 }
+                                if let Slot::Named(n) = slot
+                                    && is_numeric_prop_sym(self.module, n)
+                                {
+                                    self.fire_stack.push(FireStep::AddEdge(
+                                        value,
+                                        Ptr::Field(loc, Slot::Index),
+                                    ));
+                                    let idx_rearm = self.note_bucket_rearms(loc, Slot::Index);
+                                    for (rid, ro) in idx_rearm.into_iter().rev() {
+                                        self.fire_stack.push(FireStep::Fire(rid, ro));
+                                    }
+                                }
                             }
                             None => match o {
                                 Obj::GlobalThis => match slot {
                                     Slot::Named(name) => {
                                         self.fire_stack
                                             .push(FireStep::AddEdge(value, Ptr::Global(name)));
+                                        if is_numeric_prop_sym(self.module, name) {
+                                            self.fire_stack
+                                                .push(FireStep::AddEdge(value, Ptr::GlobalDynamic));
+                                        }
                                     }
                                     Slot::Index | Slot::Dynamic => {
                                         self.fire_stack
@@ -378,7 +411,13 @@ impl<'m> Pta<'m> {
                         Handler::Load { result, read } => match o.loc() {
                             Some(loc) => {
                                 let slots: Vec<Slot> = match read {
-                                    Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
+                                    Read::Named(n) => {
+                                        if is_numeric_prop_sym(self.module, n) {
+                                            vec![Slot::Named(n), Slot::Index, Slot::Dynamic]
+                                        } else {
+                                            vec![Slot::Named(n), Slot::Dynamic]
+                                        }
+                                    }
                                     Read::Index => vec![Slot::Index, Slot::Dynamic],
                                     Read::Private(pslot) => vec![Slot::Private(pslot)],
                                     Read::All => {
@@ -960,21 +999,27 @@ impl<'m> Pta<'m> {
                 keyed: true,
             });
         if constructed_instance.is_some() {
+            self.wired_news_by_ctor
+                .entry(callee)
+                .or_default()
+                .push((call, caller_ctx));
             let inst_loc = ObjLoc::Site(call, caller_ctx);
             if let Some(methods) = self.ctor_inst_methods.get(&callee).cloned() {
                 for (msym, mfid) in methods {
                     let slot = Slot::Named(msym);
+                    let method_obj = Obj::Site {
+                        site: call,
+                        ctx: PackedCtx::NONE,
+                        callable: PackedFunc::some(mfid),
+                        keyed: false,
+                    };
                     self.own_class_members.insert((inst_loc, slot));
-                    self.add_fact(
-                        Ptr::Field(inst_loc, slot),
-                        Obj::Site {
-                            site: call,
-                            ctx: PackedCtx::NONE,
-                            callable: PackedFunc::some(mfid),
-                            keyed: false,
-                        },
-                    );
+                    self.add_fact(Ptr::Field(inst_loc, slot), method_obj);
                     self.note_bucket_deferred(inst_loc, slot);
+                    if is_numeric_prop_sym(self.module, msym) {
+                        self.add_fact(Ptr::Field(inst_loc, Slot::Index), method_obj);
+                        self.note_bucket_deferred(inst_loc, Slot::Index);
+                    }
                 }
             }
             // Link constructed instance to `Cls.prototype` (`DefineClass` prototype

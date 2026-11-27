@@ -34,7 +34,7 @@ use crate::fusion::{Suppression, const_u32_index};
 use crate::regalloc::{self, RegAlloc, RegSlot};
 
 /// Result of instruction selection for one function.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IselResult {
     /// Bytecodes per block (in RPO order).
     pub block_codes: Vec<(BlockId, Vec<Bytecode>)>,

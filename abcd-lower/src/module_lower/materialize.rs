@@ -33,7 +33,13 @@ pub(super) struct Materializer<'m, 'f> {
     strings: &'f mut StringPool,
     literal_arrays: &'f mut Vec<LiteralArray>,
     func_to_method_idx: &'m [MethodIdx],
-    synth_shapes: HashMap<ConstId, LiteralArrayIdx>,
+    base_index: Option<&'m BaseEntityIndex>,
+    /// Lazy dense `ConstId -> Option<LiteralArrayIdx>` cache (`None` = unvisited,
+    /// `Some(Some(idx))` = materialized, `Some(None)` = permanently invalid/cyclic,
+    /// `#103`).
+    synth_shapes: Vec<Option<Option<LiteralArrayIdx>>>,
+    /// Memoized inline `TypedArrayLiteral` conversions keyed by `ConstId` (`#103`).
+    synth_inline_typed: HashMap<ConstId, Option<LiteralValue>>,
 }
 
 impl<'m, 'f> Materializer<'m, 'f> {
@@ -42,13 +48,16 @@ impl<'m, 'f> Materializer<'m, 'f> {
         strings: &'f mut StringPool,
         literal_arrays: &'f mut Vec<LiteralArray>,
         func_to_method_idx: &'m [MethodIdx],
+        base_index: Option<&'m BaseEntityIndex>,
     ) -> Self {
         Self {
             module,
             strings,
             literal_arrays,
             func_to_method_idx,
-            synth_shapes: HashMap::new(),
+            base_index,
+            synth_shapes: Vec::new(),
+            synth_inline_typed: HashMap::new(),
         }
     }
 
@@ -56,7 +65,6 @@ impl<'m, 'f> Materializer<'m, 'f> {
         &mut self,
         func_id: FuncId,
         mut result: LayoutResult,
-        base_index: Option<&BaseEntityIndex>,
     ) -> Result<MethodBody, LowerError> {
         let param_count = self
             .module
@@ -69,7 +77,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
                 match kind {
                     EntityKind::StringId => {
                         let sym = Sym::new(raw);
-                        if let Some(r) = base_index
+                        if let Some(r) = self.base_index
                             && let Some(eref) = r.string_ref(self.module, self.strings, sym)
                         {
                             Ok(eref)
@@ -91,19 +99,13 @@ impl<'m, 'f> Materializer<'m, 'f> {
                     }
                     EntityKind::LiteralarrayId => {
                         let cid = ConstId::new(raw);
-                        if let Some(r) = base_index
-                            && let Some(eref) = r.literal_array_ref(self.module, cid)
-                        {
-                            Ok(eref)
-                        } else {
-                            self.literal_array_idx(cid)
-                                .map(EntityRef::LiteralArray)
-                                .ok_or(LowerError::UntraceableEntity {
-                                    func: func_id,
-                                    kind,
-                                    raw,
-                                })
-                        }
+                        self.literal_array_idx(cid)
+                            .map(EntityRef::LiteralArray)
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind,
+                                raw,
+                            })
                     }
                 }
             })?;
@@ -178,38 +180,125 @@ impl<'m, 'f> Materializer<'m, 'f> {
     }
 
     pub(super) fn literal_array_idx(&mut self, shape: ConstId) -> Option<LiteralArrayIdx> {
-        if let Some(&idx) = self.synth_shapes.get(&shape) {
+        if let Some(base) = self.base_index
+            && let Some(idx) = base.literal_array_idx(shape)
+        {
             return Some(idx);
+        }
+        let shape_usize = shape.index();
+        if shape_usize >= self.module.consts.len() {
+            return None;
+        }
+        if let Some(&Some(cached)) = self.synth_shapes.get(shape_usize) {
+            return cached;
         }
         self.materialize_shape_tree(shape)
     }
 
+    #[inline]
+    fn lookup_cached_standalone(&self, cid: ConstId) -> Option<Option<LiteralArrayIdx>> {
+        if let Some(base) = self.base_index
+            && let Some(idx) = base.literal_array_idx(cid)
+        {
+            return Some(Some(idx));
+        }
+        self.synth_shapes.get(cid.index()).copied().flatten()
+    }
+
+    #[inline]
+    fn record_synth(&mut self, cid: ConstId, val: Option<LiteralArrayIdx>) {
+        if let Some(slot) = self.synth_shapes.get_mut(cid.index()) {
+            *slot = Some(val);
+        }
+    }
+
+    fn finish_wrapper_chain(&mut self, chain: &[ConstId], val: Option<LiteralArrayIdx>) {
+        for &cid in chain {
+            self.record_synth(cid, val);
+        }
+    }
+
+    fn abort_mat_stack(
+        &mut self,
+        chain: &[ConstId],
+        cur: ShapeFrame<'_>,
+        stack: Vec<ShapeFrame<'_>>,
+    ) {
+        self.record_synth(cur.cid, None);
+        if let Some(MatNestedWrap::BufferRef { wrapper_cid }) = cur.parent_wrap {
+            self.record_synth(wrapper_cid, None);
+        }
+        for f in stack {
+            self.record_synth(f.cid, None);
+            if let Some(MatNestedWrap::BufferRef { wrapper_cid }) = f.parent_wrap {
+                self.record_synth(wrapper_cid, None);
+            }
+        }
+        self.finish_wrapper_chain(chain, None);
+    }
+
+    fn get_or_materialize_inline_typed(
+        &mut self,
+        cid: ConstId,
+        tag: TypedArrayTag,
+        items: &[ConstId],
+    ) -> Option<LiteralValue> {
+        if let Some(cached) = self.synth_inline_typed.get(&cid) {
+            return cached.clone();
+        }
+        let computed = self.materialize_typed_array(tag, items);
+        self.synth_inline_typed.insert(cid, computed.clone());
+        computed
+    }
+
     fn materialize_shape_tree(&mut self, root_cid: ConstId) -> Option<LiteralArrayIdx> {
         let module = self.module;
+        if self.synth_shapes.is_empty() && !module.consts.is_empty() {
+            self.synth_shapes.resize(module.consts.len(), None);
+        }
+
         let mut active: HashSet<ConstId> = HashSet::new();
+        let mut wrapper_chain: Vec<ConstId> = Vec::new();
         let mut actual_root = root_cid;
         let root_const = loop {
+            if let Some(cached) = self.lookup_cached_standalone(actual_root) {
+                self.finish_wrapper_chain(&wrapper_chain, cached);
+                return cached;
+            }
             if !active.insert(actual_root) {
+                self.finish_wrapper_chain(&wrapper_chain, None);
                 return None;
             }
-            match module.consts.get(actual_root)? {
-                Const::LiteralBufferRef(inner) => actual_root = *inner,
+            let Some(c) = module.consts.get(actual_root) else {
+                self.finish_wrapper_chain(&wrapper_chain, None);
+                return None;
+            };
+            match c {
+                Const::LiteralBufferRef(inner) => {
+                    wrapper_chain.push(actual_root);
+                    actual_root = *inner;
+                }
                 other => break other,
             }
         };
-        if let Some(&existing) = self.synth_shapes.get(&actual_root) {
-            self.synth_shapes.insert(root_cid, existing);
-            return Some(existing);
-        }
+
         if let Const::TypedArrayLiteral { tag, items } = root_const {
-            let lit_val = self.materialize_typed_array(*tag, items)?;
-            let idx = LiteralArrayIdx(self.literal_arrays.len() as u32);
-            self.literal_arrays.push(LiteralArray::new(vec![lit_val]));
-            self.synth_shapes.insert(actual_root, idx);
-            self.synth_shapes.insert(root_cid, idx);
-            return Some(idx);
+            let res = self
+                .get_or_materialize_inline_typed(actual_root, *tag, items)
+                .map(|lit_val| {
+                    let idx = LiteralArrayIdx(self.literal_arrays.len() as u32);
+                    self.literal_arrays.push(LiteralArray::new(vec![lit_val]));
+                    idx
+                });
+            self.record_synth(actual_root, res);
+            self.finish_wrapper_chain(&wrapper_chain, res);
+            return res;
         }
-        let (root_cursor, root_cap) = ShapeCursor::from_const(root_const)?;
+        let Some((root_cursor, root_cap)) = ShapeCursor::from_const(root_const) else {
+            self.record_synth(actual_root, None);
+            self.finish_wrapper_chain(&wrapper_chain, None);
+            return None;
+        };
         let mut stack = vec![ShapeFrame {
             cid: actual_root,
             parent_wrap: None,
@@ -219,11 +308,18 @@ impl<'m, 'f> Materializer<'m, 'f> {
 
         'outer: while let Some(mut frame) = stack.pop() {
             while let Some(child_cid) = frame.cursor.next_id() {
-                let elem = module.consts.get(child_cid)?;
+                let Some(elem) = module.consts.get(child_cid) else {
+                    self.abort_mat_stack(&wrapper_chain, frame, stack);
+                    return None;
+                };
                 if let Const::TypedArrayLiteral { tag, items } = elem {
-                    frame
-                        .values
-                        .push(self.materialize_typed_array(*tag, items)?);
+                    let Some(lit_val) =
+                        self.get_or_materialize_inline_typed(child_cid, *tag, items)
+                    else {
+                        self.abort_mat_stack(&wrapper_chain, frame, stack);
+                        return None;
+                    };
+                    frame.values.push(lit_val);
                     continue;
                 }
                 let nested = match elem {
@@ -232,19 +328,36 @@ impl<'m, 'f> Materializer<'m, 'f> {
                     }
                     Const::LiteralBufferRef(inner_cid) => {
                         if active.contains(&child_cid) {
+                            self.abort_mat_stack(&wrapper_chain, frame, stack);
                             return None;
                         }
-                        let inner_elem = module.consts.get(*inner_cid)?;
+                        let Some(inner_elem) = module.consts.get(*inner_cid) else {
+                            self.record_synth(child_cid, None);
+                            self.abort_mat_stack(&wrapper_chain, frame, stack);
+                            return None;
+                        };
                         if let Const::TypedArrayLiteral { tag, items } = inner_elem {
-                            let child_idx = if let Some(&cached) = self.synth_shapes.get(inner_cid)
+                            let child_opt = if let Some(cached) =
+                                self.lookup_cached_standalone(*inner_cid)
                             {
                                 cached
+                            } else if active.contains(inner_cid) {
+                                None
                             } else {
-                                let lit_val = self.materialize_typed_array(*tag, items)?;
-                                let idx = LiteralArrayIdx(self.literal_arrays.len() as u32);
-                                self.literal_arrays.push(LiteralArray::new(vec![lit_val]));
-                                self.synth_shapes.insert(*inner_cid, idx);
-                                idx
+                                let built = self
+                                    .get_or_materialize_inline_typed(*inner_cid, *tag, items)
+                                    .map(|lit_val| {
+                                        let idx = LiteralArrayIdx(self.literal_arrays.len() as u32);
+                                        self.literal_arrays.push(LiteralArray::new(vec![lit_val]));
+                                        idx
+                                    });
+                                self.record_synth(*inner_cid, built);
+                                built
+                            };
+                            self.record_synth(child_cid, child_opt);
+                            let Some(child_idx) = child_opt else {
+                                self.abort_mat_stack(&wrapper_chain, frame, stack);
+                                return None;
                             };
                             frame
                                 .values
@@ -255,6 +368,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
                             inner_elem,
                             Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
                         ) {
+                            self.abort_mat_stack(&wrapper_chain, frame, stack);
                             return None;
                         }
                         Some((
@@ -269,14 +383,33 @@ impl<'m, 'f> Materializer<'m, 'f> {
                 };
 
                 if let Some((target_cid, target_elem, wrap)) = nested {
-                    if active.contains(&target_cid) {
-                        return None;
-                    }
-                    if let Some(&child_idx) = self.synth_shapes.get(&target_cid) {
+                    if let Some(cached_opt) = self.lookup_cached_standalone(target_cid) {
+                        if let MatNestedWrap::BufferRef { wrapper_cid } = wrap {
+                            self.record_synth(wrapper_cid, cached_opt);
+                        }
+                        let Some(child_idx) = cached_opt else {
+                            self.abort_mat_stack(&wrapper_chain, frame, stack);
+                            return None;
+                        };
                         frame.values.push(wrap_literal_array_value(wrap, child_idx));
                         continue;
                     }
-                    let (child_cursor, child_cap) = ShapeCursor::from_const(target_elem)?;
+                    if active.contains(&target_cid) {
+                        if let MatNestedWrap::BufferRef { wrapper_cid } = wrap {
+                            self.record_synth(wrapper_cid, None);
+                        }
+                        self.abort_mat_stack(&wrapper_chain, frame, stack);
+                        return None;
+                    }
+                    let Some((child_cursor, child_cap)) = ShapeCursor::from_const(target_elem)
+                    else {
+                        self.record_synth(target_cid, None);
+                        if let MatNestedWrap::BufferRef { wrapper_cid } = wrap {
+                            self.record_synth(wrapper_cid, None);
+                        }
+                        self.abort_mat_stack(&wrapper_chain, frame, stack);
+                        return None;
+                    };
                     if let MatNestedWrap::BufferRef { wrapper_cid } = wrap {
                         active.insert(wrapper_cid);
                     }
@@ -290,7 +423,11 @@ impl<'m, 'f> Materializer<'m, 'f> {
                     });
                     continue 'outer;
                 }
-                frame.values.push(self.materialize_scalar_elem(elem)?);
+                let Some(scalar) = self.materialize_scalar_elem(elem) else {
+                    self.abort_mat_stack(&wrapper_chain, frame, stack);
+                    return None;
+                };
+                frame.values.push(scalar);
             }
 
             active.remove(&frame.cid);
@@ -299,12 +436,15 @@ impl<'m, 'f> Materializer<'m, 'f> {
             }
             let idx = LiteralArrayIdx(self.literal_arrays.len() as u32);
             self.literal_arrays.push(LiteralArray::new(frame.values));
-            self.synth_shapes.insert(frame.cid, idx);
+            self.record_synth(frame.cid, Some(idx));
+            if let Some(MatNestedWrap::BufferRef { wrapper_cid }) = frame.parent_wrap {
+                self.record_synth(wrapper_cid, Some(idx));
+            }
             if let Some(parent) = stack.last_mut() {
                 let wrap = frame.parent_wrap.unwrap_or(MatNestedWrap::Array);
                 parent.values.push(wrap_literal_array_value(wrap, idx));
             } else {
-                self.synth_shapes.insert(root_cid, idx);
+                self.finish_wrapper_chain(&wrapper_chain, Some(idx));
                 return Some(idx);
             }
         }

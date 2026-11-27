@@ -1029,15 +1029,25 @@ pub fn run_taint_prepared_full(
     };
     if rung2_parts.is_some() {
         base_graph = None;
+    } else if base_graph.is_none() {
+        base_graph = Some(CallGraph::build_with_links(work_mod, links));
     }
 
     let (refined, oracle, rung_used, pta_root_sliced) = match (config.alias_rung, rung2_parts) {
-        (0, _) => (
-            None,
-            Oracle::Rung0(Rung0AliasOracle::new(work_mod)),
-            0u8,
-            false,
-        ),
+        (0, _) => match base_graph.as_ref() {
+            Some(bg) => (
+                None,
+                Oracle::Rung0(Rung0AliasOracle::with_links_and_graph(
+                    work_mod,
+                    links,
+                    bg,
+                    harness_fid,
+                )),
+                0u8,
+                false,
+            ),
+            None => unreachable!("base_graph is populated when rung2_parts is None"),
+        },
         (2, Some((graph, tables, stats))) => {
             let root_sliced = stats.root_sliced;
             (
@@ -1049,16 +1059,11 @@ pub fn run_taint_prepared_full(
         }
         _ => match base_graph.as_ref() {
             Some(bg) => {
-                let engine = Rung1AliasOracle::new(work_mod, bg);
+                let engine = Rung1AliasOracle::with_links(work_mod, bg, links, harness_fid);
                 let g = CallGraph::refine_with_points_to(work_mod, bg, &engine);
                 (Some(g), Oracle::rung1(engine), 1u8, false)
             }
-            None => (
-                None,
-                Oracle::Rung0(Rung0AliasOracle::new(work_mod)),
-                0u8,
-                false,
-            ),
+            None => unreachable!("base_graph is populated when rung2_parts is None"),
         },
     };
     let Some(callgraph) = refined.as_ref().or(base_graph.as_ref()) else {

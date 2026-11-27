@@ -11,7 +11,7 @@ use crate::fact::{Fact, TaintBase, TaintFact};
 use crate::oracle::Oracle;
 use crate::summary::{CallbackGap, Endpoint};
 
-use super::indexes::{ctor_this_of_module, is_global_object};
+use super::indexes::{ctor_this_of_module, is_any_index_compatible_prop_str, is_global_object};
 use super::lex_env::is_synthetic_slot_sym;
 use super::{ParamBinding, SiteClass, TaintProblem, param_binding};
 
@@ -37,7 +37,8 @@ impl<'m> TaintProblem<'m> {
         if sites.intersects(&obj.sites) {
             return true;
         }
-        if self.suppress_empty_heap_wildcard()
+        if !self.in_path_replay
+            && matches!(*self.oracle.borrow(), Oracle::Rung2(..))
             && sites.iter().all(|s| self.is_variadic_args_site(s))
         {
             if let Some(fs) = self.fresh_result_site(object) {
@@ -411,9 +412,11 @@ impl<'m> TaintProblem<'m> {
                 (Some(&FieldKey::AnyIndex), FieldKey::Named(prop))
                 | (Some(&FieldKey::Named(prop)), FieldKey::AnyIndex)
                     if !is_synthetic_slot_sym(prop)
-                        && self.module.sym.resolve(prop).is_some_and(|s| {
-                            !s.is_empty() && !s.as_bytes()[0].is_ascii_digit()
-                        }) =>
+                        && self
+                            .module
+                            .sym
+                            .resolve(prop)
+                            .is_some_and(|s| !is_any_index_compatible_prop_str(s)) =>
                 {
                     return;
                 }
@@ -462,11 +465,13 @@ impl<'m> TaintProblem<'m> {
         value: ValueId,
         at: InstId,
         is_exceptional: bool,
+        allow_strong_kill: bool,
         out: &mut FlowSink<Fact>,
     ) -> bool {
         let mut survive = true;
         let obj_info = self.oracle.borrow().site_info_at(object, at);
         if !is_exceptional
+            && allow_strong_kill
             && !fact.fields.is_empty()
             && matches!(
                 (fact.fields.elements()[0], key),
@@ -529,24 +534,20 @@ impl<'m> TaintProblem<'m> {
                     }
                     // Propagate in-place nested stores (`let t0 = x.a; t0.b = s; let t = x.a; sink(t.b)`)
                     // onto `parent` (`x`) when `object` (`t0`) came from `LoadProp(x, a)`, and onto
-                    // `Global` / `ModuleVar` containers when `suppress_empty_heap_wildcard()` applies.
+                    // `Global` / `ModuleVar` containers when `object` came from `TryGetGlobal` / `LoadModuleVar`.
                     if resolved.sites.is_empty() || resolved.has_unknown {
                         let peeled_obj = crate::names::peel_movs_fast(self.module, object);
                         if let Some(ValueDef::Inst(load_iid)) =
                             self.module.value(peeled_obj).map(|v| v.def)
                         {
                             match self.module.inst(load_iid).map(|i| &i.op) {
-                                Some(Op::TryGetGlobal { name, .. })
-                                    if self.suppress_empty_heap_wildcard() =>
-                                {
+                                Some(Op::TryGetGlobal { name, .. }) => {
                                     out.emit(Fact::of(TaintFact {
                                         base: TaintBase::Global(*name),
                                         fields: chain,
                                     }));
                                 }
-                                Some(Op::LoadModuleVar { index, kind })
-                                    if self.suppress_empty_heap_wildcard() =>
-                                {
+                                Some(Op::LoadModuleVar { index, kind }) => {
                                     let cid = self
                                         .links
                                         .inst_class(self.module, load_iid)
@@ -790,9 +791,11 @@ impl<'m> TaintProblem<'m> {
                         }
                         (FieldKey::Named(x), FieldKey::AnyIndex)
                         | (FieldKey::AnyIndex, FieldKey::Named(x))
-                            if self.module.sym.resolve(*x).is_some_and(|s| {
-                                !s.is_empty() && !s.as_bytes()[0].is_ascii_digit()
-                            }) =>
+                            if self
+                                .module
+                                .sym
+                                .resolve(*x)
+                                .is_some_and(|s| !is_any_index_compatible_prop_str(s)) =>
                         {
                             return None;
                         }
@@ -923,9 +926,11 @@ impl<'m> TaintProblem<'m> {
                         }
                         (FieldKey::Named(x), FieldKey::AnyIndex)
                         | (FieldKey::AnyIndex, FieldKey::Named(x))
-                            if self.module.sym.resolve(*x).is_some_and(|s| {
-                                !s.is_empty() && !s.as_bytes()[0].is_ascii_digit()
-                            }) =>
+                            if self
+                                .module
+                                .sym
+                                .resolve(*x)
+                                .is_some_and(|s| !is_any_index_compatible_prop_str(s)) =>
                         {
                             return None;
                         }

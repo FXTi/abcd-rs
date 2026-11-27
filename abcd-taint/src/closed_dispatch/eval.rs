@@ -14,7 +14,7 @@ use abcd_ir::{
 };
 
 use crate::oracle::Oracle;
-use crate::problem::{StaticLexEnvTable, classify_dyn_prop_key};
+use crate::problem::{StaticLexEnvTable, classify_dyn_prop_key, is_any_index_compatible_prop_str};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ClosedProvItem {
@@ -237,7 +237,7 @@ pub(super) fn is_numeric_or_obj_proto_sym(module: &Module, sym: Sym) -> bool {
     let Some(s) = module.sym.resolve(sym) else {
         return true;
     };
-    if s.is_empty() || s.as_bytes()[0].is_ascii_digit() {
+    if is_any_index_compatible_prop_str(s) {
         return true;
     }
     matches!(
@@ -379,7 +379,7 @@ pub(crate) fn func_or_lit_defines_prop(
                             if module
                                 .sym
                                 .resolve(prop)
-                                .is_none_or(|s| s.is_empty() || s.as_bytes()[0].is_ascii_digit())
+                                .is_none_or(is_any_index_compatible_prop_str)
                             {
                                 return true;
                             }
@@ -678,8 +678,8 @@ pub(super) fn map_precise_sites_to_closed_prov(
     classes: &[ClosedClassInfo],
     class_by_inst: &[Option<u32>],
     ctor_owner: &[Option<u32>],
-    obj_lits: &HashMap<InstId, ClosedObjLitInfo>,
-    call_closed_callees: &HashMap<InstId, Vec<FuncId>>,
+    obj_lits: &BTreeMap<InstId, ClosedObjLitInfo>,
+    call_closed_callees: &BTreeMap<InstId, Vec<FuncId>>,
     pv: ValueId,
     query_at: InstId,
 ) -> Option<BTreeSet<ClosedProvItem>> {
@@ -778,16 +778,16 @@ pub(super) fn eval_closed_prov_iter(
     static_written: &[HashSet<Sym>],
     open_callable_written: &HashSet<Sym>,
     inst_callable_written: &[HashSet<Sym>],
-    obj_lits: &HashMap<InstId, ClosedObjLitInfo>,
-    lex_slot_prov: &HashMap<(u16, u16), BTreeSet<ClosedProvItem>>,
-    mod_slot_prov: &HashMap<ModuleSlotRef, BTreeSet<ClosedProvItem>>,
-    static_field_prov: &HashMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
-    inst_field_prov: &HashMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
-    obj_lit_prop_prov: &HashMap<(InstId, Sym), BTreeSet<ClosedProvItem>>,
-    param_prov: &HashMap<ValueId, BTreeSet<ClosedProvItem>>,
+    obj_lits: &BTreeMap<InstId, ClosedObjLitInfo>,
+    lex_slot_prov: &BTreeMap<(u16, u16), BTreeSet<ClosedProvItem>>,
+    mod_slot_prov: &BTreeMap<ModuleSlotRef, BTreeSet<ClosedProvItem>>,
+    static_field_prov: &BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
+    inst_field_prov: &BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
+    obj_lit_prop_prov: &BTreeMap<(InstId, Sym), BTreeSet<ClosedProvItem>>,
+    param_prov: &BTreeMap<ValueId, BTreeSet<ClosedProvItem>>,
     func_ret_prov: &[Option<BTreeSet<ClosedProvItem>>],
     func_ret_nullish_only: &[bool],
-    call_closed_callees: &HashMap<InstId, Vec<FuncId>>,
+    call_closed_callees: &BTreeMap<InstId, Vec<FuncId>>,
     observed_decorator_calls: &HashSet<InstId>,
     self_slot: Option<ClosedSelfSlot>,
     root_func: FuncId,

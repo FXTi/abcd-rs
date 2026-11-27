@@ -67,8 +67,8 @@ use self::indexes::{
     build_harness_guard, build_variadic_ops_index, const_string_sym,
 };
 pub(crate) use self::indexes::{
-    classify_dyn_prop_key, is_global_object, resolve_global_sources, resolve_module_import_sources,
-    resolve_namespace_import_sources,
+    classify_dyn_prop_key, is_any_index_compatible_prop_str, is_global_object,
+    resolve_global_sources, resolve_module_import_sources, resolve_namespace_import_sources,
 };
 use self::lex_env::PrivateFieldIndex;
 pub(crate) use self::lex_env::StaticLexEnvTable;
@@ -323,6 +323,8 @@ pub struct TaintProblem<'m> {
     prop_unknown_cone: RefCell<HashMap<Sym, FuncBitSet>>,
     /// Lazily memoized `prop_sym -> FuncBitSet` backward caller cone of named property writers.
     prop_write_cone: RefCell<HashMap<Sym, FuncBitSet>>,
+    /// One-time lazy `FuncId::index() -> bool` bitset of callees whose `this` may return or escape.
+    this_ret_or_esc: RefCell<Option<FuncBitSet>>,
     /// Lazily memoized `caller_fid -> (backward_caller_ancestors, reaches_harness)`.
     caller_ancestors: RefCell<HashMap<FuncId, (FuncBitSet, bool)>>,
     /// Memoized `(caller_fid, owner_callee_or_max, source_fact_id) -> observable` answers.
@@ -613,6 +615,7 @@ impl<'m> TaintProblem<'m> {
             prop_touch_cone: RefCell::new(HashMap::new()),
             prop_unknown_cone: RefCell::new(HashMap::new()),
             prop_write_cone: RefCell::new(HashMap::new()),
+            this_ret_or_esc: RefCell::new(None),
             caller_ancestors: RefCell::new(HashMap::new()),
             caller_obs_memo: RefCell::new(HashMap::new()),
             site_local_escape_memo: RefCell::new(HashMap::new()),
@@ -719,7 +722,12 @@ impl<'m> TaintProblem<'m> {
             }
         }
 
-        *self.oracle.borrow_mut() = Oracle::Rung0(Rung0AliasOracle::new(self.module));
+        *self.oracle.borrow_mut() = Oracle::Rung0(Rung0AliasOracle::with_links_and_graph(
+            self.module,
+            &self.links,
+            self.callgraph,
+            self.harness.fid,
+        ));
         self.singletons = None;
         self.prop_stores = ClassPropStores::default();
         self.global_stores = HashMap::new();
@@ -744,6 +752,7 @@ impl<'m> TaintProblem<'m> {
         *self.prop_touch_cone.borrow_mut() = HashMap::new();
         *self.prop_unknown_cone.borrow_mut() = HashMap::new();
         *self.prop_write_cone.borrow_mut() = HashMap::new();
+        *self.this_ret_or_esc.borrow_mut() = None;
         *self.caller_ancestors.borrow_mut() = HashMap::new();
         *self.caller_obs_memo.borrow_mut() = HashMap::new();
         *self.site_local_escape_memo.borrow_mut() = HashMap::new();

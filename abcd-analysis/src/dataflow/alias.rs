@@ -65,11 +65,12 @@
 //!   Cost is paid per *queried* value rather than over the whole module —
 //!   with the memo, each distinct `(value, context)` pair is walked once.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
-use abcd_ir::{BlockId, FuncId, InstId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{BlockId, Const, ConstId, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
 use super::heap::{
     AliasOracle, AllocSiteSet, SingletonSiteClassifier, SiteInfo, is_keyed_alloc,
@@ -106,6 +107,10 @@ pub struct QueryAnswer {
     pub unbalanced: bool,
     /// The depth cap fired somewhere in the walk.
     pub capped: bool,
+    /// The value may evaluate at runtime to a non-Object (`undefined`, `null`,
+    /// or primitive scalar), so an enclosing `new C(...)` call must retain its
+    /// implicit constructed `this` site (`#104`).
+    pub may_be_non_object: bool,
 }
 
 impl QueryAnswer {
@@ -151,6 +156,7 @@ impl QueryAnswer {
         self.has_unknown |= other.has_unknown;
         self.unbalanced |= other.unbalanced;
         self.capped |= other.capped;
+        self.may_be_non_object |= other.may_be_non_object;
     }
 
     /// The opaque answer ("the walk gave up here").
@@ -160,6 +166,31 @@ impl QueryAnswer {
             ..Self::default()
         }
     }
+}
+
+fn is_non_object_const(module: &Module, cid: ConstId) -> bool {
+    matches!(
+        module.consts.get(cid),
+        Some(
+            Const::Undefined
+                | Const::Hole
+                | Const::Null
+                | Const::LitNull(_)
+                | Const::Bool(_)
+                | Const::Int8(_)
+                | Const::Int32(_)
+                | Const::Float32(_)
+                | Const::Number(_)
+                | Const::Int64(_)
+                | Const::UInt64(_)
+                | Const::String(_)
+                | Const::BigInt(_)
+                | Const::Accessor(_)
+                | Const::MethodAffiliate(_)
+                | Const::BuiltinTypeIndex(_)
+                | Const::EtsImplements(_)
+        )
+    )
 }
 
 /// Engine counters (demand-driven cost accounting + the cap-cut metric
@@ -254,7 +285,8 @@ enum Bind {
 pub struct Rung1AliasOracle<'m> {
     module: &'m Module,
     graph: &'m CallGraph,
-    links: ModuleLinkTable,
+    links: Cow<'m, ModuleLinkTable>,
+    harness_func: Option<FuncId>,
     max_depth: usize,
     /// Block → owning function.
     block_func: Vec<Option<FuncId>>,
@@ -288,6 +320,42 @@ impl<'m> Rung1AliasOracle<'m> {
 
     /// An engine with an explicit depth cap (tests).
     pub fn with_depth(module: &'m Module, graph: &'m CallGraph, max_depth: usize) -> Self {
+        let links = ModuleLinkTable::build(module);
+        Self::build_inner(module, graph, Cow::Owned(links), None, max_depth)
+    }
+
+    /// An engine borrowing a prebuilt [`ModuleLinkTable`] and optional
+    /// lifecycle `harness_func` (never rebuilding [`ModuleLinkTable`]; `#104`).
+    #[must_use]
+    pub fn with_links(
+        module: &'m Module,
+        graph: &'m CallGraph,
+        links: &'m ModuleLinkTable,
+        harness_func: Option<FuncId>,
+    ) -> Self {
+        Self::with_links_and_max_depth(module, graph, links, harness_func, DEFAULT_MAX_DEPTH)
+    }
+
+    /// An engine borrowing a prebuilt [`ModuleLinkTable`], optional lifecycle
+    /// `harness_func`, and explicit interprocedural `max_depth` (`#104`).
+    #[must_use]
+    pub fn with_links_and_max_depth(
+        module: &'m Module,
+        graph: &'m CallGraph,
+        links: &'m ModuleLinkTable,
+        harness_func: Option<FuncId>,
+        max_depth: usize,
+    ) -> Self {
+        Self::build_inner(module, graph, Cow::Borrowed(links), harness_func, max_depth)
+    }
+
+    fn build_inner(
+        module: &'m Module,
+        graph: &'m CallGraph,
+        links: Cow<'m, ModuleLinkTable>,
+        harness_func: Option<FuncId>,
+        max_depth: usize,
+    ) -> Self {
         let mut block_func = vec![None; module.blocks.len()];
         let mut value_func = vec![None; module.values.len()];
         let mut returns_of: HashMap<FuncId, Vec<ValueId>> = HashMap::new();
@@ -337,11 +405,11 @@ impl<'m> Rung1AliasOracle<'m> {
                 *slot = block_func.get(b.index()).copied().flatten();
             }
         }
-        let links = ModuleLinkTable::build(module);
         Rung1AliasOracle {
             module,
             graph,
             links,
+            harness_func,
             max_depth,
             block_func,
             value_func,
@@ -364,7 +432,12 @@ impl<'m> Rung1AliasOracle<'m> {
     /// Lazily built [`SingletonSiteClassifier`] over `(module, graph)`.
     pub fn singletons(&self) -> &SingletonSiteClassifier {
         self.singletons.get_or_init(|| {
-            SingletonSiteClassifier::build_with_links(self.module, &self.links, self.graph, None)
+            SingletonSiteClassifier::build_with_links(
+                self.module,
+                &self.links,
+                self.graph,
+                self.harness_func,
+            )
         })
     }
 
@@ -498,7 +571,7 @@ impl<'m> Rung1AliasOracle<'m> {
                     mut acc,
                 } => {
                     let child_ans = results.pop().unwrap_or_else(QueryAnswer::unknown);
-                    if is_new && child_ans.sites.is_empty() && !child_ans.has_unknown {
+                    if is_new && (child_ans.sites.is_empty() || child_ans.may_be_non_object) {
                         acc.sites.union_with(&AllocSiteSet::one(call));
                     }
                     acc.union_with(&child_ans);
@@ -518,8 +591,11 @@ impl<'m> Rung1AliasOracle<'m> {
                         }
                         None => {
                             ctx.pop();
-                            if is_new && acc.sites.len() > 1 {
-                                acc.has_phi = true;
+                            if is_new {
+                                acc.may_be_non_object = false;
+                                if acc.sites.len() > 1 {
+                                    acc.has_phi = true;
+                                }
                             }
                             self.finish_query(key, acc, &mut results);
                         }
@@ -581,9 +657,16 @@ impl<'m> Rung1AliasOracle<'m> {
         match v.def {
             ValueDef::Param(_) => self.enter_param(key, value, func, ctx, stack, results),
             ValueDef::ExceptionParam(_) => self.finish_query(key, QueryAnswer::unknown(), results),
-            ValueDef::Const(_) => {
+            ValueDef::Const(cid) => {
                 // Constants are not heap allocations: no site, no unknown.
-                self.finish_query(key, QueryAnswer::default(), results)
+                self.finish_query(
+                    key,
+                    QueryAnswer {
+                        may_be_non_object: is_non_object_const(self.module, cid),
+                        ..QueryAnswer::default()
+                    },
+                    results,
+                )
             }
             ValueDef::Inst(iid) => match self.module.inst(iid).map(|i| &i.op) {
                 Some(Op::Mov { src }) => {
@@ -617,6 +700,15 @@ impl<'m> Rung1AliasOracle<'m> {
                     },
                     results,
                 ),
+                Some(Op::LoadConst(cid)) if is_non_object_const(self.module, *cid) => self
+                    .finish_query(
+                        key,
+                        QueryAnswer {
+                            may_be_non_object: true,
+                            ..QueryAnswer::default()
+                        },
+                        results,
+                    ),
                 Some(Op::Call { .. }) => self.enter_call_result(key, iid, ctx, stack, results),
                 Some(Op::LoadModuleVar { index, kind }) => {
                     let Some(cid) = self.links.func_class(func) else {
@@ -745,8 +837,12 @@ impl<'m> Rung1AliasOracle<'m> {
                 continue;
             }
             let returns = self.returns_of.get(callee).cloned().unwrap_or_default();
-            if is_new && (returns.is_empty() || self.has_void_return.contains(callee)) {
-                acc.sites.union_with(&AllocSiteSet::one(call));
+            if returns.is_empty() || self.has_void_return.contains(callee) {
+                if is_new {
+                    acc.sites.union_with(&AllocSiteSet::one(call));
+                } else {
+                    acc.may_be_non_object = true;
+                }
             }
             for v in returns {
                 pending.push_back((*callee, v));
@@ -769,8 +865,11 @@ impl<'m> Rung1AliasOracle<'m> {
             }
             None => {
                 ctx.pop();
-                if is_new && acc.sites.len() > 1 {
-                    acc.has_phi = true;
+                if is_new {
+                    acc.may_be_non_object = false;
+                    if acc.sites.len() > 1 {
+                        acc.has_phi = true;
+                    }
                 }
                 self.finish_query(key, acc, results);
             }
@@ -951,7 +1050,10 @@ impl<'m> Rung1AliasOracle<'m> {
                 },
                 // Fewer args than formals: the formal is undefined —
                 // precise-empty (undefined is not a heap object).
-                None => Bind::Leaf(QueryAnswer::default()),
+                None => Bind::Leaf(QueryAnswer {
+                    may_be_non_object: true,
+                    ..QueryAnswer::default()
+                }),
             },
         }
     }

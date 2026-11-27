@@ -392,6 +392,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     *value,
                     curr,
                     is_exceptional,
+                    !is_exceptional,
                     out,
                 ) {
                     self.pass_through_at_sink(source, succ, out);
@@ -405,6 +406,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     *value,
                     curr,
                     is_exceptional,
+                    !is_exceptional,
                     out,
                 ) {
                     self.pass_through_at_sink(source, succ, out);
@@ -422,7 +424,16 @@ impl IfdsProblem for TaintProblem<'_> {
                 {
                     out.emit(Fact::of(fact.rebased(TaintBase::Global(k_sym))));
                 }
-                if self.store_rule(fact, *object, fk, *value, curr, is_exceptional, out) {
+                if self.store_rule(
+                    fact,
+                    *object,
+                    fk,
+                    *value,
+                    curr,
+                    is_exceptional,
+                    !is_exceptional,
+                    out,
+                ) {
                     self.pass_through_at_sink(source, succ, out);
                 }
             }
@@ -436,6 +447,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         *value,
                         curr,
                         is_exceptional,
+                        !is_exceptional,
                         out,
                     ) {
                         self.pass_through_at_sink(source, succ, out);
@@ -448,7 +460,8 @@ impl IfdsProblem for TaintProblem<'_> {
                             FieldKey::Named(psym),
                             *value,
                             curr,
-                            true,
+                            is_exceptional,
+                            false,
                             out,
                         );
                     }
@@ -464,7 +477,16 @@ impl IfdsProblem for TaintProblem<'_> {
                     SuperKey::Name(s) => FieldKey::Named(*s),
                     SuperKey::Dynamic(_) => FieldKey::AnyDynamic,
                 };
-                if self.store_rule(fact, *this_value, fk, *value, curr, is_exceptional, out) {
+                if self.store_rule(
+                    fact,
+                    *this_value,
+                    fk,
+                    *value,
+                    curr,
+                    is_exceptional,
+                    !is_exceptional,
+                    out,
+                ) {
                     self.pass_through_at_sink(source, succ, out);
                 }
             }
@@ -710,15 +732,7 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         }
         let gap = self.gap_at(call, callee);
-        if gap.is_none()
-            && matches!(
-                self.classify(call),
-                SiteClass::Summary {
-                    exclusive: true,
-                    ..
-                }
-            )
-        {
+        if gap.is_none() && self.suppress_body_for_exclusive_summary(call, callee) {
             return;
         }
         let Fact::Taint(fact) = source else { return };
@@ -1038,15 +1052,7 @@ impl IfdsProblem for TaintProblem<'_> {
         };
         let gap = call_site.and_then(|c| self.gap_at(c, callee));
         if gap.is_none()
-            && call_site.is_some_and(|c| {
-                matches!(
-                    self.classify(c),
-                    SiteClass::Summary {
-                        exclusive: true,
-                        ..
-                    }
-                )
-            })
+            && call_site.is_some_and(|c| self.suppress_body_for_exclusive_summary(c, callee))
         {
             return;
         }
@@ -1283,14 +1289,16 @@ impl IfdsProblem for TaintProblem<'_> {
             .is_some_and(|v| call_inst.op.has_operand(v));
 
         match self.classify(call) {
-            SiteClass::Summary { name, .. } => {
+            SiteClass::Summary { name, exclusive } => {
                 let base = call_base_value(module, call_inst);
                 let result = call_inst.result;
+                let has_body = self.call_has_body_callee(call);
                 if let Some(summary) = self.registry.lookup(&name, args.len()) {
-                    let cleared = summary
-                        .clears
-                        .iter()
-                        .any(|c| self.match_endpoint(c, fact, args, base).is_some());
+                    let cleared = (!has_body || exclusive)
+                        && summary
+                            .clears
+                            .iter()
+                            .any(|c| self.match_endpoint(c, fact, args, base).is_some());
                     if !cleared {
                         for flow in &summary.flows {
                             if let Some((leftover, from_heap)) =
@@ -1320,6 +1328,16 @@ impl IfdsProblem for TaintProblem<'_> {
                                 TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
                             ));
                         }
+                        if !exclusive
+                            && has_body
+                            && self.call_resolution_incomplete(call)
+                            && self.config.native_identity
+                            && on_operand
+                            && !is_handler_site
+                            && let Some(res) = result
+                        {
+                            out.emit(Fact::of(fact.rebased(TaintBase::Local(res))));
+                        }
                     }
                     // `exclusive` kills only the call edge into the callee body (plus
                     // explicit `summary.clears`), never dropping caller facts on
@@ -1346,10 +1364,8 @@ impl IfdsProblem for TaintProblem<'_> {
                     // Only defer a field-bearing caller `Local(v).[Named(prop), ...]`
                     // to the callee body when `return_site` is a normal continuation,
                     // `v` is bound to a mapped formal/this slot of every resolved
-                    // returning callee, and at least one resolved callee may write `prop`
-                    // (so callee strong-kills on `formal.prop = clean` remain effective
-                    // while excess actuals, callable operands, spread args, caught
-                    // exceptions, and read-only helpers keep `source` in `O(1)`).
+                    // returning callee, every resolved callee can touch `prop` on `this`,
+                    // and at least one resolved callee may write `prop`.
                     let defer_to_callee = if !is_handler_site
                         && on_operand
                         && let Some(v) = fact.local_base()
@@ -1360,6 +1376,9 @@ impl IfdsProblem for TaintProblem<'_> {
                             && callees
                                 .iter()
                                 .all(|&c| self.is_return_mapped_body_arg(call, call_inst, c, v))
+                            && callees
+                                .iter()
+                                .all(|&c| self.can_callee_touch_this_prop(prop, c))
                             && callees.iter().any(|&c| self.can_callee_write_prop(prop, c))
                     } else {
                         false
@@ -1417,13 +1436,7 @@ impl IfdsProblem for TaintProblem<'_> {
     ) {
         let Fact::Taint(fact) = source else { return };
         if self.gap_at(call_site, callee).is_none()
-            && matches!(
-                self.classify(call_site),
-                SiteClass::Summary {
-                    exclusive: true,
-                    ..
-                }
-            )
+            && self.suppress_body_for_exclusive_summary(call_site, callee)
         {
             return;
         }

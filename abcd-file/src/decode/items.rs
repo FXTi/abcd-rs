@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::file::{
     AbcReader, RawAnnotation, RawField, RawFieldValue, RawMethod, RawModuleRecord, StringItemCache,
 };
-use crate::literal::{decode_literal_array_values, walk_raw_literal_array};
+use crate::literal::decode_literal_array_values;
 use crate::model::*;
 use crate::types::{AccessFlags, Dialect, FunctionKind, SourceLang, Type, TypeId};
 use crate::{StringId, StringPool};
@@ -22,30 +22,67 @@ use super::{
     ES_SCOPE_NAMES_RECORD_DESCRIPTOR, JSON_FILE_CONTENT_FIELD, MODULE_RECORD_IDX_FIELD,
     MODULE_REQUEST_PHASE_FIELD, PendingMethodOps, RawEntityOp, RawLegacyBufOp, SCOPE_NAMES_FIELD,
     TYPE_SUMMARY_OFFSET_FIELD, decode_function_kind_from_flags, decode_source_lang,
+    probe_literal_array_valid,
 };
 
 // Internal Item Decoders (`decode_core`)
 // ---------------------------------------------------------------------------
+
+#[inline]
+fn intern_pool_str(strings: &mut StringPool, text: &str) -> Result<StringId, Error> {
+    strings
+        .try_get_or_intern(text)
+        .map_err(|e| Error::Malformed {
+            field: "string_pool",
+            context: e.to_string(),
+        })
+}
+
+#[inline]
+fn annotation_budget_error(off: u32) -> Error {
+    Error::Malformed {
+        field: "nested annotation",
+        context: format!(
+            "annotation expansion at offset {off:#x} exceeded file-wide annotation budget"
+        ),
+    }
+}
+
+#[inline]
+fn consume_ann_budget(ann_budget: &mut usize, count: usize, off: u32) -> Result<(), Error> {
+    match ann_budget.checked_sub(count) {
+        Some(rem) => {
+            *ann_budget = rem;
+            Ok(())
+        }
+        None => {
+            *ann_budget = 0;
+            Err(annotation_budget_error(off))
+        }
+    }
+}
 
 pub(super) fn read_class_descriptor_cached(
     reader: &AbcReader<'_>,
     class_off: u32,
     str_cache: &mut StringItemCache,
     strings: &mut StringPool,
-) -> Option<(StringId, String)> {
+) -> Result<Option<(StringId, String)>, Error> {
     if let Some(sid) = str_cache.intern_utf8(reader, class_off, strings) {
         let s = strings.resolve(sid).unwrap_or_default().to_owned();
-        return Some((sid, s));
+        return Ok(Some((sid, s)));
     }
-    let raw = reader.raw_cstr_at(class_off)?;
+    let Some(raw) = reader.raw_cstr_at(class_off) else {
+        return Ok(None);
+    };
     let text = String::from_utf8_lossy(raw).into_owned();
-    let sid = strings.get_or_intern(&text);
-    Some((sid, text))
+    let sid = intern_pool_str(strings, &text)?;
+    Ok(Some((sid, text)))
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "method decoder threads class context, lazy backing buffer, forensic diagnostics, and string cache"
+    reason = "method decoder threads class context, lazy backing buffer, forensic diagnostics, budgets, and string cache"
 )]
 pub(super) fn decode_method_item(
     reader: &AbcReader<'_>,
@@ -60,6 +97,8 @@ pub(super) fn decode_method_item(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     ann_visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
+    lnp_budget: &mut usize,
 ) -> Result<(Method, Option<PendingMethodOps>), Error> {
     let method_off = raw_m.offset;
     let name = str_cache
@@ -163,6 +202,7 @@ pub(super) fn decode_method_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
         runtime: decode_annotation_list(
             reader,
@@ -173,6 +213,7 @@ pub(super) fn decode_method_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
         compile_time_type: decode_annotation_list(
             reader,
@@ -183,6 +224,7 @@ pub(super) fn decode_method_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
         runtime_type: decode_annotation_list(
             reader,
@@ -193,6 +235,7 @@ pub(super) fn decode_method_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
     };
 
@@ -207,6 +250,7 @@ pub(super) fn decode_method_item(
                 raw_m,
                 code_byte_len,
                 debug_off,
+                lnp_budget,
                 &mut sink,
             ) {
                 Ok(()) => Some(sink.into_debug_info(&byte_offsets)),
@@ -239,6 +283,7 @@ pub(super) fn decode_method_item(
         strings,
         str_cache,
         ann_visiting,
+        ann_budget,
     )?;
 
     Ok((
@@ -505,7 +550,7 @@ fn decode_proto_types(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "param annotation decoder threads forensic diagnostics, entity map, and string cache"
+    reason = "param annotation decoder threads forensic diagnostics, entity map, budget, and string cache"
 )]
 fn decode_param_annotations(
     reader: &AbcReader<'_>,
@@ -517,6 +562,7 @@ fn decode_param_annotations(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     ann_visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
 ) -> Result<ParamAnnotations, Error> {
     let mut result = ParamAnnotations::default();
     for (is_runtime, item_off_opt) in [
@@ -571,6 +617,14 @@ fn decode_param_annotations(
         let len = num_params.max(max_end);
         bucket.resize(len, Vec::new());
         for (idx, off) in pairs {
+            if forensic && *ann_budget == 0 {
+                diagnostics.push(DecodeDiagnostic {
+                    kind: "annotation",
+                    offset: Some(off),
+                    message: annotation_budget_error(off).to_string(),
+                });
+                break;
+            }
             let anns = decode_annotation_list(
                 reader,
                 &[off],
@@ -580,6 +634,7 @@ fn decode_param_annotations(
                 strings,
                 str_cache,
                 ann_visiting,
+                ann_budget,
             )?;
             bucket[idx as usize].extend(anns);
         }
@@ -682,7 +737,7 @@ fn decode_module_request_phase_at(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "field decoder threads forensic diagnostics, discovery offset sets, and string cache"
+    reason = "field decoder threads forensic diagnostics, discovery offset sets, budgets, and string cache"
 )]
 pub(super) fn decode_field_item(
     reader: &AbcReader<'_>,
@@ -693,6 +748,8 @@ pub(super) fn decode_field_item(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     ann_visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
+    lit_probe_cache: &mut HashMap<u32, bool>,
     class_descriptor: &str,
     module_data_offsets: &mut HashSet<u32>,
     scope_names_offsets: &mut HashSet<u32>,
@@ -782,7 +839,7 @@ pub(super) fn decode_field_item(
                 if offset == 0 {
                     Ok(Some(FieldValue::I32(0)))
                 } else if entity_map.contains_key(&offset)
-                    || walk_raw_literal_array(reader, offset, |_| Ok(())).is_err()
+                    || !probe_literal_array_valid(reader, offset, lit_probe_cache)
                 {
                     Err(Error::InvalidOffset(offset))
                 } else {
@@ -908,6 +965,7 @@ pub(super) fn decode_field_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
         runtime: decode_annotation_list(
             reader,
@@ -918,6 +976,7 @@ pub(super) fn decode_field_item(
             strings,
             str_cache,
             ann_visiting,
+            ann_budget,
         )?,
         compile_time_type: Vec::new(),
         runtime_type: Vec::new(),
@@ -940,21 +999,21 @@ fn resolve_foreign_entity_name(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     off: u32,
-) -> StringId {
+) -> Result<StringId, Error> {
     if let Some(&sid) = entity_map.get(&off) {
-        return sid;
+        return Ok(sid);
     }
-    let Some(name_off) = reader.foreign_item_name_off(off) else {
-        return strings.get_or_intern("");
-    };
-    str_cache
-        .intern_utf8(reader, name_off, strings)
-        .unwrap_or_else(|| strings.get_or_intern(""))
+    if let Some(name_off) = reader.foreign_item_name_off(off)
+        && let Some(sid) = str_cache.intern_utf8(reader, name_off, strings)
+    {
+        return Ok(sid);
+    }
+    intern_pool_str(strings, "")
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "annotation list decoder threads forensic diagnostics, entity map, and string cache"
+    reason = "annotation list decoder threads forensic diagnostics, entity map, budget, and string cache"
 )]
 pub(super) fn decode_annotation_list(
     reader: &AbcReader<'_>,
@@ -965,10 +1024,30 @@ pub(super) fn decode_annotation_list(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     ann_visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
 ) -> Result<Vec<Annotation>, Error> {
+    if offsets.is_empty() {
+        return Ok(Vec::new());
+    }
+    if forensic && *ann_budget == 0 {
+        diagnostics.push(DecodeDiagnostic {
+            kind: "annotation",
+            offset: Some(offsets[0]),
+            message: annotation_budget_error(offsets[0]).to_string(),
+        });
+        return Ok(Vec::new());
+    }
     let mut out = Vec::with_capacity(offsets.len());
     for &off in offsets {
-        match decode_annotation_at(reader, off, entity_map, strings, str_cache, ann_visiting) {
+        match decode_annotation_at(
+            reader,
+            off,
+            entity_map,
+            strings,
+            str_cache,
+            ann_visiting,
+            ann_budget,
+        ) {
             Ok(ann) => out.push(ann),
             Err(err) => {
                 if forensic {
@@ -977,6 +1056,9 @@ pub(super) fn decode_annotation_list(
                         offset: Some(off),
                         message: err.to_string(),
                     });
+                    if *ann_budget == 0 {
+                        break;
+                    }
                 } else {
                     return Err(err);
                 }
@@ -1012,12 +1094,17 @@ fn open_ann_frame<'a>(
     off: u32,
     entity_map: &HashMap<u32, StringId>,
     visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
 ) -> Result<AnnDecodeFrame<'a>, Error> {
     if !visiting.insert(off) {
         return Err(Error::Malformed {
             field: "nested annotation",
             context: format!("cyclic annotation reference at offset {off:#x}"),
         });
+    }
+    if let Err(err) = consume_ann_budget(ann_budget, 1, off) {
+        visiting.remove(&off);
+        return Err(err);
     }
     let Some(ar) = reader.open_annotation(off) else {
         visiting.remove(&off);
@@ -1035,7 +1122,7 @@ fn open_ann_frame<'a>(
         off,
         class_descriptor,
         next_idx: 0,
-        elements: Vec::with_capacity(usize::from(ar.count).min(max_elems)),
+        elements: Vec::with_capacity(usize::from(ar.count).min(max_elems).min(*ann_budget)),
         pending: None,
         ar,
     })
@@ -1048,12 +1135,32 @@ fn decode_annotation_at(
     strings: &mut StringPool,
     str_cache: &mut StringItemCache,
     visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
+) -> Result<Annotation, Error> {
+    visiting.clear();
+    let res = decode_annotation_at_inner(
+        reader, root_off, entity_map, strings, str_cache, visiting, ann_budget,
+    );
+    if res.is_err() {
+        visiting.clear();
+    }
+    res
+}
+
+fn decode_annotation_at_inner(
+    reader: &AbcReader<'_>,
+    root_off: u32,
+    entity_map: &HashMap<u32, StringId>,
+    strings: &mut StringPool,
+    str_cache: &mut StringItemCache,
+    visiting: &mut HashSet<u32>,
+    ann_budget: &mut usize,
 ) -> Result<Annotation, Error> {
     use sys::AnnotationValueType as AVT;
 
-    visiting.clear();
-    let mut stack: Vec<AnnDecodeFrame<'_>> =
-        vec![open_ann_frame(reader, root_off, entity_map, visiting)?];
+    let mut stack: Vec<AnnDecodeFrame<'_>> = vec![open_ann_frame(
+        reader, root_off, entity_map, visiting, ann_budget,
+    )?];
     let mut completed: Option<Annotation> = None;
 
     while let Some(frame) = stack.last_mut() {
@@ -1079,7 +1186,8 @@ fn decode_annotation_at(
                             remaining,
                             decoded,
                         });
-                        let child = open_ann_frame(reader, next_off, entity_map, visiting)?;
+                        let child =
+                            open_ann_frame(reader, next_off, entity_map, visiting, ann_budget)?;
                         stack.push(child);
                         continue;
                     }
@@ -1101,6 +1209,7 @@ fn decode_annotation_at(
             frame.next_idx += 1;
             let off = frame.off;
 
+            consume_ann_budget(ann_budget, 1, off)?;
             let Some((name_off, raw_tag, raw_val)) = frame.ar.element(idx) else {
                 return Err(Error::Malformed {
                     field: "annotation element",
@@ -1169,7 +1278,7 @@ fn decode_annotation_at(
                 AVT::Method => {
                     let sid = resolve_foreign_entity_name(
                         reader, entity_map, strings, str_cache, raw_val,
-                    );
+                    )?;
                     AnnotationValue::Method {
                         name: sid,
                         method: None,
@@ -1179,7 +1288,7 @@ fn decode_annotation_at(
                 AVT::Enum => {
                     let sid = resolve_foreign_entity_name(
                         reader, entity_map, strings, str_cache, raw_val,
-                    );
+                    )?;
                     AnnotationValue::Enum {
                         name: sid,
                         field: None,
@@ -1188,7 +1297,9 @@ fn decode_annotation_at(
                 }
                 AVT::Annotation => {
                     frame.pending = Some(PendingAnnSlot::Scalar { name });
-                    next_child = Some(open_ann_frame(reader, raw_val, entity_map, visiting)?);
+                    next_child = Some(open_ann_frame(
+                        reader, raw_val, entity_map, visiting, ann_budget,
+                    )?);
                     break;
                 }
                 AVT::MethodHandle => {
@@ -1204,10 +1315,10 @@ fn decode_annotation_at(
                             "annotation at offset {off:#x}, element {idx}: unknown handle type {ht_raw:#x}"
                         ),
                     })?;
-                    let entity = entity_map
-                        .get(&entity_off)
-                        .copied()
-                        .unwrap_or_else(|| strings.get_or_intern(""));
+                    let entity = match entity_map.get(&entity_off).copied() {
+                        Some(sid) => sid,
+                        None => intern_pool_str(strings, "")?,
+                    };
                     AnnotationValue::MethodHandle(ResolvedMethodHandle {
                         handle_type: ht,
                         entity,
@@ -1218,13 +1329,20 @@ fn decode_annotation_at(
                 }
                 AVT::LiteralArray => {
                     let values = decode_literal_array_values(reader, raw_val, strings, str_cache)?;
+                    consume_ann_budget(ann_budget, values.len(), off)?;
                     AnnotationValue::LiteralArray(values)
                 }
                 AVT::Void => AnnotationValue::Void,
                 AVT::StringNullptr => AnnotationValue::StringNullptr,
                 AVT::ArrayAnnotation => {
-                    let (_, raw_values) =
-                        read_annotation_array_from_elem(reader, off, idx, raw_tag, raw_val)?;
+                    let (_, raw_values) = read_annotation_array_from_elem(
+                        reader,
+                        off,
+                        idx,
+                        raw_tag,
+                        raw_val,
+                        Some(ann_budget),
+                    )?;
                     let mut offsets_iter = raw_values
                         .into_iter()
                         .map(|v| v as u32)
@@ -1237,7 +1355,9 @@ fn decode_annotation_at(
                             decoded: Vec::with_capacity(offsets_iter.len().saturating_add(1)),
                             remaining: offsets_iter,
                         });
-                        next_child = Some(open_ann_frame(reader, first_off, entity_map, visiting)?);
+                        next_child = Some(open_ann_frame(
+                            reader, first_off, entity_map, visiting, ann_budget,
+                        )?);
                         break;
                     }
                     AnnotationValue::Array {
@@ -1262,8 +1382,14 @@ fn decode_annotation_at(
                 | AVT::ArrayMethod
                 | AVT::ArrayEnum
                 | AVT::ArrayMethodHandle => {
-                    let (avt, raw_values) =
-                        read_annotation_array_from_elem(reader, off, idx, raw_tag, raw_val)?;
+                    let (avt, raw_values) = read_annotation_array_from_elem(
+                        reader,
+                        off,
+                        idx,
+                        raw_tag,
+                        raw_val,
+                        Some(ann_budget),
+                    )?;
                     let values = convert_annotation_array_values(
                         reader, raw_tag, avt, raw_val, raw_values, entity_map, strings, str_cache,
                     )?;
@@ -1346,6 +1472,7 @@ pub(super) fn read_annotation_array_from_elem(
     elem_idx: u16,
     tag: u8,
     entity_offset: u32,
+    ann_budget: Option<&mut usize>,
 ) -> Result<(sys::AnnotationValueType, Vec<u64>), Error> {
     // Match `abc_annotation_get_array_element` check first: `[uleb count]` must
     // satisfy `count <= rem_bytes` inside `get_span(entity_offset)`.
@@ -1370,6 +1497,9 @@ pub(super) fn read_annotation_array_from_elem(
     let (avt, elem_size) = annotation_array_elem_size(tag, entity_offset)?;
     if declared_count == 0 {
         return Ok((avt, Vec::new()));
+    }
+    if let Some(budget) = ann_budget {
+        consume_ann_budget(budget, declared_count as usize, ann_off)?;
     }
     let raw_values = reader
         .read_annotation_array(entity_offset, elem_size)
@@ -1424,8 +1554,9 @@ fn convert_annotation_array_values(
                 AnnotationValue::Record(sid)
             }
             AVT::ArrayMethod => {
-                let sid =
-                    resolve_foreign_entity_name(reader, entity_map, strings, str_cache, raw as u32);
+                let sid = resolve_foreign_entity_name(
+                    reader, entity_map, strings, str_cache, raw as u32,
+                )?;
                 AnnotationValue::Method {
                     name: sid,
                     method: None,
@@ -1433,8 +1564,9 @@ fn convert_annotation_array_values(
                 }
             }
             AVT::ArrayEnum => {
-                let sid =
-                    resolve_foreign_entity_name(reader, entity_map, strings, str_cache, raw as u32);
+                let sid = resolve_foreign_entity_name(
+                    reader, entity_map, strings, str_cache, raw as u32,
+                )?;
                 AnnotationValue::Enum {
                     name: sid,
                     field: None,
@@ -1465,10 +1597,10 @@ fn convert_annotation_array_values(
                         "annotation array at offset {entity_offset:#x}: unknown handle type {ht_raw:#x}"
                     ),
                 })?;
-                let entity = entity_map
-                    .get(&entity_off)
-                    .copied()
-                    .unwrap_or_else(|| strings.get_or_intern(""));
+                let entity = match entity_map.get(&entity_off).copied() {
+                    Some(sid) => sid,
+                    None => intern_pool_str(strings, "")?,
+                };
                 AnnotationValue::MethodHandle(ResolvedMethodHandle {
                     handle_type: ht,
                     entity,

@@ -434,30 +434,6 @@ impl<'m> TaintProblem<'m> {
                     )
                 )
         };
-        let is_ext_native_callee = |callee_val: ValueId, caller_cid: ClassId| -> bool {
-            let mut cur = crate::names::peel_movs_fast(self.module, callee_val);
-            for _ in 0..4 {
-                let Some(ValueDef::Inst(diid)) = self.module.value(cur).map(|v| v.def) else {
-                    return false;
-                };
-                match self.module.inst(diid).map(|i| &i.op) {
-                    Some(Op::LoadProp { object, .. }) => {
-                        cur = crate::names::peel_movs_fast(self.module, *object);
-                    }
-                    Some(Op::LoadModuleVar { index, kind }) if !kind.is_local() => {
-                        return self
-                            .links
-                            .external_load(caller_cid, *index)
-                            .is_some_and(|t| t.slots.is_empty());
-                    }
-                    Some(Op::GetModuleNamespace { index }) => {
-                        return self.links.namespace_target(caller_cid, *index).is_none();
-                    }
-                    _ => return false,
-                }
-            }
-            false
-        };
         let is_ext_result_unused = |fd: &abcd_ir::FunctionData, rv: ValueId| -> bool {
             let cd_borrow = self.closed_dispatch.borrow();
             let unused_resumes = cd_borrow.as_ref().map(|idx| &idx.unused_await_resumes);
@@ -1187,7 +1163,8 @@ impl<'m> TaintProblem<'m> {
                                     return true;
                                 }
                                 if !self.call_has_body_callee(iid) {
-                                    if is_ext_native_callee(*callee, fd.class_id)
+                                    if !self.source_cb_edges.contains_key(&iid)
+                                        && self.is_known_non_escaping_void_call(cur_fid, iid, inst)
                                         && inst.result.is_none_or(|rv| is_ext_result_unused(fd, rv))
                                     {
                                         continue;
@@ -1311,11 +1288,14 @@ impl<'m> TaintProblem<'m> {
         if self.classify_local_site_escape(site) == LocalSiteEscape::DirectOnly {
             return false;
         }
-        if !self.suppress_empty_heap_wildcard() {
+        if self.in_path_replay || !matches!(*self.oracle.borrow(), Oracle::Rung2(..)) {
             return true;
         }
         if self.is_variadic_args_site(site) {
             return false;
+        }
+        if !self.links.has_multi_record_esm() {
+            return true;
         }
         self.ensure_heap_site_index();
         let idx_borrow = self.heap_site_index.borrow();
@@ -1331,7 +1311,10 @@ impl<'m> TaintProblem<'m> {
         callee: FuncId,
         first_is_any_index: bool,
     ) -> bool {
-        if self.suppress_empty_heap_wildcard() && self.is_variadic_args_site(site) {
+        if !self.in_path_replay
+            && matches!(*self.oracle.borrow(), Oracle::Rung2(..))
+            && self.is_variadic_args_site(site)
+        {
             return self.explicit_callee_uses_heap_site(site, callee);
         }
         self.ensure_heap_site_index();
@@ -1412,8 +1395,25 @@ impl<'m> TaintProblem<'m> {
         let store_edges = idx_borrow.as_ref().map(|idx| &idx.store_edges);
         let class_def_sites = idx_borrow.as_ref().map(|idx| &idx.class_def_sites);
 
-        if is_rung2 && let Some(edges) = store_edges {
-            let mut main_seeds: Vec<(InstId, ClassId)> = Vec::new();
+        let mut bfs_queue: VecDeque<InstId> = VecDeque::new();
+        let mut bfs_in_q: HashSet<InstId> = HashSet::new();
+        fn push_unique<T: Copy + PartialEq>(dst: &mut Vec<T>, item: T) -> bool {
+            if dst.contains(&item) {
+                false
+            } else {
+                dst.push(item);
+                true
+            }
+        }
+        fn merge_unique<T: Copy + PartialEq>(dst: &mut Vec<T>, src: &[T]) -> bool {
+            let mut changed = false;
+            for &item in src {
+                changed |= push_unique(dst, item);
+            }
+            changed
+        }
+
+        if is_rung2 {
             for (fi, f) in self.module.functions.iter().enumerate() {
                 let fid = FuncId::new(fi as u32);
                 if Some(fid) == self.harness.fid || f.blocks.is_empty() {
@@ -1445,56 +1445,24 @@ impl<'m> TaintProblem<'m> {
                         } else {
                             matches!(inst.op, Op::DefineClass(_) | Op::DefineSendableClass(_))
                         };
-                        if is_seed {
-                            main_seeds.push((iid, f.class_id));
+                        if is_seed
+                            && push_unique(site_main_classes.entry(iid).or_default(), f.class_id)
+                            && bfs_in_q.insert(iid)
+                        {
+                            bfs_queue.push_back(iid);
                         }
                     }
                 }
             }
-            let mut visited = HashSet::new();
-            let mut q = VecDeque::new();
-            for (seed_iid, seed_cid) in main_seeds {
-                visited.clear();
-                visited.insert(seed_iid);
-                q.push_back(seed_iid);
-                while let Some(cur) = q.pop_front() {
-                    let list = site_main_classes.entry(cur).or_default();
-                    if !list.contains(&seed_cid) {
-                        list.push(seed_cid);
-                    }
-                    if let Some(children) = edges.get(&cur) {
-                        for &ch in children {
-                            if visited.insert(ch) {
-                                q.push_back(ch);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
-        if is_rung2 && let Some(edges) = store_edges {
             let mut h_roots_sorted: Vec<InstId> =
                 self.harness.alloc_sites.iter().copied().collect();
             h_roots_sorted.sort();
-            let mut visited = HashSet::new();
-            let mut q = VecDeque::new();
             for h_root in h_roots_sorted {
-                visited.clear();
-                visited.insert(h_root);
-                q.push_back(h_root);
-                while let Some(cur) = q.pop_front() {
-                    let list = site_harness_roots.entry(cur).or_default();
-                    if !list.contains(&h_root) {
-                        list.push(h_root);
-                    }
-                    if let Some(children) = edges.get(&cur) {
-                        for &ch in children {
-                            if visited.insert(ch) {
-                                q.push_back(ch);
-                            }
-                        }
-                    }
+                if push_unique(site_harness_roots.entry(h_root).or_default(), h_root)
+                    && bfs_in_q.insert(h_root)
+                {
+                    bfs_queue.push_back(h_root);
                 }
             }
         }
@@ -1517,16 +1485,12 @@ impl<'m> TaintProblem<'m> {
                             ..
                         },
                     ) => {
-                        if !out.contains(&diid) {
-                            out.push(diid);
-                        }
+                        let _ = push_unique(&mut out, diid);
                     }
                     Some(Op::GetLexVar { .. } | Op::LoadModuleVar { .. }) if out.is_empty() => {
                         if let Some(csites) = class_def_sites.and_then(|m| m.get(&cid)) {
                             for &cs in csites {
-                                if !out.contains(&cs) {
-                                    out.push(cs);
-                                }
+                                let _ = push_unique(&mut out, cs);
                             }
                         }
                     }
@@ -1553,33 +1517,12 @@ impl<'m> TaintProblem<'m> {
                     };
                     let seeds = resolve_export_seed_sites(*value, iid, f.class_id);
                     let pair = (f.class_id, *index);
-                    if is_rung2 && let Some(edges) = store_edges {
-                        let mut visited = HashSet::new();
-                        let mut q = VecDeque::new();
-                        for s in &seeds {
-                            if visited.insert(*s) {
-                                q.push_back(*s);
-                            }
-                        }
-                        while let Some(cur) = q.pop_front() {
-                            let list = site_module_slots.entry(cur).or_default();
-                            if !list.contains(&pair) {
-                                list.push(pair);
-                            }
-                            if let Some(children) = edges.get(&cur) {
-                                for &ch in children {
-                                    if visited.insert(ch) {
-                                        q.push_back(ch);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        for s in &seeds {
-                            let list = site_module_slots.entry(*s).or_default();
-                            if !list.contains(&pair) {
-                                list.push(pair);
-                            }
+                    for s in &seeds {
+                        if push_unique(site_module_slots.entry(*s).or_default(), pair)
+                            && is_rung2
+                            && bfs_in_q.insert(*s)
+                        {
+                            bfs_queue.push_back(*s);
                         }
                     }
                     if (!is_rung2
@@ -1587,39 +1530,63 @@ impl<'m> TaintProblem<'m> {
                             && self.oracle.borrow().site_info_at(*value, iid).has_unknown))
                         && !is_non_container_export_val(*value)
                     {
-                        let slots = class_container_slots.entry(f.class_id).or_default();
-                        if !slots.contains(index) {
-                            slots.push(*index);
-                        }
+                        let _ = push_unique(
+                            class_container_slots.entry(f.class_id).or_default(),
+                            *index,
+                        );
                     }
                 }
             }
         }
 
-        for (&sym, vals) in &self.global_stores {
-            let mut visited = HashSet::new();
-            let mut q = VecDeque::new();
+        let mut global_syms: Vec<Sym> = self.global_stores.keys().copied().collect();
+        global_syms.sort();
+        for sym in global_syms {
+            let Some(vals) = self.global_stores.get(&sym) else {
+                continue;
+            };
             for &v in vals {
                 let known = self.oracle.borrow().known_sites_at(v, InstId::new(0));
                 for s in known.iter() {
-                    if visited.insert(s) {
-                        q.push_back(s);
+                    if push_unique(site_globals.entry(s).or_default(), sym)
+                        && is_rung2
+                        && bfs_in_q.insert(s)
+                    {
+                        bfs_queue.push_back(s);
                     }
                 }
             }
-            while let Some(cur) = q.pop_front() {
-                let list = site_globals.entry(cur).or_default();
-                if !list.contains(&sym) {
-                    list.push(sym);
-                }
-                if is_rung2
-                    && let Some(edges) = store_edges
-                    && let Some(children) = edges.get(&cur)
-                {
-                    for &ch in children {
-                        if visited.insert(ch) {
-                            q.push_back(ch);
-                        }
+        }
+
+        if is_rung2 && let Some(edges) = store_edges {
+            while let Some(cur) = bfs_queue.pop_front() {
+                bfs_in_q.remove(&cur);
+                let Some(children) = edges.get(&cur) else {
+                    continue;
+                };
+                let cur_mc = site_main_classes.get(&cur).cloned().unwrap_or_default();
+                let cur_hr = site_harness_roots.get(&cur).cloned().unwrap_or_default();
+                let cur_ms = site_module_slots.get(&cur).cloned().unwrap_or_default();
+                let cur_gl = site_globals.get(&cur).cloned().unwrap_or_default();
+                for &ch in children {
+                    let mut ch_changed = false;
+                    if !cur_mc.is_empty() {
+                        ch_changed |=
+                            merge_unique(site_main_classes.entry(ch).or_default(), &cur_mc);
+                    }
+                    if !cur_hr.is_empty() {
+                        ch_changed |=
+                            merge_unique(site_harness_roots.entry(ch).or_default(), &cur_hr);
+                    }
+                    if !cur_ms.is_empty() {
+                        ch_changed |=
+                            merge_unique(site_module_slots.entry(ch).or_default(), &cur_ms);
+                    }
+                    if !cur_gl.is_empty() {
+                        ch_changed |= merge_unique(site_globals.entry(ch).or_default(), &cur_gl);
+                    }
+                    if ch_changed && bfs_in_q.insert(ch) {
+                        bfs_queue.push_back(ch);
                     }
                 }
             }

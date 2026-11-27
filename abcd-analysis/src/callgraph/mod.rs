@@ -210,6 +210,20 @@ impl CallGraph {
         CallGraph { sites, callers }
     }
 
+    /// Downgrade `resolution_complete` to `false` on any call edge matching
+    /// `pred` (used by Rung-2 PTA post-solve soundness when a caller may run in
+    /// an unscanned `PackedCtx::NONE` activation; `#104`).
+    pub(crate) fn mark_edges_incomplete_where(
+        &mut self,
+        mut pred: impl FnMut(InstId, &CallEdge) -> bool,
+    ) {
+        for (&iid, edge) in &mut self.sites {
+            if edge.resolution_complete && pred(iid, edge) {
+                edge.resolution_complete = false;
+            }
+        }
+    }
+
     /// The edge record of a call instruction.
     pub fn edge_at(&self, call: InstId) -> Option<&CallEdge> {
         self.sites.get(&call)
@@ -344,6 +358,20 @@ fn compute_open_caller_funcs(module: &Module, base: &CallGraph) -> Vec<bool> {
     let mut val_funcs: Vec<BTreeSet<FuncId>> = vec![BTreeSet::new(); module.values.len()];
     let mut copy_edges: Vec<Vec<ValueId>> = vec![Vec::new(); module.values.len()];
     let mut q = std::collections::VecDeque::new();
+    let mut visited_consts: HashSet<abcd_ir::ConstId> = HashSet::new();
+
+    for (fi, fd) in module.functions.iter().enumerate() {
+        if matches!(
+            fd.kind,
+            abcd_ir::FunctionKind::Constructor
+                | abcd_ir::FunctionKind::Getter
+                | abcd_ir::FunctionKind::Setter
+                | abcd_ir::FunctionKind::Generator
+                | abcd_ir::FunctionKind::AsyncGenerator
+        ) {
+            open[fi] = true;
+        }
+    }
 
     for (vi, v) in module.values.iter().enumerate() {
         if let ValueDef::Const(cid) = v.def
@@ -366,6 +394,28 @@ fn compute_open_caller_funcs(module: &Module, base: &CallGraph) -> Vec<bool> {
                         if let Some(slot) = open.get_mut(cls.ctor.index()) {
                             *slot = true;
                         }
+                        crate::dataflow::heap::mark_const_pool_funcs(
+                            module,
+                            cls.members,
+                            &mut open,
+                            &mut visited_consts,
+                        );
+                    }
+                    Op::AllocObject { shape } => {
+                        crate::dataflow::heap::mark_const_pool_funcs(
+                            module,
+                            *shape,
+                            &mut open,
+                            &mut visited_consts,
+                        );
+                    }
+                    Op::AllocArray { shape: Some(shape) } => {
+                        crate::dataflow::heap::mark_const_pool_funcs(
+                            module,
+                            *shape,
+                            &mut open,
+                            &mut visited_consts,
+                        );
                     }
                     Op::DefineFunc { body, .. } => {
                         if let Some(r) = inst.result

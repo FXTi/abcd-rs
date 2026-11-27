@@ -15,7 +15,7 @@ use crate::names::{
 use crate::oracle::Oracle;
 
 use super::escape::LocalSiteEscape;
-use super::indexes::{classify_dyn_prop_key, is_global_object};
+use super::indexes::{classify_dyn_prop_key, is_any_index_compatible_prop_str, is_global_object};
 use super::lex_env::is_synthetic_slot_sym;
 use super::{FuncBitSet, ParamBinding, SiteClass, TaintProblem, param_binding};
 
@@ -399,119 +399,509 @@ impl<'m> TaintProblem<'m> {
         .any(|c| self.sink_leaves.contains(c.rsplit('.').next().unwrap_or(c)))
     }
 
-    pub(super) fn callee_may_return_this(&self, callee: FuncId) -> bool {
-        let Some(fd) = self.module.func(callee) else {
-            return false;
-        };
-        let this_v = match param_binding(self.module, callee) {
-            ParamBinding::OverApproxAll => return true,
-            ParamBinding::Precise {
-                this_slot: Some(slot),
-                ..
-            } => match fd.params.get(slot).copied() {
-                Some(v) => v,
-                None => return false,
-            },
-            ParamBinding::Precise {
-                this_slot: None, ..
-            } => return false,
-        };
-        for &b in &fd.blocks {
-            let Some(bb) = self.module.block(b) else {
+    pub(super) fn ensure_this_ret_or_esc(&self) {
+        if self.this_ret_or_esc.borrow().is_some() {
+            return;
+        }
+        const MAX_FORMALS: usize = 15;
+        let n_funcs = self.module.functions.len();
+        let mut func_ret_mask = vec![0u16; n_funcs];
+        let mut func_esc_mask = vec![0u16; n_funcs];
+        let mut queue = VecDeque::with_capacity(n_funcs);
+        let mut in_queue = vec![false; n_funcs];
+
+        for (fi, fd) in self.module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if Some(fid) == self.harness.fid || fd.is_external || fd.blocks.is_empty() {
+                continue;
+            }
+            if matches!(param_binding(self.module, fid), ParamBinding::OverApproxAll) {
+                func_ret_mask[fi] = u16::MAX;
+                func_esc_mask[fi] = u16::MAX;
+                continue;
+            }
+            in_queue[fi] = true;
+            queue.push_back(fid);
+        }
+
+        while let Some(cur_fid) = queue.pop_front() {
+            let fi = cur_fid.index();
+            in_queue[fi] = false;
+            let Some(fd) = self.module.func(cur_fid) else {
                 continue;
             };
-            for &iid in &bb.insts {
-                if let Some(Op::Return { value: Some(rv) }) = self.module.inst(iid).map(|i| &i.op) {
-                    let root = abcd_analysis::dataflow::heap::peel_movs(self.module, *rv);
-                    if root == this_v {
-                        return true;
-                    }
-                    if let Some(ValueDef::Inst(def_iid)) = self.module.value(root).map(|v| v.def)
-                        && matches!(
-                            self.module.inst(def_iid).map(|i| &i.op),
-                            Some(Op::Phi { .. })
-                        )
-                    {
-                        return true;
+            let ParamBinding::Precise {
+                this_slot,
+                formal_base,
+            } = param_binding(self.module, cur_fid)
+            else {
+                continue;
+            };
+            let mut val_mask: HashMap<ValueId, u16> = HashMap::new();
+            if let Some(ts) = this_slot
+                && let Some(&tv) = fd.params.get(ts)
+            {
+                val_mask.insert(tv, 1u16);
+            }
+            for (i, &pv) in fd
+                .params
+                .iter()
+                .skip(formal_base)
+                .take(MAX_FORMALS)
+                .enumerate()
+            {
+                val_mask
+                    .entry(pv)
+                    .and_modify(|m| *m |= 1u16 << (1 + i))
+                    .or_insert(1u16 << (1 + i));
+            }
+            if val_mask.is_empty() {
+                continue;
+            }
+
+            let mut local_changed = true;
+            while local_changed {
+                local_changed = false;
+                for &b in &fd.blocks {
+                    let Some(bb) = self.module.block(b) else {
+                        continue;
+                    };
+                    for &iid in &bb.insts {
+                        let Some(inst) = self.module.inst(iid) else {
+                            continue;
+                        };
+                        let Some(res) = inst.result else {
+                            continue;
+                        };
+                        let mut add_m = 0u16;
+                        match &inst.op {
+                            Op::Mov { src }
+                            | Op::Await { value: src }
+                            | Op::AwaitUncaught { value: src, .. } => {
+                                add_m |= val_mask.get(src).copied().unwrap_or(0);
+                            }
+                            Op::Phi { entries } => {
+                                for (_, inc) in entries {
+                                    add_m |= val_mask.get(inc).copied().unwrap_or(0);
+                                }
+                            }
+                            Op::ResumeGenerator { .. } => {
+                                if let Some(avs) = self.await_resume.get(&iid) {
+                                    for av in avs {
+                                        add_m |= val_mask.get(av).copied().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            Op::Call {
+                                this, args, kind, ..
+                            } => {
+                                let base_m = call_base_value(self.module, inst)
+                                    .and_then(|bv| val_mask.get(&bv).copied())
+                                    .unwrap_or(0);
+                                let mut all_ops_m = base_m;
+                                inst.op.for_each_operand(|ov| {
+                                    all_ops_m |= val_mask.get(&ov).copied().unwrap_or(0);
+                                });
+                                if all_ops_m != 0 {
+                                    let site_cls = self.compute_class(iid, true).0;
+                                    if let SiteClass::Summary { name, .. } = site_cls {
+                                        let ret_flow =
+                                            self.registry.peek(&name, args.len()).is_some_and(
+                                                |sum| {
+                                                    sum.flows.iter().any(|f| {
+                                                        matches!(
+                                                        f.to,
+                                                        crate::summary::Endpoint::Return
+                                                            | crate::summary::Endpoint::ReturnField(
+                                                                _
+                                                            )
+                                                    )
+                                                    }) || sum.callback.as_ref().is_some_and(|g| {
+                                                        g.return_to_result.is_some()
+                                                    })
+                                                },
+                                            );
+                                        if ret_flow
+                                            || (self.call_has_body_callee(iid)
+                                                && self.call_resolution_incomplete(iid)
+                                                && self.config.native_identity)
+                                        {
+                                            add_m |= all_ops_m;
+                                        }
+                                    } else if self.call_has_body_callee(iid)
+                                        && !self.call_resolution_incomplete(iid)
+                                        && !self.gap_edges.contains_key(&iid)
+                                        && !self.source_cb_edges.contains_key(&iid)
+                                        && !matches!(
+                                            kind,
+                                            CallKind::Apply
+                                                | CallKind::SuperSpread
+                                                | CallKind::NewSpread
+                                        )
+                                    {
+                                        for &sub_fid in self.callgraph.callees_of_call_at(iid) {
+                                            let sr = func_ret_mask
+                                                .get(sub_fid.index())
+                                                .copied()
+                                                .unwrap_or(0);
+                                            if sr == 0 {
+                                                continue;
+                                            }
+                                            if (sr & 1) != 0
+                                                && !matches!(
+                                                    kind,
+                                                    CallKind::New | CallKind::NewSpread
+                                                )
+                                            {
+                                                let tm = this
+                                                    .and_then(|t| val_mask.get(&t).copied())
+                                                    .unwrap_or(0)
+                                                    | base_m;
+                                                add_m |= tm;
+                                                if *kind == CallKind::SuperForwardAllArgs {
+                                                    if this_slot.is_some() {
+                                                        add_m |= 1u16;
+                                                    }
+                                                    if let Some(&a0) = args.first() {
+                                                        add_m |=
+                                                            val_mask.get(&a0).copied().unwrap_or(0);
+                                                    }
+                                                }
+                                            }
+                                            for i in 0..MAX_FORMALS {
+                                                if (sr & (1u16 << (1 + i))) == 0 {
+                                                    continue;
+                                                }
+                                                if *kind == CallKind::SuperForwardAllArgs {
+                                                    add_m |= 1u16 << (1 + i);
+                                                } else if let Some(&av) = args.get(i) {
+                                                    add_m |=
+                                                        val_mask.get(&av).copied().unwrap_or(0);
+                                                }
+                                            }
+                                        }
+                                    } else if self.config.native_identity {
+                                        add_m |= all_ops_m;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        if add_m != 0 {
+                            let entry = val_mask.entry(res).or_insert(0);
+                            if (*entry | add_m) != *entry {
+                                *entry |= add_m;
+                                local_changed = true;
+                            }
+                        }
                     }
                 }
             }
-        }
-        false
-    }
 
-    pub(super) fn callee_passes_this_to_opaque_use(&self, callee: FuncId) -> bool {
-        let Some(fd) = self.module.func(callee) else {
-            return false;
-        };
-        let this_v = match param_binding(self.module, callee) {
-            ParamBinding::OverApproxAll => return true,
-            ParamBinding::Precise {
-                this_slot: Some(slot),
-                ..
-            } => match fd.params.get(slot).copied() {
-                Some(v) => v,
-                None => return false,
-            },
-            ParamBinding::Precise {
-                this_slot: None, ..
-            } => return false,
-        };
-        for &b in &fd.blocks {
-            let Some(bb) = self.module.block(b) else {
-                continue;
-            };
-            for &iid in &bb.insts {
-                let Some(inst) = self.module.inst(iid) else {
+            let mask_of = |v: ValueId| -> u16 { val_mask.get(&v).copied().unwrap_or(0) };
+            let mut ret_m = func_ret_mask[fi];
+            let mut esc_m = func_esc_mask[fi];
+            for &b in &fd.blocks {
+                let Some(bb) = self.module.block(b) else {
                     continue;
                 };
-                match &inst.op {
-                    Op::Mov { src } if *src == this_v => return true,
-                    Op::Phi { entries } if entries.iter().any(|(_, v)| *v == this_v) => {
-                        return true;
-                    }
-                    Op::Throw { value }
-                    | Op::StoreGlobal { value, .. }
-                    | Op::StoreGlobalRecord { value, .. }
-                    | Op::TryStoreGlobal { value, .. }
-                    | Op::StoreModuleVar { value, .. }
-                    | Op::PutLexVar { value, .. }
-                    | Op::StoreProp { value, .. }
-                    | Op::StoreOwnPropName { value, .. }
-                    | Op::StorePropIdx { value, .. }
-                    | Op::StoreOwnPropIdx { value, .. }
-                    | Op::StorePropDyn { value, .. }
-                    | Op::StoreOwnPropDyn { value, .. }
-                    | Op::StorePrivate { value, .. }
-                    | Op::DefinePrivate { value, .. }
-                    | Op::StoreSuper { value, .. }
-                        if *value == this_v =>
-                    {
-                        return true;
-                    }
-                    Op::Call { .. }
-                        if inst.op.has_operand(this_v)
-                            && (!self.call_has_body_callee(iid)
+                for &iid in &bb.insts {
+                    let Some(inst) = self.module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        Op::Return { value: Some(rv) }
+                        | Op::AsyncResolve { value: rv, .. }
+                        | Op::AsyncGeneratorResolve { value: rv, .. } => {
+                            ret_m |= mask_of(*rv);
+                        }
+                        Op::Return { value: None }
+                        | Op::Mov { .. }
+                        | Op::Phi { .. }
+                        | Op::Await { .. }
+                        | Op::AwaitUncaught { .. }
+                        | Op::ResumeGenerator { .. }
+                        | Op::LoadConst(_)
+                        | Op::Branch { .. }
+                        | Op::CondBranch { .. }
+                        | Op::ThrowUndefinedIfHole { .. }
+                        | Op::ThrowUndefinedIfHoleWithName { .. }
+                        | Op::ThrowIfNotObject { .. }
+                        | Op::NewLexEnv { .. }
+                        | Op::NewLexEnvWithName { .. }
+                        | Op::PopLexEnv
+                        | Op::GetLexVar { .. }
+                        | Op::LoadModuleVar { .. }
+                        | Op::GetModuleNamespace { .. }
+                        | Op::TryGetGlobal { .. }
+                        | Op::LoadGlobalObject
+                        | Op::AsyncFunctionEnter
+                        | Op::Unreachable
+                        | Op::LoadProp { .. }
+                        | Op::LoadPropIdx { .. }
+                        | Op::LoadPrivate { .. }
+                        | Op::LoadSuper {
+                            key: SuperKey::Name(_),
+                            ..
+                        }
+                        | Op::GetIterator { .. }
+                        | Op::GetAsyncIterator { .. }
+                        | Op::GetPropIterator { .. } => {}
+                        Op::LoadPropDyn { key, .. }
+                        | Op::LoadSuper {
+                            key: SuperKey::Dynamic(key),
+                            ..
+                        } => {
+                            esc_m |= mask_of(*key);
+                        }
+                        Op::Call {
+                            callee,
+                            this,
+                            args,
+                            kind,
+                        } => {
+                            let opaque = !self.call_has_body_callee(iid)
                                 || self.call_resolution_incomplete(iid)
-                                || self.call_matches_sink_leaf(callee, iid, inst)
+                                || self.call_matches_sink_leaf(cur_fid, iid, inst)
+                                || self.gap_edges.contains_key(&iid)
+                                || self.source_cb_edges.contains_key(&iid)
                                 || matches!(
                                     self.compute_class(iid, true).0,
                                     SiteClass::Summary { .. }
-                                )) =>
-                    {
-                        return true;
+                                )
+                                || matches!(
+                                    kind,
+                                    CallKind::Apply | CallKind::SuperSpread | CallKind::NewSpread
+                                );
+                            if opaque {
+                                if let Some(bv) = call_base_value(self.module, inst) {
+                                    esc_m |= mask_of(bv);
+                                }
+                                inst.op.for_each_operand(|ov| esc_m |= mask_of(ov));
+                            } else {
+                                esc_m |= mask_of(*callee);
+                                let base_m = call_base_value(self.module, inst).map_or(0, mask_of);
+                                for &sub_fid in self.callgraph.callees_of_call_at(iid) {
+                                    let se = func_esc_mask
+                                        .get(sub_fid.index())
+                                        .copied()
+                                        .unwrap_or(u16::MAX);
+                                    if let Some(vops) = self.variadic_ops.get(&sub_fid) {
+                                        for (ai, &av) in args.iter().enumerate() {
+                                            if vops
+                                                .iter()
+                                                .any(|&(_, ms)| ms.is_none_or(|s| ai >= s as usize))
+                                            {
+                                                esc_m |= mask_of(av);
+                                            }
+                                        }
+                                    }
+                                    if *kind == CallKind::SuperForwardAllArgs {
+                                        if (se & 1) != 0 {
+                                            if this_slot.is_some() {
+                                                esc_m |= 1u16;
+                                            }
+                                            esc_m |= this.map_or(0, mask_of)
+                                                | args.first().copied().map_or(0, mask_of);
+                                        }
+                                        for i in 0..MAX_FORMALS {
+                                            if (se & (1u16 << (1 + i))) != 0 {
+                                                esc_m |= 1u16 << (1 + i);
+                                            }
+                                        }
+                                    } else {
+                                        if !matches!(kind, CallKind::New | CallKind::NewSpread)
+                                            && (se & 1) != 0
+                                        {
+                                            esc_m |= this.map_or(0, mask_of) | base_m;
+                                        }
+                                        for (i, &av) in args.iter().enumerate() {
+                                            let m = mask_of(av);
+                                            if m != 0
+                                                && (i >= MAX_FORMALS
+                                                    || (se & (1u16 << (1 + i))) != 0)
+                                            {
+                                                esc_m |= m;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            inst.op.for_each_operand(|ov| esc_m |= mask_of(ov));
+                        }
                     }
-                    _ => {}
+                }
+            }
+            if ret_m != func_ret_mask[fi] || esc_m != func_esc_mask[fi] {
+                func_ret_mask[fi] = ret_m;
+                func_esc_mask[fi] = esc_m;
+                for &call_iid in self.callgraph.callers_of(cur_fid) {
+                    if let Some(cinst) = self.module.inst(call_iid)
+                        && let Some(cf) = self.links.func_of_block(cinst.block)
+                        && Some(cf) != self.harness.fid
+                        && cf.index() < n_funcs
+                        && !in_queue[cf.index()]
+                    {
+                        in_queue[cf.index()] = true;
+                        queue.push_back(cf);
+                    }
                 }
             }
         }
-        false
+
+        let mut out = FuncBitSet::new(n_funcs);
+        for fi in 0..n_funcs {
+            if ((func_ret_mask[fi] | func_esc_mask[fi]) & 1) != 0 {
+                let _ = out.set(fi);
+            }
+        }
+        *self.this_ret_or_esc.borrow_mut() = Some(out);
     }
 
     pub(super) fn can_callee_touch_this_prop(&self, prop: Sym, callee: FuncId) -> bool {
-        self.can_callee_touch_prop(prop, callee)
-            || self.callee_may_return_this(callee)
-            || self.callee_passes_this_to_opaque_use(callee)
+        if self.in_path_replay || self.can_callee_touch_prop(prop, callee) {
+            return true;
+        }
+        self.ensure_this_ret_or_esc();
+        self.this_ret_or_esc
+            .borrow()
+            .as_ref()
+            .is_none_or(|bits| bits.get(callee.index()))
+    }
+
+    /// Whether a bodyless call site resolves statically to a registered
+    /// non-escaping void summary (`flows.is_empty() && callback.is_none()`) or a
+    /// known pure logging sink (`@ohos.hilog.*`, `console.*`).
+    pub(super) fn is_known_non_escaping_void_call(
+        &self,
+        caller_fid: FuncId,
+        call_iid: InstId,
+        inst: &abcd_ir::Inst,
+    ) -> bool {
+        let Op::Call { callee, args, .. } = &inst.op else {
+            return false;
+        };
+        let caller_cid = self
+            .links
+            .func_class(caller_fid)
+            .or_else(|| self.module.func(caller_fid).map(|f| f.class_id))
+            .unwrap_or(ClassId::new(0));
+        // Require the callee def-chain to consist solely of clean static globals,
+        // external module/namespace imports, `LoadProp`, `Mov`, and closed `Phi`s
+        // (so `Phi(console.log, dynamicFn)` can never masquerade as pure logging).
+        {
+            let mut stack = vec![*callee];
+            let mut visited = HashSet::new();
+            let mut any_leaf = false;
+            while let Some(raw_v) = stack.pop() {
+                let cur = crate::names::peel_movs_fast(self.module, raw_v);
+                if !visited.insert(cur) {
+                    continue;
+                }
+                if visited.len() > 16 {
+                    return false;
+                }
+                let Some(ValueDef::Inst(diid)) = self.module.value(cur).map(|v| v.def) else {
+                    return false;
+                };
+                match self.module.inst(diid).map(|i| &i.op) {
+                    Some(Op::LoadProp { object, .. }) => stack.push(*object),
+                    Some(Op::Phi { entries }) if !entries.is_empty() => {
+                        for (_, inc) in entries {
+                            stack.push(*inc);
+                        }
+                    }
+                    Some(Op::TryGetGlobal { name, .. }) => {
+                        if self.has_dyn_global_store || self.global_stores.contains_key(name) {
+                            return false;
+                        }
+                        any_leaf = true;
+                    }
+                    Some(Op::LoadModuleVar { index, kind }) if !kind.is_local() => {
+                        if !self
+                            .links
+                            .external_load(caller_cid, *index)
+                            .is_some_and(|t| t.slots.is_empty())
+                        {
+                            return false;
+                        }
+                        any_leaf = true;
+                    }
+                    Some(Op::GetModuleNamespace { index }) => {
+                        if self.links.namespace_target(caller_cid, *index).is_some() {
+                            return false;
+                        }
+                        any_leaf = true;
+                    }
+                    _ => return false,
+                }
+            }
+            if !any_leaf {
+                return false;
+            }
+        }
+
+        let is_logging_name = |cand: &str| -> bool {
+            let is_hilog_m = |m: &str| {
+                matches!(
+                    m,
+                    "debug" | "info" | "warn" | "error" | "fatal" | "isLoggable"
+                )
+            };
+            let is_console_m = |m: &str| {
+                matches!(
+                    m,
+                    "log"
+                        | "info"
+                        | "warn"
+                        | "error"
+                        | "debug"
+                        | "trace"
+                        | "dir"
+                        | "assert"
+                        | "time"
+                        | "timeEnd"
+                        | "timeLog"
+                        | "count"
+                        | "countReset"
+                        | "group"
+                        | "groupCollapsed"
+                        | "groupEnd"
+                )
+            };
+            cand.strip_prefix("@ohos.hilog.").is_some_and(is_hilog_m)
+                || cand
+                    .strip_prefix("@kit.PerformanceAnalysisKit.hilog.")
+                    .is_some_and(is_hilog_m)
+                || cand
+                    .strip_prefix("@kit.PerformanceAnalysisKit.")
+                    .is_some_and(is_hilog_m)
+                || cand.strip_prefix("console.").is_some_and(is_console_m)
+        };
+        let is_void_summary = |cand: &str| -> bool {
+            self.registry
+                .peek(cand, args.len())
+                .is_some_and(|s| s.flows.is_empty() && s.callback.is_none())
+        };
+
+        if let SiteClass::Summary { name, .. } = self.compute_class(call_iid, true).0
+            && is_void_summary(&name)
+        {
+            return true;
+        }
+        let cands = callee_name_candidates_indexed(
+            self.module,
+            &self.links,
+            Some(&self.prop_stores),
+            caller_fid,
+            *callee,
+        );
+        !cands.is_empty()
+            && cands
+                .iter()
+                .all(|c| is_logging_name(c.as_str()) || is_void_summary(c.as_str()))
     }
 
     pub(super) fn ensure_prop_touch_index(&self) {
@@ -753,7 +1143,7 @@ impl<'m> TaintProblem<'m> {
                 .module
                 .sym
                 .resolve(prop)
-                .is_none_or(|s| s.is_empty() || s.as_bytes()[0].is_ascii_digit());
+                .is_none_or(is_any_index_compatible_prop_str);
         {
             let idx_borrow = self.prop_touch_index.borrow();
             if let Some(idx) = idx_borrow.as_ref() {
@@ -962,30 +1352,6 @@ impl<'m> TaintProblem<'m> {
                     }
                 }
             };
-        let is_external_native_import_callee = |callee_val: ValueId, caller_cid: ClassId| -> bool {
-            let mut cur = crate::names::peel_movs_fast(self.module, callee_val);
-            for _ in 0..4 {
-                let Some(ValueDef::Inst(diid)) = self.module.value(cur).map(|v| v.def) else {
-                    return false;
-                };
-                match self.module.inst(diid).map(|i| &i.op) {
-                    Some(Op::LoadProp { object, .. }) => {
-                        cur = crate::names::peel_movs_fast(self.module, *object);
-                    }
-                    Some(Op::LoadModuleVar { index, kind }) if !kind.is_local() => {
-                        return self
-                            .links
-                            .external_load(caller_cid, *index)
-                            .is_some_and(|t| t.slots.is_empty());
-                    }
-                    Some(Op::GetModuleNamespace { index }) => {
-                        return self.links.namespace_target(caller_cid, *index).is_none();
-                    }
-                    _ => return false,
-                }
-            }
-            false
-        };
         let record_container_write =
             |dst: ValueId,
              val: ValueId,
@@ -1168,10 +1534,11 @@ impl<'m> TaintProblem<'m> {
 
                     match &inst.op {
                         Op::LoadProp { object, name } => {
-                            let is_num =
-                                self.module.sym.resolve(*name).is_none_or(|s| {
-                                    s.is_empty() || s.as_bytes()[0].is_ascii_digit()
-                                });
+                            let is_num = self
+                                .module
+                                .sym
+                                .resolve(*name)
+                                .is_none_or(is_any_index_compatible_prop_str);
                             let mut u = false;
                             record_deref(*object, &mut by_site, &mut u);
                             if u {
@@ -1201,11 +1568,11 @@ impl<'m> TaintProblem<'m> {
                         Op::LoadPropDyn { object, key } => {
                             let fk = classify_dyn_prop_key(self.module, *key);
                             let is_idx = match fk {
-                                FieldKey::Named(name) => {
-                                    self.module.sym.resolve(name).is_none_or(|s| {
-                                        s.is_empty() || s.as_bytes()[0].is_ascii_digit()
-                                    })
-                                }
+                                FieldKey::Named(name) => self
+                                    .module
+                                    .sym
+                                    .resolve(name)
+                                    .is_none_or(is_any_index_compatible_prop_str),
                                 FieldKey::AnyIndex | FieldKey::AnyDynamic => true,
                             };
                             let mut u = false;
@@ -1367,15 +1734,10 @@ impl<'m> TaintProblem<'m> {
                                 }
                             }
                             let ext_void = is_rung2_oracle
-                                && self.links.has_multi_record_esm()
                                 && !self.call_has_body_callee(iid)
-                                && (self
-                                    .callgraph
-                                    .edge_at(iid)
-                                    .is_some_and(|e| e.resolution_complete)
-                                    || is_external_native_import_callee(*callee, f.class_id))
                                 && !self.gap_edges.contains_key(&iid)
                                 && !self.source_cb_edges.contains_key(&iid)
+                                && self.is_known_non_escaping_void_call(fid, iid, inst)
                                 && inst.result.is_none_or(|rv| {
                                     !val_used_meaningfully
                                         .get(rv.index())

@@ -207,15 +207,23 @@ fn partition_and_wire(
 
     for try_block in try_blocks {
         let try_start = try_block.start as usize;
-        let try_end = (try_block.start + try_block.len) as usize;
+        let try_end = try_start.saturating_add(try_block.len as usize);
         let catch_targets: Vec<usize> = try_block
             .catches
             .iter()
             .filter_map(|c| leader_to_block.get(&(c.handler as usize)).copied())
             .collect();
+        if catch_targets.is_empty() {
+            continue;
+        }
 
-        for block in &mut blocks {
-            if block.start < try_end && block.end > try_start {
+        // `blocks` partitions `[0, bytecodes.len())` in strictly ascending
+        // `(start, end)` order, so `[first_bi..end_bi)` is the exact contiguous
+        // slice satisfying `block.start < try_end && block.end > try_start` (`#103`).
+        let first_bi = blocks.partition_point(|b| b.end <= try_start);
+        let end_bi = blocks.partition_point(|b| b.start < try_end);
+        if first_bi < end_bi {
+            for block in &mut blocks[first_bi..end_bi] {
                 for &ct in &catch_targets {
                     if !block.catch_succs.contains(&ct) {
                         block.catch_succs.push(ct);

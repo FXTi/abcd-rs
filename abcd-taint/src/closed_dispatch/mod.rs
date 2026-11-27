@@ -8,12 +8,12 @@
 mod eval;
 mod harvest;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
-use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::{CallKind, ClassId, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
 use crate::gap;
 use crate::oracle::Oracle;
@@ -59,7 +59,6 @@ impl ClosedDispatchIndex {
         harness_fid: Option<FuncId>,
         has_dyn_global_store: bool,
     ) -> Self {
-        let is_rung2_uncapped = matches!(oracle, Oracle::Rung2(..));
         let n_funcs = module.functions.len();
         let n_insts = module.insts.len();
         let ClosedHarvest {
@@ -105,14 +104,17 @@ impl ClosedDispatchIndex {
         );
         let n_classes = classes.len();
 
-        // 4 bounded monotone rounds of closed provenance + call-site sealing.
-        let mut lex_slot_prov: HashMap<(u16, u16), BTreeSet<ClosedProvItem>> = HashMap::new();
-        let mut mod_slot_prov: HashMap<ModuleSlotRef, BTreeSet<ClosedProvItem>> = HashMap::new();
-        let mut static_field_prov: HashMap<(u32, Sym), BTreeSet<ClosedProvItem>> = HashMap::new();
-        let mut inst_field_prov: HashMap<(u32, Sym), BTreeSet<ClosedProvItem>> = HashMap::new();
-        let mut obj_lit_prop_prov: HashMap<(InstId, Sym), BTreeSet<ClosedProvItem>> =
-            HashMap::new();
-        let mut param_prov: HashMap<ValueId, BTreeSet<ClosedProvItem>> = HashMap::new();
+        // Bounded rounds of closed provenance + post-convergence call-site certifying.
+        let base_class_obj_sealed: Vec<bool> = classes.iter().map(|c| c.class_obj_sealed).collect();
+        let base_class_inst_sealed: Vec<bool> =
+            classes.iter().map(|c| c.class_inst_sealed).collect();
+        let mut lex_slot_prov: BTreeMap<(u16, u16), BTreeSet<ClosedProvItem>> = BTreeMap::new();
+        let mut mod_slot_prov: BTreeMap<ModuleSlotRef, BTreeSet<ClosedProvItem>> = BTreeMap::new();
+        let mut static_field_prov: BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>> = BTreeMap::new();
+        let mut inst_field_prov: BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>> = BTreeMap::new();
+        let mut obj_lit_prop_prov: BTreeMap<(InstId, Sym), BTreeSet<ClosedProvItem>> =
+            BTreeMap::new();
+        let mut param_prov: BTreeMap<ValueId, BTreeSet<ClosedProvItem>> = BTreeMap::new();
         let mut func_ret_prov: Vec<Option<BTreeSet<ClosedProvItem>>> = vec![None; n_funcs];
         let mut func_ret_nullish_only = vec![false; n_funcs];
         for (fi, fd) in module.functions.iter().enumerate() {
@@ -128,7 +130,7 @@ impl ClosedDispatchIndex {
                 func_ret_nullish_only[fi] = true;
             }
         }
-        let mut call_closed_callees: HashMap<InstId, Vec<FuncId>> = HashMap::new();
+        let mut base_closed_callees: BTreeMap<InstId, Vec<FuncId>> = BTreeMap::new();
         let mut open_callable_written: HashSet<Sym> = open_callable_written_base.clone();
         for &(_sfid, sobj, sname, sval) in &all_named_stores {
             if !is_fresh_plain_alloc_val(module, sobj)
@@ -149,13 +151,16 @@ impl ClosedDispatchIndex {
                             .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
                     })
                 {
-                    call_closed_callees.insert(call_iid, callees.to_vec());
+                    base_closed_callees.insert(call_iid, callees.to_vec());
                 }
             }
         }
+        let mut call_closed_callees = base_closed_callees.clone();
 
         for _round in 0..5 {
             // 1. Sealed object literal properties.
+            let mut next_obj_lit_prop_prov: BTreeMap<(InstId, Sym), BTreeSet<ClosedProvItem>> =
+                BTreeMap::new();
             for (&lit_iid, lit) in &obj_lits {
                 if !lit.sealed {
                     continue;
@@ -229,12 +234,15 @@ impl ClosedDispatchIndex {
                         && let Some(s) = acc
                         && !s.is_empty()
                     {
-                        obj_lit_prop_prov.insert((lit_iid, prop), s);
+                        next_obj_lit_prop_prov.insert((lit_iid, prop), s);
                     }
                 }
             }
+            obj_lit_prop_prov = next_obj_lit_prop_prov;
 
             // 2. Closed lexical slots.
+            let mut next_lex_slot_prov: BTreeMap<(u16, u16), BTreeSet<ClosedProvItem>> =
+                BTreeMap::new();
             for (&key, stores) in &lex_stores {
                 let any_unmapped_cls = stores.iter().any(|&(sfid, _)| {
                     links
@@ -296,11 +304,14 @@ impl ClosedDispatchIndex {
                     && let Some(s) = acc
                     && !s.is_empty()
                 {
-                    lex_slot_prov.insert(key, s);
+                    next_lex_slot_prov.insert(key, s);
                 }
             }
+            lex_slot_prov = next_lex_slot_prov;
 
             // 3. Closed ES module slots.
+            let mut next_mod_slot_prov: BTreeMap<ModuleSlotRef, BTreeSet<ClosedProvItem>> =
+                BTreeMap::new();
             if links.has_multi_record_esm() {
                 for &sr in &mod_slot_keys {
                     let stores = links.stored_values(sr);
@@ -359,14 +370,17 @@ impl ClosedDispatchIndex {
                         && let Some(s) = acc
                         && !s.is_empty()
                     {
-                        mod_slot_prov.insert(sr, s);
+                        next_mod_slot_prov.insert(sr, s);
                     }
                 }
             }
+            mod_slot_prov = next_mod_slot_prov;
 
             // 4. Class heritage, subclass graph, ctor_chain_well_behaved, and sealing.
-            for cls in &mut classes {
+            for (cidx_u, cls) in classes.iter_mut().enumerate() {
                 cls.sub_classes.clear();
+                cls.class_obj_sealed = base_class_obj_sealed[cidx_u];
+                cls.class_inst_sealed = base_class_inst_sealed[cidx_u];
             }
             for cidx_u in 0..n_classes {
                 let cidx = cidx_u as u32;
@@ -613,6 +627,8 @@ impl ClosedDispatchIndex {
                         cand_calls[fi] = Some(calls);
                     }
                 }
+                let mut next_param_prov: BTreeMap<ValueId, BTreeSet<ClosedProvItem>> =
+                    BTreeMap::new();
                 for (fi, fd) in module.functions.iter().enumerate() {
                     let Some(base_calls) = cand_calls[fi].as_ref() else {
                         continue;
@@ -730,18 +746,19 @@ impl ClosedDispatchIndex {
                             && let Some(s) = acc
                             && !s.is_empty()
                         {
-                            param_prov.insert(p_val, s);
+                            next_param_prov.insert(p_val, s);
                         }
                     }
                 }
+                param_prov = next_param_prov;
             }
 
             // 5. Static & instance fields (plus callable overwrites) on sealed classes.
             {
-                let mut static_acc: HashMap<(u32, Sym), Option<BTreeSet<ClosedProvItem>>> =
-                    HashMap::new();
-                let mut inst_acc: HashMap<(u32, Sym), Option<BTreeSet<ClosedProvItem>>> =
-                    HashMap::new();
+                let mut static_acc: BTreeMap<(u32, Sym), Option<BTreeSet<ClosedProvItem>>> =
+                    BTreeMap::new();
+                let mut inst_acc: BTreeMap<(u32, Sym), Option<BTreeSet<ClosedProvItem>>> =
+                    BTreeMap::new();
                 let mut open_written_props: HashSet<Sym> = HashSet::new();
                 let mut next_open_callable = open_callable_written_base.clone();
                 let mut next_inst_callable: Vec<HashSet<Sym>> = vec![HashSet::new(); n_classes];
@@ -908,6 +925,8 @@ impl ClosedDispatchIndex {
                 }
                 open_callable_written = next_open_callable;
                 inst_callable_written = next_inst_callable;
+                let mut next_static_field_prov = BTreeMap::new();
+                let mut next_inst_field_prov = BTreeMap::new();
                 if n_classes > 0 {
                     for ((cidx, sname), opt_set) in static_acc {
                         let cls = &classes[cidx as usize];
@@ -918,7 +937,7 @@ impl ClosedDispatchIndex {
                             && let Some(s) = opt_set
                             && !s.is_empty()
                         {
-                            static_field_prov.insert((cidx, sname), s);
+                            next_static_field_prov.insert((cidx, sname), s);
                         }
                     }
                     for ((cidx, sname), opt_set) in inst_acc {
@@ -935,13 +954,16 @@ impl ClosedDispatchIndex {
                             && let Some(s) = opt_set
                             && !s.is_empty()
                         {
-                            inst_field_prov.insert((cidx, sname), s);
+                            next_inst_field_prov.insert((cidx, sname), s);
                         }
                     }
                 }
+                static_field_prov = next_static_field_prov;
+                inst_field_prov = next_inst_field_prov;
             }
 
             // 6. Synchronous function return provenance.
+            let mut next_func_ret_prov: Vec<Option<BTreeSet<ClosedProvItem>>> = vec![None; n_funcs];
             for (fi, rvs) in func_sync_returns.iter().enumerate() {
                 if func_is_async_or_gen[fi] || rvs.is_empty() {
                     continue;
@@ -994,170 +1016,110 @@ impl ClosedDispatchIndex {
                     && let Some(s) = acc
                     && !s.is_empty()
                 {
-                    func_ret_prov[fi] = Some(s);
+                    next_func_ret_prov[fi] = Some(s);
                 }
             }
+            func_ret_prov = next_func_ret_prov;
 
-            // 7. Closed call sites.
+            // 7. Closed call sites (recomputed fresh each round).
+            let mut next_closed_callees = base_closed_callees.clone();
             for (call_iid, edge) in callgraph.sites() {
-                if edge.resolution_complete || call_closed_callees.contains_key(&call_iid) {
+                if edge.resolution_complete {
                     continue;
                 }
                 let callees = callgraph.callees_of_call_at(call_iid);
-                if callees.is_empty()
-                    || callees.iter().any(|&f| {
-                        module
-                            .func(f)
-                            .is_none_or(|fd| fd.is_external || fd.blocks.is_empty())
-                    })
-                {
+                if is_call_site_certified_closed(
+                    module,
+                    links,
+                    static_lex_env,
+                    callgraph,
+                    oracle,
+                    harness_fid,
+                    &func_entry_inst,
+                    &unmapped_lex_put_classes,
+                    &classes,
+                    &class_by_inst,
+                    &method_owner,
+                    &ctor_owner,
+                    &this_param_of,
+                    &static_written,
+                    &open_callable_written,
+                    &inst_callable_written,
+                    &obj_lits,
+                    &lex_slot_prov,
+                    &mod_slot_prov,
+                    &static_field_prov,
+                    &inst_field_prov,
+                    &obj_lit_prop_prov,
+                    &param_prov,
+                    &func_ret_prov,
+                    &func_ret_nullish_only,
+                    &call_closed_callees,
+                    &observed_decorator_calls,
+                    call_iid,
+                    edge.caller,
+                    callees,
+                ) {
+                    next_closed_callees.insert(call_iid, callees.to_vec());
+                }
+            }
+            call_closed_callees = next_closed_callees;
+        }
+
+        // Post-convergence deflationary certification: ensure no early-round
+        // provisional call site survives if a later round widened provenance or
+        // unsealed a class/superclass/call chain.
+        loop {
+            let mut to_remove: Vec<InstId> = Vec::new();
+            for &call_iid in call_closed_callees.keys() {
+                if base_closed_callees.contains_key(&call_iid) {
                     continue;
                 }
-                let Some(inst) = module.inst(call_iid) else {
+                let Some(edge) = callgraph.edge_at(call_iid) else {
+                    to_remove.push(call_iid);
                     continue;
                 };
-                let Op::Call {
-                    callee, this, kind, ..
-                } = &inst.op
-                else {
-                    continue;
-                };
-                let caller = edge.caller;
-                let is_closed = match kind {
-                    CallKind::New => eval_closed_prov_iter(
-                        module,
-                        links,
-                        static_lex_env,
-                        callgraph,
-                        oracle,
-                        harness_fid,
-                        &func_entry_inst,
-                        &unmapped_lex_put_classes,
-                        &classes,
-                        &class_by_inst,
-                        &method_owner,
-                        &ctor_owner,
-                        &this_param_of,
-                        &static_written,
-                        &open_callable_written,
-                        &inst_callable_written,
-                        &obj_lits,
-                        &lex_slot_prov,
-                        &mod_slot_prov,
-                        &static_field_prov,
-                        &inst_field_prov,
-                        &obj_lit_prop_prov,
-                        &param_prov,
-                        &func_ret_prov,
-                        &func_ret_nullish_only,
-                        &call_closed_callees,
-                        &observed_decorator_calls,
-                        None,
-                        caller,
-                        *callee,
-                    )
-                    .is_some_and(|prov| {
-                        !prov.is_empty()
-                            && prov.iter().all(|item| match item {
-                                ClosedProvItem::ClassObj(cidx) => {
-                                    classes.get(*cidx as usize).is_some_and(|cls| {
-                                        cls.ctor_chain_well_behaved && callees.contains(&cls.ctor)
-                                    })
-                                }
-                                _ => false,
-                            })
-                    }),
-                    CallKind::Super | CallKind::SuperForwardAllArgs => {
-                        let owner_cidx = method_owner
-                            .get(caller.index())
-                            .copied()
-                            .flatten()
-                            .map(|(c, _)| c)
-                            .or_else(|| ctor_owner.get(caller.index()).copied().flatten());
-                        owner_cidx.is_some_and(|oc| {
-                            classes
-                                .get(oc as usize)
-                                .and_then(|cls| match cls.super_ref {
-                                    ClosedSuperRef::Internal(sup) => Some(sup),
-                                    _ => None,
-                                })
-                                .and_then(|sup| classes.get(sup as usize))
-                                .is_some_and(|scls| {
-                                    scls.ctor_chain_well_behaved && callees.contains(&scls.ctor)
-                                })
-                        })
-                    }
-                    CallKind::Direct
-                    | CallKind::Dynamic
-                    | CallKind::SuperArrow
-                    | CallKind::ClassInit => {
-                        let pcal = crate::names::peel_movs_fast(module, *callee);
-                        let recv_matches = match module.value(pcal).map(|v| v.def) {
-                            Some(ValueDef::Inst(ciid)) => match module.inst(ciid).map(|i| &i.op) {
-                                Some(Op::LoadProp { object, .. }) => this.is_none_or(|t| {
-                                    crate::names::peel_movs_fast(module, t)
-                                        == crate::names::peel_movs_fast(module, *object)
-                                }),
-                                Some(Op::LoadSuper { this_value, .. }) => this.is_none_or(|t| {
-                                    crate::names::peel_movs_fast(module, t)
-                                        == crate::names::peel_movs_fast(module, *this_value)
-                                }),
-                                _ => true,
-                            },
-                            _ => true,
-                        };
-                        recv_matches
-                            && eval_closed_prov_iter(
-                                module,
-                                links,
-                                static_lex_env,
-                                callgraph,
-                                oracle,
-                                harness_fid,
-                                &func_entry_inst,
-                                &unmapped_lex_put_classes,
-                                &classes,
-                                &class_by_inst,
-                                &method_owner,
-                                &ctor_owner,
-                                &this_param_of,
-                                &static_written,
-                                &open_callable_written,
-                                &inst_callable_written,
-                                &obj_lits,
-                                &lex_slot_prov,
-                                &mod_slot_prov,
-                                &static_field_prov,
-                                &inst_field_prov,
-                                &obj_lit_prop_prov,
-                                &param_prov,
-                                &func_ret_prov,
-                                &func_ret_nullish_only,
-                                &call_closed_callees,
-                                &observed_decorator_calls,
-                                None,
-                                caller,
-                                *callee,
-                            )
-                            .is_some_and(|prov| {
-                                !prov.is_empty()
-                                    && prov.iter().all(|item| match item {
-                                        ClosedProvItem::Callable(mfid) => {
-                                            is_rung2_uncapped || callees.contains(mfid)
-                                        }
-                                        _ => false,
-                                    })
-                                    && (!is_rung2_uncapped
-                                        || callees.iter().all(|cf| {
-                                            prov.contains(&ClosedProvItem::Callable(*cf))
-                                        }))
-                            })
-                    }
-                    CallKind::Apply | CallKind::NewSpread | CallKind::SuperSpread => false,
-                };
-                if is_closed {
-                    call_closed_callees.insert(call_iid, callees.to_vec());
+                let callees = callgraph.callees_of_call_at(call_iid);
+                if !is_call_site_certified_closed(
+                    module,
+                    links,
+                    static_lex_env,
+                    callgraph,
+                    oracle,
+                    harness_fid,
+                    &func_entry_inst,
+                    &unmapped_lex_put_classes,
+                    &classes,
+                    &class_by_inst,
+                    &method_owner,
+                    &ctor_owner,
+                    &this_param_of,
+                    &static_written,
+                    &open_callable_written,
+                    &inst_callable_written,
+                    &obj_lits,
+                    &lex_slot_prov,
+                    &mod_slot_prov,
+                    &static_field_prov,
+                    &inst_field_prov,
+                    &obj_lit_prop_prov,
+                    &param_prov,
+                    &func_ret_prov,
+                    &func_ret_nullish_only,
+                    &call_closed_callees,
+                    &observed_decorator_calls,
+                    call_iid,
+                    edge.caller,
+                    callees,
+                ) {
+                    to_remove.push(call_iid);
                 }
+            }
+            if to_remove.is_empty() {
+                break;
+            }
+            for cid in to_remove {
+                call_closed_callees.remove(&cid);
             }
         }
 
@@ -1176,5 +1138,184 @@ impl ClosedDispatchIndex {
             unused_await_resumes,
             synth_rethrow_insts,
         }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat pre-indexed module tables passed into non-recursive call-site certifier"
+)]
+fn is_call_site_certified_closed(
+    module: &Module,
+    links: &ModuleLinkTable,
+    static_lex_env: &StaticLexEnvTable,
+    callgraph: &CallGraph,
+    oracle: &Oracle<'_>,
+    harness_fid: Option<FuncId>,
+    func_entry_inst: &[Option<InstId>],
+    unmapped_lex_put_classes: &HashSet<ClassId>,
+    classes: &[eval::ClosedClassInfo],
+    class_by_inst: &[Option<u32>],
+    method_owner: &[Option<(u32, bool)>],
+    ctor_owner: &[Option<u32>],
+    this_param_of: &[Option<ValueId>],
+    static_written: &[HashSet<Sym>],
+    open_callable_written: &HashSet<Sym>,
+    inst_callable_written: &[HashSet<Sym>],
+    obj_lits: &BTreeMap<InstId, eval::ClosedObjLitInfo>,
+    lex_slot_prov: &BTreeMap<(u16, u16), BTreeSet<ClosedProvItem>>,
+    mod_slot_prov: &BTreeMap<ModuleSlotRef, BTreeSet<ClosedProvItem>>,
+    static_field_prov: &BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
+    inst_field_prov: &BTreeMap<(u32, Sym), BTreeSet<ClosedProvItem>>,
+    obj_lit_prop_prov: &BTreeMap<(InstId, Sym), BTreeSet<ClosedProvItem>>,
+    param_prov: &BTreeMap<ValueId, BTreeSet<ClosedProvItem>>,
+    func_ret_prov: &[Option<BTreeSet<ClosedProvItem>>],
+    func_ret_nullish_only: &[bool],
+    call_closed_callees: &BTreeMap<InstId, Vec<FuncId>>,
+    observed_decorator_calls: &HashSet<InstId>,
+    call_iid: InstId,
+    caller: FuncId,
+    callees: &[FuncId],
+) -> bool {
+    if callees.is_empty()
+        || callees.iter().any(|&f| {
+            module
+                .func(f)
+                .is_none_or(|fd| fd.is_external || fd.blocks.is_empty())
+        })
+    {
+        return false;
+    }
+    let Some(inst) = module.inst(call_iid) else {
+        return false;
+    };
+    let Op::Call {
+        callee, this, kind, ..
+    } = &inst.op
+    else {
+        return false;
+    };
+    match kind {
+        CallKind::New => eval_closed_prov_iter(
+            module,
+            links,
+            static_lex_env,
+            callgraph,
+            oracle,
+            harness_fid,
+            func_entry_inst,
+            unmapped_lex_put_classes,
+            classes,
+            class_by_inst,
+            method_owner,
+            ctor_owner,
+            this_param_of,
+            static_written,
+            open_callable_written,
+            inst_callable_written,
+            obj_lits,
+            lex_slot_prov,
+            mod_slot_prov,
+            static_field_prov,
+            inst_field_prov,
+            obj_lit_prop_prov,
+            param_prov,
+            func_ret_prov,
+            func_ret_nullish_only,
+            call_closed_callees,
+            observed_decorator_calls,
+            None,
+            caller,
+            *callee,
+        )
+        .is_some_and(|prov| {
+            !prov.is_empty()
+                && prov.iter().all(|item| match item {
+                    ClosedProvItem::ClassObj(cidx) => {
+                        classes.get(*cidx as usize).is_some_and(|cls| {
+                            cls.ctor_chain_well_behaved && callees.contains(&cls.ctor)
+                        })
+                    }
+                    _ => false,
+                })
+        }),
+        CallKind::Super | CallKind::SuperForwardAllArgs => {
+            let owner_cidx = method_owner
+                .get(caller.index())
+                .copied()
+                .flatten()
+                .map(|(c, _)| c)
+                .or_else(|| ctor_owner.get(caller.index()).copied().flatten());
+            owner_cidx.is_some_and(|oc| {
+                classes
+                    .get(oc as usize)
+                    .and_then(|cls| match cls.super_ref {
+                        ClosedSuperRef::Internal(sup) => Some(sup),
+                        _ => None,
+                    })
+                    .and_then(|sup| classes.get(sup as usize))
+                    .is_some_and(|scls| {
+                        scls.ctor_chain_well_behaved && callees.contains(&scls.ctor)
+                    })
+            })
+        }
+        CallKind::Direct | CallKind::Dynamic | CallKind::SuperArrow | CallKind::ClassInit => {
+            let pcal = crate::names::peel_movs_fast(module, *callee);
+            let recv_matches = match module.value(pcal).map(|v| v.def) {
+                Some(ValueDef::Inst(ciid)) => match module.inst(ciid).map(|i| &i.op) {
+                    Some(Op::LoadProp { object, .. }) => this.is_none_or(|t| {
+                        crate::names::peel_movs_fast(module, t)
+                            == crate::names::peel_movs_fast(module, *object)
+                    }),
+                    Some(Op::LoadSuper { this_value, .. }) => this.is_none_or(|t| {
+                        crate::names::peel_movs_fast(module, t)
+                            == crate::names::peel_movs_fast(module, *this_value)
+                    }),
+                    _ => true,
+                },
+                _ => true,
+            };
+            recv_matches
+                && eval_closed_prov_iter(
+                    module,
+                    links,
+                    static_lex_env,
+                    callgraph,
+                    oracle,
+                    harness_fid,
+                    func_entry_inst,
+                    unmapped_lex_put_classes,
+                    classes,
+                    class_by_inst,
+                    method_owner,
+                    ctor_owner,
+                    this_param_of,
+                    static_written,
+                    open_callable_written,
+                    inst_callable_written,
+                    obj_lits,
+                    lex_slot_prov,
+                    mod_slot_prov,
+                    static_field_prov,
+                    inst_field_prov,
+                    obj_lit_prop_prov,
+                    param_prov,
+                    func_ret_prov,
+                    func_ret_nullish_only,
+                    call_closed_callees,
+                    observed_decorator_calls,
+                    None,
+                    caller,
+                    *callee,
+                )
+                .is_some_and(|prov| {
+                    !prov.is_empty()
+                        && prov.iter().all(|item| match item {
+                            ClosedProvItem::Callable(mfid) => callees.contains(mfid),
+                            _ => false,
+                        })
+                })
+        }
+        CallKind::Apply | CallKind::NewSpread | CallKind::SuperSpread => false,
     }
 }

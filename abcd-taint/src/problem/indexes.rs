@@ -445,6 +445,15 @@ pub(super) fn build_exception_indexes(
     (func_handler_exc, protected_handler_edges)
 }
 
+#[inline]
+pub(crate) fn is_any_index_compatible_prop_str(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.is_empty()
+        || bytes[0].is_ascii_digit()
+        || (bytes.len() >= 2 && bytes[0] == b'-' && bytes[1].is_ascii_digit())
+        || matches!(s, "NaN" | "Infinity" | "-Infinity")
+}
+
 pub(crate) fn classify_dyn_prop_key(module: &Module, key: ValueId) -> FieldKey {
     if let Some(sym) = const_string_sym(module, key) {
         return FieldKey::Named(sym);

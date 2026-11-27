@@ -28,6 +28,30 @@ use summary::CompactU32Set;
 
 pub(super) const ABSENT: u32 = u32::MAX;
 
+const MAX_ANNOTATION_BUDGET: usize = 16_000_000;
+
+#[inline]
+fn initial_annotation_budget(file_size: u32) -> usize {
+    (file_size as usize)
+        .max(4_096)
+        .saturating_mul(4)
+        .min(MAX_ANNOTATION_BUDGET)
+}
+
+#[inline]
+pub(super) fn probe_literal_array_valid(
+    reader: &AbcReader<'_>,
+    off: u32,
+    cache: &mut HashMap<u32, bool>,
+) -> bool {
+    if let Some(&valid) = cache.get(&off) {
+        return valid;
+    }
+    let valid = walk_raw_literal_array(reader, off, |_| Ok(())).is_ok();
+    cache.insert(off, valid);
+    valid
+}
+
 // ---------------------------------------------------------------------------
 // Public DecodeMode, DecodeOptions, & DecodeDiagnostics (`#49`)
 // ---------------------------------------------------------------------------
@@ -334,7 +358,7 @@ fn decode_core(
         };
 
         let Some((desc_sid, descriptor_str)) =
-            read_class_descriptor_cached(&reader, class_off, &mut str_cache, &mut strings)
+            read_class_descriptor_cached(&reader, class_off, &mut str_cache, &mut strings)?
         else {
             continue;
         };
@@ -392,6 +416,9 @@ fn decode_core(
     let mut scope_names_offsets: HashSet<u32> = HashSet::new();
     let mut phase_blob_offsets: HashSet<u32> = HashSet::new();
     let mut ann_visiting: HashSet<u32> = HashSet::new();
+    let mut ann_budget = initial_annotation_budget(size);
+    let mut lnp_budget = crate::debug::initial_lnp_budget(size);
+    let mut lit_probe_cache: HashMap<u32, bool> = HashMap::new();
 
     for staged in staged_classes {
         if classes.contains_key(&staged.descriptor) {
@@ -487,6 +514,8 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
+                &mut lnp_budget,
             ) {
                 Ok((m, m_ops)) => {
                     methods.push(m);
@@ -517,6 +546,8 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
+                &mut lit_probe_cache,
                 &staged.descriptor_str,
                 &mut module_data_offsets,
                 &mut scope_names_offsets,
@@ -547,6 +578,7 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
             )?,
             runtime: decode_annotation_list(
                 &reader,
@@ -557,6 +589,7 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
             )?,
             compile_time_type: decode_annotation_list(
                 &reader,
@@ -567,6 +600,7 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
             )?,
             runtime_type: decode_annotation_list(
                 &reader,
@@ -577,6 +611,7 @@ fn decode_core(
                 &mut strings,
                 &mut str_cache,
                 &mut ann_visiting,
+                &mut ann_budget,
             )?,
         };
 
@@ -655,6 +690,8 @@ fn decode_core(
                 continue;
             };
             let mut body_corrupt = false;
+            let mut entity_pairs: Vec<((abcd_isa::EntityKind, u32), EntityRef)> =
+                Vec::with_capacity(ops.entity_ops.len());
             for op in ops.entity_ops {
                 use abcd_isa::EntityKind;
                 let invalid = || Error::Malformed {
@@ -759,10 +796,10 @@ fn decode_core(
                                 }
                             },
                         };
-                        body.entities.insert(
+                        entity_pairs.push((
                             (op.kind, op.raw_id),
                             EntityRef::string_with_offset(sid, offset),
-                        );
+                        ));
                     }
                     EntityKind::MethodId => {
                         let eref = if let Some(&midx) = method_offset_to_idx.get(&offset) {
@@ -804,9 +841,13 @@ fn decode_core(
                                 source_offset: offset,
                             }
                         };
-                        body.entities.insert((op.kind, op.raw_id), eref);
+                        entity_pairs.push(((op.kind, op.raw_id), eref));
                     }
                 }
+            }
+
+            if !body_corrupt {
+                body.entities = MethodEntities::from_iter(entity_pairs);
             }
 
             if !body_corrupt && legacy {
@@ -871,6 +912,7 @@ fn decode_core(
         size,
         &module_data_offsets,
         &phase_blob_offsets,
+        &mut lit_probe_cache,
         &mut referenced_literal_offsets,
     );
     let (literal_arrays, literal_array_offsets, literal_array_header_offsets) =
@@ -885,6 +927,7 @@ fn decode_core(
             &module_data_offsets,
             &phase_blob_offsets,
             &method_offset_to_idx,
+            &mut lit_probe_cache,
         )?;
 
     // Finalize bytecode literal-array operands, field `LiteralArrayRef`s, and
@@ -894,16 +937,39 @@ fn decode_core(
             .values_mut()
             .flat_map(|c| c.methods.iter_mut())
             .collect();
-        for (fidx, raw_id, off) in pending_code_lit_refs {
-            let table_idx = literal_array_offsets.get(&off).copied().unwrap_or(ABSENT);
+        let mut cursor = 0usize;
+        while cursor < pending_code_lit_refs.len() {
+            let fidx = pending_code_lit_refs[cursor].0;
+            let group_end = pending_code_lit_refs[cursor..]
+                .iter()
+                .position(|&(f, _, _)| f != fidx)
+                .map_or(pending_code_lit_refs.len(), |d| cursor + d);
+            let slice = &pending_code_lit_refs[cursor..group_end];
             if let Some(m) = methods_mut.get_mut(fidx)
                 && let Some(body) = m.body.as_mut()
             {
-                body.entities.insert(
-                    (abcd_isa::EntityKind::LiteralarrayId, raw_id),
-                    EntityRef::LiteralArray(LiteralArrayIdx(table_idx)),
-                );
+                if slice.len() == 1 {
+                    let (_, raw_id, off) = slice[0];
+                    let table_idx = literal_array_offsets.get(&off).copied().unwrap_or(ABSENT);
+                    body.entities.insert(
+                        (abcd_isa::EntityKind::LiteralarrayId, raw_id),
+                        EntityRef::LiteralArray(LiteralArrayIdx(table_idx)),
+                    );
+                } else {
+                    let prev = std::mem::take(&mut body.entities);
+                    let mut all = Vec::with_capacity(prev.len() + slice.len());
+                    all.extend(prev);
+                    for &(_, raw_id, off) in slice {
+                        let table_idx = literal_array_offsets.get(&off).copied().unwrap_or(ABSENT);
+                        all.push((
+                            (abcd_isa::EntityKind::LiteralarrayId, raw_id),
+                            EntityRef::LiteralArray(LiteralArrayIdx(table_idx)),
+                        ));
+                    }
+                    body.entities = MethodEntities::from_iter(all);
+                }
             }
+            cursor = group_end;
         }
     }
     for class in classes.values_mut() {
@@ -997,18 +1063,10 @@ fn collect_annotation_nested_literal_offsets(
     file_size: u32,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
+    lit_probe_cache: &mut HashMap<u32, bool>,
     out: &mut HashSet<u32>,
 ) {
     let header_size = reader.header_size();
-    let is_valid_lit_array = |cand: u32| -> bool {
-        is_plausible_literal_array_offset(
-            cand,
-            header_size,
-            file_size,
-            module_data_offsets,
-            phase_blob_offsets,
-        ) && walk_raw_literal_array(reader, cand, |_| Ok(())).is_ok()
-    };
 
     let mut stack: Vec<&AnnotationValue> = Vec::new();
     for class in classes.values() {
@@ -1049,7 +1107,15 @@ fn collect_annotation_nested_literal_offsets(
                         {
                             out.insert(idx.0);
                         }
-                        LiteralValue::LiteralBufferIndex(idx) if is_valid_lit_array(idx.0) => {
+                        LiteralValue::LiteralBufferIndex(idx)
+                            if is_plausible_literal_array_offset(
+                                idx.0,
+                                header_size,
+                                file_size,
+                                module_data_offsets,
+                                phase_blob_offsets,
+                            ) && probe_literal_array_valid(reader, idx.0, lit_probe_cache) =>
+                        {
                             out.insert(idx.0);
                         }
                         _ => {}
@@ -1196,7 +1262,7 @@ type LiteralArrayTable = (Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>);
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "literal-array table builder threads forensic diagnostics, offset sets, and string cache"
+    reason = "literal-array table builder threads forensic diagnostics, offset sets, probe cache, and string cache"
 )]
 fn decode_literal_arrays(
     reader: &AbcReader<'_>,
@@ -1209,6 +1275,7 @@ fn decode_literal_arrays(
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
     method_offset_to_idx: &HashMap<u32, MethodIdx>,
+    lit_probe_cache: &mut HashMap<u32, bool>,
 ) -> Result<LiteralArrayTable, Error> {
     let mut header_offsets = Vec::new();
     let mut offsets = Vec::new();
@@ -1294,7 +1361,7 @@ fn decode_literal_arrays(
                             module_data_offsets,
                             phase_blob_offsets,
                         ) && !seen.contains(idx.0)
-                            && walk_raw_literal_array(reader, idx.0, |_| Ok(())).is_ok() =>
+                            && probe_literal_array_valid(reader, idx.0, lit_probe_cache) =>
                     {
                         nested.push(idx.0);
                     }

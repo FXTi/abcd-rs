@@ -499,90 +499,36 @@ impl<'l, 'f, B: LiftBackend<'f>> FnLift<'l, 'f, B> {
     }
 
     /// Resolve a legacy `0.0.0.2` local module-var string `name` against the
-    /// enclosing `EsModule` (or standalone module) distinct `ExportDecl::Local`
-    /// slots (`D8`), returning `Err(name)` when falling back to `name.0`.
+    /// enclosing `EsModule` (or standalone module) pre-indexed `ExportDecl::Local`
+    /// slots (`D8`, `#103`), returning `Err(name)` when falling back to `name.0`.
+    #[inline]
     fn try_resolve_legacy_local_module_slot(&self, name: Sym) -> Result<u32, Sym> {
-        let Some((_, exports, _)) = self.lf.backend_active_module_tables(self.class_id) else {
-            return Err(name);
-        };
-        let mut distinct_locals: Vec<Sym> = Vec::new();
-        let mut export_name_fallback: Option<u32> = None;
-        for exp in exports {
-            if let abcd_ir::ExportDecl::Local {
-                export_name,
-                local_name,
-            } = exp
-            {
-                let slot = match distinct_locals.iter().position(|&s| s == *local_name) {
-                    Some(idx) => idx as u32,
-                    None => {
-                        let idx = distinct_locals.len() as u32;
-                        distinct_locals.push(*local_name);
-                        idx
-                    }
-                };
-                if *local_name == name {
-                    return Ok(slot);
-                }
-                if *export_name == name && export_name_fallback.is_none() {
-                    export_name_fallback = Some(slot);
-                }
-            }
-        }
-        export_name_fallback.ok_or(name)
+        self.lf
+            .backend_legacy_module_slots(self.class_id)
+            .and_then(|slots| slots.local_slots.get(&name).copied())
+            .ok_or(name)
     }
 
     /// Resolve a legacy `0.0.0.2` external module-var string `name` against the
-    /// enclosing `EsModule` (or standalone module) 0-based `ImportDecl::Regular`
-    /// slots (`D8`), returning `Err(name)` when falling back to `name.0`.
+    /// enclosing `EsModule` (or standalone module) pre-indexed `ImportDecl::Regular`
+    /// slots (`D8`, `#103`), returning `Err(name)` when falling back to `name.0`.
+    #[inline]
     fn try_resolve_legacy_external_module_slot(&self, name: Sym) -> Result<u32, Sym> {
-        let Some((imports, _, _)) = self.lf.backend_active_module_tables(self.class_id) else {
-            return Err(name);
-        };
-        let mut ext_slot = 0u32;
-        let mut import_name_fallback: Option<u32> = None;
-        for imp in imports {
-            if let abcd_ir::ImportDecl::Regular {
-                local_name,
-                import_name,
-                ..
-            } = imp
-            {
-                if *local_name == name {
-                    return Ok(ext_slot);
-                }
-                if *import_name == name && import_name_fallback.is_none() {
-                    import_name_fallback = Some(ext_slot);
-                }
-                ext_slot += 1;
-            }
-        }
-        import_name_fallback.ok_or(name)
+        self.lf
+            .backend_legacy_module_slots(self.class_id)
+            .and_then(|slots| slots.external_slots.get(&name).copied())
+            .ok_or(name)
     }
 
     /// Resolve a legacy `0.0.0.2` module-namespace string `name` against the
-    /// enclosing `EsModule` (or standalone module) 0-based `module_requests`
-    /// table (`D8`), returning `Err(name)` when falling back to `name.0`.
+    /// enclosing `EsModule` (or standalone module) pre-indexed `module_requests`
+    /// slots (`D8`, `#103`), returning `Err(name)` when falling back to `name.0`.
+    #[inline]
     fn try_resolve_legacy_module_namespace_slot(&self, name: Sym) -> Result<u32, Sym> {
-        let Some((imports, _, requests)) = self.lf.backend_active_module_tables(self.class_id)
-        else {
-            return Err(name);
-        };
-        if let Some(idx) = requests.iter().position(|r| r.specifier == name) {
-            return Ok(idx as u32);
-        }
-        for imp in imports {
-            if let abcd_ir::ImportDecl::Namespace {
-                local_name,
-                module_request,
-            } = imp
-                && *local_name == name
-                && let Some(idx) = requests.iter().position(|r| r.specifier == *module_request)
-            {
-                return Ok(idx as u32);
-            }
-        }
-        Err(name)
+        self.lf
+            .backend_legacy_module_slots(self.class_id)
+            .and_then(|slots| slots.namespace_slots.get(&name).copied())
+            .ok_or(name)
     }
 }
 

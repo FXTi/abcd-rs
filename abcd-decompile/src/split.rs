@@ -19,11 +19,11 @@ use rayon::prelude::*;
 
 use crate::consts::{render_pool_string, render_sym_string, sym_str};
 use crate::emit::{
-    BatchLimits, DecompileStats, EmitOptions, Emitter, ORPHAN_SCAN_BATCH, PreparedFunc,
-    accumulate_decompile_stats, collect_orphans_for_funcs, consumed_functions, emit_esm_imports,
-    func_may_have_orphan_lexenv, index_has_fallback_module_slot, module_facing_name,
-    next_bounded_top_batch, orphan_lexenv_names_in_func, precompute_func_inst_weights,
-    prepare_func, prepare_func_only, try_extend_batch_funcs,
+    BatchLimits, DecompileStats, EmitOptions, Emitter, ExportLocalIndex, ORPHAN_SCAN_BATCH,
+    PreparedFunc, accumulate_decompile_stats, collect_orphans_for_funcs, consumed_functions_cached,
+    emit_esm_imports, func_may_have_orphan_lexenv, index_has_fallback_module_slot,
+    module_facing_name, next_bounded_top_batch_cached, orphan_lexenv_names_in_func,
+    precompute_func_inst_weights, prepare_func, prepare_func_only, try_extend_batch_funcs_cached,
 };
 use crate::legalize::{Legalizer, sanitize};
 use crate::names::{DecompileIndex, module_slot_fallback};
@@ -298,9 +298,9 @@ where
         "js"
     };
 
-    let consumed = consumed_functions(module);
-    let inst_weights = precompute_func_inst_weights(module);
     let index = DecompileIndex::build_split(module);
+    let consumed = consumed_functions_cached(module, &index.const_method_refs);
+    let inst_weights = precompute_func_inst_weights(module);
     let has_fallback_slot = index_has_fallback_module_slot(&index);
 
     // Group all functions and top-level unconsumed functions by `ClassId`.
@@ -394,16 +394,18 @@ where
             let tfs = class_funcs.get(&plan.cid).map(Vec::as_slice).unwrap_or(&[]);
             if batch_end == batch_start {
                 if tfs.len() <= 1 {
-                    let _ = try_extend_batch_funcs(
+                    let _ = try_extend_batch_funcs_cached(
                         module,
+                        &index.const_method_refs,
                         &inst_weights,
                         tfs,
                         &mut visited_fids,
                         &mut batch_inst_weight,
                         None,
                     );
-                } else if !try_extend_batch_funcs(
+                } else if !try_extend_batch_funcs_cached(
                     module,
+                    &index.const_method_refs,
                     &inst_weights,
                     tfs,
                     &mut visited_fids,
@@ -419,8 +421,9 @@ where
                     break;
                 }
             } else {
-                if !try_extend_batch_funcs(
+                if !try_extend_batch_funcs_cached(
                     module,
+                    &index.const_method_refs,
                     &inst_weights,
                     tfs,
                     &mut visited_fids,
@@ -827,28 +830,24 @@ fn emit_single_record(
 
     // Also ensure any `ExportDecl::Local` binding not touched by bytecode instructions
     // has a declaration if no top-level function will declare it.
-    if let Some(esm) = esm {
+    let export_index = esm.map(|e| ExportLocalIndex::build(module, &e.exports, record_env));
+    if let (Some(esm), Some(exp_idx)) = (esm, &export_index) {
+        let top_fn_names: HashSet<String> = top_funcs
+            .iter()
+            .filter_map(|&f| module.func(f))
+            .map(|fd| sanitize(&sym_str(module, fd.name)))
+            .collect();
         for exp in &esm.exports {
             if let ExportDecl::Local { local_name, .. } = exp {
-                let local = crate::emit::resolve_export_local_ident(
-                    module,
-                    &esm.exports,
-                    record_env,
-                    &sym_str(module, *local_name),
-                );
+                let local = exp_idx.resolve(&sym_str(module, *local_name));
                 if !declared_locals.contains(&local)
                     && !globals.contains(&local)
                     && !record_globals.contains(&local)
+                    && !top_fn_names.contains(&local)
+                    && declared_locals.insert(local.clone())
                 {
-                    let has_matching_top_fn = top_funcs.iter().any(|&f| {
-                        module
-                            .func(f)
-                            .is_some_and(|fd| sanitize(&sym_str(module, fd.name)) == local)
-                    });
-                    if !has_matching_top_fn && declared_locals.insert(local.clone()) {
-                        em.fn_names.reserve(&local);
-                        out.push_str(&format!("let {local};\n"));
-                    }
+                    em.fn_names.reserve(&local);
+                    out.push_str(&format!("let {local};\n"));
                 }
             }
         }
@@ -863,10 +862,23 @@ fn emit_single_record(
     // 5. Top-level functions of this record.
     let mut entry_call: Option<String> = None;
     if chunk_top_funcs {
+        let owned_cache;
+        let method_refs = match em.index {
+            Some(idx) => &idx.const_method_refs,
+            None => {
+                owned_cache = crate::consts::ConstMethodRefCache::build(module);
+                &owned_cache
+            }
+        };
         let mut cursor = 0usize;
         while cursor < top_funcs.len() {
-            let (take, batch_fids) =
-                next_bounded_top_batch(module, inst_weights, &top_funcs[cursor..], limits);
+            let (take, batch_fids) = next_bounded_top_batch_cached(
+                module,
+                method_refs,
+                inst_weights,
+                &top_funcs[cursor..],
+                limits,
+            );
             let chunk = &top_funcs[cursor..cursor + take];
             cursor += take;
             let prepared_batch: Vec<(FuncId, PreparedFunc)> = batch_fids
@@ -932,19 +944,14 @@ fn emit_single_record(
     }
 
     // 6. Exports.
-    if let Some(esm) = esm {
+    if let (Some(esm), Some(exp_idx)) = (esm, &export_index) {
         for exp in &esm.exports {
             match exp {
                 ExportDecl::Local {
                     local_name,
                     export_name,
                 } => {
-                    let local = crate::emit::resolve_export_local_ident(
-                        module,
-                        &esm.exports,
-                        record_env,
-                        &sym_str(module, *local_name),
-                    );
+                    let local = exp_idx.resolve(&sym_str(module, *local_name));
                     let export = module_facing_name(module, &sym_str(module, *export_name));
                     if local == export {
                         out.push_str(&format!("export {{ {local} }};\n"));

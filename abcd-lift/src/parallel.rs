@@ -17,8 +17,8 @@
 //! that is 100% bit-for-bit structurally identical to sequential lifting.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 
@@ -29,6 +29,7 @@ use abcd_ir::{
     ValueId,
 };
 
+use crate::metadata::{self, LegacyModuleSlotIndex};
 use crate::resolve::{self, LitWrap};
 use crate::{IrArenas, LiftBackend, LiftError, Lifter, lift_method_with};
 
@@ -117,7 +118,9 @@ pub(crate) struct SharedLiftState<'a, 'f> {
     pub(crate) base_imports: &'a [ImportDecl],
     pub(crate) base_exports: &'a [ExportDecl],
     pub(crate) base_module_requests: &'a [ModuleRequest],
-    pub(crate) scope_name_fields: &'a [(Sym, ConstId)],
+    pub(crate) class_module_slots: &'a [OnceLock<Box<LegacyModuleSlotIndex>>],
+    pub(crate) standalone_module_slots: &'a OnceLock<Box<LegacyModuleSlotIndex>>,
+    pub(crate) scope_name_fields: &'a HashMap<Sym, ConstId>,
     /// Lock-free `0 = unchecked`, `1 = validated acyclic` cache per `file.literal_arrays` slot.
     pub(crate) lit_valid_cache: Vec<AtomicU8>,
     /// Lowest method index that returned `Err(LiftError)` (`usize::MAX` while error-free).
@@ -594,29 +597,17 @@ impl<'f> LiftBackend<'f> for MethodLiftCtx<'_, 'f> {
         matches!(self.get_const(cid), Some(Const::Bool(_)))
     }
 
-    fn backend_active_module_tables(
-        &self,
-        class_id: ClassId,
-    ) -> Option<(&[ImportDecl], &[ExportDecl], &[ModuleRequest])> {
-        if let Some(esm) = self
-            .shared
-            .base_classes
-            .get(class_id.index())
-            .and_then(|c| c.es_module.as_ref())
-        {
-            return Some((&esm.imports, &esm.exports, &esm.module_requests));
-        }
-        if !self.shared.base_imports.is_empty()
-            || !self.shared.base_exports.is_empty()
-            || !self.shared.base_module_requests.is_empty()
-        {
-            return Some((
-                self.shared.base_imports,
-                self.shared.base_exports,
-                self.shared.base_module_requests,
-            ));
-        }
-        None
+    #[inline]
+    fn backend_legacy_module_slots(&self, class_id: ClassId) -> Option<&LegacyModuleSlotIndex> {
+        metadata::resolve_legacy_module_slots(
+            class_id,
+            self.shared.base_classes,
+            self.shared.class_module_slots,
+            self.shared.base_imports,
+            self.shared.base_exports,
+            self.shared.base_module_requests,
+            self.shared.standalone_module_slots,
+        )
     }
 
     fn backend_record_legacy_modvar_fallback(&mut self, inst_id: InstId, sym: Sym) {
@@ -634,15 +625,7 @@ impl<'f> LiftBackend<'f> for MethodLiftCtx<'_, 'f> {
             .base_classes
             .get(class_id.index())
             .and_then(|c| c.scope_names)
-            .or_else(|| {
-                source_file.and_then(|sf| {
-                    self.shared
-                        .scope_name_fields
-                        .iter()
-                        .find(|(name, _)| *name == sf)
-                        .map(|(_, c)| *c)
-                })
-            })
+            .or_else(|| source_file.and_then(|sf| self.shared.scope_name_fields.get(&sf).copied()))
     }
 
     fn backend_resolve_source_code(&mut self, sid: abcd_file::StringId) -> Option<Arc<str>> {
@@ -869,6 +852,8 @@ pub(crate) fn lift_methods_parallel<'f>(
             base_imports: &lf.module.imports,
             base_exports: &lf.module.exports,
             base_module_requests: &lf.module.module_requests,
+            class_module_slots: &lf.class_module_slots,
+            standalone_module_slots: &lf.standalone_module_slots,
             scope_name_fields: &lf.scope_name_fields,
             lit_valid_cache,
             min_err_idx: AtomicUsize::new(usize::MAX),

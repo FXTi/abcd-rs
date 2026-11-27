@@ -965,3 +965,204 @@ fn exhaustive_bytecode_cannot_throw_ir_matches_op_effects_may_throw() {
     assert!(!local_op.effects().may_throw);
     assert!(!cannot_throw_ir(&DeprecatedLdmodulevar(eid, i1)));
 }
+
+#[test]
+fn try_block_partition_point_matches_linear_overlap_across_straddling_and_nested_ranges() {
+    use abcd_file::{
+        AccessFlags, Class, File, FileType, FunctionKind as FileFunctionKind, Method,
+        SourceLang as FileSourceLang, StringPool, Version,
+    };
+    use abcd_ir::modules_structurally_eq;
+
+    // Build a multi-block bytecode body (~24 basic blocks + 4 catch handlers):
+    // - Block 0 starts with a non-throwing prefix (`Ldundefined; Sta(v0)`) at
+    //   pcs `0..2`, followed by throwing `Callarg0` at pc `2` so a TryBlock
+    //   starting at `try_start = 2` straddles Block 0 (`b.start = 0 < 2 < b.end`)!
+    // - Interleaved diamond/chain blocks (`Jeqz` / `Callarg0`) from pc `3..43`.
+    // - Exit `Returnundefined` at pc `43`, followed by 4 catch handlers at `44..48`.
+    let mut code = vec![
+        Bytecode::Ldundefined,      // 0 (non-throwing prefix)
+        Bytecode::Sta(Reg(0)),      // 1 (non-throwing prefix)
+        Bytecode::Callarg0(Imm(0)), // 2 (throwing; straddled by try_block 0!)
+    ];
+    for step in 0..20u32 {
+        let next_target = 3 + (step + 1) * 2;
+        code.push(Bytecode::Callarg0(Imm(step as i64))); // 3 + step*2
+        code.push(Bytecode::Jeqz(Label(next_target))); // 4 + step*2
+    }
+    assert_eq!(code.len(), 43);
+    // Pure non-throwing 2-instruction block `[43..45)` (`Ldundefined; Return`):
+    code.push(Bytecode::Ldundefined); // 43
+    code.push(Bytecode::Return); // 44
+    let h0 = code.len() as u32; // 45
+    code.push(Bytecode::Return);
+    let h1 = code.len() as u32; // 46
+    code.push(Bytecode::Return);
+    let h2 = code.len() as u32; // 47
+    code.push(Bytecode::Return);
+    let h3 = code.len() as u32; // 48
+    code.push(Bytecode::Returnundefined);
+
+    let catch_of = |h: u32| CatchBlock {
+        type_class: None,
+        handler: h,
+        len: 1,
+    };
+    let try_blocks = vec![
+        // [0] Straddles Block 0 (`start = 2`, while Block 0 is `[0..5)` because `0..2` cannot throw)
+        TryBlock {
+            start: 2,
+            len: 5,
+            catches: vec![catch_of(h0)],
+        },
+        // [1] Nested inside [2]
+        TryBlock {
+            start: 11,
+            len: 6,
+            catches: vec![catch_of(h1), catch_of(h2)],
+        },
+        // [2] Wide outer region covering multiple blocks `[9..29)`
+        TryBlock {
+            start: 9,
+            len: 20,
+            catches: vec![catch_of(h2)],
+        },
+        // [3] Adjacent region `[29..37)`
+        TryBlock {
+            start: 29,
+            len: 8,
+            catches: vec![catch_of(h3)],
+        },
+        // [4] Zero-length range at block boundary `43` (`b.start < 43 && b.end > 43` is false everywhere)
+        TryBlock {
+            start: 43,
+            len: 0,
+            catches: vec![catch_of(h0)],
+        },
+        // [5] Zero-length range strictly inside `[43..45)` (`43 < 44 && 45 > 44` is true on `[43..45)`)
+        TryBlock {
+            start: 44,
+            len: 0,
+            catches: vec![catch_of(h1)],
+        },
+    ];
+
+    let body = MethodBody {
+        entities: MethodEntities::new(),
+        num_vregs: 2,
+        num_args: 0,
+        code: MethodCode::Decoded(code),
+        try_blocks: try_blocks.clone(),
+        ic_size: None,
+    };
+
+    let cfg = build_cfg_body(&body).expect("CFG builds cleanly");
+    assert!(
+        cfg.blocks.len() >= 24,
+        "expected >= 24 blocks, got {}",
+        cfg.blocks.len()
+    );
+    assert_eq!(cfg.blocks[0].start, 0);
+    assert!(
+        cfg.blocks[0].end > 2,
+        "non-throwing prefix stays merged with pc 2"
+    );
+
+    // Reference linear oracle for every block's `catch_succs`.
+    for (bi, rb) in cfg.blocks.iter().enumerate() {
+        let mut expected_catches = Vec::new();
+        for tb in &try_blocks {
+            let ts = tb.start as usize;
+            let te = ts + tb.len as usize;
+            if rb.start < te && rb.end > ts {
+                for c in &tb.catches {
+                    let h_bi = cfg.leader_to_block[&(c.handler as usize)];
+                    if !expected_catches.contains(&h_bi) {
+                        expected_catches.push(h_bi);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            rb.catch_succs, expected_catches,
+            "block {bi} ([{}..{})) catch_succs mismatch",
+            rb.start, rb.end
+        );
+    }
+
+    // Also lift through `lift_file` (sequential and forced-parallel) and verify
+    // `TryRegion::protected` + `verify_module` + structural parity!
+    let mut strings = StringPool::new();
+    let desc = strings.get_or_intern("LTrySearch;");
+    let mname = strings.get_or_intern("run");
+    let method = Method {
+        name: mname,
+        offset: 0x100,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: FileSourceLang::EcmaScript,
+        is_external: false,
+        return_type: None,
+        arg_types: Vec::new(),
+        body: Some(body),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    };
+    let cls = Class {
+        descriptor: desc,
+        name: desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: vec![method],
+        fields: Vec::new(),
+        annotations: Default::default(),
+    };
+    let file = File {
+        version: Version::new(12, 0, 6, 0),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings,
+        classes: [(desc, cls)].into_iter().collect(),
+        literal_arrays: Vec::new(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let seq = crate::lift_file_with_options(
+        &file,
+        &crate::LiftOptions {
+            retain_tail_capacity: false,
+            parallel: false,
+        },
+    )
+    .expect("sequential lift succeeds");
+    assert!(abcd_ir::verify_module(&seq).errors.is_empty());
+    let par = crate::lift_file_forced_parallel(&file, false).expect("parallel lift succeeds");
+    assert_eq!(modules_structurally_eq(&seq, &par), Ok(()));
+
+    // Every `TryRegion::protected` matches the reference linear overlap oracle
+    // (including empty `try_regions[4]` at boundary `43` and straddling `try_regions[0]`).
+    assert_eq!(seq.functions[0].try_regions.len(), try_blocks.len());
+    assert!(seq.functions[0].try_regions[4].protected.is_empty());
+    assert_eq!(seq.functions[0].try_regions[5].protected.len(), 1);
+    for (ti, tb) in try_blocks.iter().enumerate() {
+        let ts = tb.start as usize;
+        let te = ts + tb.len as usize;
+        let expected_protected: Vec<abcd_ir::BlockId> = cfg
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, rb)| rb.start < te && rb.end > ts)
+            .map(|(bi, _)| seq.functions[0].blocks[bi])
+            .collect();
+        assert_eq!(
+            seq.functions[0].try_regions[ti].protected, expected_protected,
+            "try_region[{ti}] protected blocks mismatch"
+        );
+    }
+}

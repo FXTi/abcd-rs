@@ -1,10 +1,10 @@
 //! Root-sliced forward reachability (`compute_sliced_bfs`) and per-activation
 //! SSA instruction transfer scanning (`Pta::scan`).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use abcd_ir::{CallKind, Const, ConstId, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::{CallKind, Const, ConstId, FuncId, Module, Op, Sym, ValueDef, ValueId};
 
 use crate::callgraph::CallGraph;
 use crate::dataflow::heap::is_keyed_alloc;
@@ -167,39 +167,153 @@ pub(super) fn is_pure_primitive_op(module: &Module, op: &Op) -> bool {
         _ => false,
     }
 }
-pub(super) fn collect_const_method_refs(module: &Module, root: ConstId) -> Vec<FuncId> {
-    let mut out = Vec::new();
-    let mut seen_funcs = BTreeSet::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut stack = vec![root];
-    while let Some(cid) = stack.pop() {
-        if !visited.insert(cid) {
-            continue;
-        }
-        match module.consts.get(cid) {
-            Some(Const::MethodRef { func: mfid, .. }) => {
-                if seen_funcs.insert(*mfid) {
-                    out.push(*mfid);
-                }
-            }
-            Some(Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. }) => {
-                for &item_cid in items.iter().rev() {
-                    stack.push(item_cid);
-                }
-            }
-            Some(Const::ObjectLiteral { keys, values }) => {
-                for &item_cid in values.iter().rev() {
-                    stack.push(item_cid);
-                }
-                for &key_cid in keys.iter().rev() {
-                    stack.push(key_cid);
-                }
-            }
-            Some(Const::LiteralBufferRef(inner)) => stack.push(*inner),
-            _ => {}
+/// Whether `sym` can match a numeric/indexed property key in ECMAScript
+/// (`"NaN"`, `"Infinity"`, `"-Infinity"`, or a non-empty string starting with
+/// an ASCII digit `0..=9` or `'-'` followed by an ASCII digit; `#104`).
+pub(super) fn is_numeric_prop_sym(module: &Module, sym: Sym) -> bool {
+    let Some(s) = module.sym.resolve(sym) else {
+        return false;
+    };
+    if matches!(s, "NaN" | "Infinity" | "-Infinity") {
+        return true;
+    }
+    matches!(s.as_bytes(), [b'0'..=b'9', ..] | [b'-', b'0'..=b'9', ..])
+}
+
+/// Pass-wide memo over [`ConstPool`] DAGs mapping each [`ConstId`] to the
+/// sorted, deduplicated [`FuncId`]s reachable via [`Const::MethodRef`] (`#104`).
+pub(super) struct ConstMethodRefMemo {
+    memo: HashMap<ConstId, Arc<[FuncId]>>,
+    empty: Arc<[FuncId]>,
+}
+
+impl Default for ConstMethodRefMemo {
+    fn default() -> Self {
+        Self {
+            memo: HashMap::new(),
+            empty: Arc::from([]),
         }
     }
-    out
+}
+
+impl ConstMethodRefMemo {
+    /// Return the sorted slice of [`FuncId`]s referenced under `root`,
+    /// expanding each [`ConstId`] in `module.consts` at most once across the
+    /// entire pass via iterative Tarjan SCC (`O(|ConstPool|)` total).
+    pub(super) fn get(&mut self, module: &Module, root: ConstId) -> &[FuncId] {
+        if !self.memo.contains_key(&root) {
+            self.populate(module, root);
+        }
+        self.memo.get(&root).map_or(&[], |s| s.as_ref())
+    }
+
+    fn populate(&mut self, module: &Module, root: ConstId) {
+        struct ConstFrame {
+            cid: ConstId,
+            children: Vec<ConstId>,
+            idx: usize,
+            direct_func: Option<FuncId>,
+        }
+
+        let make_frame = |cid: ConstId| -> ConstFrame {
+            let mut children = Vec::new();
+            let mut direct_func = None;
+            match module.consts.get(cid) {
+                Some(Const::MethodRef { func, .. }) => direct_func = Some(*func),
+                Some(Const::ArrayLiteral(items) | Const::TypedArrayLiteral { items, .. }) => {
+                    children.extend_from_slice(items);
+                }
+                Some(Const::ObjectLiteral { keys, values }) => {
+                    children.extend_from_slice(keys);
+                    children.extend_from_slice(values);
+                }
+                Some(Const::LiteralBufferRef(inner)) => children.push(*inner),
+                _ => {}
+            }
+            ConstFrame {
+                cid,
+                children,
+                idx: 0,
+                direct_func,
+            }
+        };
+
+        let mut index_counter = 1u32;
+        let mut indices: HashMap<ConstId, u32> = HashMap::new();
+        let mut lowlink: HashMap<ConstId, u32> = HashMap::new();
+        let mut on_stack: HashSet<ConstId> = HashSet::new();
+        let mut scc_stack: Vec<(ConstId, Vec<ConstId>, Option<FuncId>)> = Vec::new();
+        let mut dfs: Vec<ConstFrame> = Vec::new();
+
+        indices.insert(root, index_counter);
+        lowlink.insert(root, index_counter);
+        on_stack.insert(root);
+        let first = make_frame(root);
+        scc_stack.push((root, first.children.clone(), first.direct_func));
+        dfs.push(first);
+
+        while let Some(top) = dfs.last_mut() {
+            let u = top.cid;
+            if top.idx < top.children.len() {
+                let w = top.children[top.idx];
+                top.idx += 1;
+                if self.memo.contains_key(&w) {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(e) = indices.entry(w) {
+                    index_counter += 1;
+                    e.insert(index_counter);
+                    lowlink.insert(w, index_counter);
+                    on_stack.insert(w);
+                    let next_f = make_frame(w);
+                    scc_stack.push((w, next_f.children.clone(), next_f.direct_func));
+                    dfs.push(next_f);
+                } else if on_stack.contains(&w) {
+                    let w_idx = indices[&w];
+                    if let Some(u_low) = lowlink.get_mut(&u) {
+                        *u_low = (*u_low).min(w_idx);
+                    }
+                }
+            } else {
+                let finished = dfs.pop();
+                if let (Some(fin), Some(parent)) = (finished, dfs.last())
+                    && let Some(&fin_low) = lowlink.get(&fin.cid)
+                    && let Some(p_low) = lowlink.get_mut(&parent.cid)
+                {
+                    *p_low = (*p_low).min(fin_low);
+                }
+                if indices.get(&u) == lowlink.get(&u) {
+                    let mut members = Vec::new();
+                    let mut funcs = BTreeSet::new();
+                    while let Some((m_cid, m_children, m_func)) = scc_stack.pop() {
+                        on_stack.remove(&m_cid);
+                        if let Some(f) = m_func {
+                            funcs.insert(f);
+                        }
+                        members.push((m_cid, m_children));
+                        if m_cid == u {
+                            break;
+                        }
+                    }
+                    for (_, m_children) in &members {
+                        for ch in m_children {
+                            if let Some(ch_funcs) = self.memo.get(ch) {
+                                funcs.extend(ch_funcs.iter().copied());
+                            }
+                        }
+                    }
+                    let slice_arc: Arc<[FuncId]> = if funcs.is_empty() {
+                        Arc::clone(&self.empty)
+                    } else {
+                        Arc::from(funcs.into_iter().collect::<Vec<_>>())
+                    };
+                    for (m_cid, _) in members {
+                        self.memo.insert(m_cid, Arc::clone(&slice_arc));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Extract `(method_sym, mfid, is_static)` entries from a `DefineClass` /
@@ -644,18 +758,27 @@ impl<'m> Pta<'m> {
                                             Some(Const::String(sym)) => Slot::Named(*sym),
                                             _ => Slot::Dynamic,
                                         };
+                                        let also_index = matches!(
+                                            slot,
+                                            Slot::Named(sym) if is_numeric_prop_sym(self.module, sym)
+                                        );
                                         match self.module.consts.get(v_cid).cloned() {
                                             Some(Const::MethodRef { func: mfid, .. }) => {
-                                                self.add_fact(
-                                                    Ptr::Field(obj_loc, slot),
-                                                    Obj::Site {
-                                                        site: iid,
-                                                        ctx: PackedCtx::NONE,
-                                                        callable: PackedFunc::some(mfid),
-                                                        keyed: false,
-                                                    },
-                                                );
+                                                let mobj = Obj::Site {
+                                                    site: iid,
+                                                    ctx: PackedCtx::NONE,
+                                                    callable: PackedFunc::some(mfid),
+                                                    keyed: false,
+                                                };
+                                                self.add_fact(Ptr::Field(obj_loc, slot), mobj);
                                                 self.note_bucket(obj_loc, slot);
+                                                if also_index {
+                                                    self.add_fact(
+                                                        Ptr::Field(obj_loc, Slot::Index),
+                                                        mobj,
+                                                    );
+                                                    self.note_bucket(obj_loc, Slot::Index);
+                                                }
                                                 if sliced
                                                     && self.try_record_dyn_hop(mfid, next_dyn_hop)
                                                 {
@@ -673,6 +796,13 @@ impl<'m> Pta<'m> {
                                                     Obj::Unknown,
                                                 );
                                                 self.note_bucket(obj_loc, slot);
+                                                if also_index {
+                                                    self.add_fact(
+                                                        Ptr::Field(obj_loc, Slot::Index),
+                                                        Obj::Unknown,
+                                                    );
+                                                    self.note_bucket(obj_loc, Slot::Index);
+                                                }
                                             }
                                             _ => {}
                                         }
@@ -680,7 +810,9 @@ impl<'m> Pta<'m> {
                                 }
                             }
                             Op::AllocArray { shape: Some(shape) } => {
-                                for mfid in collect_const_method_refs(self.module, *shape) {
+                                let mfids =
+                                    self.const_method_refs.get(self.module, *shape).to_vec();
+                                for mfid in mfids {
                                     self.add_fact(
                                         Ptr::Field(obj_loc, Slot::Index),
                                         Obj::Site {
@@ -788,24 +920,12 @@ impl<'m> Pta<'m> {
                             .entry(cls.ctor)
                             .or_default()
                             .insert((iid, ctx));
-                        if is_new_cls_act {
+                        if is_new_cls_act
+                            && let Some(existing_news) =
+                                self.wired_news_by_ctor.get(&cls.ctor).cloned()
+                        {
                             // Retroactively link any already-wired `new Sub()` instances
                             // constructed before `DefineClass` ran in this scan order.
-                            let existing_news: Vec<(InstId, PackedCtx)> = self
-                                .wired
-                                .iter()
-                                .filter_map(|&(call_iid, c_ctx, callee)| {
-                                    (callee == cls.ctor
-                                        && matches!(
-                                            self.module.inst(call_iid).map(|i| &i.op),
-                                            Some(Op::Call {
-                                                kind: CallKind::New | CallKind::NewSpread,
-                                                ..
-                                            })
-                                        ))
-                                    .then_some((call_iid, c_ctx))
-                                })
-                                .collect();
                             for (call_iid, c_ctx) in existing_news {
                                 self.link_proto_locs(ObjLoc::Site(call_iid, c_ctx), proto_loc);
                             }
@@ -825,6 +945,7 @@ impl<'m> Pta<'m> {
                         self.add_fact(Ptr::SuperPropBase(cls.ctor), Obj::Proto(super_proto_loc));
                         for (msym, mfid, is_static) in class_named_methods(self.module, cls) {
                             let mslot = Slot::Named(msym);
+                            let also_index = is_numeric_prop_sym(self.module, msym);
                             let method_obj = Obj::Site {
                                 site: iid,
                                 ctx: PackedCtx::NONE,
@@ -835,6 +956,10 @@ impl<'m> Pta<'m> {
                                 self.own_class_members.insert((cls_loc, mslot));
                                 self.add_fact(Ptr::Field(cls_loc, mslot), method_obj);
                                 self.note_bucket(cls_loc, mslot);
+                                if also_index {
+                                    self.add_fact(Ptr::Field(cls_loc, Slot::Index), method_obj);
+                                    self.note_bucket(cls_loc, Slot::Index);
+                                }
                                 self.add_fact(
                                     Ptr::SuperPropBase(mfid),
                                     Obj::Proto(super_static_loc),
@@ -843,6 +968,10 @@ impl<'m> Pta<'m> {
                                 self.own_class_members.insert((proto_loc, mslot));
                                 self.add_fact(Ptr::Field(proto_loc, mslot), method_obj);
                                 self.note_bucket(proto_loc, mslot);
+                                if also_index {
+                                    self.add_fact(Ptr::Field(proto_loc, Slot::Index), method_obj);
+                                    self.note_bucket(proto_loc, Slot::Index);
+                                }
                                 self.add_fact(
                                     Ptr::SuperPropBase(mfid),
                                     Obj::Proto(super_proto_loc),
@@ -1238,6 +1367,9 @@ impl<'m> Pta<'m> {
                     | Op::StoreGlobalRecord { name, value, .. }
                     | Op::TryStoreGlobal { name, value } => {
                         self.add_edge(local(*value), Ptr::Global(*name));
+                        if is_numeric_prop_sym(self.module, *name) {
+                            self.add_edge(local(*value), Ptr::GlobalDynamic);
+                        }
                     }
                     Op::TryGetGlobal { name, .. } => {
                         if let Some(r) = inst.result {
@@ -1306,6 +1438,7 @@ impl<'m> Pta<'m> {
                                         let owner_fn = links.inst_func(self.module, env_site);
                                         if sliced
                                             && let Some(of) = owner_fn
+                                            && of != func
                                             && self.try_record_dyn_hop(of, next_dyn_hop)
                                         {
                                             self.activate(of, PackedCtx::NONE);

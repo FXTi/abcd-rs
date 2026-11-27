@@ -17,7 +17,7 @@ use crate::module_link::ModuleLinkTable;
 #[cfg(doc)]
 use super::analyze;
 use super::env::{EnvAnswer, EnvState};
-use super::scan::{callable_body, collect_const_method_refs, is_harness_func};
+use super::scan::{ConstMethodRefMemo, callable_body, is_harness_func};
 use super::solver::Pta;
 use super::{Obj, ObjLoc, PackedCtx, PtaStats, Ptr};
 
@@ -162,7 +162,9 @@ impl<'m> Pta<'m> {
             lex_writers,
             lex_captured_mutated,
             ctor_inst_methods,
+            mut const_method_refs,
             wired,
+            wired_news_by_ctor,
             call_targets,
             call_unknown,
             hop_cut_calls,
@@ -199,12 +201,21 @@ impl<'m> Pta<'m> {
             lex_captured_mutated,
             ctor_inst_methods,
             wired,
+            wired_news_by_ctor,
             scanned_calls,
             load_results,
             returns_of,
         ));
 
         let scanned_funcs: BTreeSet<FuncId> = scanned.iter().map(|&(f, _)| f).collect();
+        let mut base_scanned = vec![false; module.functions.len()];
+        for &(f, c) in &scanned {
+            if c.is_none()
+                && let Some(slot) = base_scanned.get_mut(f.index())
+            {
+                *slot = true;
+            }
+        }
 
         // ── Graph assembly ───────────────────────────────────────────────
         let mut pta_targets: BTreeMap<InstId, BTreeSet<FuncId>> = BTreeMap::new();
@@ -256,9 +267,7 @@ impl<'m> Pta<'m> {
         }
         drop(pta_targets);
 
-        let graph = CallGraph::from_edges(sites);
-        let singletons =
-            SingletonSiteClassifier::build_with_links(module, links, &graph, config.harness_func);
+        let mut graph = CallGraph::from_edges(sites);
 
         // ── Externally-invocable classification & Sparse Value answers ───
         let recorded_funcs: BTreeSet<FuncId> = scanned
@@ -271,6 +280,7 @@ impl<'m> Pta<'m> {
             &pts,
             &scanned,
             &scanned_funcs,
+            &base_scanned,
             &tainted_calls,
             &pta_partial,
             &hop_cut_calls,
@@ -279,8 +289,29 @@ impl<'m> Pta<'m> {
             &recorded_funcs,
             roots,
             config.harness_func,
+            &mut const_method_refs,
         );
-        drop((tainted_calls, pta_partial, hop_cut_calls));
+        drop((tainted_calls, pta_partial, hop_cut_calls, const_method_refs));
+
+        // Any non-base-complete call edge inside a caller that may run outside
+        // recorded call sites (`may_run_unrecorded[caller]`) while its
+        // `PackedCtx::NONE` activation was never scanned (`!base_scanned[caller]`)
+        // cannot be `resolution_complete`, because those unrecorded invocations
+        // were never scanned (`#104` P3-ANA-1).
+        graph.mark_edges_incomplete_where(|iid, edge| {
+            let base_complete = base.edge_at(iid).is_some_and(|be| be.resolution_complete);
+            !base_complete
+                && may_run_unrecorded
+                    .get(edge.caller.index())
+                    .copied()
+                    .unwrap_or(true)
+                && !base_scanned
+                    .get(edge.caller.index())
+                    .copied()
+                    .unwrap_or(false)
+        });
+        let singletons =
+            SingletonSiteClassifier::build_with_links(module, links, &graph, config.harness_func);
 
         let mut answer_slot = vec![INCOMPLETE_ANSWER_SLOT; module.values.len()];
         for (v, slot) in answer_slot.iter_mut().enumerate() {
@@ -322,16 +353,13 @@ impl<'m> Pta<'m> {
                 rec_sites.clear();
                 return;
             }
-            let retain_base = value_owner
-                .get(vid.index())
-                .copied()
-                .flatten()
-                .is_none_or(|fid| {
-                    externally_invocable
-                        .get(fid.index())
-                        .copied()
-                        .unwrap_or(true)
-                });
+            let owner_fid = value_owner.get(vid.index()).copied().flatten();
+            let retain_base = owner_fid.is_none_or(|fid| {
+                externally_invocable
+                    .get(fid.index())
+                    .copied()
+                    .unwrap_or(true)
+            });
             let ans = if has_recorded && !retain_base {
                 rec_sites.sort_unstable();
                 rec_sites.dedup();
@@ -340,12 +368,19 @@ impl<'m> Pta<'m> {
                     has_unknown: rec_unknown || !rec_nonempty,
                 }
             } else {
+                let unscanned_base = retain_base
+                    && owner_fid.is_some_and(|fid| {
+                        !base_scanned.get(fid.index()).copied().unwrap_or(false)
+                    });
                 base_sites.extend_from_slice(rec_sites);
                 base_sites.sort_unstable();
                 base_sites.dedup();
                 ValueAnswer {
                     sites: AllocSiteSet::from_sorted_unique(base_sites),
-                    has_unknown: base_unknown || rec_unknown || !(base_nonempty || rec_nonempty),
+                    has_unknown: unscanned_base
+                        || base_unknown
+                        || rec_unknown
+                        || !(base_nonempty || rec_nonempty),
                 }
             };
             set_value_answer(answer_slot, answer_entries, vid, ans);
@@ -478,21 +513,31 @@ impl<'m> Pta<'m> {
                                     // Include `ctx == None` writes iff `writer_fn` may
                                     // genuinely execute outside recorded call sites (or
                                     // when querying inside an uncalled `writer_fn` itself).
-                                    if (w_unrec || (!w_has_rec && writer_fn == func))
-                                        && let Some(objs) =
+                                    if w_unrec || (!w_has_rec && writer_fn == func) {
+                                        if !base_scanned
+                                            .get(writer_fn.index())
+                                            .copied()
+                                            .unwrap_or(false)
+                                        {
+                                            has_unknown = true;
+                                        }
+                                        if let Some(objs) =
                                             pts.get(&Ptr::LexVar(env_site, writer_fn, *slot, false))
-                                    {
-                                        for o in objs {
-                                            nonempty = true;
-                                            match o {
-                                                Obj::Unknown | Obj::GlobalThis | Obj::Proto(_) => {
-                                                    has_unknown = true;
-                                                }
-                                                Obj::Site {
-                                                    site, keyed: true, ..
-                                                } => lex_sites_buf.push(*site),
-                                                Obj::Site { keyed: false, .. } => {
-                                                    has_unknown = true;
+                                        {
+                                            for o in objs {
+                                                nonempty = true;
+                                                match o {
+                                                    Obj::Unknown
+                                                    | Obj::GlobalThis
+                                                    | Obj::Proto(_) => {
+                                                        has_unknown = true;
+                                                    }
+                                                    Obj::Site {
+                                                        site, keyed: true, ..
+                                                    } => lex_sites_buf.push(*site),
+                                                    Obj::Site { keyed: false, .. } => {
+                                                        has_unknown = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -540,6 +585,7 @@ fn compute_externally_invocable(
     pts: &BTreeMap<Ptr, BTreeSet<Obj>>,
     scanned: &BTreeSet<(FuncId, PackedCtx)>,
     scanned_funcs: &BTreeSet<FuncId>,
+    base_scanned: &[bool],
     tainted_calls: &BTreeSet<(InstId, PackedCtx)>,
     pta_partial: &BTreeSet<InstId>,
     hop_cut_calls: &BTreeSet<InstId>,
@@ -548,6 +594,7 @@ fn compute_externally_invocable(
     recorded_funcs: &BTreeSet<FuncId>,
     roots: Option<&[FuncId]>,
     explicit_harness: Option<FuncId>,
+    const_method_refs: &mut ConstMethodRefMemo,
 ) -> (Vec<bool>, Vec<bool>, Vec<Option<FuncId>>) {
     let n_funcs = module.functions.len();
     let mut unrec = vec![false; n_funcs];
@@ -771,7 +818,7 @@ fn compute_externally_invocable(
                     }
                     Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         // Class getters/setters may run implicitly on property access.
-                        for mfid in collect_const_method_refs(module, cls.members) {
+                        for &mfid in const_method_refs.get(module, cls.members) {
                             if module.func(mfid).is_some_and(|mfd| {
                                 matches!(
                                     mfd.kind,
@@ -814,28 +861,44 @@ fn compute_externally_invocable(
         }
     }
 
-    // Fixed point over escaped objects and values returned by `unrec[fid]` functions.
-    let mut returned_seeded = vec![false; n_funcs];
+    // Fixed point over escaped objects and values returned by `unrec[fid]`
+    // functions, driven by an explicit `unrec_queue` (`O(n_funcs + |Insts| + |EscapedObjs|)`
+    // instead of rescanning `0..n_funcs` inside `loop`; `#104` P3-ANA-3).
+    let mut unrec_queue: VecDeque<usize> = (0..n_funcs).filter(|&fi| unrec[fi]).collect();
+    let mark_unrec = |idx: usize, unrec: &mut [bool], q: &mut VecDeque<usize>| {
+        if let Some(slot) = unrec.get_mut(idx)
+            && !*slot
+        {
+            *slot = true;
+            q.push_back(idx);
+        }
+    };
     loop {
-        for fi in 0..n_funcs {
-            if unrec[fi] && !returned_seeded[fi] {
-                returned_seeded[fi] = true;
-                let fid = FuncId::new(fi as u32);
-                if let Some(fd) = module.func(fid) {
-                    for &b in &fd.blocks {
-                        let Some(bb) = module.block(b) else { continue };
-                        for &iid in &bb.insts {
-                            if let Some(Op::Return { value: Some(rv) }) =
-                                module.inst(iid).map(|i| &i.op)
-                            {
-                                for &c in &ctxs_by_func[fi] {
-                                    enqueue_ptr(
-                                        Ptr::Local(*rv, c),
-                                        pts,
-                                        &mut escaped_objs,
-                                        &mut obj_queue,
-                                    );
-                                }
+        while let Some(fi) = unrec_queue.pop_front() {
+            let fid = FuncId::new(fi as u32);
+            let caller_base_unscanned = !base_scanned.get(fi).copied().unwrap_or(false);
+            if let Some(fd) = module.func(fid) {
+                for &b in &fd.blocks {
+                    let Some(bb) = module.block(b) else { continue };
+                    for &iid in &bb.insts {
+                        if let Some(Op::Return { value: Some(rv) }) =
+                            module.inst(iid).map(|i| &i.op)
+                        {
+                            for &c in &ctxs_by_func[fi] {
+                                enqueue_ptr(
+                                    Ptr::Local(*rv, c),
+                                    pts,
+                                    &mut escaped_objs,
+                                    &mut obj_queue,
+                                );
+                            }
+                        }
+                        if caller_base_unscanned
+                            && let Some(edge) = graph.edge_at(iid)
+                            && let CallTargets::Resolved(targets) = &edge.targets
+                        {
+                            for &t in targets {
+                                mark_unrec(t.index(), &mut unrec, &mut unrec_queue);
                             }
                         }
                     }
@@ -843,10 +906,7 @@ fn compute_externally_invocable(
             }
         }
         let Some(o) = obj_queue.pop_front() else {
-            if (0..n_funcs).all(|fi| !unrec[fi] || returned_seeded[fi]) {
-                break;
-            }
-            continue;
+            break;
         };
         match o {
             Obj::Site {
@@ -855,21 +915,15 @@ fn compute_externally_invocable(
                 callable,
                 ..
             } => {
-                if let Some(cfid) = callable.to_opt()
-                    && let Some(slot) = unrec.get_mut(cfid.index())
-                {
-                    *slot = true;
+                if let Some(cfid) = callable.to_opt() {
+                    mark_unrec(cfid.index(), &mut unrec, &mut unrec_queue);
                 }
                 if let Some(Op::DefineClass(cls) | Op::DefineSendableClass(cls)) =
                     module.inst(site).map(|i| &i.op)
                 {
-                    if let Some(slot) = unrec.get_mut(cls.ctor.index()) {
-                        *slot = true;
-                    }
-                    for mfid in collect_const_method_refs(module, cls.members) {
-                        if let Some(slot) = unrec.get_mut(mfid.index()) {
-                            *slot = true;
-                        }
+                    mark_unrec(cls.ctor.index(), &mut unrec, &mut unrec_queue);
+                    for &mfid in const_method_refs.get(module, cls.members) {
+                        mark_unrec(mfid.index(), &mut unrec, &mut unrec_queue);
                     }
                     if let Some(fptrs) = fields_by_obj.get(&ObjLoc::ClassProto(site, ctx)) {
                         for &fp in fptrs {
@@ -964,6 +1018,7 @@ impl<'m> Rung2AliasOracle<'m> {
             has_unknown: answer.has_unknown,
             unbalanced: false,
             capped: self.stats.capped,
+            may_be_non_object: false,
         }
     }
 

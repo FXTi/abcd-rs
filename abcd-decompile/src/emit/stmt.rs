@@ -122,17 +122,18 @@ pub(in crate::emit) enum PrintTask<'b> {
     },
 }
 
-fn scan_expr_inline_funcs(module: &Module, root: &Expr, out: &mut Vec<FuncId>) {
+fn scan_expr_inline_funcs(
+    method_refs: &crate::consts::ConstMethodRefCache,
+    root: &Expr,
+    out: &mut Vec<FuncId>,
+) {
     let mut stack: Vec<&Expr> = vec![root];
-    let mut mrefs = BTreeSet::new();
     while let Some(cur) = stack.pop() {
         match cur {
             Expr::Closure { body, .. } => out.push(*body),
             Expr::Class { ctor, members, .. } => {
                 out.push(*ctor);
-                mrefs.clear();
-                collect_method_refs(module, *members, &mut mrefs);
-                out.extend(mrefs.iter().copied());
+                out.extend_from_slice(method_refs.get(*members));
             }
             _ => {}
         }
@@ -140,31 +141,43 @@ fn scan_expr_inline_funcs(module: &Module, root: &Expr, out: &mut Vec<FuncId>) {
     }
 }
 
-fn scan_stmt_inline_funcs(module: &Module, stmt: &Stmt, out: &mut Vec<FuncId>) {
+fn scan_stmt_inline_funcs(
+    method_refs: &crate::consts::ConstMethodRefCache,
+    stmt: &Stmt,
+    out: &mut Vec<FuncId>,
+) {
     for e in stmt_exprs(stmt) {
-        scan_expr_inline_funcs(module, e, out);
+        scan_expr_inline_funcs(method_refs, e, out);
     }
 }
 
-fn scan_leaf_inline_funcs(module: &Module, leaf: &Leaf, out: &mut Vec<FuncId>) {
+fn scan_leaf_inline_funcs(
+    method_refs: &crate::consts::ConstMethodRefCache,
+    leaf: &Leaf,
+    out: &mut Vec<FuncId>,
+) {
     match leaf {
-        Leaf::Raw(s) => scan_stmt_inline_funcs(module, s, out),
-        Leaf::Destructure { obj, .. } => scan_expr_inline_funcs(module, obj, out),
+        Leaf::Raw(s) => scan_stmt_inline_funcs(method_refs, s, out),
+        Leaf::Destructure { obj, .. } => scan_expr_inline_funcs(method_refs, obj, out),
         Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
-            scan_expr_inline_funcs(module, v, out);
+            scan_expr_inline_funcs(method_refs, v, out);
         }
         Leaf::Decl { value: None, .. } => {}
     }
 }
 
-fn scan_nodes_inline_funcs(module: &Module, nodes: &[SNode], out: &mut Vec<FuncId>) {
+fn scan_nodes_inline_funcs(
+    method_refs: &crate::consts::ConstMethodRefCache,
+    nodes: &[SNode],
+    out: &mut Vec<FuncId>,
+) {
     let mut stack: Vec<&[SNode]> = vec![nodes];
     while let Some(seq) = stack.pop() {
         for n in seq {
             match n {
                 SNode::Stmts(leaves) => {
                     for l in leaves {
-                        scan_leaf_inline_funcs(module, l, out);
+                        scan_leaf_inline_funcs(method_refs, l, out);
                     }
                 }
                 SNode::If {
@@ -172,18 +185,18 @@ fn scan_nodes_inline_funcs(module: &Module, nodes: &[SNode], out: &mut Vec<FuncI
                     then,
                     otherwise,
                 } => {
-                    scan_expr_inline_funcs(module, cond, out);
+                    scan_expr_inline_funcs(method_refs, cond, out);
                     stack.push(otherwise);
                     stack.push(then);
                 }
                 SNode::While { cond, body, .. } => {
                     if let Some(c) = cond {
-                        scan_expr_inline_funcs(module, c, out);
+                        scan_expr_inline_funcs(method_refs, c, out);
                     }
                     stack.push(body);
                 }
                 SNode::DoWhile { body, cond, .. } => {
-                    scan_expr_inline_funcs(module, cond, out);
+                    scan_expr_inline_funcs(method_refs, cond, out);
                     stack.push(body);
                 }
                 SNode::Block(body) | SNode::Labeled { body, .. } => stack.push(body),
@@ -202,18 +215,18 @@ fn scan_nodes_inline_funcs(module: &Module, nodes: &[SNode], out: &mut Vec<FuncI
                     stack.push(body);
                 }
                 SNode::ForOf { iter, body, .. } => {
-                    scan_expr_inline_funcs(module, iter, out);
+                    scan_expr_inline_funcs(method_refs, iter, out);
                     stack.push(body);
                 }
                 SNode::ForIn { obj, body, .. } => {
-                    scan_expr_inline_funcs(module, obj, out);
+                    scan_expr_inline_funcs(method_refs, obj, out);
                     stack.push(body);
                 }
                 SNode::Switch { disc, cases } => {
-                    scan_expr_inline_funcs(module, disc, out);
+                    scan_expr_inline_funcs(method_refs, disc, out);
                     for c in cases.iter().rev() {
                         for t in &c.tests {
-                            scan_expr_inline_funcs(module, t, out);
+                            scan_expr_inline_funcs(method_refs, t, out);
                         }
                         stack.push(&c.body);
                     }
@@ -295,15 +308,23 @@ impl<'m> Emitter<'m> {
     }
 
     pub(in crate::emit) fn run_print_tasks(&mut self, root: PrintRoot<'_>, out: &mut String) {
+        let owned_cache;
+        let method_refs = match self.index {
+            Some(idx) => &idx.const_method_refs,
+            None => {
+                owned_cache = crate::consts::ConstMethodRefCache::build(self.module);
+                &owned_cache
+            }
+        };
         let mut queue: Vec<FuncId> = Vec::new();
         match &root {
-            PrintRoot::Nodes(s, _) => scan_nodes_inline_funcs(self.module, s, &mut queue),
+            PrintRoot::Nodes(s, _) => scan_nodes_inline_funcs(method_refs, s, &mut queue),
             PrintRoot::Node(n, _) => {
-                scan_nodes_inline_funcs(self.module, std::slice::from_ref(*n), &mut queue);
+                scan_nodes_inline_funcs(method_refs, std::slice::from_ref(*n), &mut queue);
             }
-            PrintRoot::Leaf(l, _) => scan_leaf_inline_funcs(self.module, l, &mut queue),
-            PrintRoot::Stmt(s, _) => scan_stmt_inline_funcs(self.module, s, &mut queue),
-            PrintRoot::Expr(e, _) => scan_expr_inline_funcs(self.module, e, &mut queue),
+            PrintRoot::Leaf(l, _) => scan_leaf_inline_funcs(method_refs, l, &mut queue),
+            PrintRoot::Stmt(s, _) => scan_stmt_inline_funcs(method_refs, s, &mut queue),
+            PrintRoot::Expr(e, _) => scan_expr_inline_funcs(method_refs, e, &mut queue),
             PrintRoot::ClassMethod { func, .. } => queue.push(*func),
         }
 
@@ -313,7 +334,7 @@ impl<'m> Emitter<'m> {
                 continue;
             }
             let pre = self.take_or_prepare_inline(fid);
-            scan_nodes_inline_funcs(self.module, &pre.body, &mut queue);
+            scan_nodes_inline_funcs(method_refs, &pre.body, &mut queue);
             inline_pool.insert(fid, pre);
         }
 
