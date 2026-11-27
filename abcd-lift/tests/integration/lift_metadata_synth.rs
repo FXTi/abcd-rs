@@ -166,8 +166,8 @@ fn model_method(
         body: Some(abcd_file::MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes: vec![Bytecode::Returnundefined],
-            entities: HashMap::new(),
+            code: abcd_file::MethodCode::Decoded(vec![Bytecode::Returnundefined]),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

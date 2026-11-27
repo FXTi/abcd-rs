@@ -695,3 +695,261 @@ fn taint_pta_budget_conflicts_with_alias_rung_below_two() {
         "{err}"
     );
 }
+
+#[test]
+fn jobs_flag_accepts_positive_counts_and_rejects_zero_with_exit_one() {
+    let (_dir, abc) = tiny_abc_file("dispatch-jobs-flag");
+
+    // `--jobs 2` / `-j 1` succeed across commands.
+    run_argv(&["abcd", "-j", "2", "analyze", &abc, "--dominators", "--json"]).expect("-j 2");
+    run_argv(&["abcd", "decompile", &abc, "--jobs", "1", "--call-entry"]).expect("--jobs 1");
+
+    // `--jobs 0` / `-j 0` fail with exit code 1 (`CliError::User`).
+    for bad in [
+        &["abcd", "--jobs", "0", "dis", &abc][..],
+        &["abcd", "analyze", &abc, "-j", "0"][..],
+    ] {
+        let err = run_argv(bad).expect_err("--jobs 0 must be rejected");
+        assert_eq!(err.exit_code(), 1, "{err}");
+        assert_eq!(err, CliError::User("--jobs must be at least 1".to_string()));
+    }
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+        .args(["--jobs", "0", "dis", &abc])
+        .output()
+        .expect("spawn abcd --jobs 0");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--jobs must be at least 1"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn timings_flag_writes_to_stderr_and_keeps_stdout_byte_identical() {
+    let (dir, abc) = tiny_abc_file("dispatch-timings-stdio");
+
+    for subcmd in [
+        vec!["dis", abc.as_str()],
+        vec!["decompile", abc.as_str(), "--call-entry"],
+        vec!["analyze", abc.as_str(), "--dominators", "--json"],
+        vec!["taint", abc.as_str(), "--preset", "ohos", "--json"],
+        vec!["info", abc.as_str(), "--verify", "--json"],
+    ] {
+        let plain = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+            .args(&subcmd)
+            .output()
+            .expect("spawn plain abcd");
+        assert!(
+            plain.status.success(),
+            "plain {subcmd:?} failed: {}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+        assert!(
+            plain.stderr.is_empty(),
+            "plain {subcmd:?} unexpectedly wrote stderr: {}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+
+        let mut timed_args = vec!["--timings"];
+        timed_args.extend_from_slice(&subcmd);
+        let timed = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+            .args(&timed_args)
+            .output()
+            .expect("spawn timed abcd");
+        assert!(
+            timed.status.success(),
+            "timed {subcmd:?} failed: {}",
+            String::from_utf8_lossy(&timed.stderr)
+        );
+        assert_eq!(
+            timed.stdout, plain.stdout,
+            "--timings must leave stdout 100% byte-identical for {subcmd:?}"
+        );
+        let stderr = String::from_utf8(timed.stderr).expect("utf8 timing stderr");
+        assert!(
+            stderr.contains("timing:"),
+            "expected timing lines on stderr for {subcmd:?}, got: {stderr:?}"
+        );
+    }
+
+    // Also pin `rewrite --timings -o`: output `.abc` bytes are identical and stderr gets timings.
+    let out_plain = dir.join("rw_plain.abc");
+    let out_timed = dir.join("rw_timed.abc");
+    let rw1 = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+        .args(["rewrite", &abc, "-o", out_plain.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let rw2 = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+        .args([
+            "rewrite",
+            &abc,
+            "--timings",
+            "-o",
+            out_timed.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(rw1.status.success() && rw2.status.success());
+    assert_eq!(
+        std::fs::read(&out_plain).unwrap(),
+        std::fs::read(&out_timed).unwrap()
+    );
+    let rw_stderr = String::from_utf8(rw2.stderr).unwrap();
+    assert!(rw_stderr.contains("decode"), "{rw_stderr}");
+    assert!(rw_stderr.contains("lift"), "{rw_stderr}");
+    assert!(rw_stderr.contains("rewrite"), "{rw_stderr}");
+}
+
+#[test]
+fn forensic_flag_recovers_healthy_methods_on_corrupt_abc_and_rejects_writers() {
+    use abcd_file::{AccessFlags, Builder, CodeEntity, SourceLang, Type};
+    use abcd_isa::{Bytecode, EntityId, Imm};
+
+    // Build a 2-method `.abc`: `func_main_0` (healthy) + `decoy_bad` (whose
+    // bytecode we corrupt with invalid opcode `0xfe`), PLUS flip the header
+    // Adler-32 checksum (`corrupted[8] ^= 0xFF`).
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+
+    let s_ok = b.add_string("recovered_forensic_payload");
+    let (ok_code, ok_offs) =
+        abcd_isa::encode(&[Bytecode::LdaStr(placeholder), Bytecode::Return]).unwrap();
+    let ok_m = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::STATIC,
+        &ok_code,
+        2,
+        3,
+    );
+    b.relocate_code_id(ok_m, ok_offs[0], 0, CodeEntity::String(s_ok))
+        .unwrap();
+
+    let marker = [
+        Bytecode::Ldai(Imm(0x13)),
+        Bytecode::Ldai(Imm(0x37)),
+        Bytecode::Ldai(Imm(0x42)),
+        Bytecode::Return,
+    ];
+    let (decoy_code, _) = abcd_isa::encode(&marker).unwrap();
+    b.class_add_method(
+        cls,
+        "decoy_bad",
+        proto,
+        AccessFlags::STATIC,
+        &decoy_code,
+        1,
+        3,
+    );
+    b.deduplicate();
+    let mut corrupted = b.finalize().expect("finalize seed forensic abc");
+
+    let pos = corrupted
+        .windows(decoy_code.len())
+        .position(|w| w == decoy_code.as_slice())
+        .expect("locate decoy_bad code bytes");
+    for slot in &mut corrupted[pos..pos + decoy_code.len() - 1] {
+        *slot = 0x65; // returnundefined
+    }
+    corrupted[pos + decoy_code.len() - 1] = 0xfe; // invalid opcode
+    corrupted[8] ^= 0xFF; // corrupt Adler-32 header checksum
+
+    let dir = common::tempdir("dispatch-forensic");
+    let bad_abc = write_in(&dir, "corrupted.abc", &corrupted);
+    let (_, pa_in) = pa_file("dispatch-forensic-pa");
+    let hap = write_in(
+        &dir,
+        "entry.hap",
+        &common::hap("entry", &common::tiny_abc()),
+    );
+
+    // Without `--forensic`, strict decode rejects `corrupted.abc` with exit code 2.
+    for strict_argv in [
+        &["abcd", "dis", bad_abc.as_str()][..],
+        &["abcd", "decompile", bad_abc.as_str()][..],
+        &["abcd", "analyze", bad_abc.as_str()][..],
+        &["abcd", "taint", bad_abc.as_str(), "--preset", "ohos"][..],
+    ] {
+        let err = run_argv(strict_argv).expect_err("strict decode must fail on corrupt decoy");
+        assert_eq!(err.exit_code(), 2, "{strict_argv:?} -> {err}");
+    }
+
+    // With `--forensic`, `dis`, `decompile`, `analyze`, and `taint` recover
+    // `func_main_0` on stdout while emitting `[checksum` and `[bytecode` warnings on stderr!
+    for (subcmd, expected_stdout) in [
+        (
+            vec!["dis", "--forensic", bad_abc.as_str()],
+            "recovered_forensic_payload",
+        ),
+        (
+            vec!["decompile", "--forensic", bad_abc.as_str()],
+            "recovered_forensic_payload",
+        ),
+        (
+            vec!["analyze", "--forensic", "--json", bad_abc.as_str()],
+            "\"entry\": \"func_main_0\"",
+        ),
+        (
+            vec![
+                "taint",
+                "--forensic",
+                "--preset",
+                "ohos",
+                "--json",
+                bad_abc.as_str(),
+            ],
+            "\"module\": \"corrupted\"",
+        ),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+            .args(&subcmd)
+            .output()
+            .expect("spawn forensic abcd");
+        assert!(
+            out.status.success(),
+            "{subcmd:?} failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+        let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+        assert!(
+            stdout.contains(expected_stdout),
+            "{subcmd:?} stdout missing {expected_stdout:?}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("warning:"),
+            "{subcmd:?} must never leak warnings onto stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("warning:") && stderr.contains("checksum"),
+            "{subcmd:?} stderr missing checksum warning:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("bytecode"),
+            "{subcmd:?} stderr missing bytecode warning:\n{stderr}"
+        );
+    }
+
+    // Writer/non-inspection commands reject `--forensic` cleanly with exit code 1.
+    for rejected in [
+        &["abcd", "rewrite", "--forensic", bad_abc.as_str()][..],
+        &["abcd", "extract", "--forensic", hap.as_str()][..],
+        &["abcd", "asm", "--forensic", pa_in.as_str()][..],
+        &["abcd", "info", "--forensic", bad_abc.as_str()][..],
+    ] {
+        let err = run_argv(rejected).expect_err("--forensic on unsupported subcommand must fail");
+        assert_eq!(err.exit_code(), 1, "{rejected:?} -> {err}");
+        assert!(
+            err.to_string().contains("--forensic is only supported"),
+            "{rejected:?} -> {err}"
+        );
+    }
+}

@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::CliError;
 
@@ -39,8 +40,9 @@ pub struct InputModule {
     /// otherwise derived from the container entry name, otherwise the
     /// source file stem.
     pub name: String,
-    /// Raw `.abc` bytes.
-    pub abc: Vec<u8>,
+    /// Raw `.abc` bytes (`Arc<[u8]>` for O(1) zero-copy sharing from inflated
+    /// container entries and lazy `MethodCode::Span` decoding).
+    pub abc: Arc<[u8]>,
     /// Raw `module.json` / `config.json` bytes, if the container carried one.
     pub module_json: Option<Vec<u8>>,
     /// Human-readable provenance chain (e.g.
@@ -85,7 +87,7 @@ pub fn load(path: &Path, selection: ModuleSelection<'_>) -> Result<Vec<InputModu
     } else {
         vec![InputModule {
             name: file_stem(&source_name),
-            abc: bytes,
+            abc: Arc::from(bytes),
             module_json: None,
             provenance: source_name.clone(),
         }]
@@ -105,7 +107,7 @@ pub fn load_bytes(
     } else {
         vec![InputModule {
             name: file_stem(source_name),
-            abc: bytes.to_vec(),
+            abc: Arc::from(bytes),
             module_json: None,
             provenance: source_name.to_string(),
         }]
@@ -136,7 +138,7 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
     let mut used_keys: BTreeSet<String> = BTreeSet::new();
     for m in modules {
         let summary = m.manifest_summary();
-        let abc = m.data.as_slice().to_vec();
+        let abc = m.data.into_arc();
         let module_json = m.module_json.as_ref().map(|d| d.as_slice().to_vec());
         let raw_base = resolve_module_name(
             summary.as_ref().and_then(|s| s.module_name.as_deref()),
@@ -365,7 +367,7 @@ mod tests {
         let mods = load_bytes(b"\x00\x01", "foo/modules.abc", ModuleSelection::Single).unwrap();
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].name, "modules");
-        assert_eq!(mods[0].abc, b"\x00\x01");
+        assert_eq!(mods[0].abc.as_ref(), b"\x00\x01");
         assert_eq!(mods[0].provenance, "foo/modules.abc");
     }
 

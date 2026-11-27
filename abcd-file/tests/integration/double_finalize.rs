@@ -54,7 +54,7 @@ fn second_finalize_produces_identical_bytes() {
         .unwrap()
         .1;
     let body = f.body.as_ref().unwrap();
-    let array_id = body.bytecodes[1].entity_operands()[0].1;
+    let array_id = body.bytecodes()[1].entity_operands()[0].1;
     let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, array_id.0)]
     else {
         panic!("expected EntityRef::LiteralArray");
@@ -108,7 +108,7 @@ fn staged_items_added_after_finalize_accumulate() {
         .unwrap()
         .1;
     let body = f.body.as_ref().unwrap();
-    let array_id = body.bytecodes[0].entity_operands()[0].1;
+    let array_id = body.bytecodes()[0].entity_operands()[0].1;
     let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, array_id.0)]
     else {
         panic!("expected EntityRef::LiteralArray");

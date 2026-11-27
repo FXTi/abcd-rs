@@ -7,15 +7,14 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
 ## Features
 
 - **Container & `.abc` Codec (`abcd-hap`, `abcd-file`, `abcd-isa`)**:
-  - Pure-Rust, zero-C reader for `.hap`, `.hsp`, `.app`, and `.hqf` packages (signing-block tolerant, borrowed Stored fast path).
-  - Full `.abc` `decode` & `encode` across modern formats (`9.0.0.0`–`24.0.0.0`, including `20+ MB` commercial `--merge-abc` bundles) plus legacy `0.0.0.2` decoding.
+  - 100% pure Safe Rust readers (`#![forbid(unsafe_code)]`) for `.hap`/`.hsp`/`.app`/`.hqf` packages and `.abc` containers (`60B` dynamic `0.0.0.2`/`0.0.0.3`/`9.0.0.0`–`24.0.0.0` + `64B`/`72B` static `0.0.0.5`/`0.0.0.6`/`0.1.0.7`), with zero-copy `Arc<[u8]>` `MethodCode::Span`, `DecodeMode::{Strict, Forensic}`, relocated `encode`, and C++ differential reader oracles.
   - Byte-identical `.pa` disassembler (`abcd dis`, `5,517/5,517` vs. upstream `ark_disasm`) and semantic `.pa` assembler (`abcd asm`).
 - **Format-Independent `94`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
-  - Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), Hack–Grund–Goos dominance-tree SSA coloring + Boissinot CSSA coalescing, `acc`-as-cache instruction selection, and per-method `u16` entity compaction.
+  - Flat-arena `SymbolTable` & `HashTable`-backed `ConstPool`, bit-identical parallel Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), Hack–Grund–Goos dominance-tree SSA coloring + Boissinot CSSA coalescing, streaming batched `rewrite_file_owned`, and per-method `u16` entity compaction.
 - **Interprocedural Static & Taint Analysis (`abcd-analysis`, `abcd-taint`)**:
-  - Iterative Semi-NCA dominators, IFDS tabulation solver with zero-copy identity passthrough, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with on-the-fly call-graph co-evolution, cross-module ES linking, Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
+  - Iterative Semi-NCA dominators, cursor-driven IFDS tabulation with shared `IfdsResult` CSR, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with sparse `Rung2Tables` and on-the-fly call-graph co-evolution, zero-clone `PreparedModule` + steady-state `while (*)` Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
 - **JS / TS & ArkUI Decompiler (`abcd-decompile`)**:
-  - Three-stage expression, control-flow, and state-machine (`function*`, `async`, `async*`, `yield*`, `for await..of`) recovery (`1,149/1,149` corpus dream gate, `2,676/2,685` `test262` dream gate), `--split-modules` multi-file bundle recovery, and `--arkui` `@Component struct` reconstruction.
+  - Three-stage expression, control-flow, and state-machine (`function*`, `async`, `async*`, `yield*`, `for await..of`) recovery (`1,149/1,149` corpus dream gate, `2,680/2,685` `test262` dream gate) with deduplicated instruction-weight batching, `--split-modules` multi-file bundle recovery, and `--arkui` `@Component struct` reconstruction.
 
 ---
 
@@ -25,8 +24,8 @@ A high-performance Rust toolkit for inspecting, disassembling, assembling, optim
 | :--- | :--- |
 | [`abcd-isa-sys`](abcd-isa-sys/README.md) | Vendored C++17 `BytecodeInst` / `BytecodeEmitter` C99 differential-oracle FFI bridge |
 | [`abcd-isa`](abcd-isa/README.md) | Pure-Rust `Bytecode` enum, modern & legacy `0.0.0.2` decoders, Fenwick encoder, relocation, and `Version` |
-| [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded, span-checked C99 FFI bridge over vendored `libpandafile` |
-| [`abcd-file`](abcd-file/README.md) | `.abc` `decode` / `encode`, lossless MUTF-8 `StringPool`, and `pandasm` `.pa` text layer |
+| [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded C99 FFI bridge over vendored `libpandafile` (`AbcBuilder` writer + differential reader oracle) |
+| [`abcd-file`](abcd-file/README.md) | Pure-Rust zero-copy `.abc` reader (`Strict`/`Forensic`), `encode`, flat-arena `StringPool`, and `pandasm` `.pa` layer |
 | [`abcd-hap`](abcd-hap/README.md) | Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` container & manifest reader |
 | [`abcd-ir`](abcd-ir/README.md) | Format-independent `94`-op SSA IR, Semi-NCA `DomTree`, `Effects`, `Ty`, `FrameSlots`, and verifier |
 | [`abcd-lift`](abcd-lift/README.md) | `abcd_file::File` → `abcd_ir::Module` lifter |

@@ -10,10 +10,12 @@ readme = "README.md"
 # Crate-graph invariant (design/ir.md, design/analysis.md):
 # analysis infra is strictly format-independent and never depends on abcd-file /
 # abcd-isa / abcd-lift / abcd-lower / abcd-opt. The LIBRARY consumes only
-# `abcd-ir`; integration tests under `tests/` pull `abcd-file` and `abcd-lift`
-# as DEV-dependencies only to drive decode -> lift on real bytecode modules.
+# `abcd-ir` (plus `hashbrown` for compact index-only hash tables); integration
+# tests under `tests/` pull `abcd-file` and `abcd-lift` as DEV-dependencies only
+# to drive decode -> lift on real bytecode modules.
 [dependencies]
 abcd-ir = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 abcd-file = { workspace = true }

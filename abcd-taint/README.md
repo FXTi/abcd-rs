@@ -22,9 +22,10 @@ tabulation solver over `abcd_ir::Module`:
 | [`gap`](src/gap.rs) | Eager callback-gap propagator (`GapCallGraph`) materializing synthetic IFDS call edges into user closures and `DefineMethod` / `MethodRef` callbacks passed to higher-order builtins. |
 | [`prototype`](src/prototype.rs) | DAG-memoized receiver prototype-family resolver (`Array`, `Object`, `RegExp`, `Function`, `String`, `Number`, `Boolean`, `Iterator`, `Promise`). |
 | [`oracle`](src/oracle.rs) | Uniform point-aware adapter (`Oracle`) over Alias Oracle Rungs `0`, `1`, and `2` plus `SingletonSiteClassifier` concrete-singleton gating. |
-| [`problem`](src/problem.rs) | Zero-copy `FlowSink::pass_through()` `TaintProblem` flow functions (`normal_flow_out`, `call_flow_out`, `return_flow_out`, `call_to_return_flow_out`, `call_uncaught_exit_flow_out`), `#private` field symbols, static `LexVar` scope resolution, multi-frame uncaught exception propagation, and JSBridge seed discovery. |
+| [`closed_dispatch/`](src/closed_dispatch/mod.rs) | Whole-module closed class, prototype, object-literal, lexical-scope, and async-rethrow dispatch index (`mod.rs` monotone sealing, `harvest.rs` class/literal/scope passes, `eval.rs` iterative provenance evaluator). |
+| [`problem/`](src/problem/mod.rs) | Cohesive `TaintProblem` subsystem: `mod.rs` state & constructors, `cones.rs` reader/writer/heap cones, `escape.rs` local & OHOS harness escape gating, `classify.rs` fallback ladder & return observation, `transfer.rs` load/store/summary/GAP rules, `ifds.rs` zero-copy `IfdsProblem` flow functions, `lex_env.rs` static `LexVar` & `#private` slots, `indexes.rs` source/guard/variadic indexes, and `liveness.rs` backward SSA liveness & JSBridge seeds. |
 | [`ohos`](src/ohos.rs) | Versioned OpenHarmony (`@ohos.*` / `@kit.*`) sources, sinks, and ArkUI declarative component summaries (`ohos_preset`). |
-| [`driver`](src/driver.rs) | Pipeline driver (`run_taint`), steady-state `EntryModel` OHOS lifecycle harness integration, sink matching, and replay-guided witness-path reconstruction. |
+| [`driver/`](src/driver/mod.rs) | Pipeline driver (`PreparedModule`, `run_taint`, `run_taint_prepared`), in-place zero-clone `OhosHarness` lifecycle synthesis, sink matching, and shared-CSR replay-guided witness-path reconstruction. |
 
 ### Access-Path Fact Model
 Each `TaintFact` pairs a `FieldChain` (`Named(Sym)`, `AnyIndex`, `AnyDynamic`,
@@ -56,7 +57,7 @@ Each call site is classified once in strict precedence order:
 2. **Resolved user body** — steps into non-external `FunctionData` bodies via normal
    IFDS call/return edges (concrete user code takes precedence over preloaded builtin summaries
    and receiver heuristics; incomplete or mixed external/body call edges additionally retain
-   conservative caller bypass and `native_identity` flows).
+   conservative caller bypass and `native_identity` flows unless sealed by `ClosedDispatchIndex`).
 3. **Direct-name builtin summary** (`SummaryRegistry::with_builtins`) — applies preloaded
    ECMAScript/builtin propagation rules when no user summary or concrete body overrides the site.
 4. **Receiver prototype summary** — `PrototypeResolver` infers receiver families from
@@ -99,7 +100,7 @@ See [`../design/analysis.md`](../design/analysis.md) and
 
 ```rust,no_run
 use abcd_ir::Module;
-use abcd_taint::{SinkSpec, SourceSpec, TaintConfig, ohos_preset, run_taint};
+use abcd_taint::{PreparedModule, SinkSpec, SourceSpec, TaintConfig, ohos_preset, run_taint_prepared};
 
 let module = Module::new(); // or lifted via `abcd_lift::lift_file`
 let mut config: TaintConfig = ohos_preset();
@@ -110,7 +111,8 @@ config.sinks.push(SinkSpec::Call {
     name: "print".to_owned(),
 });
 
-let report = run_taint(&module, &config);
+let prepared = PreparedModule::owned(module, &config);
+let report = run_taint_prepared(&prepared, &config);
 for hit in &report.hits {
     println!("{} ({}) at {:?}", hit.sink, hit.position, hit.loc);
 }

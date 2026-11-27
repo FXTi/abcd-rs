@@ -8,12 +8,14 @@
 //! pipeline bug surfaces as a tool error (exit 2) instead of a corrupt file on
 //! disk.
 //!
-//! Whole-file lowering delegates to [`abcd_lower::rewrite_file`]: the lifted
+//! Whole-file lowering delegates to [`abcd_lower::rewrite_file_owned`]: the lifted
 //! module is verified ([`abcd_ir::verify_module`]), optionally optimized, and
-//! lowered back onto the decoded [`File`] with synced constant/literal pools,
-//! IC slot sizing, and rebuilt per-method debug tables (`R3-H8`).
+//! lowered back onto the decoded [`File`] by value with synced constant/literal
+//! pools, IC slot sizing, and rebuilt per-method debug tables (`R3-H8`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use abcd_file::File;
 use abcd_ir::verify_module;
@@ -71,7 +73,7 @@ fn shape(file: &File) -> (usize, usize) {
     for (_class, method) in file.all_methods() {
         methods += 1;
         if let Some(body) = &method.body {
-            instructions += body.bytecodes.len();
+            instructions += body.insn_count();
         }
     }
     (methods, instructions)
@@ -83,15 +85,50 @@ fn shape(file: &File) -> (usize, usize) {
 /// and no bytes leave the function (design/cli.md §2–§3: writer commands get a
 /// round-trip self-check and never emit partial output).
 pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenModule, CliError> {
-    let ctx = || format!("rewrite {} ({})", module.name, module.provenance);
+    rewrite_core(
+        module.name.clone(),
+        module.provenance.clone(),
+        Arc::clone(&module.abc),
+        opts,
+        false,
+    )
+}
 
-    // Stage 1: decode the input bytes.
-    let file = abcd_file::decode(&module.abc)
+pub(crate) fn rewrite_owned(
+    module: InputModule,
+    opts: RewriteOptions,
+    timings: bool,
+) -> Result<RewrittenModule, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    rewrite_core(name, provenance, abc, opts, timings)
+}
+
+fn rewrite_core(
+    name: String,
+    provenance: String,
+    abc_in: Arc<[u8]>,
+    opts: RewriteOptions,
+    timings: bool,
+) -> Result<RewrittenModule, CliError> {
+    let ctx = || format!("rewrite {name} ({provenance})");
+
+    // Stage 1: lazily decode the input bytes (`MethodCode::Span`).
+    let t_dec = timings.then(Instant::now);
+    let file = abcd_file::decode_lazy(abc_in)
         .map_err(|e| CliError::Tool(format!("{}: decode failed: {e}", ctx())))?;
+    if let Some(start) = t_dec {
+        crate::log_timing(true, &name, "decode", start.elapsed());
+    }
 
     // Stage 2: lift the whole file to the IR, then verify it (same order
     // as the corpus pipeline's front_end: verify catches structural IR
     // bugs with precise errors before the lower trips over them).
+    let t_lift = timings.then(Instant::now);
     let mut ir = abcd_lift::lift_file(&file)
         .map_err(|e| CliError::Tool(format!("{}: lift failed: {e}", ctx())))?;
     let report = verify_module(&ir);
@@ -102,12 +139,17 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
             report.errors
         )));
     }
+    if let Some(start) = t_lift {
+        crate::log_timing(true, &name, "lift", start.elapsed());
+    }
 
     // Stage 3 (optional): optimize.
+    let t_rw = timings.then(Instant::now);
     let optimized_changed = opts.optimize && abcd_opt::optimize_module(&mut ir);
 
-    // Stage 4: lower the IR back onto `file` via `abcd_lower::rewrite_file`
-    // (syncing constant/literal pools, IC slot counts, and method debug info).
+    // Stage 4: lower the IR back onto `file` by value via
+    // `abcd_lower::rewrite_file_owned` (freeing replaced MethodSpan bodies
+    // immediately without cloning `file`).
     let (methods, input_instructions) = shape(&file);
     let before_body_tags: Vec<&'static str> = if opts.check {
         file.all_methods()
@@ -118,10 +160,9 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     };
     let lowered = ir.functions.iter().filter(|f| !f.blocks.is_empty()).count();
 
-    let rewritten_file = abcd_lower::rewrite_file(&ir, &file, LowerOptions::default())
+    let rewritten_file = abcd_lower::rewrite_file_owned(&ir, file, LowerOptions::default())
         .map_err(|e| CliError::Tool(format!("{}: lower failed: {e}", ctx())))?;
     drop(ir);
-    drop(file);
 
     let unchecked_output_instructions = if opts.check {
         0
@@ -145,11 +186,14 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     } else {
         unchecked_output_instructions
     };
+    if let Some(start) = t_rw {
+        crate::log_timing(true, &name, "rewrite", start.elapsed());
+    }
 
     Ok(RewrittenModule {
-        name: module.name.clone(),
+        name,
         abc,
-        provenance: module.provenance.clone(),
+        provenance,
         stats: RewriteStats {
             methods,
             lowered,
@@ -160,7 +204,7 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     })
 }
 
-/// Run the `--check` readback pipeline (`decode → parity → lift_file → verify_module`)
+/// Run the `--check` readback pipeline (`decode_lazy → parity → lift_file → verify_module`)
 /// over emitted `.abc` bytes, returning the decoded instruction count on success.
 fn check_emitted(
     ctx: &dyn Fn() -> String,
@@ -168,7 +212,7 @@ fn check_emitted(
     expected_methods: usize,
     before_body_tags: &[&'static str],
 ) -> Result<usize, CliError> {
-    let redecoded = abcd_file::decode(abc).map_err(|e| {
+    let redecoded = abcd_file::decode_lazy(Arc::from(abc)).map_err(|e| {
         CliError::Tool(format!(
             "{}: --check: emitted bytes do not re-decode: {e}",
             ctx()
@@ -211,7 +255,7 @@ fn check_emitted(
 /// Short body-state tag for `--check` diagnostics.
 fn body_state(body: &Option<abcd_file::MethodBody>) -> &'static str {
     match body {
-        Some(b) if b.bytecodes.is_empty() => "empty body",
+        Some(b) if b.insn_count() == 0 => "empty body",
         Some(_) => "body",
         None => "no body",
     }
@@ -244,6 +288,30 @@ pub fn write_all(
     Ok(written)
 }
 
+pub(crate) fn write_all_owned(
+    modules: Vec<InputModule>,
+    out_dir: &Path,
+    opts: RewriteOptions,
+    timings: bool,
+) -> Result<Vec<(String, PathBuf, usize)>, CliError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        CliError::Tool(format!(
+            "cannot create output directory {}: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let mut written = Vec::with_capacity(modules.len());
+    for m in modules {
+        let out = rewrite_owned(m, opts, timings)?;
+        let path = out_dir.join(format!("{}.abc", out.name));
+        std::fs::write(&path, &out.abc)
+            .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
+        let size = out.abc.len();
+        written.push((out.name, path, size));
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +320,7 @@ mod tests {
         abcd_file::MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes,
+            code: bytecodes.into(),
             entities: Default::default(),
             try_blocks: Vec::new(),
             ic_size: None,
@@ -335,7 +403,7 @@ mod tests {
 
         let module = InputModule {
             name: "dbg".to_string(),
-            abc: input_abc,
+            abc: Arc::from(input_abc),
             module_json: None,
             provenance: "dbg.abc".to_string(),
         };
@@ -352,7 +420,7 @@ mod tests {
         let out_file = abcd_file::decode(&out.abc).expect("re-decode rewritten abc");
         let (_, out_method) = out_file.all_methods().next().expect("one output method");
         let body = out_method.body.as_ref().expect("output method has body");
-        assert!(!body.bytecodes.is_empty());
+        assert!(body.insn_count() > 0);
         let dbg = out_method
             .debug
             .as_ref()
@@ -363,10 +431,10 @@ mod tests {
         );
         for entry in &dbg.line_table {
             assert!(
-                (entry.index as usize) < body.bytecodes.len(),
+                (entry.index as usize) < body.insn_count(),
                 "line_table index {} out of bounds for {} instructions",
                 entry.index,
-                body.bytecodes.len()
+                body.insn_count()
             );
         }
         assert!(

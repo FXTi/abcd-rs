@@ -44,7 +44,7 @@ fn shape(abc: &[u8]) -> (usize, usize) {
     for (_class, method) in file.all_methods() {
         methods += 1;
         if let Some(body) = &method.body {
-            instructions += body.bytecodes.len();
+            instructions += body.insn_count();
         }
     }
     (methods, instructions)
@@ -73,7 +73,11 @@ fn identity_rewrite_preserves_method_and_instruction_counts() {
     assert_eq!(in_methods, 1);
     assert_eq!(out_methods, in_methods, "method count must survive");
     assert_eq!(out_insns, in_insns, "instruction count must survive");
-    assert_eq!(out.abc, module.abc, "the normal form is a fixpoint");
+    assert_eq!(
+        out.abc,
+        module.abc.as_ref(),
+        "the normal form is a fixpoint"
+    );
 
     // Stats are measured, not assumed: they must agree with the decode.
     assert_eq!(out.stats.methods, in_methods);

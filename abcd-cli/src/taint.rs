@@ -12,14 +12,16 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 
 use abcd_analysis::dataflow::heap::FieldKey;
 use abcd_ir::{Loc, Module, Sym};
 use abcd_taint::{Fact, TaintBase, TaintConfig, TaintFact, TaintReport};
 use serde::Serialize;
 
-use crate::CliError;
 use crate::input::InputModule;
+use crate::{CliError, ExecContext};
 
 /// Machine-readable taint report of one module (serialized by `--json`).
 #[derive(Clone, Debug, Serialize)]
@@ -185,34 +187,81 @@ pub fn resolve_config(
 
 /// Decode, lift, and run the taint analysis over one module.
 pub fn report(module: &InputModule, config: &TaintConfig) -> Result<TaintCliReport, CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    report_arc(
+        module.name.clone(),
+        module.provenance.clone(),
+        Arc::clone(&module.abc),
+        module.module_json.as_deref(),
+        config,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn report_owned(
+    module: InputModule,
+    config: &TaintConfig,
+    ctx: ExecContext,
+) -> Result<TaintCliReport, CliError> {
+    let InputModule {
+        name,
+        abc,
+        module_json,
+        provenance,
+    } = module;
     let mut run_cfg = config.clone();
     if run_cfg.manifest_json.is_none()
-        && let Some(mj) = &module.module_json
+        && let Some(mj) = module_json.as_deref()
         && let Ok(txt) = std::str::from_utf8(mj)
     {
         run_cfg.manifest_json = Some(txt.to_owned());
     }
-    let report = abcd_taint::run_taint(&ir, &run_cfg);
-    Ok(build_report(module, &run_cfg, &ir, &report))
+    drop(module_json);
+    run_single_with_cfg(name, provenance, abc, run_cfg, ctx)
+}
+
+fn report_arc(
+    name: String,
+    provenance: String,
+    abc: Arc<[u8]>,
+    module_json: Option<&[u8]>,
+    config: &TaintConfig,
+    ctx: ExecContext,
+) -> Result<TaintCliReport, CliError> {
+    let mut run_cfg = config.clone();
+    if run_cfg.manifest_json.is_none()
+        && let Some(mj) = module_json
+        && let Ok(txt) = std::str::from_utf8(mj)
+    {
+        run_cfg.manifest_json = Some(txt.to_owned());
+    }
+    run_single_with_cfg(name, provenance, abc, run_cfg, ctx)
+}
+
+fn run_single_with_cfg(
+    name: String,
+    provenance: String,
+    abc: Arc<[u8]>,
+    run_cfg: TaintConfig,
+    ctx: ExecContext,
+) -> Result<TaintCliReport, CliError> {
+    let lift_opts = abcd_lift::LiftOptions {
+        retain_tail_capacity: run_cfg.ohos_lifecycle,
+        parallel: true,
+    };
+    let ir = crate::lift_abc_arc(abc, &name, &provenance, &lift_opts, ctx)?;
+    let t_taint = ctx.timings.then(Instant::now);
+    let prepared = abcd_taint::PreparedModule::owned(ir, &run_cfg);
+    let report = abcd_taint::run_taint_prepared(&prepared, &run_cfg);
+    let out = build_report(&name, &provenance, &run_cfg, prepared.module(), &report);
+    if let Some(start) = t_taint {
+        crate::log_timing(true, &name, "taint", start.elapsed());
+    }
+    Ok(out)
 }
 
 /// Decode, lift, link all `modules` into one unified [`Module`] via
-/// [`abcd_analysis::module_link::merge_ir_modules`], and run whole-application
-/// cross-module taint analysis.
+/// [`abcd_analysis::module_link::merge_ir_modules_owned`], and run
+/// whole-application cross-module taint analysis.
 pub fn report_linked(
     modules: &[InputModule],
     config: &TaintConfig,
@@ -220,54 +269,132 @@ pub fn report_linked(
     if modules.len() == 1 {
         return report(&modules[0], config);
     }
-    let mut lifted: Vec<(String, Module)> = Vec::with_capacity(modules.len());
+    let lift_opts = abcd_lift::LiftOptions {
+        retain_tail_capacity: config.ohos_lifecycle,
+        parallel: true,
+    };
     let mut manifests = Vec::new();
     let mut names = Vec::with_capacity(modules.len());
     let mut provs = Vec::with_capacity(modules.len());
-    for m in modules {
-        let ir = {
-            let file = abcd_file::decode(&m.abc).map_err(|e| {
-                CliError::Tool(format!(
-                    "failed to decode {} ({}): {e}",
-                    m.name, m.provenance
-                ))
-            })?;
-            abcd_lift::lift_file(&file).map_err(|e| {
-                CliError::Tool(format!("failed to lift {} ({}): {e}", m.name, m.provenance))
-            })?
-        };
-        if let Some(mj) = &m.module_json
+    let mut first_err: Option<CliError> = None;
+    let stream = modules.iter().map_while(|m| {
+        if let Some(mj) = m.module_json.as_deref()
             && let Ok(txt) = std::str::from_utf8(mj)
         {
             manifests.push(txt.to_owned());
         }
-        names.push(m.name.clone());
-        provs.push(m.provenance.clone());
-        lifted.push((m.name.clone(), ir));
+        match crate::lift_abc_arc(
+            Arc::clone(&m.abc),
+            &m.name,
+            &m.provenance,
+            &lift_opts,
+            ExecContext::default(),
+        ) {
+            Ok(ir) => {
+                names.push(m.name.clone());
+                provs.push(m.provenance.clone());
+                Some((m.name.clone(), ir))
+            }
+            Err(e) => {
+                first_err = Some(e);
+                None
+            }
+        }
+    });
+    let merged_ir = abcd_analysis::module_link::merge_ir_modules_owned(stream);
+    if let Some(err) = first_err {
+        return Err(err);
     }
-    let refs: Vec<(&str, &Module)> = lifted.iter().map(|(n, m)| (n.as_str(), m)).collect();
-    let merged_ir = abcd_analysis::module_link::merge_ir_modules(&refs);
-    drop(refs);
-    drop(lifted);
     let mut run_cfg = config.clone();
     if run_cfg.manifest_json.is_none() && !manifests.is_empty() {
         run_cfg.manifest_json = Some(manifests.join("\n"));
     }
-    let synthetic_in = InputModule {
-        name: names.join("+"),
-        abc: Vec::new(),
-        module_json: None,
-        provenance: provs.join(" + "),
+    let linked_name = names.join("+");
+    let linked_prov = provs.join(" + ");
+    let prepared = abcd_taint::PreparedModule::owned(merged_ir, &run_cfg);
+    let rep = abcd_taint::run_taint_prepared(&prepared, &run_cfg);
+    Ok(build_report(
+        &linked_name,
+        &linked_prov,
+        &run_cfg,
+        prepared.module(),
+        &rep,
+    ))
+}
+
+pub(crate) fn report_linked_owned(
+    mut modules: Vec<InputModule>,
+    config: &TaintConfig,
+    ctx: ExecContext,
+) -> Result<TaintCliReport, CliError> {
+    if modules.len() == 1 {
+        return report_owned(modules.swap_remove(0), config, ctx);
+    }
+    let lift_opts = abcd_lift::LiftOptions {
+        retain_tail_capacity: config.ohos_lifecycle,
+        parallel: true,
     };
-    let rep = abcd_taint::run_taint(&merged_ir, &run_cfg);
-    Ok(build_report(&synthetic_in, &run_cfg, &merged_ir, &rep))
+    let mut manifests = Vec::new();
+    let mut names = Vec::with_capacity(modules.len());
+    let mut provs = Vec::with_capacity(modules.len());
+    let mut first_err: Option<CliError> = None;
+    let stream = modules.into_iter().map_while(|m| {
+        let InputModule {
+            name,
+            abc,
+            module_json,
+            provenance,
+        } = m;
+        if let Some(mj) = module_json.as_deref()
+            && let Ok(txt) = std::str::from_utf8(mj)
+        {
+            manifests.push(txt.to_owned());
+        }
+        drop(module_json);
+        match crate::lift_abc_arc(abc, &name, &provenance, &lift_opts, ctx) {
+            Ok(ir) => {
+                names.push(name.clone());
+                provs.push(provenance);
+                Some((name, ir))
+            }
+            Err(e) => {
+                first_err = Some(e);
+                None
+            }
+        }
+    });
+    let merged_ir = abcd_analysis::module_link::merge_ir_modules_owned(stream);
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    let linked_name = names.join("+");
+    let linked_prov = provs.join(" + ");
+    let mut run_cfg = config.clone();
+    if run_cfg.manifest_json.is_none() && !manifests.is_empty() {
+        run_cfg.manifest_json = Some(manifests.join("\n"));
+    }
+    let t_taint = ctx.timings.then(Instant::now);
+    let prepared = abcd_taint::PreparedModule::owned(merged_ir, &run_cfg);
+    let rep = abcd_taint::run_taint_prepared(&prepared, &run_cfg);
+    let out = build_report(
+        &linked_name,
+        &linked_prov,
+        &run_cfg,
+        prepared.module(),
+        &rep,
+    );
+    if let Some(start) = t_taint {
+        crate::log_timing(true, &linked_name, "taint", start.elapsed());
+    }
+    Ok(out)
 }
 
 /// Project the driver's [`TaintReport`] onto the serializable CLI
-/// report (name/fact resolution happens here, against the module's
-/// symbol table).
+/// report (name/fact resolution happens here, against the prepared module's
+/// symbol table so harness-interned symbols such as `"context"` resolve).
 fn build_report(
-    module: &InputModule,
+    module_name: &str,
+    provenance: &str,
     config: &TaintConfig,
     ir: &Module,
     report: &TaintReport,
@@ -302,8 +429,8 @@ fn build_report(
         })
         .collect();
     TaintCliReport {
-        module: module.name.clone(),
-        provenance: module.provenance.clone(),
+        module: module_name.to_string(),
+        provenance: provenance.to_string(),
         config: ConfigReport {
             sources: config.sources.iter().map(|s| format!("{s:?}")).collect(),
             sinks: config.sinks.iter().map(|s| format!("{s:?}")).collect(),

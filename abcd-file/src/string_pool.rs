@@ -1,23 +1,40 @@
-//! Lossless string pool for `.abc` MUTF-8 strings (#30).
+//! Lossless flat-arena string pool for `.abc` MUTF-8 strings (`#30`, `#72`, `#77`).
 //!
 //! `.abc` string items are encoded in Modified UTF-8 (MUTF-8: `U+0000` as
 //! `C0 80`, astral scalar values as CESU-8 6-byte surrogate pairs, and
 //! ECMAScript lone surrogates `U+D800..=U+DFFF` as 3-byte `ED A0..BF 80..BF`
-//! sequences). Valid Unicode strings — including embedded `U+0000`, astral
-//! planes, and BMP Private Use Area code points (`U+E000..=U+F8FF`, used
-//! heavily for HarmonyOS IconFont / SymbolGlyph icons) — are stored as native
-//! UTF-8 `Arc<str>` entries (`as_str` returns `Some(&str)`), sharing a single
-//! heap allocation between the index table and the deduplication map.
+//! sequences).
 //!
-//! Strings that contain lone surrogates (or ill-formed byte sequences) have
-//! no lossless UTF-8 `str` representation; they are stored in a separate
-//! byte-keyed bucket carrying BOTH their exact MUTF-8 wire bytes (`Arc<[u8]>`,
-//! shared with the lookup map) and their replacement-character (`U+FFFD`)
-//! display string, with zero sentinel mangling in `str` space.
+//! All display UTF-8 strings (exact UTF-8 for lossless entries and replacement
+//! `U+FFFD` display text for lone-surrogate entries) live in a single
+//! contiguous `String` arena indexed by `len() + 1` `u32` byte offsets inside
+//! `Arc<Arena>` (`O(1)` copy-on-write `clone()`, `O(1)` `resolve()`).
+//! Lone-surrogate / ill-formed MUTF-8 entries additionally record their exact
+//! wire bytes in `Arena::cold` (sorted strictly ascending by `id`), while
+//! deduplication uses SipHash-keyed `hashbrown::HashTable<u32>` indices that
+//! can be dropped via [`StringPool::drop_index`] once construction finishes.
+
+#![forbid(unsafe_code)]
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::fmt;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
+
+use hashbrown::HashTable;
+
+/// Capacity error returned when [`StringPool`] would exceed `< u32::MAX`
+/// entries or `< u32::MAX` UTF-8 arena bytes (`#77`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StringPoolOverflow;
+
+impl fmt::Display for StringPoolOverflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("string pool exceeded u32::MAX entries or UTF-8 arena bytes")
+    }
+}
+
+impl std::error::Error for StringPoolOverflow {}
 
 /// Handle to an interned entry in [`StringPool`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,41 +55,235 @@ impl StringId {
 }
 
 #[derive(Clone, Debug)]
-enum PoolEntry {
-    /// Lossless valid UTF-8 string (shared with `utf8_to_id`).
-    Utf8(Arc<str>),
-    /// MUTF-8 byte sequence with no lossless UTF-8 `str` form (e.g. ECMAScript
-    /// lone surrogates). Deduplicated by exact `raw` wire bytes (`Arc<[u8]>`
-    /// shared with `raw_to_id`); `lossy` holds the clean `U+FFFD`-substituted
-    /// display text (never sentinel-mangled).
-    RawMutf8 { raw: Arc<[u8]>, lossy: Arc<str> },
+struct Cold {
+    id: u32,
+    raw: Box<[u8]>,
 }
 
-/// Append-only, deduplicating MUTF-8 / UTF-8 string pool.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
+struct Arena {
+    /// Concatenated display UTF-8 text of every entry in `StringId` order
+    /// (exact UTF-8 for lossless entries, `U+FFFD` display text for `cold`).
+    text: String,
+    /// `len() + 1` byte offsets into `text` (`offs[0] == 0`,
+    /// `offs[len] == text.len() as u32`).
+    offs: Vec<u32>,
+    /// Lossy MUTF-8 entries (lone surrogates / ill-formed MUTF-8), strictly
+    /// ascending by `id`.
+    cold: Vec<Cold>,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            offs: vec![0],
+            cold: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.offs.len() - 1
+    }
+
+    #[inline]
+    fn slice(&self, id: u32) -> Option<&str> {
+        let idx = id as usize;
+        let start = *self.offs.get(idx)? as usize;
+        let end = *self.offs.get(idx + 1)? as usize;
+        self.text.get(start..end)
+    }
+
+    #[inline]
+    fn cold_index(&self, id: u32) -> Option<usize> {
+        if self.cold.is_empty() {
+            return None;
+        }
+        self.cold.binary_search_by_key(&id, |c| c.id).ok()
+    }
+}
+
+impl Default for Arena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Index {
+    hasher: RandomState,
+    /// Lossless entries ONLY -> `StringId` (`u32`).
+    utf8: HashTable<u32>,
+    /// Lossy entries ONLY -> index into `Arena::cold` (`u32`).
+    raw: HashTable<u32>,
+}
+
+impl Index {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            utf8: HashTable::new(),
+            raw: HashTable::new(),
+        }
+    }
+
+    fn rebuild(arena: &Arena) -> Self {
+        let hasher = RandomState::new();
+        let total = arena.len();
+        let cold_len = arena.cold.len();
+        let mut utf8 = HashTable::with_capacity(total.saturating_sub(cold_len));
+        let mut raw = HashTable::with_capacity(cold_len);
+
+        let mut cold_cur = 0usize;
+        for idx in 0..total {
+            let id = idx as u32;
+            if cold_cur < cold_len && arena.cold[cold_cur].id == id {
+                let bytes = &*arena.cold[cold_cur].raw;
+                let h = hasher.hash_one(bytes);
+                let cidx = cold_cur as u32;
+                raw.insert_unique(h, cidx, |&existing_cidx| {
+                    hasher.hash_one(&*arena.cold[existing_cidx as usize].raw)
+                });
+                cold_cur += 1;
+            } else if let Some(s) = arena.slice(id) {
+                let h = hasher.hash_one(s);
+                utf8.insert_unique(h, id, |&existing_id| {
+                    hasher.hash_one(arena.slice(existing_id).unwrap_or(""))
+                });
+            }
+        }
+
+        Self { hasher, utf8, raw }
+    }
+}
+
+/// Append-only, deduplicating flat-arena MUTF-8 / UTF-8 string pool.
+#[derive(Clone, Debug)]
 pub struct StringPool {
-    entries: Vec<PoolEntry>,
-    utf8_to_id: HashMap<Arc<str>, StringId>,
-    raw_to_id: HashMap<Arc<[u8]>, StringId>,
+    arena: Arc<Arena>,
+    index: Option<Index>,
+}
+
+impl Default for StringPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StringPool {
-    /// Create an empty string pool.
+    /// Create an empty string pool with an active deduplication index.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            arena: Arc::new(Arena::new()),
+            index: Some(Index::new()),
+        }
+    }
+
+    /// Drop the transient reverse-lookup hash tables while retaining all
+    /// `StringId -> str / MUTF-8` arena data (`#72`).
+    ///
+    /// Subsequent [`Self::get`] and [`Self::get_raw_mutf8`] calls fall back to
+    /// length-prefiltered linear scans without mutating `self`; mutating
+    /// `intern` calls automatically rebuild the index if needed.
+    pub fn drop_index(&mut self) {
+        self.index = None;
+    }
+
+    /// Whether the deduplication hash index is currently resident.
+    #[inline]
+    pub fn has_index(&self) -> bool {
+        self.index.is_some()
+    }
+
+    /// Iterate all lossy (lone-surrogate / ill-formed MUTF-8) [`StringId`]s in
+    /// strictly ascending ID order.
+    pub fn lossy_ids(&self) -> impl Iterator<Item = StringId> + '_ {
+        self.arena.cold.iter().map(|c| StringId(c.id))
+    }
+
+    fn ensure_index(&mut self) -> &mut Index {
+        if self.index.is_none() {
+            self.index = Some(Index::rebuild(&self.arena));
+        }
+        match &mut self.index {
+            Some(idx) => idx,
+            None => unreachable!("index was just populated"),
+        }
+    }
+
+    fn check_append_bounds(&self, add_bytes: usize) -> Result<(u32, u32), StringPoolOverflow> {
+        let next_id_usize = self.arena.len();
+        let next_id = u32::try_from(next_id_usize)
+            .ok()
+            .filter(|&id| id < u32::MAX)
+            .ok_or(StringPoolOverflow)?;
+        let new_text_len = self
+            .arena
+            .text
+            .len()
+            .checked_add(add_bytes)
+            .ok_or(StringPoolOverflow)?;
+        let end_off = u32::try_from(new_text_len)
+            .ok()
+            .filter(|&off| off < u32::MAX)
+            .ok_or(StringPoolOverflow)?;
+        Ok((next_id, end_off))
+    }
+
+    /// Fallible counterpart of [`Self::get_or_intern`], enforcing `< u32::MAX`
+    /// entry count and UTF-8 arena byte-offset bounds (`#77`).
+    pub fn try_get_or_intern<T: AsRef<str>>(
+        &mut self,
+        s: T,
+    ) -> Result<StringId, StringPoolOverflow> {
+        let s = s.as_ref();
+        self.ensure_index();
+        let hash = match &self.index {
+            Some(idx) => idx.hasher.hash_one(s),
+            None => unreachable!("ensure_index guarantees Some"),
+        };
+        if let Some(idx) = &self.index
+            && let Some(&existing) = idx.utf8.find(hash, |&id| self.arena.slice(id) == Some(s))
+        {
+            return Ok(StringId(existing));
+        }
+
+        let (id, end_off) = self.check_append_bounds(s.len())?;
+        let arena = Arc::make_mut(&mut self.arena);
+        arena.text.push_str(s);
+        arena.offs.push(end_off);
+
+        if let Some(idx) = &mut self.index {
+            let hasher = &idx.hasher;
+            idx.utf8.insert_unique(hash, id, |&existing_id| {
+                hasher.hash_one(arena.slice(existing_id).unwrap_or(""))
+            });
+        }
+        Ok(StringId(id))
     }
 
     /// Intern a lossless UTF-8 string, returning its stable [`StringId`].
     pub fn get_or_intern<T: AsRef<str>>(&mut self, s: T) -> StringId {
-        let s = s.as_ref();
-        if let Some(&id) = self.utf8_to_id.get(s) {
-            return id;
+        match self.try_get_or_intern(s) {
+            Ok(id) => id,
+            Err(e) => panic!("{e}"),
         }
-        let id = StringId(self.entries.len() as u32);
-        let shared: Arc<str> = Arc::from(s);
-        self.entries.push(PoolEntry::Utf8(Arc::clone(&shared)));
-        self.utf8_to_id.insert(shared, id);
-        id
+    }
+
+    /// Fallible counterpart of [`Self::intern_mutf8`], enforcing `< u32::MAX`
+    /// entry count and UTF-8 arena byte-offset bounds (`#77`).
+    pub fn try_intern_mutf8(&mut self, raw: &[u8]) -> Result<StringId, StringPoolOverflow> {
+        if !raw.contains(&0)
+            && let Ok(s) = std::str::from_utf8(raw)
+        {
+            return self.try_get_or_intern(s);
+        }
+        if let Some(text) = mutf8_decode_utf8(raw) {
+            return self.try_get_or_intern(&text);
+        }
+        let lossy = String::from_utf8_lossy(raw);
+        self.try_intern_lossy_internal(&lossy, raw)
     }
 
     /// Intern raw MUTF-8 bytes losslessly:
@@ -83,62 +294,153 @@ impl StringPool {
     /// - Otherwise (lone surrogates or malformed MUTF-8), it interns as a
     ///   byte-backed entry deduplicated by exact `raw` bytes.
     pub fn intern_mutf8(&mut self, raw: &[u8]) -> StringId {
+        match self.try_intern_mutf8(raw) {
+            Ok(id) => id,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Fallible counterpart of [`Self::intern_lossy_raw`], enforcing `< u32::MAX`
+    /// entry count and UTF-8 arena byte-offset bounds (`#77`) and `R2-M9`
+    /// lossless MUTF-8 normalization (`#72`).
+    pub fn try_intern_lossy_raw(
+        &mut self,
+        lossy: &str,
+        raw: &[u8],
+    ) -> Result<StringId, StringPoolOverflow> {
         if !raw.contains(&0)
             && let Ok(s) = std::str::from_utf8(raw)
         {
-            return self.get_or_intern(s);
+            return self.try_get_or_intern(s);
         }
         if let Some(text) = mutf8_decode_utf8(raw) {
-            return self.get_or_intern(&text);
+            return self.try_get_or_intern(&text);
         }
-        let lossy = String::from_utf8_lossy(raw);
-        self.intern_lossy_raw(&lossy, raw)
+        self.try_intern_lossy_internal(lossy, raw)
     }
 
-    /// Intern a pre-classified lossy MUTF-8 byte sequence (`raw` has no
-    /// lossless UTF-8 representation; `lossy` is its replacement display form).
-    pub fn intern_lossy_raw(&mut self, lossy: &str, raw: &[u8]) -> StringId {
-        if let Some(&id) = self.raw_to_id.get(raw) {
-            return id;
+    fn try_intern_lossy_internal(
+        &mut self,
+        lossy: &str,
+        raw: &[u8],
+    ) -> Result<StringId, StringPoolOverflow> {
+        self.ensure_index();
+        let hash = match &self.index {
+            Some(idx) => idx.hasher.hash_one(raw),
+            None => unreachable!("ensure_index guarantees Some"),
+        };
+        if let Some(idx) = &self.index
+            && let Some(&cidx) = idx
+                .raw
+                .find(hash, |&ci| &*self.arena.cold[ci as usize].raw == raw)
+        {
+            return Ok(StringId(self.arena.cold[cidx as usize].id));
         }
-        let id = StringId(self.entries.len() as u32);
-        let raw_shared: Arc<[u8]> = Arc::from(raw);
-        self.entries.push(PoolEntry::RawMutf8 {
-            raw: Arc::clone(&raw_shared),
-            lossy: Arc::from(lossy),
+
+        let cold_idx = u32::try_from(self.arena.cold.len())
+            .ok()
+            .filter(|&ci| ci < u32::MAX)
+            .ok_or(StringPoolOverflow)?;
+        let (id, end_off) = self.check_append_bounds(lossy.len())?;
+
+        let arena = Arc::make_mut(&mut self.arena);
+        arena.text.push_str(lossy);
+        arena.offs.push(end_off);
+        arena.cold.push(Cold {
+            id,
+            raw: Box::from(raw),
         });
-        self.raw_to_id.insert(raw_shared, id);
-        id
+
+        if let Some(idx) = &mut self.index {
+            let hasher = &idx.hasher;
+            idx.raw.insert_unique(hash, cold_idx, |&existing_ci| {
+                hasher.hash_one(&*arena.cold[existing_ci as usize].raw)
+            });
+        }
+        Ok(StringId(id))
+    }
+
+    /// Intern a MUTF-8 byte sequence alongside its replacement display form.
+    ///
+    /// Per `R2-M9` (`#72`), if `raw` actually decodes to valid Unicode via
+    /// [`mutf8_decode_utf8`], this routes to [`Self::get_or_intern`] so
+    /// duplicate UTF-8 vs. raw `StringId`s can never be created.
+    pub fn intern_lossy_raw(&mut self, lossy: &str, raw: &[u8]) -> StringId {
+        match self.try_intern_lossy_raw(lossy, raw) {
+            Ok(id) => id,
+            Err(e) => panic!("{e}"),
+        }
     }
 
     /// Look up an already-interned lossless UTF-8 string without mutating.
     /// Never collides with lossy lone-surrogate entries.
     pub fn get<T: AsRef<str>>(&self, s: T) -> Option<StringId> {
-        self.utf8_to_id.get(s.as_ref()).copied()
+        let s = s.as_ref();
+        if let Some(idx) = &self.index {
+            let hash = idx.hasher.hash_one(s);
+            return idx
+                .utf8
+                .find(hash, |&id| self.arena.slice(id) == Some(s))
+                .map(|&id| StringId(id));
+        }
+
+        let target_len = s.len();
+        let offs = &self.arena.offs;
+        let text = &self.arena.text;
+        let cold = &self.arena.cold;
+        let mut cold_cur = 0usize;
+        let total = self.len();
+        for i in 0..total {
+            let id = i as u32;
+            if cold_cur < cold.len() && cold[cold_cur].id == id {
+                cold_cur += 1;
+                continue;
+            }
+            let start = offs[i] as usize;
+            let end = offs[i + 1] as usize;
+            if end - start == target_len && text.get(start..end) == Some(s) {
+                return Some(StringId(id));
+            }
+        }
+        None
     }
 
     /// Look up an already-interned lossy MUTF-8 byte entry by exact wire bytes.
     pub fn get_raw_mutf8(&self, raw: &[u8]) -> Option<StringId> {
-        self.raw_to_id.get(raw).copied()
+        if let Some(idx) = &self.index {
+            let hash = idx.hasher.hash_one(raw);
+            return idx
+                .raw
+                .find(hash, |&ci| &*self.arena.cold[ci as usize].raw == raw)
+                .map(|&ci| StringId(self.arena.cold[ci as usize].id));
+        }
+
+        let target_len = raw.len();
+        self.arena
+            .cold
+            .iter()
+            .find(|c| c.raw.len() == target_len && &*c.raw == raw)
+            .map(|c| StringId(c.id))
     }
 
     /// Borrow the exact UTF-8 string if `id` is valid AND lossless (`None` for
     /// lone-surrogate entries or out-of-range IDs).
     pub fn as_str(&self, id: StringId) -> Option<&str> {
-        match self.entries.get(id.index())? {
-            PoolEntry::Utf8(s) => Some(s),
-            PoolEntry::RawMutf8 { .. } => None,
+        if self.arena.cold.is_empty() {
+            return self.arena.slice(id.0);
         }
+        if self.arena.cold_index(id.0).is_some() {
+            return None;
+        }
+        self.arena.slice(id.0)
     }
 
     /// Resolve `id` to a UTF-8 `&str` (exact for lossless strings; clean
     /// `U+FFFD`-substituted display text for lone-surrogate strings, never
     /// carrying synthetic sentinels). Returns `None` for out-of-range IDs.
+    #[inline]
     pub fn resolve(&self, id: StringId) -> Option<&str> {
-        match self.entries.get(id.index())? {
-            PoolEntry::Utf8(s) => Some(s),
-            PoolEntry::RawMutf8 { lossy, .. } => Some(lossy),
-        }
+        self.arena.slice(id.0)
     }
 
     /// Explicit alias for [`Self::resolve`].
@@ -150,10 +452,8 @@ impl StringPool {
     /// Exact original MUTF-8 bytes when `id` is a lossy (lone-surrogate) entry;
     /// `None` for lossless UTF-8 entries or out-of-range IDs.
     pub fn raw_mutf8(&self, id: StringId) -> Option<&[u8]> {
-        match self.entries.get(id.index())? {
-            PoolEntry::Utf8(_) => None,
-            PoolEntry::RawMutf8 { raw, .. } => Some(raw),
-        }
+        let cidx = self.arena.cold_index(id.0)?;
+        Some(&self.arena.cold[cidx].raw)
     }
 
     /// Canonical MUTF-8 wire bytes for any valid `id`: borrowed verbatim for
@@ -161,48 +461,48 @@ impl StringPool {
     /// or encoded as canonical MUTF-8 (`C0 80` NUL, 6-byte CESU-8 astral pairs)
     /// when needed.
     pub fn to_mutf8_bytes(&self, id: StringId) -> Option<Cow<'_, [u8]>> {
-        match self.entries.get(id.index())? {
-            PoolEntry::Utf8(s) => Some(mutf8_encode_cow(s)),
-            PoolEntry::RawMutf8 { raw, .. } => Some(Cow::Borrowed(raw)),
+        if let Some(raw) = self.raw_mutf8(id) {
+            return Some(Cow::Borrowed(raw));
         }
+        let s = self.arena.slice(id.0)?;
+        Some(mutf8_encode_cow(s))
     }
 
     /// Lossless UTF-16 code-unit view of `id` (both valid Unicode strings and
     /// lone-surrogate MUTF-8 strings decode to their exact ECMAScript UTF-16
     /// code units).
     pub fn utf16_units(&self, id: StringId) -> Option<Vec<u16>> {
-        match self.entries.get(id.index())? {
-            PoolEntry::Utf8(s) => Some(s.encode_utf16().collect()),
-            PoolEntry::RawMutf8 { raw, .. } => Some(mutf8_to_utf16_lossy(raw)),
+        if let Some(raw) = self.raw_mutf8(id) {
+            return Some(mutf8_to_utf16_lossy(raw));
         }
+        let s = self.arena.slice(id.0)?;
+        Some(s.encode_utf16().collect())
     }
 
     /// Total number of interned entries (lossless + lossy).
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.arena.len()
     }
 
     /// Whether the pool contains zero entries.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     /// Number of lossy (lone-surrogate / raw-MUTF-8) entries in the pool.
     #[inline]
     pub fn lossy_count(&self) -> usize {
-        self.raw_to_id.len()
+        self.arena.cold.len()
     }
 
     /// Iterate `(id, lossy_or_exact_str)` in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (StringId, &str)> {
-        self.entries.iter().enumerate().map(|(i, e)| {
-            let s: &str = match e {
-                PoolEntry::Utf8(s) => s,
-                PoolEntry::RawMutf8 { lossy, .. } => lossy,
-            };
-            (StringId(i as u32), s)
+        let total = self.len();
+        (0..total).map(move |i| {
+            let id = i as u32;
+            (StringId(id), self.arena.slice(id).unwrap_or(""))
         })
     }
 }
@@ -370,9 +670,9 @@ mod tests {
 
         // Every identity is distinct; re-interning deduplicates cleanly.
         let ids = [id_pua, id_fake, id_repl, id_hi, id_lo];
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                assert_ne!(ids[i], ids[j], "collision between {i} and {j}");
+        for (i, &lhs) in ids.iter().enumerate() {
+            for &rhs in &ids[(i + 1)..] {
+                assert_ne!(lhs, rhs);
             }
         }
         assert_eq!(pool.intern_mutf8(&raw_hi), id_hi);
@@ -381,6 +681,8 @@ mod tests {
         assert_eq!(pool.get(fake_sentinel), Some(id_fake));
         assert_eq!(pool.get(replacement), Some(id_repl));
         assert_eq!(pool.lossy_count(), 2);
+        let lossy_vec: Vec<StringId> = pool.lossy_ids().collect();
+        assert_eq!(lossy_vec, vec![id_hi, id_lo]);
 
         // PUA strings round-trip their exact MUTF-8 bytes with zero truncation.
         assert_eq!(pool.as_str(id_pua), Some(pua_icon));
@@ -452,20 +754,131 @@ mod tests {
         let raw_surrogate = [0xED, 0xA0, 0xB4];
         let id_raw = pool.intern_mutf8(&raw_surrogate);
 
-        let entry_str = pool.as_str(id_utf8).unwrap();
-        let (map_key_str, _) = pool.utf8_to_id.get_key_value("shared_utf8_entry").unwrap();
-        assert!(
-            std::ptr::eq(entry_str, &**map_key_str),
-            "UTF-8 entry and lookup map key must share one backing allocation"
-        );
-        assert_eq!(Arc::strong_count(map_key_str), 2);
+        // Flat arena invariants: offs[0] == 0, offs[len] == text.len(), and a
+        // single `Arc<Arena>` backs all strings without duplicate key buffers.
+        assert_eq!(pool.arena.offs[0], 0);
+        assert_eq!(pool.arena.offs[pool.len()] as usize, pool.arena.text.len());
+        assert_eq!(Arc::strong_count(&pool.arena), 1);
 
-        let entry_raw = pool.raw_mutf8(id_raw).unwrap();
-        let (map_key_raw, _) = pool.raw_to_id.get_key_value(&raw_surrogate[..]).unwrap();
+        let entry_str = pool.as_str(id_utf8).unwrap();
+        let arena_base = pool.arena.text.as_ptr() as usize;
+        let arena_end = arena_base + pool.arena.text.len();
+        let ptr = entry_str.as_ptr() as usize;
         assert!(
-            std::ptr::eq(entry_raw, &**map_key_raw),
-            "raw MUTF-8 entry and lookup map key must share one backing allocation"
+            ptr >= arena_base && ptr + entry_str.len() <= arena_end,
+            "resolved UTF-8 slice must point directly into the single flat Arena::text"
         );
-        assert_eq!(Arc::strong_count(map_key_raw), 2);
+        assert_eq!(pool.raw_mutf8(id_raw), Some(&raw_surrogate[..]));
+
+        // Cloning shares the single `Arc<Arena>` without copying text/offs/cold.
+        let cloned = pool.clone();
+        assert_eq!(Arc::strong_count(&pool.arena), 2);
+        assert!(Arc::ptr_eq(&pool.arena, &cloned.arena));
+    }
+
+    #[test]
+    fn empty_string_vs_lossy_and_r2_m9_intern_lossy_raw_normalization() {
+        let mut pool = StringPool::new();
+        let raw_lossy = [0xED, 0xA0, 0x80]; // lone high surrogate U+D800
+        let id_lossy_empty_display = pool.intern_lossy_raw("", &raw_lossy);
+        let id_empty = pool.get_or_intern("");
+
+        assert_ne!(id_lossy_empty_display, id_empty);
+        assert_eq!(pool.as_str(id_lossy_empty_display), None);
+        assert_eq!(pool.resolve(id_lossy_empty_display), Some(""));
+        assert_eq!(pool.as_str(id_empty), Some(""));
+        assert_eq!(pool.get(""), Some(id_empty));
+        assert_eq!(pool.get_raw_mutf8(&raw_lossy), Some(id_lossy_empty_display));
+
+        // R2-M9: calling `intern_lossy_raw` with valid MUTF-8 / UTF-8 routes to
+        // `get_or_intern` and never creates a duplicate cold entry.
+        let id_valid_ascii = pool.intern_lossy_raw("bogus", b"hello");
+        assert_eq!(id_valid_ascii, pool.get_or_intern("hello"));
+        assert_eq!(pool.as_str(id_valid_ascii), Some("hello"));
+        assert_eq!(pool.raw_mutf8(id_valid_ascii), None);
+
+        let cesu_pair = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        let id_valid_cesu = pool.intern_lossy_raw("\u{FFFD}", &cesu_pair);
+        assert_eq!(id_valid_cesu, pool.get_or_intern("😀"));
+        assert_eq!(pool.lossy_count(), 1);
+    }
+
+    #[test]
+    fn lossy_and_lossless_equal_display_fffd_and_drop_index_parity() {
+        let mut pool = StringPool::new();
+        let fffd = "\u{FFFD}\u{FFFD}\u{FFFD}";
+        let raw_a = [0xED, 0xA0, 0xB4];
+        let raw_b = [0xED, 0xB4, 0x86];
+
+        // Intern lossy BEFORE lossless with the exact same `U+FFFD` display text.
+        let id_a = pool.intern_mutf8(&raw_a);
+        let id_fffd = pool.get_or_intern(fffd);
+        let id_b = pool.intern_mutf8(&raw_b);
+        let id_other = pool.get_or_intern("alpha");
+
+        assert!(pool.has_index());
+        assert_eq!(pool.get(fffd), Some(id_fffd));
+        assert_eq!(pool.get("alpha"), Some(id_other));
+        assert_eq!(pool.get("missing"), None);
+        assert_eq!(pool.get_raw_mutf8(&raw_a), Some(id_a));
+        assert_eq!(pool.get_raw_mutf8(&raw_b), Some(id_b));
+
+        // Drop index: `get` and `get_raw_mutf8` must stay total and exact
+        // without mutating `self` or resurrecting the index.
+        pool.drop_index();
+        assert!(!pool.has_index());
+        assert_eq!(pool.get(fffd), Some(id_fffd));
+        assert_eq!(pool.get("alpha"), Some(id_other));
+        assert_eq!(pool.get("missing"), None);
+        assert_eq!(pool.get_raw_mutf8(&raw_a), Some(id_a));
+        assert_eq!(pool.get_raw_mutf8(&raw_b), Some(id_b));
+        assert_eq!(pool.get_raw_mutf8(&[0xED, 0xB4, 0x87]), None);
+        assert!(!pool.has_index());
+
+        // Subsequent mutation rebuilds the index automatically and preserves IDs.
+        assert_eq!(pool.get_or_intern(fffd), id_fffd);
+        assert!(pool.has_index());
+        assert_eq!(pool.intern_mutf8(&raw_b), id_b);
+        let id_new = pool.get_or_intern("beta");
+        assert_eq!(pool.get("beta"), Some(id_new));
+    }
+
+    #[test]
+    fn cow_clone_and_mutation_isolation() {
+        let mut base = StringPool::new();
+        let id0 = base.get_or_intern("zero");
+        let id1 = base.intern_mutf8(&[0xED, 0xA0, 0x81]);
+
+        let mut fork = base.clone();
+        assert!(Arc::ptr_eq(&base.arena, &fork.arena));
+
+        // Read hit on fork does not detach COW arena.
+        assert_eq!(fork.get_or_intern("zero"), id0);
+        assert!(Arc::ptr_eq(&base.arena, &fork.arena));
+
+        // Appending to fork detaches `fork.arena` without mutating `base`.
+        let id2 = fork.get_or_intern("two");
+        assert!(!Arc::ptr_eq(&base.arena, &fork.arena));
+        assert_eq!(base.len(), 2);
+        assert_eq!(base.get("two"), None);
+        assert_eq!(fork.len(), 3);
+        assert_eq!(fork.as_str(id0), Some("zero"));
+        assert_eq!(fork.raw_mutf8(id1), Some(&[0xED, 0xA0, 0x81][..]));
+        assert_eq!(fork.as_str(id2), Some("two"));
+    }
+
+    #[test]
+    fn checked_u32_overflow_bounds_surface_typed_error() {
+        let mut pool = StringPool::new();
+        pool.get_or_intern("seed");
+        // Check byte-offset overflow against `< u32::MAX` without allocating 4 GiB:
+        assert_eq!(
+            pool.check_append_bounds(u32::MAX as usize),
+            Err(StringPoolOverflow)
+        );
+        assert_eq!(
+            pool.check_append_bounds((u32::MAX as usize) - pool.arena.text.len()),
+            Err(StringPoolOverflow)
+        );
     }
 }

@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+mod closed_dispatch;
 pub mod driver;
 pub mod fact;
 pub mod gap;
@@ -46,7 +47,10 @@ pub mod problem;
 pub mod prototype;
 pub mod summary;
 
-pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
+pub use driver::{
+    PathStep, PreparedModule, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint,
+    run_taint_full, run_taint_prepared, run_taint_prepared_full,
+};
 pub use fact::{Fact, TaintBase, TaintFact, UNCAUGHT_EXCEPTION_VALUE};
 pub use gap::GapCallGraph;
 pub use ohos::{OHOS_PRESET_VERSION, apply_ohos_preset, ohos_preset};

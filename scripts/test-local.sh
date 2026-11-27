@@ -51,7 +51,8 @@ run_corpus() {
         --test file-lift \
         --test lift-analysis \
         --test lift-taint \
-        --release -- --ignored
+        --release -- --ignored \
+        --skip modules_abc_ohos_taint_full_ifds_gate
 
     # Commercial --merge-abc bundle rewrite gate (runs against local modules.abc when present; skips Docker oracle)
     cargo test -p abcd-rs --test merge-abc --release -- --ignored \

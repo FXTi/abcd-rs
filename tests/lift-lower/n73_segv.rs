@@ -57,7 +57,7 @@ const FIXTURES: [&str; 3] = [
 /// no special-casing here.
 fn max_ic_slot_end(body: &abcd_file::MethodBody) -> u32 {
     let mut max_end = 0u32;
-    for bc in &body.bytecodes {
+    for bc in body.bytecodes().iter() {
         if !bc.has_flag(BytecodeFlags::IC_SLOT) && !bc.has_flag(BytecodeFlags::JIT_IC_SLOT) {
             continue;
         }

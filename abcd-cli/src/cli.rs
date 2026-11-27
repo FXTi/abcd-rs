@@ -25,6 +25,20 @@ use clap::{Args, Parser, Subcommand};
     long_about = "ArkCompiler .abc toolkit.\n\nEvery command that takes bytecode accepts both a bare .abc file and a\ncontainer (.hap/.hsp/.app/.hqf); the input kind is sniffed by magic bytes.\nMulti-module containers require --module <name> or --all."
 )]
 pub struct Cli {
+    /// Best-effort forensic decode mode for packed or partially corrupted .abc
+    /// inputs (supported on read-only commands: dis, decompile, analyze, taint).
+    #[arg(long, global = true)]
+    pub forensic: bool,
+
+    /// Number of worker threads for parallel stages (defaults to host CPU count;
+    /// must be >= 1).
+    #[arg(short = 'j', long = "jobs", global = true, value_name = "N")]
+    pub jobs: Option<usize>,
+
+    /// Emit per-phase wall-clock timings to stderr without altering stdout.
+    #[arg(long = "timings", global = true)]
+    pub timings: bool,
+
     /// The subcommand to run.
     #[command(subcommand)]
     pub command: Command,
@@ -650,5 +664,43 @@ mod tests {
         assert!(parse(&["abcd", "asm", "x.pa", "--version", "12.0"]).is_err());
         assert!(parse(&["abcd", "asm", "x.pa", "--version", "a.b.c.d"]).is_err());
         assert!(parse(&["abcd", "asm", "x.pa", "--version", "1.2.3.256"]).is_err());
+    }
+
+    // ---- global flags (--jobs / --timings / --forensic) ----
+
+    #[test]
+    fn global_flags_parse_before_and_after_subcommand() {
+        let before = parse(&[
+            "abcd",
+            "-j",
+            "2",
+            "--timings",
+            "--forensic",
+            "dis",
+            "modules.abc",
+        ])
+        .unwrap();
+        assert_eq!(before.jobs, Some(2));
+        assert!(before.timings);
+        assert!(before.forensic);
+
+        let after = parse(&[
+            "abcd",
+            "decompile",
+            "modules.abc",
+            "--jobs",
+            "4",
+            "--timings",
+            "--forensic",
+        ])
+        .unwrap();
+        assert_eq!(after.jobs, Some(4));
+        assert!(after.timings);
+        assert!(after.forensic);
+
+        let defaults = parse(&["abcd", "dis", "modules.abc"]).unwrap();
+        assert_eq!(defaults.jobs, None);
+        assert!(!defaults.timings);
+        assert!(!defaults.forensic);
     }
 }

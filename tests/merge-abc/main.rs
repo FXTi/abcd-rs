@@ -299,7 +299,7 @@ fn assert_helper_module_var_opcodes(file: &File) {
         .iter()
         .find(|m| file.strings.resolve(m.name) == Some("func_main_0"))
         .expect("Lhelper::func_main_0");
-    let bcs = &helper_main.body.as_ref().expect("helper body").bytecodes;
+    let bcs = helper_main.body.as_ref().expect("helper body").bytecodes();
     assert!(
         bcs.iter()
             .any(|bc| matches!(bc, Bytecode::Ldexternalmodulevar(Imm(0)))),
@@ -356,10 +356,11 @@ fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
             let slot = cursor.next().expect("method cursor");
             if method.body.is_some() {
                 let b = slot.expect("lowered body");
-                if let Err(e) = encode_isa(&b.bytecodes) {
+                let bcs = b.bytecodes();
+                if let Err(e) = encode_isa(&bcs) {
                     let m_name = file.strings.resolve(method.name).unwrap_or("?");
                     let mut bad_insns = Vec::new();
-                    for (i, bc) in b.bytecodes.iter().enumerate() {
+                    for (i, bc) in bcs.iter().enumerate() {
                         if !matches!(bc, Bytecode::Jmp(_) | Bytecode::Jeqz(_) | Bytecode::Jnez(_))
                             && encode_isa(std::slice::from_ref(bc)).is_err()
                         {
@@ -368,11 +369,12 @@ fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
                     }
                     bc_errs.push(format!(
                         "FuncId({method_idx}) {cls_name}::{m_name} (len={}, vregs={}, args={}): {e}; bad_nonbranch={bad_insns:?}",
-                        b.bytecodes.len(),
+                        bcs.len(),
                         b.num_vregs,
                         b.num_args
                     ));
                 }
+                drop(bcs);
                 method.body = Some(b);
             }
             method_idx += 1;
@@ -902,7 +904,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
         body: Some(MethodBody {
             num_vregs: 2,
             num_args: 4,
-            bytecodes: vec![
+            code: vec![
                 Bytecode::Lda(Reg(5)),              // [0] header0: acc = a3
                 Bytecode::Sta(Reg(0)),              // [1] v0 = a3 (kept live!)
                 Bytecode::Ldai(Imm(0)),             // [2] acc = 0
@@ -914,8 +916,9 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                 Bytecode::Jmp(Label(0)),            // [8] back-edge to offset 0
                 Bytecode::Lda(Reg(0)),              // [9] exit
                 Bytecode::Return,                   // [10]
-            ],
-            entities: std::collections::HashMap::new(),
+            ]
+            .into(),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: Some(2),
         }),
@@ -935,15 +938,16 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
         body: Some(MethodBody {
             num_vregs: 1,
             num_args: 3,
-            bytecodes: vec![
+            code: vec![
                 Bytecode::Sta(Reg(0)),    // [0] handler == 0 & entry target
                 Bytecode::Jeqz(Label(4)), // [1]
                 Bytecode::Ldundefined,    // [2] try [2..4)
                 Bytecode::Throw,          // [3]
                 Bytecode::Lda(Reg(0)),    // [4]
                 Bytecode::Return,         // [5]
-            ],
-            entities: std::collections::HashMap::new(),
+            ]
+            .into(),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: vec![TryBlock {
                 start: 2,
                 len: 2,
@@ -1000,8 +1004,8 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                     body: Some(MethodBody {
                         num_vregs: 0,
                         num_args: 3,
-                        bytecodes: vec![Bytecode::Lda(Reg(2)), Bytecode::Return],
-                        entities: std::collections::HashMap::new(),
+                        code: vec![Bytecode::Lda(Reg(2)), Bytecode::Return].into(),
+                        entities: abcd_file::MethodEntities::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1021,8 +1025,8 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                     body: Some(MethodBody {
                         num_vregs: 0,
                         num_args: 3,
-                        bytecodes: vec![Bytecode::Ldai(Imm(7)), Bytecode::Return],
-                        entities: std::collections::HashMap::new(),
+                        code: vec![Bytecode::Ldai(Imm(7)), Bytecode::Return].into(),
+                        entities: abcd_file::MethodEntities::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1042,7 +1046,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                     body: Some(MethodBody {
                         num_vregs: 1,
                         num_args: 3,
-                        bytecodes: vec![
+                        code: vec![
                             Bytecode::Ldhole,
                             Bytecode::Sta(Reg(0)),
                             Bytecode::CallruntimeDefinesendableclass(
@@ -1053,8 +1057,9 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
                                 Reg(0),
                             ),
                             Bytecode::Return,
-                        ],
-                        entities: std::collections::HashMap::new(),
+                        ]
+                        .into(),
+                        entities: abcd_file::MethodEntities::new(),
                         try_blocks: Vec::new(),
                         ic_size: None,
                     }),
@@ -1087,7 +1092,7 @@ fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
         .body
         .as_mut()
         .unwrap()
-        .entities = std::collections::HashMap::from([
+        .entities = abcd_file::MethodEntities::from_iter([
         (
             (EntityKind::MethodId, 0),
             abcd_file::EntityRef::Method(abcd_file::MethodIdx(send_ctor_idx)),
@@ -1141,7 +1146,7 @@ fn assert_commercial_edge_invariants(file: &File) {
     // 2) Zero dead fused register-compare branches anywhere in the file
     for (_, method) in file.all_methods() {
         let Some(body) = &method.body else { continue };
-        for bc in &body.bytecodes {
+        for bc in body.bytecodes().iter() {
             assert!(
                 !matches!(
                     bc,

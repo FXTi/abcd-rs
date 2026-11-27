@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::error::Error;
 use crate::literal::LiteralValue;
 

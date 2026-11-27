@@ -175,7 +175,8 @@ fn build_synthetic_legacy() -> SyntheticLegacy {
     let caller_model = find_method("caller");
     let target_offset = find_method("target").offset;
     let body = caller_model.body.as_ref().unwrap();
-    let (kind, mid) = body.bytecodes[0].entity_operands()[0];
+    let bcs = body.bytecodes();
+    let (kind, mid) = bcs[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
     let EntityRef::Method(target_idx) = body.entities[&(kind, mid.0)] else {
         panic!("expected EntityRef::Method");
@@ -185,7 +186,7 @@ fn build_synthetic_legacy() -> SyntheticLegacy {
         target_offset
     );
     let method_index = u16::try_from(mid.0).unwrap();
-    let (kind, sid) = body.bytecodes[1].entity_operands()[0];
+    let (kind, sid) = bcs[1].entity_operands()[0];
     assert_eq!(kind, EntityKind::StringId);
     let EntityRef::String {
         id: str_sid,
@@ -276,7 +277,7 @@ fn legacy_file_decodes() {
     // Every method decoded its (legacy) bytecode.
     for method in file.classes.values().flat_map(|c| &c.methods) {
         let body = method.body.as_ref().expect("method body");
-        assert!(!body.bytecodes.is_empty());
+        assert!(!body.bytecodes().is_empty());
     }
 }
 
@@ -290,18 +291,18 @@ fn legacy_ir_contents() {
         .expect("caller")
         .1;
     let body = caller.body.as_ref().unwrap();
+    let bcs = body.bytecodes();
 
     // Legacy `lda.str` keeps the direct 32-bit file offset as its operand.
     assert!(
-        body.bytecodes
-            .iter()
+        bcs.iter()
             .any(|bc| matches!(bc, Bytecode::LdaStr(id) if id.0 == syn.string_offset)),
         "expected lda.str with a direct string offset"
     );
     // Legacy `ecma.ldobjbyname` keeps its legacy layout via the deprecated
     // variant.
     assert!(
-        body.bytecodes.iter().any(
+        bcs.iter().any(
             |bc| matches!(bc, Bytecode::DeprecatedLdobjbyname(id, _) if id.0 == syn.string_offset)
         ),
         "expected deprecated.ldobjbyname"
@@ -309,7 +310,7 @@ fn legacy_ir_contents() {
     // Legacy `definefuncdyn` maps to modern Definefunc with a synthesized
     // IC-slot immediate of 0.
     assert!(
-        body.bytecodes.iter().any(
+        bcs.iter().any(
             |bc| matches!(bc, Bytecode::Definefunc(Imm(0), id, Imm(0)) if id.0 == syn.method_index as u32)
         ),
         "expected legacy definefuncdyn -> definefunc"
@@ -317,8 +318,7 @@ fn legacy_ir_contents() {
     // Legacy `createobjectwithbuffer` carries the literal array as a plain
     // 16-bit immediate: a global index into the header table.
     assert!(
-        body.bytecodes
-            .iter()
+        bcs.iter()
             .any(|bc| matches!(bc, Bytecode::DeprecatedCreateobjectwithbuffer(Imm(0)))),
         "expected deprecated.createobjectwithbuffer with global index 0"
     );

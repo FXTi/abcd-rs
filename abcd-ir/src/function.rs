@@ -37,7 +37,7 @@ pub enum ValueDef {
 }
 
 /// An SSA value: its definition and its (analysis) type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Value {
     /// The definition point.
     pub def: ValueDef,
@@ -47,7 +47,7 @@ pub struct Value {
 
 /// One instruction: a semantic op, its SSA result, its home block, and
 /// its source location.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inst {
     /// The operation.
     pub op: Op,
@@ -60,6 +60,24 @@ pub struct Inst {
     /// Passes propagate or drop it — never fabricate it (`design/ir.md`
     /// hard contract).
     pub loc: Option<Loc>,
+}
+
+impl Inst {
+    /// Visit the SSA definition produced by this instruction (`0` or `1` [`ValueId`]).
+    #[inline]
+    pub fn for_each_def<F: FnMut(ValueId)>(&self, mut f: F) {
+        if let Some(res) = self.result {
+            f(res);
+        }
+    }
+
+    /// Visit the mutable SSA definition produced by this instruction (`0` or `1` [`ValueId`]).
+    #[inline]
+    pub fn for_each_def_mut<'a, F: FnMut(&'a mut ValueId)>(&'a mut self, mut f: F) {
+        if let Some(res) = &mut self.result {
+            f(res);
+        }
+    }
 }
 
 /// A CFG edge kind (T5): exception flow is a first-class edge, so IFDS
@@ -89,7 +107,7 @@ pub struct Edge {
 /// A basic block: phi nodes first, then instructions, ending in exactly
 /// one terminator (verifier-checked). Successors are derived from the
 /// terminator plus the function's [`TryRegion`]s.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Block {
     /// Instructions; leading [`Op::Phi`]s form the phi prefix.
     pub insts: Vec<InstId>,
@@ -98,7 +116,7 @@ pub struct Block {
 }
 
 /// A catch entry of a [`TryRegion`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Catch {
     /// The handler's entry block.
     pub handler: BlockId,
@@ -117,7 +135,7 @@ pub struct Catch {
 /// [`FunctionData::try_regions`] are ordered in **inner-first dispatch
 /// priority** (`R2-M7`): when nested regions protect the same block, earlier
 /// entries in `try_regions` take precedence at runtime before outer handlers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TryRegion {
     /// Blocks whose executing instructions are protected.
     pub protected: Vec<BlockId>,
@@ -128,7 +146,7 @@ pub struct TryRegion {
 /// Per-function debug information (`design/ir.md`: program semantics — local
 /// names feed taint readability; line tables replay at lower per `#16`).
 /// Tables key on [`InstId`], never on instruction offsets.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DebugData {
     /// Source file name, when known.
     pub source_file: Option<Sym>,
@@ -196,7 +214,7 @@ pub struct LocalScope {
 }
 
 /// IR representation of one function/method.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionData {
     /// The class this function belongs to (the module top-level is itself
     /// a class record, so every function has one).

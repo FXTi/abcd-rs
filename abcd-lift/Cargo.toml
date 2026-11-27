@@ -11,6 +11,7 @@ readme = "README.md"
 abcd-file.workspace = true
 abcd-isa.workspace = true
 abcd-ir.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 
 [lints]

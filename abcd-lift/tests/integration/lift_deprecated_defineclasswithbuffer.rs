@@ -191,8 +191,8 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
         body: Some(abcd_file::MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes: vec![Bytecode::Returnundefined],
-            entities: HashMap::new(),
+            code: abcd_file::MethodCode::Decoded(vec![Bytecode::Returnundefined]),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -218,7 +218,7 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
         body: Some(abcd_file::MethodBody {
             num_vregs: 2,
             num_args: 1,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::Ldai(Imm(77)),  // 0: proto = 77 -> v1
                 Bytecode::Sta(Reg(1)),    // 1
                 Bytecode::Lda(Reg(2)),    // 2: cond from arg0
@@ -236,7 +236,7 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
                     Reg(1),
                 ), // 9
                 Bytecode::Return,         // 10
-            ],
+            ]),
             entities: HashMap::from([
                 (
                     (EntityKind::MethodId, 9),
@@ -246,7 +246,8 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
                     (EntityKind::LiteralarrayId, 0),
                     abcd_file::EntityRef::LiteralArray(abcd_file::LiteralArrayIdx(1)),
                 ),
-            ]),
+            ])
+            .into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

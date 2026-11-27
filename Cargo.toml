@@ -55,6 +55,7 @@ mimalloc = "0.1"
 miniz_oxide = "0.9"
 rayon = "1"
 libm = { version = "0.2", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 
 abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }

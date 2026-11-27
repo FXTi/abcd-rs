@@ -2,7 +2,13 @@
 //!
 //! Every field is owned — no lifetimes, no raw pointers.
 
+#![forbid(unsafe_code)]
+
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Index;
+use std::sync::Arc;
 
 use abcd_isa::Version;
 
@@ -107,6 +113,345 @@ impl EntityRef {
     #[must_use]
     pub const fn literal_array(idx: LiteralArrayIdx) -> Self {
         Self::LiteralArray(idx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compact sorted MethodEntities & Dual-mode MethodCode (`#49`)
+// ---------------------------------------------------------------------------
+
+#[inline]
+const fn entity_key_rank(key: &(abcd_isa::EntityKind, u32)) -> (u8, u32) {
+    (key.0 as u8, key.1)
+}
+
+#[inline]
+fn entity_key_cmp(
+    lhs: &(abcd_isa::EntityKind, u32),
+    rhs: &(abcd_isa::EntityKind, u32),
+) -> Ordering {
+    entity_key_rank(lhs).cmp(&entity_key_rank(rhs))
+}
+
+/// Compact sorted `(EntityKind, raw_operand_id) -> EntityRef` table on
+/// [`MethodBody`] (`#49`).
+///
+/// Replaces per-method `HashMap` bucket overhead with a dense `Vec` sorted
+/// strictly by `(kind as u8, raw_id)` and queried via binary search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MethodEntities {
+    entries: Vec<((abcd_isa::EntityKind, u32), EntityRef)>,
+}
+
+impl MethodEntities {
+    /// Construct an empty entity table.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Construct an empty entity table with pre-reserved capacity.
+    #[inline]
+    #[must_use]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Number of stored `(EntityKind, raw_id)` mappings.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the entity table is empty.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Remove all entries from the table.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Whether `key` is present in the table.
+    #[inline]
+    #[must_use]
+    pub fn contains_key(&self, key: &(abcd_isa::EntityKind, u32)) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Binary-search lookup by `&(EntityKind, raw_id)`.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, key: &(abcd_isa::EntityKind, u32)) -> Option<&EntityRef> {
+        let pos = self
+            .entries
+            .binary_search_by(|(k, _)| entity_key_cmp(k, key))
+            .ok()?;
+        Some(&self.entries[pos].1)
+    }
+
+    /// Mutable binary-search lookup by `&(EntityKind, raw_id)`.
+    #[inline]
+    pub fn get_mut(&mut self, key: &(abcd_isa::EntityKind, u32)) -> Option<&mut EntityRef> {
+        let pos = self
+            .entries
+            .binary_search_by(|(k, _)| entity_key_cmp(k, key))
+            .ok()?;
+        Some(&mut self.entries[pos].1)
+    }
+
+    /// Insert or replace `(key, value)`, returning any displaced [`EntityRef`].
+    pub fn insert(
+        &mut self,
+        key: (abcd_isa::EntityKind, u32),
+        value: EntityRef,
+    ) -> Option<EntityRef> {
+        if let Some((last_k, _)) = self.entries.last()
+            && entity_key_cmp(last_k, &key).is_lt()
+        {
+            self.entries.push((key, value));
+            return None;
+        }
+        match self
+            .entries
+            .binary_search_by(|(k, _)| entity_key_cmp(k, &key))
+        {
+            Ok(pos) => Some(std::mem::replace(&mut self.entries[pos].1, value)),
+            Err(pos) => {
+                self.entries.insert(pos, (key, value));
+                None
+            }
+        }
+    }
+
+    /// Remove `key` from the table, returning its [`EntityRef`] if present.
+    pub fn remove(&mut self, key: &(abcd_isa::EntityKind, u32)) -> Option<EntityRef> {
+        let pos = self
+            .entries
+            .binary_search_by(|(k, _)| entity_key_cmp(k, key))
+            .ok()?;
+        Some(self.entries.remove(pos).1)
+    }
+
+    /// Iterate `(&(EntityKind, raw_id), &EntityRef)` in canonical `(kind, raw_id)` order.
+    pub fn iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&(abcd_isa::EntityKind, u32), &EntityRef)>
+    + DoubleEndedIterator
+    + '_ {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    /// Iterate `&(EntityKind, raw_id)` keys in canonical `(kind, raw_id)` order.
+    pub fn keys(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &(abcd_isa::EntityKind, u32)> + DoubleEndedIterator + '_
+    {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    /// Iterate `&EntityRef` values in canonical `(kind, raw_id)` order.
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &EntityRef> + DoubleEndedIterator + '_ {
+        self.entries.iter().map(|(_, v)| v)
+    }
+
+    /// Mutably iterate `&mut EntityRef` values in canonical `(kind, raw_id)` order.
+    pub fn values_mut(
+        &mut self,
+    ) -> impl ExactSizeIterator<Item = &mut EntityRef> + DoubleEndedIterator + '_ {
+        self.entries.iter_mut().map(|(_, v)| v)
+    }
+}
+
+impl Index<&(abcd_isa::EntityKind, u32)> for MethodEntities {
+    type Output = EntityRef;
+
+    fn index(&self, key: &(abcd_isa::EntityKind, u32)) -> &Self::Output {
+        match self.get(key) {
+            Some(v) => v,
+            None => panic!("no entry found for key {key:?} in MethodEntities"),
+        }
+    }
+}
+
+impl FromIterator<((abcd_isa::EntityKind, u32), EntityRef)> for MethodEntities {
+    fn from_iter<T: IntoIterator<Item = ((abcd_isa::EntityKind, u32), EntityRef)>>(
+        iter: T,
+    ) -> Self {
+        let raw: Vec<_> = iter.into_iter().collect();
+        if raw.is_empty() {
+            return Self::new();
+        }
+        // Tag original position so last-write-wins on duplicate keys after stable sort.
+        let mut indexed: Vec<_> = raw.into_iter().enumerate().collect();
+        indexed.sort_by(|(ia, (ka, _)), (ib, (kb, _))| {
+            entity_key_cmp(ka, kb).then_with(|| ia.cmp(ib))
+        });
+        let mut entries: Vec<((abcd_isa::EntityKind, u32), EntityRef)> =
+            Vec::with_capacity(indexed.len());
+        for (_, (k, v)) in indexed {
+            if let Some((last_k, last_v)) = entries.last_mut()
+                && *last_k == k
+            {
+                *last_v = v;
+            } else {
+                entries.push((k, v));
+            }
+        }
+        Self { entries }
+    }
+}
+
+impl From<HashMap<(abcd_isa::EntityKind, u32), EntityRef>> for MethodEntities {
+    fn from(map: HashMap<(abcd_isa::EntityKind, u32), EntityRef>) -> Self {
+        // Keys in `HashMap` are unique; sorting by `(kind as u8, raw_id)`
+        // establishes a canonical `N20`-deterministic layout independent of
+        // `HashMap` bucket iteration order.
+        let mut entries: Vec<_> = map.into_iter().collect();
+        entries.sort_by(|(ka, _), (kb, _)| entity_key_cmp(ka, kb));
+        Self { entries }
+    }
+}
+
+impl<'a> IntoIterator for &'a MethodEntities {
+    type Item = (&'a (abcd_isa::EntityKind, u32), &'a EntityRef);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, ((abcd_isa::EntityKind, u32), EntityRef)>,
+        fn(
+            &'a ((abcd_isa::EntityKind, u32), EntityRef),
+        ) -> (&'a (abcd_isa::EntityKind, u32), &'a EntityRef),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl IntoIterator for MethodEntities {
+    type Item = ((abcd_isa::EntityKind, u32), EntityRef);
+    type IntoIter = std::vec::IntoIter<((abcd_isa::EntityKind, u32), EntityRef)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+/// Validated zero-copy byte range inside a shared `Arc<[u8]>` `.abc` backing
+/// buffer for lazy method-body decoding (`#49`).
+#[derive(Clone, Debug)]
+pub struct MethodSpan {
+    pub backing: Arc<[u8]>,
+    pub offset: u32,
+    pub len: u32,
+    pub insn_count: u32,
+    pub legacy: bool,
+}
+
+impl MethodSpan {
+    /// Borrow the raw instruction slice inside [`Self::backing`].
+    #[inline]
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        let start = self.offset as usize;
+        let end = start.saturating_add(self.len as usize);
+        self.backing.get(start..end).unwrap_or(&[])
+    }
+
+    fn decode_bytecodes(&self) -> Vec<Bytecode> {
+        let raw = self.bytes();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let res = if self.legacy {
+            abcd_isa::decode_legacy(raw)
+        } else {
+            abcd_isa::decode(raw)
+        };
+        match res {
+            Ok(pairs) => pairs.into_iter().map(|(bc, _)| bc).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl PartialEq for MethodSpan {
+    fn eq(&self, other: &Self) -> bool {
+        self.insn_count == other.insn_count
+            && self.legacy == other.legacy
+            && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for MethodSpan {}
+
+/// Dual-mode method instruction storage (`#49`): either eagerly materialized
+/// [`Bytecode`]s or a validated zero-copy [`MethodSpan`] into the source `.abc`
+/// backing buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MethodCode {
+    Decoded(Vec<Bytecode>),
+    Span(MethodSpan),
+}
+
+impl Default for MethodCode {
+    #[inline]
+    fn default() -> Self {
+        Self::Decoded(Vec::new())
+    }
+}
+
+impl From<Vec<Bytecode>> for MethodCode {
+    #[inline]
+    fn from(v: Vec<Bytecode>) -> Self {
+        Self::Decoded(v)
+    }
+}
+
+impl MethodCode {
+    /// Number of instructions in the method without materializing lazy spans.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Decoded(v) => v.len(),
+            Self::Span(s) => s.insn_count as usize,
+        }
+    }
+
+    /// Whether the method contains zero instructions.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Borrow decoded instructions directly when eager, or decode transiently
+    /// on the fly when backed by a [`MethodSpan`].
+    #[must_use]
+    pub fn decode_cow(&self) -> Cow<'_, [Bytecode]> {
+        match self {
+            Self::Decoded(v) => Cow::Borrowed(v.as_slice()),
+            Self::Span(s) => Cow::Owned(s.decode_bytecodes()),
+        }
+    }
+
+    /// Consume `self` and return an owned `Vec<Bytecode>`.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<Bytecode> {
+        match self {
+            Self::Decoded(v) => v,
+            Self::Span(s) => s.decode_bytecodes(),
+        }
     }
 }
 
@@ -220,9 +565,9 @@ pub enum FieldValue {
     /// on the module's own record class in `--merge-abc` output): the u32 wire
     /// value is the source-file offset of an untagged ModuleDataAccessor-format
     /// blob (vendored `module_data_accessor-inl.h`). Decode reads the blob
-    /// through the vendored accessor into this structural model; encode
-    /// re-emits it as a fresh literal-array item and writes the field value as
-    /// the item's NEW layout offset (never the stale source offset).
+    /// structurally into this model; encode re-emits it as a fresh
+    /// literal-array item and writes the field value as the item's NEW layout
+    /// offset (never the stale source offset).
     ModuleData(ModuleData),
     /// Tagged literal-array reference field (standalone `_ESScopeNamesRecord`,
     /// `scopeNames` on `--merge-abc` module records, or non-zero
@@ -266,18 +611,20 @@ impl FieldValue {
     }
 }
 
-/// Decoded method body (bytecodes + exception handlers).
+/// Decoded method body (dual-mode instructions + exception handlers).
 #[derive(Clone, Debug)]
 pub struct MethodBody {
     /// Number of virtual registers used by this method.
     pub num_vregs: u32,
     /// Number of arguments (including `this` for instance methods).
     pub num_args: u32,
-    pub bytecodes: Vec<Bytecode>,
+    /// Dual-mode instruction payload (`Decoded(Vec<Bytecode>)` or lazy
+    /// zero-copy `Span(MethodSpan)`).
+    pub code: MethodCode,
     /// `(EntityKind, raw_operand_id)` → resolved [`EntityRef`]. Bytecodes
     /// retain their raw immediate/index operands while semantic consumers and
-    /// [`crate::encode`] consult this table directly without raw file offsets.
-    pub entities: HashMap<(abcd_isa::EntityKind, u32), EntityRef>,
+    /// [`crate::encode`] consult this compact sorted table directly.
+    pub entities: MethodEntities,
     pub try_blocks: Vec<TryBlock>,
     /// Total IC-slot consumption of this bytecode, as computed by the
     /// lower that produced it (N73).
@@ -286,6 +633,22 @@ pub struct MethodBody {
     /// keeps the source annotation verbatim. `Some(n)` tells [`crate::encode`]
     /// to sync the method's `SlotNumber` element to `n`.
     pub ic_size: Option<u32>,
+}
+
+impl MethodBody {
+    /// Borrow decoded instructions directly when eager, or decode transiently
+    /// on the fly when backed by a lazy [`MethodSpan`].
+    #[must_use]
+    pub fn bytecodes(&self) -> Cow<'_, [Bytecode]> {
+        self.code.decode_cow()
+    }
+
+    /// Number of instructions in this method body without materializing lazy spans.
+    #[inline]
+    #[must_use]
+    pub fn insn_count(&self) -> usize {
+        self.code.len()
+    }
 }
 
 /// Four kinds of annotations grouped by retention policy.

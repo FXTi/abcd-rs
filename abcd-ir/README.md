@@ -4,7 +4,7 @@ Format-independent Static Single Assignment (SSA) intermediate representation fo
 
 ## Purpose & Layering Contract
 
-`abcd-ir` sits at the center of the `abcd-rs` compiler, analysis, and decompilation stack with **zero internal workspace dependencies** (`Cargo.toml` depends solely on `thiserror`). It is structurally incapable of importing `abcd-file`, `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`:
+`abcd-ir` sits at the center of the `abcd-rs` compiler, analysis, and decompilation stack with **zero internal workspace dependencies** (`Cargo.toml` depends solely on `thiserror` and `hashbrown`). It is structurally incapable of importing `abcd-file`, `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`:
 
 - **Program semantics, never container layout**: models classes, functions, SSA value flow, structured exception regions, types, annotations, ES module records, and line/column debug info — never file versions, raw 32-bit offsets, literal-array table indices, or virtual register / accumulator numbers.
 - **Explicit container dialect (`D6`)**: `Module::dialect` (`Dialect::DynamicEcma` vs. `Dialect::StaticArkTS`) models execution ABI and frame layout orthogonally to per-class authoring provenance (`SourceLang`): dynamic ECMAScript/TypeScript/ArkTS-1.1 frames prepend `[func][new.target][this]` (`H = 3` default under `0xF`, overridden per function by `L_ESCallTypeAnnotation;`), while static ArkTS (`0.1.0.x`) carries `H = 0` hidden slots on `static` methods and explicit `this` at `params[0]` on instance methods and constructors.
@@ -17,14 +17,17 @@ Format-independent Static Single Assignment (SSA) intermediate representation fo
 | `Module`, `ClassData`, `Dialect`, `SourceLang`, `Annotation`, `AnnValue` | [`module`](src/module.rs) | Top-level program container (`Module::dialect`), global arenas (`insts`, `blocks`, `values`), class/field metadata, ES & `--merge-abc` module records |
 | `FunctionData`, `Block`, `Edge`, `TryRegion` | [`function`](src/function.rs) | Per-function CFG, leading phi prefix, `EdgeKind::{Normal, Exceptional}` edges, `ValueDef::ExceptionParam`, debug tables |
 | `FuncId`, `ClassId`, `FieldId`, `BlockId`, `InstId`, `ValueId`, `Sym`, `ConstId` | [`id`](src/id.rs) | Typed `u32` append-only arena indices with module-wide uniqueness |
-| `Op` (`94` variants), `DefineClassData`, `CallKind`, `LexEnvKind`, `OwnStoreKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy (`<= 40 B`) with single-point `for_each_operand[_mut]()`, `for_each_{block_id,const_id,func_id,sym}[_mut]()`, `produces_bool[_in]()`, `has_result()`, `is_terminator()`, and `arity()` |
+| `Op` (`94` variants), `DefineClassData`, `CallKind`, `LexEnvKind`, `OwnStoreKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy (`<= 40 B`) with single-point `for_each_operand[_mut]()`, `for_each_{block_id,class_id,const_id,func_id,sym}[_mut]()`, `produces_bool[_in]()`, `has_result()`, `is_terminator()`, and `arity()` |
 | `Effects`, `MemClasses`, `CallEffect`, `AllocKind` | [`effects`](src/effects.rs) | Conservative `Op::effects()` baseline plus context-sensitive `Op::effects_in(module)` primitive/constant refinement (`N36`) and `Effects::is_removable_if_unused()` |
 | `DomTree`, `IndexedDom`, `ExceptionHandlerMap`, `compute_rpo[_with]`, `block_succs`, `inst_succs`, `augmented_succs[_with_map]`, `normal_succs_inline` | [`cfg`](src/cfg.rs) | Iterative Georgiadis–Tarjan–Werneck (*JGAA* 2006) Semi-NCA dominator trees over flat CSR buffers (`O(1)` stack, `O(1)` Euler-interval queries, `depth`, `dom_children`), shared `N10` RPO, and CSR `O(1)` exception-handler lookup |
 | `Ty`, `DynPrim`, `StaticTy` | [`ty`](src/ty.rs) | Dynamic-first type lattice (`Any`, `Never`, `DynPrim`, canonical `Ty::union` -> `Union(Box<[Ty]>)`, `Unknown`) with iterative heap-workstack traits plus `ClassId`-indexed `StaticTy` |
-| `SymbolTable` | [`symbol`](src/symbol.rs) | Append-only `Arc`-backed dual-bucket string interner preserving both valid UTF-8 and lone-surrogate MUTF-8 byte sequences |
-| `ConstPool`, `Const`, `LitMethodKind`, `TypedArrayTag` | [`consts`](src/consts.rs) | Append-only & deduplicating (`intern`) typed constant pool with lossless `LiteralArray` tag fidelity (`Int8`/`Int32`/`Float32`/`Int64`/`UInt64`, `MethodRef { func, kind }`, `TypedArrayLiteral`, `LiteralBufferRef`, `ArrayLiteral`/`ObjectLiteral`) |
+| `SymbolTable`, `SymbolTableOverflow` | [`symbol`](src/symbol.rs) | Append-only `Arc`-backed flat UTF-8 arena (`text` + `offs` + sparse `cold` MUTF-8 table) with droppable `HashTable<u32>` deduplication index (`drop_index`, `lossy_syms`, `try_intern*`) |
+| `ConstPool`, `Const`, `ConstPoolOverflow`, `LitMethodKind`, `TypedArrayTag` | [`consts`](src/consts.rs) | Append-only & deduplicating (`intern`) typed constant pool indexed via `HashTable<u32>` without duplicate key clones (`drop_index`, `lookup`, `try_push`, `try_intern`) |
+| `IdRemapper`, `FragmentRemapper`, `remap_module_body`, `modules_structurally_eq` | [`remap`](src/remap.rs) | Exhaustive zero-recursion `_mut` ID visitors across `Const`/`Ty`/`Signature`/`Op`/function/class arenas plus structural `Module` equivalence checking |
 | `FrameSlots`, `this_param_index` | [`frame`](src/frame.rs) | Calling-convention slot resolver across `Dialect::DynamicEcma` (`L_ESCallTypeAnnotation;` / `call_type_bits` / `has_extra` / `0xF`) and `Dialect::StaticArkTS` |
 | `verify_module`, `verify_func`, `VerifyReport` | [`verify`](src/verify.rs) | Deterministic (`N20`) structural, class-method bijection, entity/const-shape/debug-bounds, `ConstCycle`, and pre-throw / post-normal-exit split SSA dominance verifier |
+
+Large and multi-theme unit suites live in topic-organized sibling modules (`src/op/tests.rs`, `src/remap/tests.rs`, and `src/verify/tests/{structural,dominance,module_meta}.rs`), complemented by integration & 256 KiB-stack regression tests in `tests/round2_regressions.rs`.
 
 ## Key Semantic Invariants
 

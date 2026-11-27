@@ -62,11 +62,18 @@ fn collect_abc(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 
 /// Count `callruntime.definesendableclass` in a decoded file's methods.
 fn sendable_opcode_count(file: &File) -> usize {
-    file.all_methods()
-        .flat_map(|(_, m)| m.body.iter())
-        .flat_map(|b| b.bytecodes.iter())
-        .filter(|bc| matches!(bc, Bytecode::CallruntimeDefinesendableclass(..)))
-        .count()
+    let mut count = 0usize;
+    for (_, m) in file.all_methods() {
+        let Some(body) = &m.body else {
+            continue;
+        };
+        for bc in body.bytecodes().iter() {
+            if matches!(bc, Bytecode::CallruntimeDefinesendableclass(..)) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Count lifted `Op::DefineSendableClass` instructions in a module.

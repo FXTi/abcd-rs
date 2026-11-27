@@ -6,14 +6,16 @@
 
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use abcd_decompile::{
     DecompiledModule, EmitOptions, SplitDecompiledModule, decompile_module, decompile_module_split,
     decompile_module_split_each, decompile_module_to_writer,
 };
 
-use crate::CliError;
 use crate::input::InputModule;
+use crate::{CliError, ExecContext};
 
 const IO_BUF_CAPACITY: usize = 256 * 1024;
 
@@ -80,20 +82,13 @@ pub fn decompile(
     module: &InputModule,
     opts: DecompileOptions,
 ) -> Result<DecompiledModule, CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    let ir = crate::lift_abc_arc(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        &abcd_lift::LiftOptions::default(),
+        ExecContext::default(),
+    )?;
     Ok(decompile_module(&ir, &opts.into()))
 }
 
@@ -104,25 +99,56 @@ pub fn decompile_to_writer<W: std::io::Write>(
     opts: DecompileOptions,
     out: W,
 ) -> Result<usize, CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
-    match emit_counted(&ir, &opts.into(), out) {
+    decompile_arc_to_writer(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        opts,
+        out,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn decompile_owned_to_writer<W: std::io::Write>(
+    module: InputModule,
+    opts: DecompileOptions,
+    out: W,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    decompile_arc_to_writer(abc, &name, &provenance, opts, out, ctx)
+}
+
+fn decompile_arc_to_writer<W: std::io::Write>(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    opts: DecompileOptions,
+    out: W,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let ir = crate::lift_abc_arc(
+        abc,
+        name,
+        provenance,
+        &abcd_lift::LiftOptions::default(),
+        ctx,
+    )?;
+    let t_dec = ctx.timings.then(Instant::now);
+    let res = match emit_counted(&ir, &opts.into(), out) {
         Ok(n) => Ok(n),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(CliError::Tool(format!("failed writing to stdout: {e}"))),
+    };
+    if let Some(start) = t_dec {
+        crate::log_timing(true, name, "decompile", start.elapsed());
     }
+    res
 }
 
 /// Stream one decompiled module to `path`, returning the number of emitted
@@ -133,24 +159,55 @@ pub fn decompile_to_path(
     opts: DecompileOptions,
     path: &Path,
 ) -> Result<usize, CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    decompile_arc_to_path(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        opts,
+        path,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn decompile_owned_to_path(
+    module: InputModule,
+    opts: DecompileOptions,
+    path: &Path,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    decompile_arc_to_path(abc, &name, &provenance, opts, path, ctx)
+}
+
+fn decompile_arc_to_path(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    opts: DecompileOptions,
+    path: &Path,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let ir = crate::lift_abc_arc(
+        abc,
+        name,
+        provenance,
+        &abcd_lift::LiftOptions::default(),
+        ctx,
+    )?;
     let out_file = std::fs::File::create(path)
         .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-    emit_counted(&ir, &opts.into(), out_file)
-        .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))
+    let t_dec = ctx.timings.then(Instant::now);
+    let size = emit_counted(&ir, &opts.into(), out_file)
+        .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
+    if let Some(start) = t_dec {
+        crate::log_timing(true, name, "decompile", start.elapsed());
+    }
+    Ok(size)
 }
 
 /// Decompile one module into a multi-file directory tree (`--split-modules`).
@@ -158,20 +215,13 @@ pub fn decompile_split(
     module: &InputModule,
     opts: DecompileOptions,
 ) -> Result<SplitDecompiledModule, CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    let ir = crate::lift_abc_arc(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        &abcd_lift::LiftOptions::default(),
+        ExecContext::default(),
+    )?;
     Ok(decompile_module_split(&ir, &opts.into()))
 }
 
@@ -181,26 +231,53 @@ pub fn write_split(
     out_dir: &Path,
     opts: DecompileOptions,
 ) -> Result<(usize, usize), CliError> {
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    write_split_arc(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        out_dir,
+        opts,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn write_split_owned(
+    module: InputModule,
+    out_dir: &Path,
+    opts: DecompileOptions,
+    ctx: ExecContext,
+) -> Result<(usize, usize), CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    write_split_arc(abc, &name, &provenance, out_dir, opts, ctx)
+}
+
+fn write_split_arc(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    out_dir: &Path,
+    opts: DecompileOptions,
+    ctx: ExecContext,
+) -> Result<(usize, usize), CliError> {
+    let ir = crate::lift_abc_arc(
+        abc,
+        name,
+        provenance,
+        &abcd_lift::LiftOptions::default(),
+        ctx,
+    )?;
     std::fs::create_dir_all(out_dir).map_err(|e| {
         CliError::Tool(format!(
             "cannot create output directory {}: {e}",
             out_dir.display()
         ))
     })?;
+    let t_dec = ctx.timings.then(Instant::now);
     let mut total_files = 0usize;
     let mut total_bytes = 0usize;
     decompile_module_split_each(&ir, &opts.into(), |sf| -> Result<(), CliError> {
@@ -216,6 +293,9 @@ pub fn write_split(
         total_bytes += sf.text.len();
         Ok(())
     })?;
+    if let Some(start) = t_dec {
+        crate::log_timing(true, name, "decompile", start.elapsed());
+    }
     Ok((total_files, total_bytes))
 }
 
@@ -247,7 +327,7 @@ pub fn write_all(
     modules: &[InputModule],
     out_dir: &Path,
     opts: DecompileOptions,
-) -> Result<Vec<(String, std::path::PathBuf, usize)>, CliError> {
+) -> Result<Vec<(String, PathBuf, usize)>, CliError> {
     std::fs::create_dir_all(out_dir).map_err(|e| {
         CliError::Tool(format!(
             "cannot create output directory {}: {e}",
@@ -259,6 +339,28 @@ pub fn write_all(
         let path = out_dir.join(format!("{}.js", m.name));
         let size = decompile_to_path(m, opts, &path)?;
         written.push((m.name.clone(), path, size));
+    }
+    Ok(written)
+}
+
+pub(crate) fn write_all_owned(
+    modules: Vec<InputModule>,
+    out_dir: &Path,
+    opts: DecompileOptions,
+    ctx: ExecContext,
+) -> Result<Vec<(String, PathBuf, usize)>, CliError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        CliError::Tool(format!(
+            "cannot create output directory {}: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let mut written = Vec::with_capacity(modules.len());
+    for m in modules {
+        let mod_name = m.name.clone();
+        let path = out_dir.join(format!("{mod_name}.js"));
+        let size = decompile_owned_to_path(m, opts, &path, ctx)?;
+        written.push((mod_name, path, size));
     }
     Ok(written)
 }

@@ -9,6 +9,7 @@ dependencies = [
  "abcd-file",
  "abcd-ir",
  "abcd-lift",
+ "hashbrown",
 ]
 
 [[package]]
@@ -52,6 +53,7 @@ dependencies = [
  "abcd-file-sys",
  "abcd-isa",
  "bitflags",
+ "hashbrown",
  "serde_json",
  "thiserror",
 ]
@@ -76,6 +78,7 @@ dependencies = [
 name = "abcd-ir"
 version = "0.1.0"
 dependencies = [
+ "hashbrown",
  "thiserror",
 ]
 
@@ -102,6 +105,7 @@ dependencies = [
  "abcd-file",
  "abcd-ir",
  "abcd-isa",
+ "rayon",
  "thiserror",
 ]
 
@@ -114,6 +118,7 @@ dependencies = [
  "abcd-isa",
  "abcd-lift",
  "abcd-opt",
+ "hashbrown",
  "rayon",
  "thiserror",
 ]

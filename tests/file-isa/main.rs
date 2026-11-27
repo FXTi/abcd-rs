@@ -94,7 +94,7 @@ fn modules_abc_decodes_fully_with_v24_table() {
                 proto_shorty += 1;
             }
             if let Some(body) = &m.body {
-                instructions += body.bytecodes.len();
+                instructions += body.insn_count();
             }
         }
     }
@@ -144,9 +144,10 @@ fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
             for class in file.classes.values() {
                 for method in &class.methods {
                     let Some(body) = &method.body else { continue };
-                    let encoded = encode_isa(&body.bytecodes).expect("encode method bytecodes");
+                    let bcs = body.bytecodes();
+                    let encoded = encode_isa(&bcs).expect("encode method bytecodes");
                     let decoded = decode_isa(&encoded.0).expect("decode encoded method bytecodes");
-                    assert_eq!(decoded.len(), body.bytecodes.len());
+                    assert_eq!(decoded.len(), bcs.len());
                     methods += 1;
                 }
             }
@@ -182,8 +183,8 @@ fn rewritten_corpus_preserves_arithmetic_entities() {
                     .map(|(_, method)| {
                         let name = f.strings.resolve(method.name).unwrap().to_owned();
                         let body = method.body.as_ref().unwrap();
-                        let operands = body
-                            .bytecodes
+                        let bcs = body.bytecodes();
+                        let operands = bcs
                             .iter()
                             .flat_map(|bc| {
                                 bc.entity_operands().into_iter().map(|(kind, id)| {
@@ -207,7 +208,7 @@ fn rewritten_corpus_preserves_arithmetic_entities() {
                                 })
                             })
                             .collect::<Vec<_>>();
-                        (name, body.bytecodes.len(), operands)
+                        (name, bcs.len(), operands)
                     })
                     .collect::<Vec<_>>()
             };
@@ -454,4 +455,120 @@ fn rewritten_corpus_module_request_phase_cases() {
         checked, 9,
         "3 lazy-import cases x 3 profiles (12.0.6.0 only)"
     );
+}
+
+/// Across all 5,517 exported corpus fixtures, verify that lazy zero-copy
+/// decoding (`abcd_file::decode_lazy`, `#49`) produces byte-identical `pandasm`
+/// disassembly to eager `abcd_file::decode` and keeps every method body in
+/// `MethodCode::Span` form without upfront `Vec<Bytecode>` materialization.
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn exported_corpus_decode_lazy_matches_eager_pandasm() {
+    let root = exported_corpus_root();
+    let rows = manifest_select(&root, SELECT_ABC);
+    assert_eq!(rows.len(), 5517, "expected the full 5517-fixture corpus");
+    rows.par_iter().for_each(|rel| {
+        let path = root.join(rel);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("fixture missing at {}: {e}", path.display()));
+        let eager =
+            decode(&data).unwrap_or_else(|e| panic!("decode failed at {}: {e:?}", path.display()));
+        let lazy = abcd_file::decode_lazy(std::sync::Arc::from(data.as_slice()))
+            .unwrap_or_else(|e| panic!("decode_lazy failed at {}: {e:?}", path.display()));
+        for (_, m) in lazy.all_methods() {
+            if let Some(body) = &m.body {
+                assert!(
+                    matches!(body.code, abcd_file::MethodCode::Span(_)),
+                    "{rel}: decode_lazy must retain MethodCode::Span"
+                );
+            }
+        }
+        let pa_eager = abcd_file::pandasm::emit_file(&eager, "corpus.abc");
+        let pa_lazy = abcd_file::pandasm::emit_file(&lazy, "corpus.abc");
+        assert_eq!(pa_eager, pa_lazy, "{rel}: lazy vs eager pandasm mismatch");
+    });
+}
+
+/// Across all 5,517 exported corpus fixtures, verify that parallel lifting
+/// (`LiftOptions { parallel: true }`, `#84`) produces a 100% structurally
+/// identical `abcd_ir::Module` to sequential lifting (`parallel: false`).
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn exported_corpus_parallel_lift_matches_sequential_structurally() {
+    let root = exported_corpus_root();
+    let rows = manifest_select(&root, SELECT_ABC);
+    assert_eq!(rows.len(), 5517, "expected the full 5517-fixture corpus");
+    rows.par_iter().for_each(|rel| {
+        let path = root.join(rel);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("fixture missing at {}: {e}", path.display()));
+        let file = abcd_file::decode_lazy(std::sync::Arc::from(data))
+            .unwrap_or_else(|e| panic!("decode_lazy failed at {}: {e:?}", path.display()));
+        let seq = abcd_lift::lift_file_with_options(
+            &file,
+            &abcd_lift::LiftOptions {
+                retain_tail_capacity: false,
+                parallel: false,
+            },
+        );
+        let par = abcd_lift::lift_file_with_options(
+            &file,
+            &abcd_lift::LiftOptions {
+                retain_tail_capacity: false,
+                parallel: true,
+            },
+        );
+        match (seq, par) {
+            (Ok(m_seq), Ok(m_par)) => {
+                if let Err(diff) = abcd_ir::modules_structurally_eq(&m_seq, &m_par) {
+                    panic!("{rel}: parallel vs sequential lift mismatch: {diff}");
+                }
+            }
+            (Err(e_seq), Err(e_par)) => {
+                assert_eq!(
+                    e_seq.to_string(),
+                    e_par.to_string(),
+                    "{rel}: parallel vs sequential error mismatch"
+                );
+            }
+            (res_seq, res_par) => {
+                panic!(
+                    "{rel}: parallel vs sequential outcome mismatch: seq={:?}, par={:?}",
+                    res_seq.err(),
+                    res_par.err()
+                );
+            }
+        }
+    });
+}
+
+/// On local `modules.abc` (when present), verify that parallel lifting over a
+/// lazy-decoded container is 100% structurally identical to sequential lifting.
+#[test]
+#[ignore = "requires local-only modules.abc (gitignored)"]
+fn modules_abc_parallel_lift_matches_sequential_structurally() {
+    let path = corpus_path();
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("modules.abc absent at {} — skipped", path.display());
+        return;
+    };
+    let file = abcd_file::decode_lazy(std::sync::Arc::from(data)).expect("decode_lazy modules.abc");
+    let m_seq = abcd_lift::lift_file_with_options(
+        &file,
+        &abcd_lift::LiftOptions {
+            retain_tail_capacity: false,
+            parallel: false,
+        },
+    )
+    .expect("sequential lift modules.abc");
+    let m_par = abcd_lift::lift_file_with_options(
+        &file,
+        &abcd_lift::LiftOptions {
+            retain_tail_capacity: true,
+            parallel: true,
+        },
+    )
+    .expect("parallel lift modules.abc");
+    abcd_ir::modules_structurally_eq(&m_seq, &m_par)
+        .expect("modules.abc parallel vs sequential Module must be 100% structurally identical");
 }

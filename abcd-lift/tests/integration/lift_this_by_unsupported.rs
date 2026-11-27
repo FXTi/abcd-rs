@@ -232,14 +232,15 @@ fn this_by_access_respects_static_arkts_instance_and_no_this_fallback() {
         body: Some(MethodBody {
             num_vregs: 0,
             num_args: 1,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::Ldthisbyname(Imm(0), EntityId(0)),
                 Bytecode::Return,
-            ],
+            ]),
             entities: HashMap::from([(
                 (EntityKind::StringId, 0),
                 abcd_file::EntityRef::string(field_str),
-            )]),
+            )])
+            .into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

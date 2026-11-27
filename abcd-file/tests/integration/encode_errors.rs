@@ -1205,7 +1205,7 @@ fn model_with_entity_ref(kind: EntityKind, eref: abcd_file::EntityRef) -> abcd_f
     };
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     let body = cls.methods[0].body.as_mut().expect("body");
-    body.bytecodes = vec![bytecode, Bytecode::Returnundefined];
+    body.code = vec![bytecode, Bytecode::Returnundefined].into();
     body.entities.insert((kind, 0), eref);
     file
 }
@@ -1217,7 +1217,7 @@ fn code_ref_missing_entity_offset_entry() {
     let mut file = base_model();
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     let body = cls.methods[0].body.as_mut().expect("body");
-    body.bytecodes = vec![Bytecode::LdaStr(EntityId(0)), Bytecode::Returnundefined];
+    body.code = vec![Bytecode::LdaStr(EntityId(0)), Bytecode::Returnundefined].into();
     // No `entities` entry for `(StringId, 0)`.
     let err = encode(&file).expect_err("missing entity entry must fail");
     assert!(
@@ -1282,10 +1282,11 @@ fn code_ref_method_offset_miss() {
         .find(|c| !c.is_external)
         .unwrap();
     let body = cls.methods[0].body.as_mut().expect("body");
-    body.bytecodes = vec![
+    body.code = vec![
         Bytecode::Definefunc(abcd_isa::Imm(0), EntityId(0), abcd_isa::Imm(0)),
         Bytecode::Returnundefined,
-    ];
+    ]
+    .into();
     body.entities.insert(
         (EntityKind::MethodId, 0),
         abcd_file::EntityRef::ExternalMethod {

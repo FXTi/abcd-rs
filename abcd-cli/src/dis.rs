@@ -8,9 +8,11 @@
 
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::CliError;
 use crate::input::InputModule;
+use crate::{CliError, ExecContext};
 
 const IO_BUF_CAPACITY: usize = 256 * 1024;
 
@@ -29,15 +31,6 @@ impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-fn decode_module(module: &InputModule) -> Result<abcd_file::File, CliError> {
-    abcd_file::decode(&module.abc).map_err(|e| {
-        CliError::Tool(format!(
-            "failed to decode {} ({}): {e}",
-            module.name, module.provenance
-        ))
-    })
 }
 
 fn emit_counted<W: std::io::Write>(
@@ -59,8 +52,16 @@ fn emit_counted<W: std::io::Write>(
 
 /// Disassemble one module to pandasm text bytes.
 pub fn disassemble(module: &InputModule) -> Result<Vec<u8>, CliError> {
-    let file = decode_module(module)?;
-    Ok(abcd_file::pandasm::emit_file(&file, &source_name(module)))
+    let file = crate::decode_abc_arc(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        ExecContext::default(),
+    )?;
+    Ok(abcd_file::pandasm::emit_file(
+        &file,
+        &source_name_of(&module.provenance),
+    ))
 }
 
 /// Stream disassembled pandasm text of `module` directly to `out`, returning
@@ -69,35 +70,101 @@ pub fn disassemble_to_writer<W: std::io::Write>(
     module: &InputModule,
     out: W,
 ) -> Result<usize, CliError> {
-    let file = decode_module(module)?;
-    match emit_counted(&file, &source_name(module), out) {
+    disassemble_arc_to_writer(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        out,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn disassemble_owned_to_writer<W: std::io::Write>(
+    module: InputModule,
+    out: W,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    disassemble_arc_to_writer(abc, &name, &provenance, out, ctx)
+}
+
+fn disassemble_arc_to_writer<W: std::io::Write>(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    out: W,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let file = crate::decode_abc_arc(abc, name, provenance, ctx)?;
+    let t_dis = ctx.timings.then(Instant::now);
+    let res = match emit_counted(&file, &source_name_of(provenance), out) {
         Ok(n) => Ok(n),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(CliError::Tool(format!("failed writing to stdout: {e}"))),
+    };
+    if let Some(start) = t_dis {
+        crate::log_timing(true, name, "dis", start.elapsed());
     }
+    res
 }
 
 /// Stream disassembled pandasm text of `module` to `path`, returning the
 /// number of emitted bytes. Decodes `module` before creating or truncating
 /// `path` so corrupt inputs never leave an empty file on disk.
 pub fn disassemble_to_path(module: &InputModule, path: &Path) -> Result<usize, CliError> {
-    let file = decode_module(module)?;
+    disassemble_arc_to_path(
+        Arc::clone(&module.abc),
+        &module.name,
+        &module.provenance,
+        path,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn disassemble_owned_to_path(
+    module: InputModule,
+    path: &Path,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    disassemble_arc_to_path(abc, &name, &provenance, path, ctx)
+}
+
+fn disassemble_arc_to_path(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    path: &Path,
+    ctx: ExecContext,
+) -> Result<usize, CliError> {
+    let file = crate::decode_abc_arc(abc, name, provenance, ctx)?;
     let out_file = std::fs::File::create(path)
         .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-    emit_counted(&file, &source_name(module), out_file)
-        .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))
+    let t_dis = ctx.timings.then(Instant::now);
+    let size = emit_counted(&file, &source_name_of(provenance), out_file)
+        .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
+    if let Some(start) = t_dis {
+        crate::log_timing(true, name, "dis", start.elapsed());
+    }
+    Ok(size)
 }
 
 /// The name printed in the `# source binary:` header, matching upstream
 /// ark_disasm's basename convention: the input file's basename for a bare
 /// `.abc`, the innermost entry's basename for container-extracted modules
 /// (`app.app::entry.hap::ets/modules.abc` → `modules.abc`).
-fn source_name(module: &InputModule) -> String {
-    let last = module
-        .provenance
-        .rsplit("::")
-        .next()
-        .unwrap_or(&module.provenance);
+fn source_name_of(provenance: &str) -> String {
+    let last = provenance.rsplit("::").next().unwrap_or(provenance);
     last.rsplit(['/', '\\']).next().unwrap_or(last).to_string()
 }
 
@@ -117,6 +184,27 @@ pub fn write_all(
         let path = out_dir.join(format!("{}.pa", m.name));
         let size = disassemble_to_path(m, &path)?;
         written.push((m.name.clone(), path, size));
+    }
+    Ok(written)
+}
+
+pub(crate) fn write_all_owned(
+    modules: Vec<InputModule>,
+    out_dir: &Path,
+    ctx: ExecContext,
+) -> Result<Vec<(String, PathBuf, usize)>, CliError> {
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        CliError::Tool(format!(
+            "cannot create output directory {}: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let mut written = Vec::with_capacity(modules.len());
+    for m in modules {
+        let mod_name = m.name.clone();
+        let path = out_dir.join(format!("{mod_name}.pa"));
+        let size = disassemble_owned_to_path(m, &path, ctx)?;
+        written.push((mod_name, path, size));
     }
     Ok(written)
 }

@@ -16,11 +16,19 @@ macro_rules! define_id {
 
         impl $name {
             /// Wrap a raw arena index.
+            #[must_use]
             pub const fn new(index: u32) -> Self {
                 Self(index)
             }
 
-            /// The raw arena index.
+            /// The raw `u32` arena index.
+            #[must_use]
+            pub const fn raw(self) -> u32 {
+                self.0
+            }
+
+            /// The raw arena index as `usize`.
+            #[must_use]
             pub const fn index(self) -> usize {
                 self.0 as usize
             }

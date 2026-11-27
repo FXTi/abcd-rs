@@ -43,14 +43,15 @@ fn forward_and_same_named_references_relocate_after_layout() {
         .1;
     let target_offset = file.class_by_str("LOther;").unwrap().methods[0].offset;
     let body = caller.body.as_ref().unwrap();
-    let method_id = body.bytecodes[0].entity_operands()[0].1;
+    let bcs = body.bytecodes();
+    let method_id = bcs[0].entity_operands()[0].1;
     let EntityRef::Method(target_idx) = body.entities[&(EntityKind::MethodId, method_id.0)] else {
         panic!("expected EntityRef::Method");
     };
     let (_, _, resolved_target) = file.method_by_idx(target_idx).expect("target method");
     assert_eq!(resolved_target.offset, target_offset);
 
-    let string_id = body.bytecodes[1].entity_operands()[0].1;
+    let string_id = bcs[1].entity_operands()[0].1;
     let EntityRef::String {
         id: str_sid,
         source_offset: Some(string_offset),
@@ -64,7 +65,7 @@ fn forward_and_same_named_references_relocate_after_layout() {
     );
     assert_eq!(file.strings.resolve(str_sid), Some("same"));
 
-    let array_id = body.bytecodes[2].entity_operands()[0].1;
+    let array_id = bcs[2].entity_operands()[0].1;
     let EntityRef::LiteralArray(la_idx) = body.entities[&(EntityKind::LiteralarrayId, array_id.0)]
     else {
         panic!("expected EntityRef::LiteralArray");

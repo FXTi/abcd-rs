@@ -22,8 +22,11 @@
 //! *without changing the key shape* — climbing the precision ladder only
 //! makes [`AllocSiteSet`]s sharper, never re-keys facts (`design/analysis.md`).
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::OnceLock;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use abcd_ir::cfg::{ExceptionHandlerMap, augmented_succs_with_map};
 use abcd_ir::{
@@ -52,48 +55,139 @@ pub enum FieldKey {
     AnyDynamic,
 }
 
+/// Inline capacity of [`FieldChain`], matching [`DEFAULT_MAX_FIELD_CHAIN`] (`5`)
+/// so all default-configuration access paths require zero heap allocation.
+const INLINE_FIELD_CHAIN_CAP: usize = DEFAULT_MAX_FIELD_CHAIN;
+
+#[derive(Clone)]
+enum FieldChainRepr {
+    Inline {
+        len: u8,
+        buf: [FieldKey; INLINE_FIELD_CHAIN_CAP],
+    },
+    Spill(Arc<[FieldKey]>),
+}
+
 /// A k-capped chain of field accesses — the access-path tail of a heap
-/// fact key.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FieldChain(Vec<FieldKey>);
+/// fact key (`#84` Part 3b).
+///
+/// Chains of length `<= 5` ([`DEFAULT_MAX_FIELD_CHAIN`]) live inline with zero
+/// heap allocation; longer chains (when a caller configures `cap > 5`) spill
+/// into a shared `Arc<[FieldKey]>`.
+#[derive(Clone)]
+pub struct FieldChain(FieldChainRepr);
+
+impl Default for FieldChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for FieldChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FieldChain").field(&self.elements()).finish()
+    }
+}
+
+impl PartialEq for FieldChain {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.elements() == other.elements()
+    }
+}
+
+impl Eq for FieldChain {}
+
+impl PartialOrd for FieldChain {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FieldChain {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.elements().cmp(other.elements())
+    }
+}
+
+impl Hash for FieldChain {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.elements().hash(state);
+    }
+}
 
 impl FieldChain {
     /// The empty chain (the base object itself).
-    pub fn new() -> Self {
-        Self(Vec::new())
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(FieldChainRepr::Inline {
+            len: 0,
+            buf: [FieldKey::AnyDynamic; INLINE_FIELD_CHAIN_CAP],
+        })
     }
 
     /// `chain.key`, k-capped: at the cap the extension collapses back onto
     /// the prefix (k-limiting), so chains are bounded and merging at the
     /// cutoff is automatic.
+    #[must_use]
     pub fn pushed(&self, key: FieldKey, cap: usize) -> Self {
-        let mut chain = self.0.clone();
-        if chain.len() < cap {
-            chain.push(key);
+        let cur = self.elements();
+        if cur.len() >= cap {
+            return self.clone();
         }
-        Self(chain)
+        let new_len = cur.len() + 1;
+        if new_len <= INLINE_FIELD_CHAIN_CAP {
+            let mut buf = [FieldKey::AnyDynamic; INLINE_FIELD_CHAIN_CAP];
+            buf[..cur.len()].copy_from_slice(cur);
+            buf[cur.len()] = key;
+            Self(FieldChainRepr::Inline {
+                len: new_len as u8,
+                buf,
+            })
+        } else {
+            let mut vec = Vec::with_capacity(new_len);
+            vec.extend_from_slice(cur);
+            vec.push(key);
+            Self(FieldChainRepr::Spill(Arc::from(vec)))
+        }
     }
 
     /// Chain length.
+    #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        match &self.0 {
+            FieldChainRepr::Inline { len, .. } => *len as usize,
+            FieldChainRepr::Spill(slice) => slice.len(),
+        }
     }
 
     /// Whether the chain is empty.
+    #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
 
     /// The elements, base-first.
+    #[must_use]
+    #[inline]
     pub fn elements(&self) -> &[FieldKey] {
-        &self.0
+        match &self.0 {
+            FieldChainRepr::Inline { len, buf } => &buf[..*len as usize],
+            FieldChainRepr::Spill(slice) => slice,
+        }
     }
 
     /// Whether the two chains could denote the same property chain:
     /// pointwise-compatible on the shared prefix (`AnyIndex`/`AnyDynamic`
     /// are wildcards; two different names are not).
+    #[must_use]
     pub fn compatible_with(&self, other: &FieldChain) -> bool {
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
+        for (a, b) in self.elements().iter().zip(other.elements().iter()) {
             match (a, b) {
                 (FieldKey::Named(x), FieldKey::Named(y)) if x != y => return false,
                 _ => {}
@@ -103,45 +197,294 @@ impl FieldChain {
     }
 }
 
-/// A set of allocation sites (the `InstId`s of the four keyed `Alloc*`
-/// ops). A B-tree: iteration order is part of determinism.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AllocSiteSet(BTreeSet<InstId>);
+/// Inline capacity of [`AllocSiteSet`]: `<= 4` sorted [`InstId`]s live inline
+/// with zero heap allocation; `> 4` spill into a shared sorted `Arc<[InstId]>`.
+const INLINE_ALLOC_SITES_CAP: usize = 4;
+
+#[derive(Clone)]
+enum AllocSiteSetRepr {
+    Inline {
+        len: u8,
+        buf: [InstId; INLINE_ALLOC_SITES_CAP],
+    },
+    Spill(Arc<[InstId]>),
+}
+
+/// A set of allocation sites (the [`InstId`]s of the four keyed `Alloc*` ops;
+/// `#84` Part 3a).
+///
+/// Sites are maintained in strictly ascending [`InstId`] order (`N20`), stored
+/// inline for `<= 4` sites and backed by a shared `Arc<[InstId]>` for `> 4`
+/// sites so cloning is `O(1)` and `<= 4`-site sets require zero heap allocation.
+#[derive(Clone)]
+pub struct AllocSiteSet(AllocSiteSetRepr);
+
+impl Default for AllocSiteSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for AllocSiteSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AllocSiteSet")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+impl PartialEq for AllocSiteSet {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for AllocSiteSet {}
+
+impl PartialOrd for AllocSiteSet {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AllocSiteSet {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl Hash for AllocSiteSet {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl FromIterator<InstId> for AllocSiteSet {
+    fn from_iter<I: IntoIterator<Item = InstId>>(iter: I) -> Self {
+        let mut vec: Vec<InstId> = iter.into_iter().collect();
+        vec.sort_unstable();
+        vec.dedup();
+        Self::from_sorted_unique(&vec)
+    }
+}
 
 impl AllocSiteSet {
     /// The empty set (no known sites).
-    pub fn new() -> Self {
-        Self::default()
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AllocSiteSetRepr::Inline {
+            len: 0,
+            buf: [InstId::new(0); INLINE_ALLOC_SITES_CAP],
+        })
     }
 
     /// A singleton set.
-    pub fn one(site: InstId) -> Self {
-        Self(BTreeSet::from([site]))
+    #[must_use]
+    pub const fn one(site: InstId) -> Self {
+        Self(AllocSiteSetRepr::Inline {
+            len: 1,
+            buf: [site, InstId::new(0), InstId::new(0), InstId::new(0)],
+        })
+    }
+
+    /// Construct from a strictly ascending, deduplicated slice of [`InstId`]s.
+    #[must_use]
+    pub(crate) fn from_sorted_unique(sites: &[InstId]) -> Self {
+        debug_assert!(sites.windows(2).all(|w| w[0] < w[1]));
+        if sites.len() <= INLINE_ALLOC_SITES_CAP {
+            let mut buf = [InstId::new(0); INLINE_ALLOC_SITES_CAP];
+            buf[..sites.len()].copy_from_slice(sites);
+            Self(AllocSiteSetRepr::Inline {
+                len: sites.len() as u8,
+                buf,
+            })
+        } else {
+            Self(AllocSiteSetRepr::Spill(Arc::from(sites)))
+        }
+    }
+
+    /// Borrow the sites as a strictly ascending [`InstId`] slice.
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> &[InstId] {
+        match &self.0 {
+            AllocSiteSetRepr::Inline { len, buf } => &buf[..*len as usize],
+            AllocSiteSetRepr::Spill(slice) => slice,
+        }
     }
 
     /// The sites, in [`InstId`] order.
-    pub fn iter(&self) -> impl Iterator<Item = InstId> + '_ {
-        self.0.iter().copied()
+    pub fn iter(&self) -> std::iter::Copied<std::slice::Iter<'_, InstId>> {
+        self.as_slice().iter().copied()
     }
 
     /// Number of sites.
+    #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.as_slice().len()
     }
 
     /// Whether the set is empty.
+    #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
 
-    /// Whether the sets share at least one site.
+    /// Whether `site` is present in this set.
+    #[must_use]
+    pub fn contains(&self, site: InstId) -> bool {
+        let s = self.as_slice();
+        if s.len() <= INLINE_ALLOC_SITES_CAP {
+            s.contains(&site)
+        } else {
+            s.binary_search(&site).is_ok()
+        }
+    }
+
+    /// Insert a single allocation `site`, returning `true` iff it was newly added.
+    pub fn insert(&mut self, site: InstId) -> bool {
+        match &mut self.0 {
+            AllocSiteSetRepr::Inline { len, buf } => {
+                let n = *len as usize;
+                let mut pos = 0usize;
+                while pos < n && buf[pos] < site {
+                    pos += 1;
+                }
+                if pos < n && buf[pos] == site {
+                    return false;
+                }
+                if n < INLINE_ALLOC_SITES_CAP {
+                    buf.copy_within(pos..n, pos + 1);
+                    buf[pos] = site;
+                    *len += 1;
+                    return true;
+                }
+                let mut spilled = Vec::with_capacity(INLINE_ALLOC_SITES_CAP + 1);
+                spilled.extend_from_slice(&buf[..pos]);
+                spilled.push(site);
+                spilled.extend_from_slice(&buf[pos..n]);
+                self.0 = AllocSiteSetRepr::Spill(Arc::from(spilled));
+                true
+            }
+            AllocSiteSetRepr::Spill(slice) => match slice.binary_search(&site) {
+                Ok(_) => false,
+                Err(pos) => {
+                    let mut spilled = Vec::with_capacity(slice.len() + 1);
+                    spilled.extend_from_slice(&slice[..pos]);
+                    spilled.push(site);
+                    spilled.extend_from_slice(&slice[pos..]);
+                    *slice = Arc::from(spilled);
+                    true
+                }
+            },
+        }
+    }
+
+    /// Whether the sets share at least one site (`O(|A| + |B|)`).
+    #[must_use]
     pub fn intersects(&self, other: &AllocSiteSet) -> bool {
-        self.0.intersection(&other.0).next().is_some()
+        let a = self.as_slice();
+        let b = other.as_slice();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => return true,
+            }
+        }
+        false
     }
 
-    /// Union in place.
+    /// Union in place (`O(|A| + |B|)` two-pointer sorted merge; zero heap
+    /// allocation whenever the merged cardinality stays `<= 4`).
     pub fn union_with(&mut self, other: &AllocSiteSet) {
-        self.0.extend(other.0.iter().copied());
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = other.clone();
+            return;
+        }
+        let b = other.as_slice();
+        if b.len() == 1 {
+            self.insert(b[0]);
+            return;
+        }
+        let a = self.as_slice();
+        if a.len() <= INLINE_ALLOC_SITES_CAP && b.len() <= INLINE_ALLOC_SITES_CAP {
+            let mut tmp = [InstId::new(0); INLINE_ALLOC_SITES_CAP * 2];
+            let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    Ordering::Less => {
+                        tmp[k] = a[i];
+                        i += 1;
+                    }
+                    Ordering::Greater => {
+                        tmp[k] = b[j];
+                        j += 1;
+                    }
+                    Ordering::Equal => {
+                        tmp[k] = a[i];
+                        i += 1;
+                        j += 1;
+                    }
+                }
+                k += 1;
+            }
+            while i < a.len() {
+                tmp[k] = a[i];
+                i += 1;
+                k += 1;
+            }
+            while j < b.len() {
+                tmp[k] = b[j];
+                j += 1;
+                k += 1;
+            }
+            if k == a.len() {
+                return;
+            }
+            *self = Self::from_sorted_unique(&tmp[..k]);
+            return;
+        }
+
+        let mut merged = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                Ordering::Less => {
+                    merged.push(a[i]);
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    merged.push(b[j]);
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    merged.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        if i < a.len() {
+            merged.extend_from_slice(&a[i..]);
+        }
+        if j < b.len() {
+            merged.extend_from_slice(&b[j..]);
+        }
+        if merged.len() == a.len() {
+            return;
+        }
+        self.0 = AllocSiteSetRepr::Spill(Arc::from(merged));
     }
 }
 
@@ -275,7 +618,7 @@ impl SingletonSiteClassifier {
         callgraph: &CallGraph,
         harness_func: Option<FuncId>,
     ) -> Self {
-        let links = ModuleLinkTable::build(module);
+        let links = ModuleLinkTable::build_with_harness(module, harness_func);
         Self::build_with_links(module, &links, callgraph, harness_func)
     }
 
@@ -319,21 +662,18 @@ impl SingletonSiteClassifier {
             escaped,
             val_funcs,
             effective_callers,
-        } = analyze_closure_callability(module, links, callgraph, &loop_blocks);
+        } = analyze_closure_callability(module, links, callgraph, &loop_blocks, harness_func);
         let mut single_exec_funcs = vec![false; num_funcs];
 
         // Determine whether `module` carries canonical top-level entry roots
-        // (`func_main_0`, `<cctor>`, or the lifecycle harness). Synthetic unit
-        // test modules with none of those names treat unescaped 0-caller
+        // (`func_main_0`, `<cctor>`, or an explicit `harness_func`). Synthetic
+        // unit-test modules with none of those roots treat unescaped 0-caller
         // `FunctionKind::Function` roots as single-execution entries.
         let has_named_init_root = harness_func.is_some()
             || module.functions.iter().any(|fd| {
                 !fd.is_external
                     && !fd.blocks.is_empty()
-                    && matches!(
-                        module.sym.resolve(fd.name),
-                        Some("func_main_0" | "<cctor>" | crate::ohos_lifecycle::OHOS_HARNESS_FUNC)
-                    )
+                    && matches!(module.sym.resolve(fd.name), Some("func_main_0" | "<cctor>"))
             });
 
         let mut queue = VecDeque::new();
@@ -347,10 +687,7 @@ impl SingletonSiteClassifier {
             }
             let is_root = if has_named_init_root {
                 Some(fid) == harness_func
-                    || matches!(
-                        module.sym.resolve(fd.name),
-                        Some("func_main_0" | "<cctor>" | crate::ohos_lifecycle::OHOS_HARNESS_FUNC)
-                    )
+                    || matches!(module.sym.resolve(fd.name), Some("func_main_0" | "<cctor>"))
             } else {
                 fd.kind == FunctionKind::Function
             };
@@ -653,6 +990,7 @@ fn analyze_closure_callability(
     links: &ModuleLinkTable,
     callgraph: &CallGraph,
     loop_blocks: &[bool],
+    harness_func: Option<FuncId>,
 ) -> ClosureCallability {
     let n_funcs = module.functions.len();
     let mut escaped = vec![false; n_funcs];
@@ -689,7 +1027,7 @@ fn analyze_closure_callability(
                         .unwrap_or("");
                     if mname != "func_main_0"
                         && mname != "<cctor>"
-                        && mname != crate::ohos_lifecycle::OHOS_HARNESS_FUNC
+                        && Some(mfid) != harness_func
                         && let Some(slot) = escaped.get_mut(mfid.index())
                     {
                         *slot = true;
@@ -1150,7 +1488,7 @@ fn resolve_into(
                     }
                 }
                 Some(op) if is_keyed_alloc(op) => {
-                    info.sites.union_with(&AllocSiteSet::one(iid));
+                    info.sites.insert(iid);
                 }
                 Some(_) => {
                     info.has_unknown = true;
@@ -1261,384 +1599,4 @@ impl<'m> Rung0AliasOracle<'m> {
 impl<F> AliasOracle<F> for Rung0AliasOracle<'_> {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testutil::*;
-    use abcd_ir::{EdgeKind, Op};
-
-    #[test]
-    fn straight_line_alloc_is_single_precise() {
-        let mut m = mk_module();
-        let f = add_func(&mut m);
-        let entry = entry_of(&m, f);
-        let obj = alloc_object(&mut m, entry);
-        let alias = emit(&mut m, entry, Op::Mov { src: obj });
-        emit_void(&mut m, entry, Op::Return { value: None });
-
-        let info = resolve_alloc_sites(&m, alias);
-        assert_eq!(info.sites.len(), 1);
-        assert!(info.is_single_precise());
-        assert_eq!(update_kind(&info), UpdateKind::Strong);
-
-        // The oracle seam's must-alias/points-to delegates were deleted
-        // as dead surface; the same answers come from `resolve`:
-        // must-alias = both sides single-precise with equal sites,
-        // points-to = the resolved site set.
-        let oracle = Rung0AliasOracle::new(&m);
-        let (a, b) = (oracle.resolve(obj), oracle.resolve(alias));
-        assert!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites);
-        assert_eq!(oracle.resolve(alias).sites.len(), 1);
-    }
-
-    #[test]
-    fn phi_merge_is_weak() {
-        let mut m = mk_module();
-        let f = add_func(&mut m);
-        let entry = entry_of(&m, f);
-        let t = add_block(&mut m, f);
-        let e = add_block(&mut m, f);
-        let join = add_block(&mut m, f);
-
-        let cond = load_number(&mut m, entry, 1.0);
-        emit_void(
-            &mut m,
-            entry,
-            Op::CondBranch {
-                cond,
-                true_dest: t,
-                false_dest: e,
-            },
-        );
-        let a = alloc_object(&mut m, t);
-        emit_void(&mut m, t, Op::Branch { dest: join });
-        let b = alloc_object(&mut m, e);
-        emit_void(&mut m, e, Op::Branch { dest: join });
-        link(&mut m, entry, t);
-        link(&mut m, entry, e);
-        link(&mut m, t, join);
-        link(&mut m, e, join);
-        let phi = emit(
-            &mut m,
-            join,
-            Op::Phi {
-                entries: vec![
-                    (
-                        abcd_ir::Edge {
-                            from: t,
-                            kind: EdgeKind::Normal,
-                        },
-                        a,
-                    ),
-                    (
-                        abcd_ir::Edge {
-                            from: e,
-                            kind: EdgeKind::Normal,
-                        },
-                        b,
-                    ),
-                ],
-            },
-        );
-        emit_void(&mut m, join, Op::Return { value: None });
-
-        let info = resolve_alloc_sites(&m, phi);
-        assert_eq!(info.sites.len(), 2, "phi merges sites");
-        assert!(info.has_phi);
-        assert_eq!(update_kind(&info), UpdateKind::Weak);
-
-        let oracle = Rung0AliasOracle::new(&m);
-        // Not must-alias: the phi side is not single-precise.
-        let (pa, pb) = (oracle.resolve(phi), oracle.resolve(a));
-        assert!(!(pa.is_single_precise() && pb.is_single_precise() && pa.sites == pb.sites));
-        assert_eq!(oracle.resolve(phi).sites.len(), 2);
-    }
-
-    #[test]
-    fn array_alloc_site_and_consts() {
-        let mut m = mk_module();
-        let f = add_func(&mut m);
-        let entry = entry_of(&m, f);
-        let arr = alloc_array(&mut m, entry);
-        let undef = const_undefined(&mut m);
-        emit_void(&mut m, entry, Op::Return { value: None });
-
-        // An array allocation is a keyed site (T7).
-        let info = resolve_alloc_sites(&m, arr);
-        assert!(info.is_single_precise());
-        assert_eq!(update_kind(&info), UpdateKind::Strong);
-
-        // Constants contribute no site and no unknown — they are not heap
-        // objects at all.
-        let info = resolve_alloc_sites(&m, undef);
-        assert!(info.sites.is_empty());
-        assert!(!info.has_unknown && !info.has_phi);
-
-        // Different sites of different kinds do not alias.
-        let obj = alloc_object(&mut m, entry);
-        let oracle = Rung0AliasOracle::new(&m);
-        let (a, b) = (oracle.resolve(arr), oracle.resolve(obj));
-        assert!(!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites));
-    }
-
-    #[test]
-    fn unknown_sources_are_weak_and_never_must_alias() {
-        let mut m = mk_module();
-        let f = add_func(&mut m);
-        let entry = entry_of(&m, f);
-        let p = add_param(&mut m, f, 1);
-        let name = intern(&mut m, "x");
-        let loaded = emit(&mut m, entry, Op::LoadProp { object: p, name });
-        emit_void(&mut m, entry, Op::Return { value: None });
-
-        let info = resolve_alloc_sites(&m, loaded);
-        assert!(info.sites.is_empty());
-        assert!(info.has_unknown);
-        assert_eq!(update_kind(&info), UpdateKind::Weak);
-
-        let oracle = Rung0AliasOracle::new(&m);
-        // Not must-alias: an unknown-source value is not single-precise.
-        let (a, b) = (oracle.resolve(loaded), oracle.resolve(loaded));
-        assert!(!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites));
-    }
-
-    #[test]
-    fn access_path_cutoff_at_k() {
-        let cap = 3usize;
-        let s = Sym::new(7);
-        let mut chain = FieldChain::new();
-        for _ in 0..5 {
-            chain = chain.pushed(FieldKey::Named(s), cap);
-        }
-        assert_eq!(chain.len(), cap, "chain is capped at k");
-
-        // Two chains that differ ONLY below the cutoff collapse to the
-        // same key (k-limiting merges them).
-        let other = Sym::new(8);
-        let mut a = FieldChain::new();
-        let mut b = FieldChain::new();
-        for _ in 0..cap {
-            a = a.pushed(FieldKey::Named(s), cap);
-            b = b.pushed(FieldKey::Named(s), cap);
-        }
-        a = a.pushed(FieldKey::Named(s), cap);
-        b = b.pushed(FieldKey::Named(other), cap);
-        assert_eq!(a, b, "beyond-k extensions collapse onto the prefix");
-    }
-
-    #[test]
-    fn may_alias_tri_state() {
-        let f1 = FieldChain::new().pushed(FieldKey::Named(Sym::new(1)), DEFAULT_MAX_FIELD_CHAIN);
-        let f2 = FieldChain::new().pushed(FieldKey::Named(Sym::new(2)), DEFAULT_MAX_FIELD_CHAIN);
-        let s1 = AllocSiteSet::one(InstId::new(1));
-        let s2 = AllocSiteSet::one(InstId::new(2));
-
-        // The oracle seam's may-alias delegate was deleted as dead
-        // surface; it was a pure forward to `key_may_alias`.
-        let same = HeapRef {
-            sites: s1.clone(),
-            fields: f1.clone(),
-        };
-        assert_eq!(key_may_alias(&same, &same.clone()), Tribool::True);
-        // Different named fields: never the same location.
-        let other_field = HeapRef {
-            sites: s1.clone(),
-            fields: f2,
-        };
-        assert_eq!(key_may_alias(&same, &other_field), Tribool::False);
-        // Same field, disjoint sites: different objects.
-        let other_obj = HeapRef {
-            sites: s2,
-            fields: f1.clone(),
-        };
-        assert_eq!(key_may_alias(&same, &other_obj), Tribool::False);
-        // Same field, unknown sites on one side: undecidable.
-        let unknown = HeapRef {
-            sites: AllocSiteSet::new(),
-            fields: f1,
-        };
-        assert_eq!(key_may_alias(&same, &unknown), Tribool::Unknown);
-    }
-
-    #[test]
-    fn concrete_singleton_classifier_gates_loops_multi_call_helpers_and_escaped_closures() {
-        let mut m = mk_module();
-
-        // 1. `single_helper`: called ONCE from `func_main_0` outside any loop -> singleton!
-        let single_helper = add_func_named(&mut m, "single_helper");
-        let b_sh = entry_of(&m, single_helper);
-        let obj_single_helper = alloc_object(&mut m, b_sh);
-        let site_single_helper = m.blocks[b_sh.index()].insts[0];
-        emit_void(
-            &mut m,
-            b_sh,
-            Op::Return {
-                value: Some(obj_single_helper),
-            },
-        );
-
-        // 2. `multi_helper`: called TWICE from `func_main_0` -> NOT singleton!
-        let multi_helper = add_func_named(&mut m, "multi_helper");
-        let b_mh = entry_of(&m, multi_helper);
-        let obj_multi_helper = alloc_object(&mut m, b_mh);
-        let site_multi_helper = m.blocks[b_mh.index()].insts[0];
-        emit_void(
-            &mut m,
-            b_mh,
-            Op::Return {
-                value: Some(obj_multi_helper),
-            },
-        );
-
-        // 3. `escaped_cb`: stored onto an object -> NOT singleton!
-        let escaped_cb = add_func_named(&mut m, "escaped_cb");
-        let b_cb = entry_of(&m, escaped_cb);
-        let obj_escaped = alloc_object(&mut m, b_cb);
-        let site_escaped = m.blocks[b_cb.index()].insts[0];
-        emit_void(
-            &mut m,
-            b_cb,
-            Op::Return {
-                value: Some(obj_escaped),
-            },
-        );
-
-        // 4. `func_main_0`: top-level alloc, natural `while` loop alloc, and
-        //    irreducible 2-entry loop (`ir1 <-> ir2`) alloc.
-        let main_fn = add_func_named(&mut m, "func_main_0");
-        let b_entry = entry_of(&m, main_fn);
-        let b_while_head = add_block(&mut m, main_fn);
-        let b_while_body = add_block(&mut m, main_fn);
-        let b_ir1 = add_block(&mut m, main_fn);
-        let b_ir2 = add_block(&mut m, main_fn);
-        let b_exit = add_block(&mut m, main_fn);
-
-        let obj_top = alloc_object(&mut m, b_entry);
-        let site_top = m.blocks[b_entry.index()].insts[0];
-
-        let sh_ref = load_method_ref(&mut m, b_entry, single_helper);
-        let _ = emit(
-            &mut m,
-            b_entry,
-            Op::Call {
-                callee: sh_ref,
-                this: None,
-                args: Vec::new(),
-                kind: abcd_ir::CallKind::Direct,
-            },
-        );
-        let mh_ref = load_method_ref(&mut m, b_entry, multi_helper);
-        for _ in 0..2 {
-            let _ = emit(
-                &mut m,
-                b_entry,
-                Op::Call {
-                    callee: mh_ref,
-                    this: None,
-                    args: Vec::new(),
-                    kind: abcd_ir::CallKind::Direct,
-                },
-            );
-        }
-        let df_cb = emit(
-            &mut m,
-            b_entry,
-            Op::DefineFunc {
-                body: escaped_cb,
-                captures: Vec::new(),
-                length: 0,
-            },
-        );
-        let cl_cb = emit(&mut m, b_entry, Op::AllocClosure { func: df_cb });
-        let s_fn = intern(&mut m, "fn");
-        emit_void(
-            &mut m,
-            b_entry,
-            Op::StoreProp {
-                object: obj_top,
-                name: s_fn,
-                value: cl_cb,
-            },
-        );
-        emit_void(&mut m, b_entry, Op::Branch { dest: b_while_head });
-        link(&mut m, b_entry, b_while_head);
-
-        let cond = load_number(&mut m, b_while_head, 1.0);
-        emit_void(
-            &mut m,
-            b_while_head,
-            Op::CondBranch {
-                cond,
-                true_dest: b_while_body,
-                false_dest: b_ir1,
-            },
-        );
-        link(&mut m, b_while_head, b_while_body);
-        link(&mut m, b_while_head, b_ir1);
-
-        let obj_while = alloc_object(&mut m, b_while_body);
-        let site_while = m.blocks[b_while_body.index()].insts[0];
-        emit_void(
-            &mut m,
-            b_while_body,
-            Op::CondBranch {
-                cond,
-                true_dest: b_while_head,
-                false_dest: b_ir2,
-            },
-        );
-        link(&mut m, b_while_body, b_while_head);
-        link(&mut m, b_while_body, b_ir2);
-
-        // Irreducible cycle `b_ir1 <-> b_ir2` entered from both `b_while_head` and `b_while_body`.
-        let _ = alloc_object(&mut m, b_ir1);
-        let site_ir1 = m.blocks[b_ir1.index()].insts[0];
-        emit_void(
-            &mut m,
-            b_ir1,
-            Op::CondBranch {
-                cond,
-                true_dest: b_ir2,
-                false_dest: b_exit,
-            },
-        );
-        link(&mut m, b_ir1, b_ir2);
-        link(&mut m, b_ir1, b_exit);
-
-        emit_void(&mut m, b_ir2, Op::Branch { dest: b_ir1 });
-        link(&mut m, b_ir2, b_ir1);
-
-        let ret_iid = emit_void(&mut m, b_exit, Op::Return { value: None });
-
-        let cls = SingletonSiteClassifier::from_module(&m);
-        assert!(cls.is_single_execution_func(main_fn));
-        assert!(cls.is_single_execution_func(single_helper));
-        assert!(!cls.is_single_execution_func(multi_helper));
-        assert!(!cls.is_single_execution_func(escaped_cb));
-
-        assert!(!cls.is_loop_block(b_entry));
-        assert!(cls.is_loop_block(b_while_head));
-        assert!(cls.is_loop_block(b_while_body));
-        assert!(cls.is_loop_block(b_ir1));
-        assert!(cls.is_loop_block(b_ir2));
-        assert!(!cls.is_loop_block(b_exit));
-
-        assert!(cls.is_concrete_singleton_site(site_top));
-        assert!(cls.is_concrete_singleton_site(site_single_helper));
-        assert!(!cls.is_concrete_singleton_site(site_while));
-        assert!(!cls.is_concrete_singleton_site(site_ir1));
-        assert!(!cls.is_concrete_singleton_site(site_multi_helper));
-        assert!(!cls.is_concrete_singleton_site(site_escaped));
-        assert!(is_concrete_singleton_site(&m, site_top));
-        assert!(!is_concrete_singleton_site(&m, site_while));
-
-        let r0 = Rung0AliasOracle::new(&m);
-        assert_eq!(r0.update_kind_of(obj_top), UpdateKind::Strong);
-        assert_eq!(r0.update_kind_of(obj_single_helper), UpdateKind::Strong);
-        assert_eq!(r0.update_kind_of(obj_while), UpdateKind::Weak);
-        assert_eq!(r0.update_kind_of(obj_multi_helper), UpdateKind::Weak);
-        assert_eq!(r0.update_kind_of(obj_escaped), UpdateKind::Weak);
-        assert!(!r0.site_info_at(obj_top, ret_iid).has_phi);
-        assert!(r0.site_info_at(obj_while, ret_iid).has_phi);
-        assert!(r0.site_info_at(obj_multi_helper, ret_iid).has_phi);
-    }
-}
+mod tests;

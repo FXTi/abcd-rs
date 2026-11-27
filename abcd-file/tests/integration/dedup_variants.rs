@@ -50,7 +50,7 @@ fn deduplicate_code_and_debug_info_merges_identical_bodies() {
     for (_, m) in file.all_methods() {
         let body = m.body.as_ref().expect("body");
         assert!(
-            matches!(body.bytecodes.as_slice(), [Bytecode::Returnundefined]),
+            matches!(body.bytecodes().as_ref(), [Bytecode::Returnundefined]),
             "method body intact after dedup"
         );
     }

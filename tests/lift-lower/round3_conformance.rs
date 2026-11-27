@@ -68,7 +68,7 @@ fn build_test_file(
         body: Some(MethodBody {
             num_vregs,
             num_args,
-            bytecodes,
+            code: bytecodes.into(),
             entities: entities.into_iter().collect(),
             try_blocks,
             ic_size: None,
@@ -90,8 +90,8 @@ fn build_test_file(
         body: Some(MethodBody {
             num_vregs: 0,
             num_args: 3,
-            bytecodes: vec![Bytecode::Returnundefined],
-            entities: HashMap::new(),
+            code: vec![Bytecode::Returnundefined].into(),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -166,7 +166,7 @@ fn roundtrip_main(file: &File, optimize: bool) -> (File, MethodBody) {
 /// never lands on or straddles `0xff` unless degraded to `0xff` as `eight_bit_ic`.
 fn assert_valid_ic_layout(body: &MethodBody) {
     let mut occupied = HashMap::<u32, &'static str>::new();
-    for bc in &body.bytecodes {
+    for bc in body.bytecodes().iter() {
         let has_ic = bc.has_flag(BytecodeFlags::IC_SLOT) || bc.has_flag(BytecodeFlags::JIT_IC_SLOT);
         if !has_ic {
             continue;
@@ -514,27 +514,23 @@ fn r3_c1_to_h4_table_driven_opcode_identity_and_acc_roundtrip() {
         let file = build_test_file(bcs, ents, Vec::new(), sp.clone(), 3, 6, Vec::new(), None);
         for opt in [false, true] {
             let (_, body) = roundtrip_main(&file, opt);
-            let mnems: Vec<&str> = body.bytecodes.iter().map(Bytecode::mnemonic).collect();
+            let bcs = body.bytecodes();
+            let mnems: Vec<&str> = bcs.iter().map(Bytecode::mnemonic).collect();
             assert!(
                 mnems.contains(&expected_mnem),
                 "{label} (opt={opt}): expected `{expected_mnem}` in {mnems:?}"
             );
             if label.starts_with("R3-C6") {
-                let has_imm0 = body
-                    .bytecodes
+                let has_imm0 = bcs
                     .iter()
                     .any(|bc| matches!(bc, Bytecode::Createobjectwithexcludedkeys(Imm(0), _, _)));
                 assert!(
                     has_imm0,
-                    "{label} (opt={opt}): expected imm=0 for 1 excluded key, got {:?}",
-                    body.bytecodes
+                    "{label} (opt={opt}): expected imm=0 for 1 excluded key, got {bcs:?}"
                 );
             }
             if label.starts_with("R3-H2") && opt {
-                let has_ldtrue = body
-                    .bytecodes
-                    .iter()
-                    .any(|bc| matches!(bc, Bytecode::Ldtrue));
+                let has_ldtrue = bcs.iter().any(|bc| matches!(bc, Bytecode::Ldtrue));
                 assert!(
                     has_ldtrue,
                     "{label}: `Ldtrue` feeding `definegettersetterbyvalue` must survive `--optimize`!"
@@ -566,21 +562,18 @@ fn r3_x1_raw_jeqz_jnez_semantics_preserved_across_opt() {
         None,
     );
     let (_, body_null_opt) = roundtrip_main(&file_null, true);
+    let bcs_null = body_null_opt.bytecodes();
     assert!(
-        body_null_opt
-            .bytecodes
+        bcs_null
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldai(Imm(11)))),
-        "`ldnull; jeqz` must fold to fallthrough `Ldai(11)`, got {:?}",
-        body_null_opt.bytecodes
+        "`ldnull; jeqz` must fold to fallthrough `Ldai(11)`, got {bcs_null:?}"
     );
     assert!(
-        !body_null_opt
-            .bytecodes
+        !bcs_null
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldai(Imm(99)))),
-        "`ldnull; jeqz` must NOT take branch `Ldai(99)`, got {:?}",
-        body_null_opt.bytecodes
+        "`ldnull; jeqz` must NOT take branch `Ldai(99)`, got {bcs_null:?}"
     );
 
     // 2. `ldnan; jnez target`: in Ark VM `jnez` branches on `double != 0.0`, which is
@@ -603,21 +596,18 @@ fn r3_x1_raw_jeqz_jnez_semantics_preserved_across_opt() {
         None,
     );
     let (_, body_nan_opt) = roundtrip_main(&file_nan, true);
+    let bcs_nan = body_nan_opt.bytecodes();
     assert!(
-        body_nan_opt
-            .bytecodes
+        bcs_nan
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldai(Imm(77)))),
-        "`ldnan; jnez` must fold to branch target `Ldai(77)`, got {:?}",
-        body_nan_opt.bytecodes
+        "`ldnan; jnez` must fold to branch target `Ldai(77)`, got {bcs_nan:?}"
     );
     assert!(
-        !body_nan_opt
-            .bytecodes
+        !bcs_nan
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldai(Imm(22)))),
-        "`ldnan; jnez` must NOT fall through to `Ldai(22)`, got {:?}",
-        body_nan_opt.bytecodes
+        "`ldnan; jnez` must NOT fall through to `Ldai(22)`, got {bcs_nan:?}"
     );
 }
 
@@ -646,7 +636,8 @@ fn r3_x5_out_of_u32_and_neg_zero_prop_idx_never_wraps_to_byindex() {
     );
     for opt in [false, true] {
         let (_, body) = roundtrip_main(&file, opt);
-        let has_byindex = body.bytecodes.iter().any(|bc| {
+        let bcs = body.bytecodes();
+        let has_byindex = bcs.iter().any(|bc| {
             matches!(
                 bc,
                 Bytecode::Ldobjbyindex(..) | Bytecode::WideLdobjbyindex(..)
@@ -654,8 +645,7 @@ fn r3_x5_out_of_u32_and_neg_zero_prop_idx_never_wraps_to_byindex() {
         });
         assert!(
             !has_byindex,
-            "opt={opt}: `2^32` and `-0.0` keys must lower via `ldobjbyvalue`, never `*byindex`: {:?}",
-            body.bytecodes
+            "opt={opt}: `2^32` and `-0.0` keys must lower via `ldobjbyvalue`, never `*byindex`: {bcs:?}"
         );
     }
 }
@@ -738,7 +728,8 @@ fn r3_h7_h8_h9_wide_isel_debug_rebuild_and_literal_tag_isolation() {
     );
 
     let (redecoded, body) = roundtrip_main(&file, true);
-    let mnems: Vec<&str> = body.bytecodes.iter().map(Bytecode::mnemonic).collect();
+    let bcs = body.bytecodes();
+    let mnems: Vec<&str> = bcs.iter().map(Bytecode::mnemonic).collect();
     assert!(mnems.contains(&"wide.newlexenv"), "{mnems:?}");
     assert!(mnems.contains(&"wide.stlexvar"), "{mnems:?}");
     assert!(mnems.contains(&"wide.ldlexvar"), "{mnems:?}");
@@ -761,10 +752,10 @@ fn r3_h7_h8_h9_wide_isel_debug_rebuild_and_literal_tag_isolation() {
     );
     for le in &dbg.line_table {
         assert!(
-            (le.index as usize) < body.bytecodes.len(),
+            (le.index as usize) < bcs.len(),
             "line_table index {} >= bytecode count {}",
             le.index,
-            body.bytecodes.len()
+            bcs.len()
         );
     }
 
@@ -857,14 +848,15 @@ fn r3_x3_competing_nested_catch_handler_phis_do_not_clobber() {
     assert!(c1.type_class.is_none(), "catch-all must keep None");
 
     // Extract the `Lda(reg)` read by H1 and H2: they MUST read distinct registers!
-    let h1_lda = body.bytecodes[c0.handler as usize..(c0.handler + c0.len) as usize]
+    let bcs = body.bytecodes();
+    let h1_lda = bcs[c0.handler as usize..(c0.handler + c0.len) as usize]
         .iter()
         .find_map(|bc| match bc {
             Bytecode::Lda(r) => Some(*r),
             _ => None,
         })
         .expect("H1 Lda");
-    let h2_lda = body.bytecodes[c1.handler as usize..(c1.handler + c1.len) as usize]
+    let h2_lda = bcs[c1.handler as usize..(c1.handler + c1.len) as usize]
         .iter()
         .find_map(|bc| match bc {
             Bytecode::Lda(r) => Some(*r),
@@ -902,12 +894,11 @@ fn r3_definefieldbyvalue_preserves_key_obj_operand_order() {
 
     for opt in [false, true] {
         let (redecoded, body) = roundtrip_main(&file, opt);
+        let bcs = body.bytecodes();
         assert!(
-            body.bytecodes
-                .iter()
+            bcs.iter()
                 .any(|bc| matches!(bc, Bytecode::CallruntimeDefinefieldbyvalue(..))),
-            "opt={opt}: expected CallruntimeDefinefieldbyvalue in {:?}",
-            body.bytecodes
+            "opt={opt}: expected CallruntimeDefinefieldbyvalue in {bcs:?}"
         );
         let relifted = lift_file(&redecoded).expect("re-lift");
         let f0 = relifted
@@ -979,16 +970,12 @@ fn r3_supercallthisrange_suppresses_ldfunction_in_v2lift_and_v2opt() {
 
     for opt in [false, true] {
         let (_, body) = roundtrip_main(&file, opt);
+        let bcs = body.bytecodes();
         assert!(
-            !body
-                .bytecodes
-                .iter()
-                .any(|bc| matches!(bc, Bytecode::Ldfunction)),
-            "opt={opt}: Supercallthisrange must NEVER emit Bytecode::Ldfunction: {:?}",
-            body.bytecodes
+            !bcs.iter().any(|bc| matches!(bc, Bytecode::Ldfunction)),
+            "opt={opt}: Supercallthisrange must NEVER emit Bytecode::Ldfunction: {bcs:?}"
         );
-        let super_calls = body
-            .bytecodes
+        let super_calls = bcs
             .iter()
             .filter(|bc| matches!(bc, Bytecode::Supercallthisrange(..)))
             .count();

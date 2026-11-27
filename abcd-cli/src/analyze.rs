@@ -17,6 +17,9 @@
 //! Output conventions (design/cli.md §3): aligned text by default, `--json`
 //! for the machine-readable form; both render from the same report data.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use abcd_analysis::callgraph::{CallEdgeKind, CallGraph, CallTargets};
 use abcd_analysis::control::Dominators;
 use abcd_analysis::dataflow::alias::Rung1AliasOracle;
@@ -25,8 +28,8 @@ use abcd_ir::{CallKind, FuncId, Module};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::CliError;
 use crate::input::InputModule;
+use crate::{CliError, ExecContext};
 
 /// Which optional sections and alias rung the report computes (wired to
 /// `--callgraph`, `--dominators`, `--pta`, `--alias-rung`, and `--pta-budget`
@@ -207,6 +210,36 @@ const ENTRY_NAME: &str = "func_main_0";
 
 /// Decode, lift, and analyze one module.
 pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeReport, CliError> {
+    report_arc(
+        module.name.clone(),
+        module.provenance.clone(),
+        Arc::clone(&module.abc),
+        opts,
+        ExecContext::default(),
+    )
+}
+
+pub(crate) fn report_owned(
+    module: InputModule,
+    opts: AnalyzeOptions,
+    ctx: ExecContext,
+) -> Result<AnalyzeReport, CliError> {
+    let InputModule {
+        name,
+        abc,
+        provenance,
+        ..
+    } = module;
+    report_arc(name, provenance, abc, opts, ctx)
+}
+
+fn report_arc(
+    name: String,
+    provenance: String,
+    abc: Arc<[u8]>,
+    opts: AnalyzeOptions,
+    ctx: ExecContext,
+) -> Result<AnalyzeReport, CliError> {
     if opts.alias_rung > 2 {
         return Err(CliError::User(format!(
             "invalid alias_rung {} (expected 0, 1, or 2)",
@@ -219,21 +252,16 @@ pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeRepor
             opts.alias_rung
         )));
     }
-    let ir = {
-        let file = abcd_file::decode(&module.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?;
-        abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to lift {} ({}): {e}",
-                module.name, module.provenance
-            ))
-        })?
-    };
+    let input_bytes = abc.len();
+    let ir = crate::lift_abc_arc(
+        abc,
+        &name,
+        &provenance,
+        &abcd_lift::LiftOptions::default(),
+        ctx,
+    )?;
 
+    let t_an = ctx.timings.then(Instant::now);
     let (graph, pta_report) = match opts.alias_rung {
         0 => (CallGraph::build(&ir), None),
         1 => {
@@ -284,11 +312,14 @@ pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeRepor
 
     let callgraph = opts.callgraph.then(|| callgraph_section(&ir, &graph));
     let dominators = opts.dominators.then(|| dominator_sections(&ir));
+    if let Some(start) = t_an {
+        crate::log_timing(true, &name, "analyze", start.elapsed());
+    }
 
     Ok(AnalyzeReport {
-        module: module.name.clone(),
-        provenance: module.provenance.clone(),
-        input_bytes: module.abc.len(),
+        module: name,
+        provenance,
+        input_bytes,
         summary: SummaryReport {
             functions: ir.functions.len(),
             external_functions: ir.functions.iter().filter(|f| f.is_external).count(),

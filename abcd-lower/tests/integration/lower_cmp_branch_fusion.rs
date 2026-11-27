@@ -96,7 +96,7 @@ fn assert_roundtrips_lift_and_verify(module: &Module) {
     let decoded = abcd_file::decode(&encoded).expect("abcd_file::decode must succeed");
     for (_, method) in decoded.all_methods() {
         if let Some(body) = &method.body {
-            assert_no_dead_fused_branch(&body.bytecodes);
+            assert_no_dead_fused_branch(&body.bytecodes());
         }
     }
     let relifted =

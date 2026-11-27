@@ -49,8 +49,8 @@ fn single_method_file(
         body: Some(MethodBody {
             num_vregs,
             num_args,
-            bytecodes,
-            entities: HashMap::new(),
+            code: abcd_file::MethodCode::Decoded(bytecodes),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks,
             ic_size: None,
         }),
@@ -341,8 +341,8 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
         body: Some(MethodBody {
             num_vregs: 0,
             num_args: 3,
-            bytecodes: vec![Bytecode::Returnundefined],
-            entities: HashMap::new(),
+            code: abcd_file::MethodCode::Decoded(vec![Bytecode::Returnundefined]),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -366,7 +366,7 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
         body: Some(MethodBody {
             num_vregs: 1,
             num_args: 3,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::CallruntimeDefinesendableclass(
                     Imm(0),
                     EntityId(1),
@@ -375,7 +375,7 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
                     Reg(0),
                 ),
                 Bytecode::Return,
-            ],
+            ]),
             entities: HashMap::from([
                 (
                     (EntityKind::MethodId, 1),
@@ -385,7 +385,8 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
                     (EntityKind::LiteralarrayId, 2),
                     abcd_file::EntityRef::LiteralArray(LiteralArrayIdx(0)),
                 ),
-            ]),
+            ])
+            .into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

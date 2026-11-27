@@ -13,6 +13,7 @@ readme = "README.md"
 # encoding knowledge lives in the lift/lower crates. This is enforced
 # structurally by the crate graph — do not add such a dependency.
 [dependencies]
+hashbrown.workspace = true
 thiserror.workspace = true
 
 [lints]

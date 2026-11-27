@@ -888,7 +888,7 @@ fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
         StringPool,
     };
     use abcd_isa::{EntityId, EntityKind, Imm, insn};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
 
     let mut strings = StringPool::default();
     let cls_a_desc = strings.get_or_intern("LA;");
@@ -922,7 +922,7 @@ fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
     // Class LA; (BTreeMap slot 0 -> MethodIdx(0), FieldIdx(0), FieldIdx(1)):
     // calls LB;::dup (MethodIdx(1)), loads "offsetless_hello", creates literal array 0,
     // and catches LError; via `type_class: Some(err_desc)`.
-    let mut entities_a = HashMap::new();
+    let mut entities_a = abcd_file::MethodEntities::new();
     entities_a.insert((EntityKind::StringId, 0), EntityRef::string(hello_sid));
     entities_a.insert(
         (EntityKind::MethodId, 0),
@@ -935,12 +935,12 @@ fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
     let body_a = MethodBody {
         num_vregs: 1,
         num_args: 0,
-        bytecodes: vec![
+        code: abcd_file::MethodCode::Decoded(vec![
             insn::LdaStr::new(EntityId(0)),
             insn::Definefunc::new(Imm(0), EntityId(0), Imm(0)),
             insn::Createarraywithbuffer::new(Imm(1), EntityId(0)),
             insn::Returnundefined::new(),
-        ],
+        ]),
         entities: entities_a,
         try_blocks: vec![abcd_file::TryBlock {
             start: 0,
@@ -958,8 +958,11 @@ fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
     let body_b = MethodBody {
         num_vregs: 0,
         num_args: 0,
-        bytecodes: vec![insn::Ldai::new(Imm(99)), insn::Returnundefined::new()],
-        entities: HashMap::new(),
+        code: abcd_file::MethodCode::Decoded(vec![
+            insn::Ldai::new(Imm(99)),
+            insn::Returnundefined::new(),
+        ]),
+        entities: abcd_file::MethodEntities::new(),
         try_blocks: Vec::new(),
         ic_size: None,
     };
@@ -1086,7 +1089,7 @@ fn r3_d2_offsetless_semantic_handles_disambiguate_same_named_entities() {
 
     let a_cls = decoded.class_by_str("LA;").unwrap();
     let a_body = a_cls.methods[0].body.as_ref().unwrap();
-    let (_, mid) = a_body.bytecodes[1].entity_operands()[0];
+    let (_, mid) = a_body.bytecodes()[1].entity_operands()[0];
     let EntityRef::Method(resolved_midx) = a_body.entities[&(EntityKind::MethodId, mid.0)] else {
         panic!("expected EntityRef::Method");
     };

@@ -75,6 +75,7 @@ pub mod function;
 pub mod id;
 pub mod module;
 pub mod op;
+pub mod remap;
 pub mod symbol;
 pub mod ty;
 pub mod verify;
@@ -83,7 +84,7 @@ pub use cfg::{
     DomTree, ExceptionHandlerMap, IndexedDom, augmented_succs, augmented_succs_with_map,
     block_succs, compute_rpo, compute_rpo_with, inst_succs, normal_succs_inline,
 };
-pub use consts::{Const, ConstPool, LitMethodKind, TypedArrayTag};
+pub use consts::{Const, ConstPool, ConstPoolOverflow, LitMethodKind, TypedArrayTag};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use frame::{FrameSlots, this_param_index};
 pub use function::{
@@ -99,7 +100,8 @@ pub use op::{
     Arity, BinOp, CallKind, CmpOp, DefineClassData, LexEnvKind, MemberAttrs, ModuleVarKind, Op,
     OwnStoreKind, PropKey, SuperCheck, SuperKey, UnOp,
 };
-pub use symbol::SymbolTable;
+pub use remap::{FragmentRemapper, IdRemapper, modules_structurally_eq, remap_module_body};
+pub use symbol::{SymbolTable, SymbolTableOverflow};
 pub use ty::{DynPrim, StaticTy, Ty};
 pub use verify::{
     VerifyError, VerifyErrorKind, VerifyReport, VerifyWarning, VerifyWarningKind, verify_func,

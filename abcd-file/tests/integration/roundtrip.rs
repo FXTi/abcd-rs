@@ -118,8 +118,9 @@ fn read_class_and_method() {
 
     let body = m.body.as_ref().expect("should have body");
     // Bytecode should be decoded.
-    assert!(!body.bytecodes.is_empty());
-    assert!(matches!(body.bytecodes[0], Bytecode::Returnundefined));
+    let bcs = body.bytecodes();
+    assert!(!bcs.is_empty());
+    assert!(matches!(bcs[0], Bytecode::Returnundefined));
 }
 
 #[test]
@@ -189,13 +190,14 @@ fn encode_roundtrip() {
             // Compare bytecodes
             match (&m1.body, &m2.body) {
                 (Some(b1), Some(b2)) => {
+                    let bcs1 = b1.bytecodes();
+                    let bcs2 = b2.bytecodes();
                     assert_eq!(
-                        b1.bytecodes.len(),
-                        b2.bytecodes.len(),
+                        bcs1.len(),
+                        bcs2.len(),
                         "bytecode count mismatch for {m1_name}",
                     );
-                    for (i, (bc1, bc2)) in b1.bytecodes.iter().zip(b2.bytecodes.iter()).enumerate()
-                    {
+                    for (i, (bc1, bc2)) in bcs1.iter().zip(bcs2.iter()).enumerate() {
                         assert_eq!(
                             format!("{bc1:?}"),
                             format!("{bc2:?}"),

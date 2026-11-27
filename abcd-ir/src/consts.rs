@@ -1,15 +1,27 @@
-//! Typed constant pool (`design/ir.md`, `#57` `R3-H9`): literal-array table
-//! indices and container offsets stay in the file layer; the IR stores semantic
-//! [`Const`] values and [`ConstId`]-linked literal shapes with lossless tag
-//! fidelity.
+//! Typed constant pool (`design/ir.md`, `#57` `R3-H9`, `#72`, `#77`):
+//! literal-array table indices and container offsets stay in the file layer;
+//! the IR stores semantic [`Const`] values and [`ConstId`]-linked literal
+//! shapes with lossless tag fidelity.
 //!
-//! The pool is append-only (T1): pushing or interning a constant never changes
-//! an existing [`ConstId`]. Array/object/typed-array literal shapes reference
-//! child constants via [`ConstId`], keeping [`Const`] flat and non-recursive.
+//! The pool is append-only (`T1`): pushing or interning a constant never
+//! changes an existing [`ConstId`]. Array/object/typed-array literal shapes
+//! reference child constants via [`ConstId`], keeping [`Const`] flat and
+//! non-recursive. Deduplication uses `hashbrown::HashTable<u32>` indexing
+//! `consts: Vec<Const>` directly with zero duplicate [`Const`] clones (`#72`).
 
-use std::collections::HashMap;
+use std::fmt;
+use std::hash::{BuildHasher, RandomState};
+
+use hashbrown::HashTable;
 
 use crate::id::{ConstId, FuncId, Sym};
+
+/// Capacity overflow error returned by [`ConstPool::try_push`] and
+/// [`ConstPool::try_intern`] when the pool count reaches `u32::MAX`
+/// (`ConstId(u32::MAX)` is reserved as an unmapped sentinel; `#77`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("ConstPool entry count reached u32::MAX sentinel limit")]
+pub struct ConstPoolOverflow;
 
 /// Method-literal tag kind carried by [`Const::MethodRef`] (`#57` `R3-H9`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -196,12 +208,72 @@ impl Const {
     }
 }
 
-/// Append-only pool of typed constants (T1) supporting both unguarded [`Self::push`]
-/// and deduplicating [`Self::intern`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
+struct ConstIndex {
+    hasher: RandomState,
+    table: HashTable<u32>,
+}
+
+impl ConstIndex {
+    fn new() -> Self {
+        Self {
+            hasher: RandomState::new(),
+            table: HashTable::new(),
+        }
+    }
+
+    fn rebuild(consts: &[Const]) -> Self {
+        let hasher = RandomState::new();
+        let mut table = HashTable::with_capacity(consts.len());
+        for (i, c) in consts.iter().enumerate() {
+            let hash = hasher.hash_one(c);
+            if table
+                .find(hash, |&existing_id| &consts[existing_id as usize] == c)
+                .is_none()
+            {
+                let raw_id = i as u32;
+                table.insert_unique(hash, raw_id, |&existing_id| {
+                    hasher.hash_one(&consts[existing_id as usize])
+                });
+            }
+        }
+        Self { hasher, table }
+    }
+}
+
+#[inline]
+const fn check_const_capacity(cur_len: usize) -> Result<u32, ConstPoolOverflow> {
+    if cur_len >= (u32::MAX as usize) {
+        return Err(ConstPoolOverflow);
+    }
+    Ok(cur_len as u32)
+}
+
+/// Append-only pool of typed constants (`T1`) supporting both unguarded
+/// [`Self::push`] and deduplicating [`Self::intern`] without cloning map keys
+/// (`#72`, `#77`).
+#[derive(Clone)]
 pub struct ConstPool {
     consts: Vec<Const>,
-    index: HashMap<Const, ConstId>,
+    index: Option<ConstIndex>,
+}
+
+impl Default for ConstPool {
+    fn default() -> Self {
+        Self {
+            consts: Vec::new(),
+            index: Some(ConstIndex::new()),
+        }
+    }
+}
+
+impl fmt::Debug for ConstPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConstPool")
+            .field("consts", &self.consts)
+            .field("has_index", &self.has_index())
+            .finish()
+    }
 }
 
 impl PartialEq for ConstPool {
@@ -213,33 +285,115 @@ impl PartialEq for ConstPool {
 impl Eq for ConstPool {}
 
 impl ConstPool {
-    /// An empty pool.
+    /// An empty pool with an active deduplication index.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Release the hash-table deduplication index while retaining all pooled
+    /// [`Const`] entries (`#72`).
+    ///
+    /// [`Self::get`] and [`Self::lookup`] remain total after `drop_index()`,
+    /// and subsequent [`Self::push`] / [`Self::intern`] calls rebuild the index
+    /// automatically.
+    pub fn drop_index(&mut self) {
+        self.index = None;
+    }
+
+    /// Whether the hash-table deduplication index is currently resident.
+    #[must_use]
+    #[inline]
+    pub fn has_index(&self) -> bool {
+        self.index.is_some()
+    }
+
+    fn ensure_index(&mut self) {
+        if self.index.is_none() {
+            self.index = Some(ConstIndex::rebuild(&self.consts));
+        }
+    }
+
+    /// Look up the canonical (first-inserted) [`ConstId`] equal to `c` without
+    /// mutating the pool.
+    ///
+    /// Uses `O(1)` hash lookup when [`Self::has_index`] is `true`, or a total
+    /// `O(len)` scan over `consts` after [`Self::drop_index`].
+    #[must_use]
+    pub fn lookup(&self, c: &Const) -> Option<ConstId> {
+        if let Some(index) = &self.index {
+            let hash = index.hasher.hash_one(c);
+            return index
+                .table
+                .find(hash, |&id| &self.consts[id as usize] == c)
+                .copied()
+                .map(ConstId::new);
+        }
+        self.consts
+            .iter()
+            .position(|existing| existing == c)
+            .map(|idx| ConstId::new(idx as u32))
+    }
+
+    /// Fallibly append a constant unconditionally, returning [`ConstPoolOverflow`]
+    /// if the pool has reached `u32::MAX` entries (`#77`).
+    ///
+    /// Preserves `or_insert` index semantics: if an equal [`Const`] was already
+    /// present, its earlier [`ConstId`] remains the canonical target for
+    /// [`Self::lookup`] and [`Self::intern`].
+    pub fn try_push(&mut self, c: Const) -> Result<ConstId, ConstPoolOverflow> {
+        let raw = check_const_capacity(self.consts.len())?;
+        self.ensure_index();
+        self.consts.push(c);
+        let Some(index) = &mut self.index else {
+            unreachable!("ensure_index populated self.index");
+        };
+        let inserted = &self.consts[raw as usize];
+        let hash = index.hasher.hash_one(inserted);
+        if index
+            .table
+            .find(hash, |&id| &self.consts[id as usize] == inserted)
+            .is_none()
+        {
+            let consts = &self.consts;
+            index.table.insert_unique(hash, raw, |&existing_id| {
+                index.hasher.hash_one(&consts[existing_id as usize])
+            });
+        }
+        Ok(ConstId::new(raw))
+    }
+
     /// Append a constant unconditionally, returning its [`ConstId`]. Ids are
     /// stable: a push never renumbers earlier entries.
     pub fn push(&mut self, c: Const) -> ConstId {
-        let raw = u32::try_from(self.consts.len()).expect("ConstPool exceeded u32::MAX entries");
-        let id = ConstId(raw);
-        self.index.entry(c.clone()).or_insert(id);
+        self.try_push(c).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible deduplicating append: returns the existing canonical [`ConstId`]
+    /// if an equal [`Const`] was already interned or pushed, otherwise appends
+    /// `c` (or returns [`ConstPoolOverflow`] if the pool is at `u32::MAX`).
+    pub fn try_intern(&mut self, c: Const) -> Result<ConstId, ConstPoolOverflow> {
+        self.ensure_index();
+        let Some(index) = &mut self.index else {
+            unreachable!("ensure_index populated self.index");
+        };
+        let hash = index.hasher.hash_one(&c);
+        if let Some(&id) = index.table.find(hash, |&id| self.consts[id as usize] == c) {
+            return Ok(ConstId::new(id));
+        }
+        let raw = check_const_capacity(self.consts.len())?;
         self.consts.push(c);
-        id
+        let consts = &self.consts;
+        index.table.insert_unique(hash, raw, |&existing_id| {
+            index.hasher.hash_one(&consts[existing_id as usize])
+        });
+        Ok(ConstId::new(raw))
     }
 
     /// Deduplicating append: returns the existing [`ConstId`] if an identical
     /// [`Const`] was already interned or pushed, otherwise appends it.
     pub fn intern(&mut self, c: Const) -> ConstId {
-        if let Some(&id) = self.index.get(&c) {
-            return id;
-        }
-        let raw = u32::try_from(self.consts.len()).expect("ConstPool exceeded u32::MAX entries");
-        let id = ConstId(raw);
-        self.index.insert(c.clone(), id);
-        self.consts.push(c);
-        id
+        self.try_intern(c).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Convenience helper appending a [`Const::ArrayLiteral`].
@@ -335,5 +489,59 @@ mod tests {
         assert_eq!(pool.get(ids[9]).and_then(Const::as_i64), Some(-42));
         assert_eq!(pool.get(ids[10]).and_then(Const::as_u64), Some(u64::MAX));
         assert_eq!(pool.get(ConstId::new(999)), None);
+    }
+
+    #[test]
+    fn const_pool_push_preserves_first_id_drop_index_lookup_and_no_key_cloning() {
+        let mut pool = ConstPool::new();
+        assert!(pool.has_index());
+
+        // `push` with a heap-backed `ArrayLiteral` must keep its original `Vec` buffer
+        // in `pool.consts` without cloning a second `Vec` into the hash index.
+        let items = vec![ConstId::new(0), ConstId::new(1), ConstId::new(2)];
+        let items_ptr = items.as_ptr();
+        let arr_first = pool.push(Const::ArrayLiteral(items));
+        let Some(Const::ArrayLiteral(stored)) = pool.get(arr_first) else {
+            panic!("expected ArrayLiteral");
+        };
+        assert_eq!(
+            stored.as_ptr(),
+            items_ptr,
+            "push must move Const into Vec without reallocating or cloning"
+        );
+
+        // Duplicate `push` appends a distinct ID while keeping `arr_first` canonical!
+        let arr_dup = pool.push(Const::ArrayLiteral(vec![
+            ConstId::new(0),
+            ConstId::new(1),
+            ConstId::new(2),
+        ]));
+        assert_ne!(arr_first, arr_dup);
+        let probe = Const::ArrayLiteral(vec![ConstId::new(0), ConstId::new(1), ConstId::new(2)]);
+        assert_eq!(pool.lookup(&probe), Some(arr_first));
+        assert_eq!(pool.intern(probe.clone()), arr_first);
+
+        // `drop_index` preserves `PartialEq`, `lookup`, and `or_insert` first-ID parity on rebuild.
+        let before_drop = pool.clone();
+        pool.drop_index();
+        assert!(!pool.has_index());
+        assert_eq!(pool, before_drop);
+        assert_eq!(pool.lookup(&probe), Some(arr_first));
+        assert_eq!(pool.lookup(&Const::Undefined), None);
+        assert!(!pool.has_index(), "lookup(&self) must not rebuild index");
+
+        let c_undef = pool.try_intern(Const::Undefined).unwrap();
+        assert!(pool.has_index());
+        assert_eq!(pool.intern(probe), arr_first);
+        assert_eq!(pool.lookup(&Const::Undefined), Some(c_undef));
+
+        assert_eq!(
+            check_const_capacity((u32::MAX as usize) - 1),
+            Ok(u32::MAX - 1)
+        );
+        assert_eq!(
+            check_const_capacity(u32::MAX as usize),
+            Err(ConstPoolOverflow)
+        );
     }
 }

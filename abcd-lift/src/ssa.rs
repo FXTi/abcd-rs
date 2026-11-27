@@ -18,10 +18,10 @@
 use std::collections::{HashMap, HashSet};
 
 use abcd_ir::{
-    BlockId, ConstId, Edge, FuncId, InstId, LocalScope, Module, Op, Ty, Value, ValueDef, ValueId,
+    BlockId, ConstId, Edge, FunctionData, InstId, LocalScope, Op, Ty, Value, ValueDef, ValueId,
 };
 
-use crate::emit_inst;
+use crate::{IrArenas, emit_inst};
 
 /// Identifies a virtual location: either the accumulator or a register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -157,7 +157,12 @@ impl SsaBuilder {
     /// Read a variable in `block`. If not locally defined, iteratively
     /// searches predecessors on an explicit heap stack and inserts phi
     /// nodes as needed.
-    pub fn read_variable(&mut self, loc: RegOrAcc, block: BlockId, module: &mut Module) -> ValueId {
+    pub(crate) fn read_variable<A: IrArenas>(
+        &mut self,
+        loc: RegOrAcc,
+        block: BlockId,
+        arenas: &mut A,
+    ) -> ValueId {
         if let Some(val) = self.defs.get(&block).and_then(|m| m.get(&loc)).copied() {
             let resolved = self.resolve_alias(val);
             if resolved != val {
@@ -165,13 +170,13 @@ impl SsaBuilder {
             }
             return resolved;
         }
-        let val = self.run_ssa_stack(vec![SsaFrame::EnterRead { loc, block }], module);
+        let val = self.run_ssa_stack(vec![SsaFrame::EnterRead { loc, block }], arenas);
         self.resolve_alias(val)
     }
 
     /// Drive Braun SSA resolution and phi-operand filling without native
     /// call-stack recursion.
-    fn run_ssa_stack(&mut self, mut stack: Vec<SsaFrame>, module: &mut Module) -> ValueId {
+    fn run_ssa_stack<A: IrArenas>(&mut self, mut stack: Vec<SsaFrame>, arenas: &mut A) -> ValueId {
         let mut returned: Option<ValueId> = None;
 
         'frames: while let Some(frame) = stack.pop() {
@@ -199,31 +204,31 @@ impl SsaBuilder {
                         if in_chain {
                             // Unreachable sealed single-predecessor cycle: break
                             // the cycle with a self-referential 1-entry phi on `cur`.
-                            let phi_val = self.emit_empty_phi(cur, module);
-                            let pred_edge = module.blocks[cur.index()].preds[0];
-                            let phi_inst = match module.values[phi_val.index()].def {
+                            let phi_val = self.emit_empty_phi(cur, arenas);
+                            let pred_edge = arenas.blocks()[cur.index()].preds[0];
+                            let phi_inst = match arenas.values()[phi_val.index()].def {
                                 ValueDef::Inst(inst) => inst,
                                 _ => unreachable!("phi_val must be an instruction result"),
                             };
-                            module.insts[phi_inst.index()].op = Op::Phi {
+                            arenas.insts_mut()[phi_inst.index()].op = Op::Phi {
                                 entries: vec![(pred_edge, phi_val)],
                             };
                             self.write_variable(loc, cur, phi_val);
                             break Some(phi_val);
                         }
 
-                        let preds_len = module.blocks[cur.index()].preds.len();
+                        let preds_len = arenas.blocks()[cur.index()].preds.len();
                         if preds_len == 0 {
                             // Predecessor edges are fully built before SSA
                             // construction starts, so a zero-predecessor block
                             // (entry, or unreachable island head) resolves to
                             // the Ark frame-initial constant instead of an
                             // invalid zero-entry phi.
-                            let val = self.frame_initial(loc, module);
+                            let val = self.frame_initial(loc, arenas);
                             self.write_variable(loc, cur, val);
                             break Some(val);
                         } else if !self.is_sealed(cur) {
-                            let phi_val = self.emit_empty_phi(cur, module);
+                            let phi_val = self.emit_empty_phi(cur, arenas);
                             self.incomplete_phis
                                 .entry(cur)
                                 .or_default()
@@ -231,7 +236,7 @@ impl SsaBuilder {
                             self.write_variable(loc, cur, phi_val);
                             break Some(phi_val);
                         } else if preds_len == 1 {
-                            let next = module.blocks[cur.index()].preds[0].from;
+                            let next = arenas.blocks()[cur.index()].preds[0].from;
                             if let Some(set) = &mut seen_large {
                                 set.insert(cur);
                             } else if chain.len() == 64 {
@@ -244,10 +249,10 @@ impl SsaBuilder {
                         } else {
                             // Multiple predecessors on a sealed block: insert an
                             // empty phi and write before recursing to break cycles.
-                            let phi_val = self.emit_empty_phi(cur, module);
+                            let phi_val = self.emit_empty_phi(cur, arenas);
                             self.write_variable(loc, cur, phi_val);
                             chain.push(cur);
-                            let preds = module.blocks[cur.index()].preds.clone();
+                            let preds = arenas.blocks()[cur.index()].preds.clone();
                             let cap = preds.len();
                             stack.push(SsaFrame::FinishChain {
                                 loc,
@@ -315,7 +320,7 @@ impl SsaBuilder {
                         }
                     }
 
-                    let phi_inst = match module.values[phi_val.index()].def {
+                    let phi_inst = match arenas.values()[phi_val.index()].def {
                         ValueDef::Inst(inst) => inst,
                         _ => unreachable!("phi_val must be an instruction result"),
                     };
@@ -329,8 +334,8 @@ impl SsaBuilder {
                             }
                         }
                     }
-                    module.insts[phi_inst.index()].op = Op::Phi { entries };
-                    returned = Some(self.try_remove_trivial_phi(phi_val, module));
+                    arenas.insts_mut()[phi_inst.index()].op = Op::Phi { entries };
+                    returned = Some(self.try_remove_trivial_phi(phi_val, arenas));
                 }
             }
         }
@@ -346,7 +351,7 @@ impl SsaBuilder {
     /// `Const::Hole` for the accumulator. v0.2 represents these as
     /// `ValueDef::Const` — constants dominate everything and need no
     /// materializing instruction.
-    fn frame_initial(&mut self, loc: RegOrAcc, module: &mut Module) -> ValueId {
+    fn frame_initial<A: IrArenas>(&mut self, loc: RegOrAcc, arenas: &mut A) -> ValueId {
         let cached = match loc {
             RegOrAcc::Acc => self.frame_initial_hole,
             RegOrAcc::Reg(_) => self.frame_initial_undefined,
@@ -359,8 +364,9 @@ impl SsaBuilder {
             RegOrAcc::Acc => self.hole_const,
             RegOrAcc::Reg(_) => self.undefined_const,
         };
-        let val = ValueId::new(module.values.len() as u32);
-        module.values.push(Value {
+        let values = arenas.values_mut();
+        let val = ValueId::new(values.len() as u32);
+        values.push(Value {
             def: ValueDef::Const(const_id),
             ty: Ty::Any,
         });
@@ -375,7 +381,7 @@ impl SsaBuilder {
 
     /// Mark a block as sealed (all predecessors are known). Completes
     /// any incomplete phis.
-    pub fn seal_block(&mut self, block: BlockId, module: &mut Module) {
+    pub(crate) fn seal_block<A: IrArenas>(&mut self, block: BlockId, arenas: &mut A) {
         let rel = block
             .index()
             .checked_sub(self.block_base)
@@ -386,7 +392,7 @@ impl SsaBuilder {
         self.sealed[rel] = true;
         if let Some(incomplete) = self.incomplete_phis.remove(&block) {
             for (loc, phi_val) in incomplete {
-                self.add_phi_operands(loc, block, phi_val, module);
+                self.add_phi_operands(loc, block, phi_val, arenas);
             }
         }
     }
@@ -404,9 +410,9 @@ impl SsaBuilder {
 
     /// Emit an empty phi node in `block`, register it in `phi_insts`, and
     /// return its result value.
-    fn emit_empty_phi(&mut self, block: BlockId, module: &mut Module) -> ValueId {
+    fn emit_empty_phi<A: IrArenas>(&mut self, block: BlockId, arenas: &mut A) -> ValueId {
         let (inst_id, result) = emit_inst(
-            module,
+            arenas,
             block,
             Op::Phi {
                 entries: Vec::new(),
@@ -420,14 +426,14 @@ impl SsaBuilder {
 
     /// Fill phi operands by reading the variable from each predecessor
     /// edge on the explicit SSA stack.
-    fn add_phi_operands(
+    fn add_phi_operands<A: IrArenas>(
         &mut self,
         loc: RegOrAcc,
         block: BlockId,
         phi_val: ValueId,
-        module: &mut Module,
+        arenas: &mut A,
     ) -> ValueId {
-        let preds = module.blocks[block.index()].preds.clone();
+        let preds = arenas.blocks()[block.index()].preds.clone();
         let cap = preds.len();
         self.run_ssa_stack(
             vec![SsaFrame::FillPhi {
@@ -437,7 +443,7 @@ impl SsaBuilder {
                 next_idx: 0,
                 entries: Vec::with_capacity(cap),
             }],
-            module,
+            arenas,
         )
     }
 
@@ -445,14 +451,14 @@ impl SsaBuilder {
     /// that become trivial (Braun et al. *CC* 2013 Algorithm 3, iterative
     /// union-find + phi-user worklist), removing dead `Op::Phi` instructions
     /// from `block.insts` immediately.
-    fn try_remove_trivial_phi(&mut self, phi_val: ValueId, module: &mut Module) -> ValueId {
-        self.collapse_trivial_phis_from(vec![phi_val], module);
+    fn try_remove_trivial_phi<A: IrArenas>(&mut self, phi_val: ValueId, arenas: &mut A) -> ValueId {
+        self.collapse_trivial_phis_from(vec![phi_val], arenas);
         self.resolve_alias(phi_val)
     }
 
     /// Run iterative worklist trivial-phi elimination starting from `seeds`
     /// (`O(1)` call stack, zero `HashMap`/`HashSet` iteration for `N20`).
-    fn collapse_trivial_phis_from(&mut self, seeds: Vec<ValueId>, module: &mut Module) {
+    fn collapse_trivial_phis_from<A: IrArenas>(&mut self, seeds: Vec<ValueId>, arenas: &mut A) {
         let mut worklist: Vec<ValueId> = Vec::with_capacity(seeds.len());
         let mut queued: HashSet<ValueId> = HashSet::with_capacity(seeds.len());
         for s in seeds {
@@ -473,7 +479,7 @@ impl SsaBuilder {
                 continue;
             }
 
-            let mut entries = match &module.insts[p_inst.index()].op {
+            let mut entries = match &arenas.insts()[p_inst.index()].op {
                 Op::Phi { entries } if !entries.is_empty() => entries.clone(),
                 // Incomplete phi in an unsealed block (or non-phi): never collapse yet.
                 _ => continue,
@@ -508,14 +514,14 @@ impl SsaBuilder {
                         }
                     }
                 }
-                module.insts[p_inst.index()].op = Op::Phi { entries };
+                arenas.insts_mut()[p_inst.index()].op = Op::Phi { entries };
                 continue;
             }
 
             // If `same` is `None`, all incoming operands self-reference `p_val`
             // (an unreachable sealed cycle prior to `sweep_dead_blocks`).
             let Some(replacement) = same else {
-                module.insts[p_inst.index()].op = Op::Phi { entries };
+                arenas.insts_mut()[p_inst.index()].op = Op::Phi { entries };
                 continue;
             };
             let replacement = self.resolve_alias(replacement);
@@ -525,8 +531,8 @@ impl SsaBuilder {
 
             self.alias.insert(p_val, replacement);
             self.removed_phis.insert(p_inst);
-            let owner_bb = module.insts[p_inst.index()].block;
-            module.blocks[owner_bb.index()]
+            let owner_bb = arenas.insts()[p_inst.index()].block;
+            arenas.blocks_mut()[owner_bb.index()]
                 .insts
                 .retain(|&iid| iid != p_inst);
 
@@ -552,49 +558,54 @@ impl SsaBuilder {
     }
 
     /// Re-run the iterative trivial-phi cascade over all surviving `Op::Phi`s
-    /// in `func_id` (catching phis reduced to trivial by dead-block sweeping),
+    /// in `fd` (catching phis reduced to trivial by dead-block sweeping),
     /// prune collapsed `Op::Phi` instructions from `block.insts`, and rewrite
     /// every SSA use across instructions (`Op::for_each_operand_mut`), catch
-    /// handlers, and `func.debug`.
-    pub fn finalize_function(&mut self, module: &mut Module, func_id: FuncId) {
-        let blocks = module.functions[func_id.index()].blocks.clone();
+    /// handlers, and `fd.debug`.
+    pub(crate) fn finalize_function_data<A: IrArenas>(
+        &mut self,
+        arenas: &mut A,
+        fd: &mut FunctionData,
+    ) {
         let mut seeds: Vec<ValueId> = Vec::new();
 
-        for &bb in &blocks {
-            let inst_ids = module.blocks[bb.index()].insts.clone();
-            for iid in inst_ids {
-                if self.removed_phis.contains(&iid) {
-                    continue;
-                }
-                let Some(phi_val) = module.insts[iid.index()].result else {
-                    continue;
-                };
-                if !module.insts[iid.index()].op.is_phi() {
-                    break; // Phis form a contiguous prefix of `block.insts`.
-                }
-                self.phi_insts.entry(phi_val).or_insert(iid);
-                if let Op::Phi { entries } = &mut module.insts[iid.index()].op {
-                    let mut operand_phis: Vec<ValueId> = Vec::new();
-                    for (_, v) in entries.iter_mut() {
-                        let resolved = self.resolve_alias(*v);
-                        *v = resolved;
-                        if resolved != phi_val && self.phi_insts.contains_key(&resolved) {
-                            operand_phis.push(resolved);
+        {
+            let (blocks, insts) = arenas.blocks_and_insts_mut();
+            for &bb in &fd.blocks {
+                for &iid in &blocks[bb.index()].insts {
+                    if self.removed_phis.contains(&iid) {
+                        continue;
+                    }
+                    let Some(phi_val) = insts[iid.index()].result else {
+                        continue;
+                    };
+                    if !insts[iid.index()].op.is_phi() {
+                        break; // Phis form a contiguous prefix of `block.insts`.
+                    }
+                    self.phi_insts.entry(phi_val).or_insert(iid);
+                    if let Op::Phi { entries } = &mut insts[iid.index()].op {
+                        let mut operand_phis: Vec<ValueId> = Vec::new();
+                        for (_, v) in entries.iter_mut() {
+                            let resolved = self.resolve_alias(*v);
+                            *v = resolved;
+                            if resolved != phi_val && self.phi_insts.contains_key(&resolved) {
+                                operand_phis.push(resolved);
+                            }
+                        }
+                        for op_phi in operand_phis {
+                            let users = self.phi_users.entry(op_phi).or_default();
+                            if !users.contains(&phi_val) {
+                                users.push(phi_val);
+                            }
                         }
                     }
-                    for op_phi in operand_phis {
-                        let users = self.phi_users.entry(op_phi).or_default();
-                        if !users.contains(&phi_val) {
-                            users.push(phi_val);
-                        }
-                    }
+                    seeds.push(phi_val);
                 }
-                seeds.push(phi_val);
             }
         }
 
         if !seeds.is_empty() {
-            self.collapse_trivial_phis_from(seeds, module);
+            self.collapse_trivial_phis_from(seeds, arenas);
         }
 
         if self.alias.is_empty() && self.removed_phis.is_empty() {
@@ -602,36 +613,38 @@ impl SsaBuilder {
         }
 
         let mut surviving_insts: Vec<InstId> = Vec::new();
-        let need_debug_fix = module.functions[func_id.index()].debug.is_some();
+        let need_debug_fix = fd.debug.is_some();
 
-        for &bb in &blocks {
-            if !self.removed_phis.is_empty() {
-                module.blocks[bb.index()]
-                    .insts
-                    .retain(|iid| !self.removed_phis.contains(iid));
-            }
-            let inst_ids = module.blocks[bb.index()].insts.clone();
-            for iid in inst_ids {
-                if need_debug_fix {
-                    surviving_insts.push(iid);
+        {
+            let (blocks, insts) = arenas.blocks_and_insts_mut();
+            for &bb in &fd.blocks {
+                if !self.removed_phis.is_empty() {
+                    blocks[bb.index()]
+                        .insts
+                        .retain(|iid| !self.removed_phis.contains(iid));
                 }
-                if !self.alias.is_empty() {
-                    module.insts[iid.index()]
-                        .op
-                        .for_each_operand_mut(|v| *v = self.resolve_alias(*v));
+                for &iid in &blocks[bb.index()].insts {
+                    if need_debug_fix {
+                        surviving_insts.push(iid);
+                    }
+                    if !self.alias.is_empty() {
+                        insts[iid.index()]
+                            .op
+                            .for_each_operand_mut(|v| *v = self.resolve_alias(*v));
+                    }
                 }
             }
         }
 
         if !self.alias.is_empty() {
-            for region in &mut module.functions[func_id.index()].try_regions {
+            for region in &mut fd.try_regions {
                 for catch in &mut region.catches {
                     catch.exception = self.resolve_alias(catch.exception);
                 }
             }
         }
 
-        if let Some(dbg) = &mut module.functions[func_id.index()].debug
+        if let Some(dbg) = &mut fd.debug
             && !self.removed_phis.is_empty()
         {
             dbg.line_table
@@ -659,12 +672,25 @@ impl SsaBuilder {
             }
         }
     }
+
+    /// Convenience wrapper over [`Self::finalize_function_data`] for unit tests.
+    #[cfg(test)]
+    pub fn finalize_function(&mut self, module: &mut abcd_ir::Module, func_id: abcd_ir::FuncId) {
+        let placeholder = FunctionData::new(
+            abcd_ir::ClassId::new(0),
+            abcd_ir::Sym::new(0),
+            abcd_ir::FunctionKind::Function,
+        );
+        let mut fd = std::mem::replace(&mut module.functions[func_id.index()], placeholder);
+        self.finalize_function_data(module, &mut fd);
+        module.functions[func_id.index()] = fd;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abcd_ir::{Block, Const, EdgeKind};
+    use abcd_ir::{Block, Const, EdgeKind, FuncId, Module};
 
     fn fresh_builder() -> (Module, SsaBuilder) {
         let mut module = Module::new();

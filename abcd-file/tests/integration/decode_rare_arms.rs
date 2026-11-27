@@ -112,7 +112,7 @@ fn foreign_method_operand_resolves_through_fallback() {
         .expect("caller")
         .1;
     let body = caller.body.as_ref().unwrap();
-    let (kind, id) = body.bytecodes[0].entity_operands()[0];
+    let (kind, id) = body.bytecodes()[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
     let abcd_file::EntityRef::ExternalMethod { name, .. } = body.entities[&(kind, id.0)] else {
         panic!("expected ExternalMethod");
@@ -142,7 +142,7 @@ fn legacy_foreign_method_operand_resolves_through_fallback() {
         .1;
     let caller_off = caller.offset;
     let body = caller.body.as_ref().unwrap();
-    let (kind, id) = body.bytecodes[0].entity_operands()[0];
+    let (kind, id) = body.bytecodes()[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
     let method_index = u16::try_from(id.0).unwrap();
 
@@ -185,7 +185,7 @@ fn legacy_foreign_method_operand_resolves_through_fallback() {
         .1;
     let body = caller.body.as_ref().unwrap();
     // Legacy definefuncdyn maps to modern Definefunc.
-    let (kind, id) = body.bytecodes[0].entity_operands()[0];
+    let (kind, id) = body.bytecodes()[0].entity_operands()[0];
     assert_eq!(kind, EntityKind::MethodId);
     let abcd_file::EntityRef::ExternalMethod { name, .. } = body.entities[&(kind, id.0)] else {
         panic!("expected ExternalMethod");
@@ -401,7 +401,7 @@ fn codeless_method_debug_offsets_map_by_identity() {
         .1;
     let dbg = m.debug.as_ref().expect("debug record present");
     assert!(
-        m.body.as_ref().is_none_or(|b| b.bytecodes.is_empty()),
+        m.body.as_ref().is_none_or(|b| b.bytecodes().is_empty()),
         "test setup: the method must be codeless"
     );
     // The extractor's initial row carries the debug item's start line at
@@ -461,7 +461,7 @@ fn legacy_foreign_method_name_unreadable_is_hard_error() {
         .1;
     let caller_off = caller.offset;
     let body = caller.body.as_ref().unwrap();
-    let (kind, id) = body.bytecodes[0].entity_operands()[0];
+    let (kind, id) = body.bytecodes()[0].entity_operands()[0];
     let method_index = u16::try_from(id.0).unwrap();
     let abcd_file::EntityRef::ExternalMethod {
         source_offset: foreign_off,
@@ -515,7 +515,7 @@ fn foreign_method_name_unreadable_is_hard_error() {
         .expect("caller")
         .1;
     let body = caller.body.as_ref().unwrap();
-    let (kind, id) = body.bytecodes[0].entity_operands()[0];
+    let (kind, id) = body.bytecodes()[0].entity_operands()[0];
     let abcd_file::EntityRef::ExternalMethod {
         source_offset: foreign_off,
         ..

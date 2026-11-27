@@ -59,6 +59,7 @@
 
 mod cfg;
 mod metadata;
+mod parallel;
 mod resolve;
 mod ssa;
 mod translate;
@@ -76,6 +77,30 @@ use cfg::{RawCfg, build_cfg};
 use ssa::RegOrAcc;
 
 pub use translate::{SuperKeyForm, super_key};
+
+const PARALLEL_MIN_METHODS: usize = 32;
+const PARALLEL_MIN_BYTECODES: usize = 1_024;
+
+/// Configuration options for [`lift_file_with_options`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiftOptions {
+    /// Retain arena tail capacity instead of calling `shrink_to_fit()` at the
+    /// end of lifting (`true` avoids `~600 MiB` arena reallocation when the
+    /// caller immediately appends an OpenHarmony lifecycle harness, `#71`).
+    pub retain_tail_capacity: bool,
+    /// Lift method bodies in parallel across Rayon workers while merging into
+    /// a 100% structurally identical [`Module`] (`#84`).
+    pub parallel: bool,
+}
+
+impl Default for LiftOptions {
+    fn default() -> Self {
+        Self {
+            retain_tail_capacity: false,
+            parallel: true,
+        }
+    }
+}
 
 /// Errors that can occur during lifting (no panics on untrusted data;
 /// `Unsupported*` variants are restricted to constructs with zero upstream VM
@@ -173,7 +198,7 @@ pub enum LiftError {
         /// Encoded register count.
         count: i64,
     },
-    /// A jump target points outside `body.bytecodes`.
+    /// A jump target points outside the method's bytecode stream.
     #[error("jump at instruction {pc} targets out-of-bounds instruction {target} (len {len})")]
     JumpTargetOutOfBounds {
         /// Instruction index of the jump.
@@ -183,7 +208,7 @@ pub enum LiftError {
         /// Total instruction count.
         len: usize,
     },
-    /// Control falls through past the end of `body.bytecodes`.
+    /// Control falls through past the end of the method's bytecode stream.
     #[error("instruction {pc} falls through past end of bytecode stream (len {len})")]
     FallthroughOutOfBounds {
         /// Instruction index of the falling-through instruction.
@@ -201,7 +226,7 @@ pub enum LiftError {
         /// Total instruction count.
         bytecode_len: usize,
     },
-    /// A `CatchBlock` handler or length points outside `body.bytecodes`.
+    /// A `CatchBlock` handler or length points outside the method's bytecode stream.
     #[error("catch handler [{handler}..{handler}+{len}) exceeds bytecode length {bytecode_len}")]
     CatchRangeOutOfBounds {
         /// Handler entry instruction index.
@@ -213,6 +238,112 @@ pub enum LiftError {
     },
 }
 
+/// Backing arena storage (`blocks`, `insts`, `values`) for SSA construction and
+/// instruction emission (`Module` in sequential lifting; `LocalArenas` on
+/// parallel workers).
+pub(crate) trait IrArenas {
+    fn blocks(&self) -> &[Block];
+    fn blocks_mut(&mut self) -> &mut Vec<Block>;
+    fn insts(&self) -> &[Inst];
+    fn insts_mut(&mut self) -> &mut Vec<Inst>;
+    fn values(&self) -> &[Value];
+    fn values_mut(&mut self) -> &mut Vec<Value>;
+    fn blocks_and_insts_mut(&mut self) -> (&mut Vec<Block>, &mut Vec<Inst>);
+}
+
+impl IrArenas for Module {
+    #[inline]
+    fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    #[inline]
+    fn blocks_mut(&mut self) -> &mut Vec<Block> {
+        &mut self.blocks
+    }
+
+    #[inline]
+    fn insts(&self) -> &[Inst] {
+        &self.insts
+    }
+
+    #[inline]
+    fn insts_mut(&mut self) -> &mut Vec<Inst> {
+        &mut self.insts
+    }
+
+    #[inline]
+    fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    #[inline]
+    fn values_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.values
+    }
+
+    #[inline]
+    fn blocks_and_insts_mut(&mut self) -> (&mut Vec<Block>, &mut Vec<Inst>) {
+        (&mut self.blocks, &mut self.insts)
+    }
+}
+
+/// Shared interface over sequential [`Lifter`] and worker-local
+/// [`parallel::MethodLiftCtx`] so [`lift_method_with`], [`metadata`],
+/// [`resolve`], and [`translate`] execute one unified code path (`#84`).
+pub(crate) trait LiftBackend<'f> {
+    type Arenas: IrArenas;
+
+    fn file(&self) -> &'f File;
+    fn arenas(&self) -> &Self::Arenas;
+    fn arenas_mut(&mut self) -> &mut Self::Arenas;
+    fn backend_method_count(&self) -> usize;
+    fn backend_method_name(&self, idx: abcd_file::MethodIdx) -> Option<Sym>;
+    fn backend_field_id(&self, idx: abcd_file::FieldIdx) -> Option<(ClassId, FieldId)>;
+    fn backend_field_name(&self, cid: ClassId, fid: FieldId) -> Option<Sym>;
+
+    fn backend_sym_of_file_sid(&mut self, sid: abcd_file::StringId) -> Option<Sym>;
+    fn backend_sym(&mut self, s: &'static str) -> Sym;
+    fn backend_class_of_descriptor(&mut self, sid: abcd_file::StringId) -> Option<ClassId>;
+    fn backend_const_scalar(&mut self, c: Const) -> ConstId;
+    fn backend_const_shape(&mut self, c: Const) -> ConstId;
+
+    fn empty_object_shape(&mut self) -> ConstId {
+        self.backend_const_shape(Const::ObjectLiteral {
+            keys: Vec::new(),
+            values: Vec::new(),
+        })
+    }
+
+    fn backend_resolve_lit_array(
+        &mut self,
+        table_idx: u32,
+        wrap: resolve::LitWrap,
+    ) -> Result<ConstId, LiftError>;
+
+    fn backend_try_lit_array_or_null(&mut self, table_idx: u32, wrap: resolve::LitWrap) -> ConstId;
+
+    fn backend_this_param_index(&self, fd: &FunctionData) -> Option<usize>;
+    fn backend_is_const_bool(&self, cid: ConstId) -> bool;
+
+    fn backend_active_module_tables(
+        &self,
+        class_id: ClassId,
+    ) -> Option<(
+        &[abcd_ir::ImportDecl],
+        &[abcd_ir::ExportDecl],
+        &[abcd_ir::ModuleRequest],
+    )>;
+
+    fn backend_record_legacy_modvar_fallback(&mut self, inst_id: InstId, sym: Sym);
+    fn backend_lookup_scope_names(
+        &self,
+        class_id: ClassId,
+        source_file: Option<Sym>,
+    ) -> Option<ConstId>;
+    fn backend_resolve_source_code(&mut self, sid: abcd_file::StringId) -> Option<Arc<str>>;
+}
+
 /// The module-level conversion state: the v0.2 module under
 /// construction plus the identity tables built in pass 1.
 pub(crate) struct Lifter<'f> {
@@ -220,6 +351,8 @@ pub(crate) struct Lifter<'f> {
     pub file: &'f File,
     /// The v0.2 module under construction.
     pub module: Module,
+    /// Dense `StringId -> Sym.raw()` memo (`u32::MAX` when uncached, `#72`).
+    pub(crate) sid_to_sym: Vec<u32>,
     /// Dense method index (`MethodIdx`) → interned method name [`Sym`] (`#50`).
     pub(crate) method_names: Vec<Sym>,
     /// Class descriptor (file string id) → class-table index. Grows at
@@ -254,6 +387,7 @@ impl<'f> Lifter<'f> {
         Self {
             file,
             module: Module::with_dialect(dialect),
+            sid_to_sym: vec![u32::MAX; file.strings.len()],
             method_names: Vec::new(),
             class_to_id: HashMap::new(),
             field_ids: Vec::new(),
@@ -266,15 +400,26 @@ impl<'f> Lifter<'f> {
         }
     }
 
-    /// Intern a file-level string as a symbol, preserving lone-surrogate
-    /// MUTF-8 bytes losslessly (#30).
+    /// Intern a file-level string as a symbol in `O(1)` when cached, preserving
+    /// lone-surrogate MUTF-8 bytes losslessly (`#30`, `#72`).
     pub(crate) fn sym_of_file_sid(&mut self, sid: abcd_file::StringId) -> Option<Sym> {
-        if let Some(raw) = self.file.strings.raw_mutf8(sid) {
-            let lossy = self.file.strings.resolve(sid)?;
-            return Some(self.module.sym.intern_lossy_raw(lossy, raw));
+        let idx = sid.index();
+        if let Some(&cached) = self.sid_to_sym.get(idx)
+            && cached != u32::MAX
+        {
+            return Some(Sym::new(cached));
         }
-        let s = self.file.strings.as_str(sid)?;
-        Some(self.module.sym.intern(s))
+        let sym = if let Some(raw) = self.file.strings.raw_mutf8(sid) {
+            let lossy = self.file.strings.resolve(sid)?;
+            self.module.sym.intern_lossy_raw(lossy, raw)
+        } else {
+            let s = self.file.strings.as_str(sid)?;
+            self.module.sym.intern(s)
+        };
+        if let Some(slot) = self.sid_to_sym.get_mut(idx) {
+            *slot = sym.raw();
+        }
+        Some(sym)
     }
 
     /// Intern a string literal as a symbol.
@@ -310,18 +455,193 @@ impl<'f> Lifter<'f> {
     pub(crate) fn const_shape(&mut self, c: Const) -> ConstId {
         self.module.consts.intern(c)
     }
+}
 
-    /// The shared empty object shape (for `createemptyobject`).
-    pub(crate) fn empty_object_shape(&mut self) -> ConstId {
-        self.const_shape(Const::ObjectLiteral {
-            keys: Vec::new(),
-            values: Vec::new(),
-        })
+impl<'f> LiftBackend<'f> for Lifter<'f> {
+    type Arenas = Module;
+
+    #[inline]
+    fn file(&self) -> &'f File {
+        self.file
+    }
+
+    #[inline]
+    fn arenas(&self) -> &Self::Arenas {
+        &self.module
+    }
+
+    #[inline]
+    fn arenas_mut(&mut self) -> &mut Self::Arenas {
+        &mut self.module
+    }
+
+    #[inline]
+    fn backend_method_count(&self) -> usize {
+        self.method_names.len()
+    }
+
+    #[inline]
+    fn backend_method_name(&self, idx: abcd_file::MethodIdx) -> Option<Sym> {
+        self.method_names.get(idx.index()).copied()
+    }
+
+    #[inline]
+    fn backend_field_id(&self, idx: abcd_file::FieldIdx) -> Option<(ClassId, FieldId)> {
+        self.field_ids.get(idx.index()).copied()
+    }
+
+    #[inline]
+    fn backend_field_name(&self, cid: ClassId, fid: FieldId) -> Option<Sym> {
+        self.module
+            .classes
+            .get(cid.index())
+            .and_then(|c| c.fields.get(fid.index()))
+            .map(|f| f.name)
+    }
+
+    #[inline]
+    fn backend_sym_of_file_sid(&mut self, sid: abcd_file::StringId) -> Option<Sym> {
+        self.sym_of_file_sid(sid)
+    }
+
+    #[inline]
+    fn backend_sym(&mut self, s: &'static str) -> Sym {
+        self.sym(s)
+    }
+
+    #[inline]
+    fn backend_class_of_descriptor(&mut self, sid: abcd_file::StringId) -> Option<ClassId> {
+        self.class_of_descriptor(sid)
+    }
+
+    #[inline]
+    fn backend_const_scalar(&mut self, c: Const) -> ConstId {
+        self.const_scalar(c)
+    }
+
+    #[inline]
+    fn backend_const_shape(&mut self, c: Const) -> ConstId {
+        self.const_shape(c)
+    }
+
+    #[inline]
+    fn backend_resolve_lit_array(
+        &mut self,
+        table_idx: u32,
+        wrap: resolve::LitWrap,
+    ) -> Result<ConstId, LiftError> {
+        resolve::const_for_literal_array_with_wrap(self, table_idx, wrap)
+    }
+
+    #[inline]
+    fn backend_try_lit_array_or_null(&mut self, table_idx: u32, wrap: resolve::LitWrap) -> ConstId {
+        resolve::const_for_literal_array_with_wrap(self, table_idx, wrap)
+            .unwrap_or_else(|_| self.const_scalar(Const::Null))
+    }
+
+    #[inline]
+    fn backend_this_param_index(&self, fd: &FunctionData) -> Option<usize> {
+        abcd_ir::frame::this_param_index(&self.module, fd)
+    }
+
+    #[inline]
+    fn backend_is_const_bool(&self, cid: ConstId) -> bool {
+        matches!(self.module.consts.get(cid), Some(Const::Bool(_)))
+    }
+
+    fn backend_active_module_tables(
+        &self,
+        class_id: ClassId,
+    ) -> Option<(
+        &[abcd_ir::ImportDecl],
+        &[abcd_ir::ExportDecl],
+        &[abcd_ir::ModuleRequest],
+    )> {
+        if let Some(esm) = self
+            .module
+            .classes
+            .get(class_id.index())
+            .and_then(|c| c.es_module.as_ref())
+        {
+            return Some((&esm.imports, &esm.exports, &esm.module_requests));
+        }
+        if !self.module.imports.is_empty()
+            || !self.module.exports.is_empty()
+            || !self.module.module_requests.is_empty()
+        {
+            return Some((
+                &self.module.imports,
+                &self.module.exports,
+                &self.module.module_requests,
+            ));
+        }
+        None
+    }
+
+    #[inline]
+    fn backend_record_legacy_modvar_fallback(&mut self, _inst_id: InstId, _sym: Sym) {}
+
+    fn backend_lookup_scope_names(
+        &self,
+        class_id: ClassId,
+        source_file: Option<Sym>,
+    ) -> Option<ConstId> {
+        self.module
+            .classes
+            .get(class_id.index())
+            .and_then(|c| c.scope_names)
+            .or_else(|| {
+                source_file.and_then(|sf| {
+                    self.scope_name_fields
+                        .iter()
+                        .find(|(name, _)| *name == sf)
+                        .map(|(_, c)| *c)
+                })
+            })
+    }
+
+    fn backend_resolve_source_code(&mut self, sid: abcd_file::StringId) -> Option<Arc<str>> {
+        if let Some(arc) = self.source_code_cache.get(&sid) {
+            return Some(Arc::clone(arc));
+        }
+        let s = self.file.strings.resolve(sid)?;
+        let arc: Arc<str> = Arc::from(s);
+        self.source_code_cache.insert(sid, Arc::clone(&arc));
+        Some(arc)
     }
 }
 
-/// Lift an entire ABC file into an [`abcd_ir::Module`].
+/// Lift an entire ABC file into an [`abcd_ir::Module`] using [`LiftOptions::default`].
 pub fn lift_file(file: &File) -> Result<Module, LiftError> {
+    lift_file_with_options(file, &LiftOptions::default())
+}
+
+/// Lift an entire ABC file into an [`abcd_ir::Module`] with explicit [`LiftOptions`].
+pub fn lift_file_with_options(file: &File, options: &LiftOptions) -> Result<Module, LiftError> {
+    lift_file_impl(file, options, false)
+}
+
+/// Force-enable parallel method lifting regardless of file size (used by unit tests).
+#[cfg(test)]
+pub(crate) fn lift_file_forced_parallel(
+    file: &File,
+    retain_tail_capacity: bool,
+) -> Result<Module, LiftError> {
+    lift_file_impl(
+        file,
+        &LiftOptions {
+            retain_tail_capacity,
+            parallel: true,
+        },
+        true,
+    )
+}
+
+fn lift_file_impl(
+    file: &File,
+    options: &LiftOptions,
+    force_parallel: bool,
+) -> Result<Module, LiftError> {
     let mut lf = Lifter::new(file);
 
     let total_classes = file.classes.len();
@@ -330,18 +650,46 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
     let total_bytecodes: usize = file
         .all_methods()
         .filter_map(|(_, m)| m.body.as_ref())
-        .map(|b| b.bytecodes.len())
+        .map(MethodBody::insn_count)
         .sum();
-    lf.module.classes.reserve(total_classes);
-    lf.module.functions.reserve_exact(total_methods);
+    let use_parallel = force_parallel
+        || (options.parallel
+            && total_methods >= PARALLEL_MIN_METHODS
+            && total_bytecodes >= PARALLEL_MIN_BYTECODES);
+    if options.retain_tail_capacity {
+        lf.module
+            .classes
+            .reserve(total_classes.saturating_add((total_classes >> 4).max(16)));
+        lf.module
+            .functions
+            .reserve(total_methods.saturating_add((total_methods >> 4).max(64)));
+    } else {
+        lf.module.classes.reserve(total_classes);
+        lf.module.functions.reserve_exact(total_methods);
+    }
     lf.method_names.reserve_exact(total_methods);
     lf.class_to_id.reserve(total_classes);
     lf.field_ids.reserve_exact(total_fields);
-    lf.module.insts.reserve_exact(total_bytecodes);
-    lf.module.values.reserve_exact(total_bytecodes);
-    lf.module
-        .blocks
-        .reserve_exact(total_methods.saturating_mul(5));
+    if !use_parallel {
+        let est_blocks = total_methods.saturating_mul(5);
+        if options.retain_tail_capacity {
+            let bc_extra = (total_bytecodes >> 4).max(64);
+            let blk_extra = (est_blocks >> 4).max(64);
+            lf.module
+                .insts
+                .reserve(total_bytecodes.saturating_add(bc_extra));
+            lf.module
+                .values
+                .reserve(total_bytecodes.saturating_add(bc_extra));
+            lf.module
+                .blocks
+                .reserve(est_blocks.saturating_add(blk_extra));
+        } else {
+            lf.module.insts.reserve_exact(total_bytecodes);
+            lf.module.values.reserve_exact(total_bytecodes);
+            lf.module.blocks.reserve_exact(est_blocks);
+        }
+    }
 
     // Pass 1 — dense identity tables (`#50`): pre-fill the class-table and
     // function-table slots in `file.classes` × declaration order (`== MethodIdx`
@@ -387,47 +735,61 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
     }
     metadata::emit_module_records(&mut lf)?;
 
-    // Pass 2b — lift method bodies in deterministic class × declaration order.
-    for (class_id, class, base) in class_schedule {
-        for (mi, method) in class.methods.iter().enumerate() {
-            let func_id = FuncId::new(base + mi as u32);
-            lift_method(&mut lf, class_id, method, func_id)?;
+    // Pass 2b — lift method bodies either in parallel (with deterministic
+    // Pass-2c event-stream replay, `#84`) or sequentially.
+    if use_parallel {
+        parallel::lift_methods_parallel(
+            &mut lf,
+            &class_schedule,
+            total_methods,
+            options.retain_tail_capacity,
+        )?;
+    } else {
+        for (class_id, class, base) in class_schedule {
+            for (mi, method) in class.methods.iter().enumerate() {
+                let func_id = FuncId::new(base + mi as u32);
+                let fd = lift_method_with(&mut lf, class_id, method, func_id)?;
+                lf.module.functions[func_id.index()] = fd;
+            }
         }
     }
 
-    for cls in &mut lf.module.classes {
-        cls.interfaces.shrink_to_fit();
-        cls.fields.shrink_to_fit();
-        cls.methods.shrink_to_fit();
-        cls.annotations.shrink_to_fit();
-        if let Some(es) = &mut cls.es_module {
-            es.imports.shrink_to_fit();
-            es.exports.shrink_to_fit();
-            es.module_requests.shrink_to_fit();
+    if !options.retain_tail_capacity {
+        for cls in &mut lf.module.classes {
+            cls.interfaces.shrink_to_fit();
+            cls.fields.shrink_to_fit();
+            cls.methods.shrink_to_fit();
+            cls.annotations.shrink_to_fit();
+            if let Some(es) = &mut cls.es_module {
+                es.imports.shrink_to_fit();
+                es.exports.shrink_to_fit();
+                es.module_requests.shrink_to_fit();
+            }
         }
+        lf.module.classes.shrink_to_fit();
+        lf.module.functions.shrink_to_fit();
+        lf.module.blocks.shrink_to_fit();
+        lf.module.insts.shrink_to_fit();
+        lf.module.values.shrink_to_fit();
+        lf.module.imports.shrink_to_fit();
+        lf.module.exports.shrink_to_fit();
+        lf.module.module_requests.shrink_to_fit();
     }
-    lf.module.classes.shrink_to_fit();
-    lf.module.functions.shrink_to_fit();
-    lf.module.blocks.shrink_to_fit();
-    lf.module.insts.shrink_to_fit();
-    lf.module.values.shrink_to_fit();
-    lf.module.imports.shrink_to_fit();
-    lf.module.exports.shrink_to_fit();
-    lf.module.module_requests.shrink_to_fit();
 
     Ok(lf.module)
 }
 
-/// Lift a single method body into its reserved function-table slot.
-pub(crate) fn lift_method<'f>(
-    lf: &mut Lifter<'f>,
+/// Lift a single method body against `lf` (sequential [`Lifter`] or worker-local
+/// [`parallel::MethodLiftCtx`]), returning the completed [`FunctionData`].
+pub(crate) fn lift_method_with<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     class_id: ClassId,
     method: &'f Method,
-    func_id: FuncId,
-) -> Result<(), LiftError> {
+    _func_id: FuncId,
+) -> Result<FunctionData, LiftError> {
     let name = lf
-        .sym_of_file_sid(method.name)
-        .unwrap_or_else(|| lf.sym("<unnamed>"));
+        .backend_sym_of_file_sid(method.name)
+        .unwrap_or_else(|| lf.backend_sym("<unnamed>"));
     let kind = metadata::function_kind(method);
     let mut fd = FunctionData::new(class_id, name, kind);
     fd.sig = metadata::signature(lf, method);
@@ -448,10 +810,14 @@ pub(crate) fn lift_method<'f>(
         fd.params = metadata::external_params(lf, method);
         fd.params.shrink_to_fit();
         fd.annotations.shrink_to_fit();
-        lf.module.functions[func_id.index()] = fd;
-        return Ok(());
+        return Ok(fd);
     };
-    if body.bytecodes.is_empty() {
+
+    // Borrow `Decoded` in O(1) or transiently decode `MethodSpan` ONCE for this
+    // method (`#49`), dropping any temporary `Vec<Bytecode>` when returning.
+    let bytecodes_cow = body.bytecodes();
+    let bytecodes: &[abcd_isa::Bytecode] = &bytecodes_cow;
+    if bytecodes.is_empty() {
         return Err(LiftError::EmptyBytecode);
     }
 
@@ -471,7 +837,7 @@ pub(crate) fn lift_method<'f>(
             num_args: body.num_args,
         })?;
 
-    let raw_cfg = build_cfg(body)?;
+    let raw_cfg = build_cfg(bytecodes, &body.try_blocks)?;
 
     // #32: If raw block 0 (bytecode offset 0) has any incoming edge — a
     // loop back-edge (`jmp 0` / `jnez 0`), a single-block self-loop at 0,
@@ -492,27 +858,31 @@ pub(crate) fn lift_method<'f>(
 
     // Create the function's blocks: optional synthetic pre-entry first,
     // then dense raw block index → IR BlockId in leader order (`R3-A4`).
-    let entry_block = BlockId::new(lf.module.blocks.len() as u32);
-    let block_base = entry_block.index();
-    lf.module.blocks.push(Block::default());
-    fd.blocks.push(entry_block);
     let mut block_map: Vec<BlockId> = Vec::with_capacity(raw_cfg.blocks.len());
-    if needs_pre_entry {
-        for _ in 0..raw_cfg.blocks.len() {
-            let bb = BlockId::new(lf.module.blocks.len() as u32);
-            lf.module.blocks.push(Block::default());
-            fd.blocks.push(bb);
-            block_map.push(bb);
+    let (entry_block, block_base) = {
+        let blocks = lf.arenas_mut().blocks_mut();
+        let entry = BlockId::new(blocks.len() as u32);
+        let base = entry.index();
+        blocks.push(Block::default());
+        fd.blocks.push(entry);
+        if needs_pre_entry {
+            for _ in 0..raw_cfg.blocks.len() {
+                let bb = BlockId::new(blocks.len() as u32);
+                blocks.push(Block::default());
+                fd.blocks.push(bb);
+                block_map.push(bb);
+            }
+        } else {
+            block_map.push(entry);
+            for _ in 1..raw_cfg.blocks.len() {
+                let bb = BlockId::new(blocks.len() as u32);
+                blocks.push(Block::default());
+                fd.blocks.push(bb);
+                block_map.push(bb);
+            }
         }
-    } else {
-        block_map.push(entry_block);
-        for _ in 1..raw_cfg.blocks.len() {
-            let bb = BlockId::new(lf.module.blocks.len() as u32);
-            lf.module.blocks.push(Block::default());
-            fd.blocks.push(bb);
-            block_map.push(bb);
-        }
-    }
+        (entry, base)
+    };
     let num_fn_blocks = fd.blocks.len();
 
     // Predecessor edges (both kinds, materialized before SSA — the
@@ -520,33 +890,36 @@ pub(crate) fn lift_method<'f>(
     // successors (plus `pre_entry -> header0` when synthesized);
     // Exceptional edges for every (protected block → handler) pair (the
     // verifier's MissingExceptionalPred rule).
-    if needs_pre_entry {
-        let header0 = block_map[0];
-        lf.module.blocks[header0.index()].preds.push(Edge {
-            from: entry_block,
-            kind: EdgeKind::Normal,
-        });
-    }
-    for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
-        let ir_block = block_map[bi];
-        for &succ_bi in &raw_block.succs {
-            let succ_bb = block_map[succ_bi];
-            let edge = Edge {
-                from: ir_block,
+    {
+        let blocks = lf.arenas_mut().blocks_mut();
+        if needs_pre_entry {
+            let header0 = block_map[0];
+            blocks[header0.index()].preds.push(Edge {
+                from: entry_block,
                 kind: EdgeKind::Normal,
-            };
-            if !lf.module.blocks[succ_bb.index()].preds.contains(&edge) {
-                lf.module.blocks[succ_bb.index()].preds.push(edge);
-            }
+            });
         }
-        for &catch_bi in &raw_block.catch_succs {
-            let catch_bb = block_map[catch_bi];
-            let edge = Edge {
-                from: ir_block,
-                kind: EdgeKind::Exceptional,
-            };
-            if !lf.module.blocks[catch_bb.index()].preds.contains(&edge) {
-                lf.module.blocks[catch_bb.index()].preds.push(edge);
+        for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
+            let ir_block = block_map[bi];
+            for &succ_bi in &raw_block.succs {
+                let succ_bb = block_map[succ_bi];
+                let edge = Edge {
+                    from: ir_block,
+                    kind: EdgeKind::Normal,
+                };
+                if !blocks[succ_bb.index()].preds.contains(&edge) {
+                    blocks[succ_bb.index()].preds.push(edge);
+                }
+            }
+            for &catch_bi in &raw_block.catch_succs {
+                let catch_bb = block_map[catch_bi];
+                let edge = Edge {
+                    from: ir_block,
+                    kind: EdgeKind::Exceptional,
+                };
+                if !blocks[catch_bb.index()].preds.contains(&edge) {
+                    blocks[catch_bb.index()].preds.push(edge);
+                }
             }
         }
     }
@@ -560,7 +933,8 @@ pub(crate) fn lift_method<'f>(
         lf,
         method,
         body,
-        func_id,
+        class_id,
+        bytecodes.len(),
         frame_limit,
         block_base,
         num_fn_blocks,
@@ -622,20 +996,19 @@ pub(crate) fn lift_method<'f>(
     // `None` (→ undefined) for shapes the model can't cover
     // (documented conservative fallback). NOT `params[0]` — the FUNC
     // slot under `0xF` (the superseded convention, N66).
-    fx.this_param = abcd_ir::frame::this_param_index(&fx.lf.module, &fd).map(|i| fd.params[i]);
+    fx.this_param = fx.lf.backend_this_param_index(&fd).map(|i| fd.params[i]);
 
     // The entry block has no predecessors: seal it immediately. When a
     // synthetic pre-entry trampoline was inserted (#32), emit its single
     // unconditional Branch into `header0` (`pc: None` so debug line/scope
     // extents attach exclusively to real bytecode instructions).
-    fx.ssa.seal_block(entry_block, &mut fx.lf.module);
+    fx.ssa.seal_block(entry_block, fx.lf.arenas_mut());
     if needs_pre_entry {
         let header0 = fx.block_map[0];
         fx.emit_void(entry_block, abcd_ir::Op::Branch { dest: header0 }, None);
     }
 
     // Translate bytecodes block by block.
-    let bytecodes = &body.bytecodes;
     for bi in 0..fx.raw_cfg.blocks.len() {
         let ir_block = fx.block_map[bi];
         let (start, end) = {
@@ -650,10 +1023,10 @@ pub(crate) fn lift_method<'f>(
         // instructions such as lda/sta may disappear during SSA
         // lifting, so inspect the emitted IR rather than the last
         // source instruction.
-        let terminated = fx.lf.module.blocks[ir_block.index()]
+        let terminated = fx.lf.arenas().blocks()[ir_block.index()]
             .insts
             .last()
-            .and_then(|&iid| fx.lf.module.insts.get(iid.index()))
+            .and_then(|&iid| fx.lf.arenas().insts().get(iid.index()))
             .is_some_and(|inst| inst.op.is_terminator());
         if !terminated {
             let succs = fx.raw_cfg.blocks[bi].succs.clone();
@@ -681,12 +1054,12 @@ pub(crate) fn lift_method<'f>(
         for &succ_bi in succs.iter().chain(catch_succs.iter()) {
             let succ_bb = fx.block_map[succ_bi];
             if !fx.ssa.is_sealed(succ_bb) {
-                let all_preds_done = fx.lf.module.blocks[succ_bb.index()]
+                let all_preds_done = fx.lf.arenas().blocks()[succ_bb.index()]
                     .preds
                     .iter()
                     .all(|edge| edge.from.index() <= ir_block.index());
                 if all_preds_done {
-                    fx.ssa.seal_block(succ_bb, &mut fx.lf.module);
+                    fx.ssa.seal_block(succ_bb, fx.lf.arenas_mut());
                 }
             }
         }
@@ -696,31 +1069,25 @@ pub(crate) fn lift_method<'f>(
     for bi in 0..fx.raw_cfg.blocks.len() {
         let bb = fx.block_map[bi];
         if !fx.ssa.is_sealed(bb) {
-            fx.ssa.seal_block(bb, &mut fx.lf.module);
+            fx.ssa.seal_block(bb, fx.lf.arenas_mut());
         }
     }
 
-    // Record the function's frame-initial constant ValueIds (#30) and
-    // publish the translated body into the reserved function-table slot.
+    // Record the function's frame-initial constant ValueIds (#30).
     fd.frame_init_consts = fx.ssa.frame_init_consts.clone();
-    fx.lf.module.functions[func_id.index()] = fd;
 
-    // N18 dead-island sweep (augmented reachability via `ExceptionHandlerMap`).
-    sweep_dead_blocks(&mut fx);
+    // N18 dead-island sweep (exception-augmented reachability).
+    sweep_dead_blocks(&mut fd, fx.lf.arenas_mut(), block_base);
 
     // Finalize iterative trivial-phi cascade (including any phis reduced to a
     // single live predecessor by `sweep_dead_blocks`) and rewrite all surviving
     // instruction operands (`Op::for_each_operand_mut`) and debug references.
-    fx.ssa.finalize_function(&mut fx.lf.module, func_id);
+    fx.ssa.finalize_function_data(fx.lf.arenas_mut(), &mut fd);
 
     // Debug data (line/column tables keyed by the lifted InstIds,
     // locals with scope extents, param names, source file/code).
-    metadata::finish_debug(&mut fx);
+    metadata::finish_debug(&mut fx, &mut fd);
 
-    let Module {
-        functions, blocks, ..
-    } = &mut fx.lf.module;
-    let fd = &mut functions[func_id.index()];
     fd.params.shrink_to_fit();
     fd.frame_init_consts.shrink_to_fit();
     fd.blocks.shrink_to_fit();
@@ -736,20 +1103,23 @@ pub(crate) fn lift_method<'f>(
         dbg.local_names.shrink_to_fit();
         dbg.param_names.shrink_to_fit();
     }
-    for &bid in &fd.blocks {
-        let blk = &mut blocks[bid.index()];
-        blk.insts.shrink_to_fit();
-        blk.preds.shrink_to_fit();
+    {
+        let blocks = fx.lf.arenas_mut().blocks_mut();
+        for &bid in &fd.blocks {
+            let blk = &mut blocks[bid.index()];
+            blk.insts.shrink_to_fit();
+            blk.preds.shrink_to_fit();
+        }
     }
 
-    Ok(())
+    Ok(fd)
 }
 
 /// Build structured try regions from the original bytecode `try_blocks`.
 /// Catch exception values start as a placeholder and are filled by the
-/// N13 handler seeding in [`lift_method`].
-fn build_try_regions(
-    lf: &mut Lifter,
+/// N13 handler seeding in [`lift_method_with`].
+fn build_try_regions<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     body: &MethodBody,
     raw_cfg: &RawCfg,
     block_map: &[BlockId],
@@ -781,7 +1151,7 @@ fn build_try_regions(
             };
             let type_class = match c.type_class {
                 Some(sid) => Some(
-                    lf.class_of_descriptor(sid)
+                    lf.backend_class_of_descriptor(sid)
                         .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?,
                 ),
                 None => None,
@@ -802,96 +1172,125 @@ fn build_try_regions(
     Ok(regions)
 }
 
-/// N18 dead-island sweep: remove blocks unreachable over the AUGMENTED
-/// successor relation (`abcd_ir::cfg::augmented_succs_with_map` over
-/// [`abcd_ir::cfg::ExceptionHandlerMap`]) and repair preds/phi entries/try
-/// regions of the survivors.
-fn sweep_dead_blocks(fx: &mut translate::FnLift) {
-    use abcd_ir::cfg::{ExceptionHandlerMap, augmented_succs_with_map};
-    use std::collections::{HashSet, VecDeque};
+/// N18 dead-island sweep: remove blocks unreachable over the exception-augmented
+/// successor relation (`abcd_ir::normal_succs_inline` + `TryRegion` handlers)
+/// and repair preds, phi entries, and try regions of the survivors.
+fn sweep_dead_blocks<A: IrArenas>(fd: &mut FunctionData, arenas: &mut A, block_base: usize) {
+    use std::collections::VecDeque;
 
-    let func_id = fx.func_id;
-    let module = &mut fx.lf.module;
-    let Some(exc_map) = ExceptionHandlerMap::build(module, func_id) else {
+    let num_blocks = fd.blocks.len();
+    let Some(&entry) = fd.blocks.first() else {
         return;
     };
-    let all_blocks = module.functions[func_id.index()].blocks.clone();
-    let Some(&entry) = all_blocks.first() else {
-        return;
+    let rel_of = |bb: BlockId| -> Option<usize> {
+        bb.index()
+            .checked_sub(block_base)
+            .filter(|&rel| rel < num_blocks)
     };
-    let func_blocks: HashSet<BlockId> = all_blocks.iter().copied().collect();
 
-    let mut reachable: HashSet<BlockId> = HashSet::with_capacity(all_blocks.len());
+    let mut exc_succs: Vec<Vec<BlockId>> = vec![Vec::new(); num_blocks];
+    for region in &fd.try_regions {
+        for &prot in &region.protected {
+            let Some(pi) = rel_of(prot) else {
+                continue;
+            };
+            for catch in &region.catches {
+                if rel_of(catch.handler).is_some() && !exc_succs[pi].contains(&catch.handler) {
+                    exc_succs[pi].push(catch.handler);
+                }
+            }
+        }
+    }
+
+    let mut reachable = vec![false; num_blocks];
+    let mut reachable_count = 0usize;
     let mut queue: VecDeque<BlockId> = VecDeque::new();
-    reachable.insert(entry);
-    queue.push_back(entry);
+    if let Some(ei) = rel_of(entry) {
+        reachable[ei] = true;
+        reachable_count = 1;
+        queue.push_back(entry);
+    }
+
     while let Some(bb) = queue.pop_front() {
-        for succ in augmented_succs_with_map(module, &exc_map, bb) {
-            if func_blocks.contains(&succ) && reachable.insert(succ) {
+        let normal = arenas.blocks()[bb.index()]
+            .insts
+            .last()
+            .and_then(|&iid| arenas.insts().get(iid.index()))
+            .map(|inst| abcd_ir::normal_succs_inline(&inst.op))
+            .unwrap_or(([BlockId::new(0); 2], 0));
+        for &succ in &normal.0[..normal.1] {
+            if let Some(si) = rel_of(succ)
+                && !reachable[si]
+            {
+                reachable[si] = true;
+                reachable_count += 1;
                 queue.push_back(succ);
             }
         }
-    }
-    if reachable.len() == all_blocks.len() {
-        return;
-    }
-    let dead: HashSet<BlockId> = all_blocks
-        .iter()
-        .copied()
-        .filter(|bb| !reachable.contains(bb))
-        .collect();
-
-    // Kept blocks: drop dead predecessors and the phi entries keyed by
-    // them (verify requires phi entry count == predecessor count).
-    for &bb in &all_blocks {
-        if dead.contains(&bb) {
-            module.blocks[bb.index()].insts.shrink_to_fit();
-            module.blocks[bb.index()].preds.shrink_to_fit();
-            continue;
-        }
-        module.blocks[bb.index()]
-            .preds
-            .retain(|e| !dead.contains(&e.from));
-        let phi_ids: Vec<InstId> = module.blocks[bb.index()]
-            .insts
-            .iter()
-            .copied()
-            .filter(|&iid| module.insts.get(iid.index()).is_some_and(|i| i.op.is_phi()))
-            .collect();
-        for phi_id in phi_ids {
-            if let abcd_ir::Op::Phi { entries } = &mut module.insts[phi_id.index()].op {
-                entries.retain(|(e, _)| !dead.contains(&e.from));
+        if let Some(bi) = rel_of(bb) {
+            for &handler in &exc_succs[bi] {
+                if let Some(hi) = rel_of(handler)
+                    && !reachable[hi]
+                {
+                    reachable[hi] = true;
+                    reachable_count += 1;
+                    queue.push_back(handler);
+                }
             }
         }
     }
 
-    // Remove the dead blocks and prune dependent metadata: try-region
-    // coverage/handler references.
-    let func = &mut module.functions[func_id.index()];
-    func.blocks.retain(|bb| !dead.contains(bb));
-    for region in &mut func.try_regions {
-        region.protected.retain(|bb| !dead.contains(bb));
-        region.catches.retain(|c| !dead.contains(&c.handler));
+    if reachable_count == num_blocks {
+        return;
     }
-    // A region with no surviving protected blocks or no surviving
-    // handler can never dispatch; drop it.
-    func.try_regions
+
+    let is_dead = |bb: BlockId| -> bool { rel_of(bb).is_none_or(|ri| !reachable[ri]) };
+
+    {
+        let (blocks, insts) = arenas.blocks_and_insts_mut();
+        for &bb in &fd.blocks {
+            if is_dead(bb) {
+                blocks[bb.index()].insts.shrink_to_fit();
+                blocks[bb.index()].preds.shrink_to_fit();
+                continue;
+            }
+            blocks[bb.index()].preds.retain(|e| !is_dead(e.from));
+            for &iid in &blocks[bb.index()].insts {
+                let Some(inst) = insts.get_mut(iid.index()) else {
+                    continue;
+                };
+                if let abcd_ir::Op::Phi { entries } = &mut inst.op {
+                    entries.retain(|(e, _)| !is_dead(e.from));
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fd.blocks.retain(|&bb| !is_dead(bb));
+    for region in &mut fd.try_regions {
+        region.protected.retain(|&bb| !is_dead(bb));
+        region.catches.retain(|c| !is_dead(c.handler));
+    }
+    fd.try_regions
         .retain(|r| !r.protected.is_empty() && !r.catches.is_empty());
 }
 
 /// Emit an IR instruction in `block` (helper used across modules).
-pub(crate) fn emit_inst(
-    module: &mut Module,
+pub(crate) fn emit_inst<A: IrArenas>(
+    arenas: &mut A,
     block: BlockId,
     op: abcd_ir::Op,
     loc: Option<abcd_ir::Loc>,
 ) -> (InstId, Option<ValueId>) {
     let has_result = op.has_result();
     let is_phi = op.is_phi();
-    let inst_id = InstId::new(module.insts.len() as u32);
+    let inst_id = InstId::new(arenas.insts().len() as u32);
     let result = if has_result {
-        let val = ValueId::new(module.values.len() as u32);
-        module.values.push(Value {
+        let values = arenas.values_mut();
+        let val = ValueId::new(values.len() as u32);
+        values.push(Value {
             def: ValueDef::Inst(inst_id),
             ty: Ty::Any,
         });
@@ -899,13 +1298,14 @@ pub(crate) fn emit_inst(
     } else {
         None
     };
-    module.insts.push(Inst {
+    arenas.insts_mut().push(Inst {
         op,
         result,
         block,
         loc,
     });
-    let bb = &mut module.blocks[block.index()];
+    let (blocks, insts) = arenas.blocks_and_insts_mut();
+    let bb = &mut blocks[block.index()];
     if is_phi {
         // Phis form the block's leading prefix: insert after the
         // existing phi run (a Braun phi can materialize for a block
@@ -913,7 +1313,7 @@ pub(crate) fn emit_inst(
         let phi_len = bb
             .insts
             .iter()
-            .take_while(|&&iid| module.insts.get(iid.index()).is_some_and(|i| i.op.is_phi()))
+            .take_while(|&&iid| insts.get(iid.index()).is_some_and(|i| i.op.is_phi()))
             .count();
         bb.insts.insert(phi_len, inst_id);
     } else {
@@ -923,93 +1323,4 @@ pub(crate) fn emit_inst(
 }
 
 #[cfg(test)]
-mod tests {
-    use abcd_file::{AccessFlags, Builder, CatchBlockDef, Type, decode};
-    use abcd_isa::{Bytecode, Reg, encode as encode_bytecodes};
-
-    use super::lift_file;
-
-    #[test]
-    fn lift_file_shrinks_arena_and_per_function_capacities() {
-        let mut b = Builder::new();
-        b.set_api(12, "");
-        let cls = b.add_global_class();
-        let proto = b.create_proto(Type::Void, &[]);
-        for idx in 0..8 {
-            let (insns, offsets) = encode_bytecodes(&[
-                Bytecode::Lda(Reg(0)),
-                Bytecode::Return,
-                Bytecode::Sta(Reg(1)),
-                Bytecode::Lda(Reg(1)),
-                Bytecode::Return,
-            ])
-            .unwrap();
-            let code = b.create_code(&insns, 2, 3);
-            b.code_add_try_block(
-                code,
-                offsets[0],
-                offsets[2] - offsets[0],
-                &[CatchBlockDef {
-                    type_class: None,
-                    handler_pc: offsets[2],
-                    code_size: insns.len() as u32 - offsets[2],
-                }],
-            );
-            let m = b.class_add_method(
-                cls,
-                &format!("f{idx}"),
-                proto,
-                AccessFlags::STATIC,
-                &[],
-                0,
-                0,
-            );
-            b.method_set_code(m, code);
-        }
-        let file = decode(&b.finalize().unwrap()).unwrap();
-        let m = lift_file(&file).unwrap();
-        assert!(abcd_ir::verify_module(&m).errors.is_empty());
-
-        assert_eq!(m.classes.capacity(), m.classes.len());
-        assert_eq!(m.functions.capacity(), m.functions.len());
-        assert_eq!(m.blocks.capacity(), m.blocks.len());
-        assert_eq!(m.insts.capacity(), m.insts.len());
-        assert_eq!(m.values.capacity(), m.values.len());
-        assert_eq!(m.imports.capacity(), m.imports.len());
-        assert_eq!(m.exports.capacity(), m.exports.len());
-        assert_eq!(m.module_requests.capacity(), m.module_requests.len());
-
-        for c in &m.classes {
-            assert_eq!(c.interfaces.capacity(), c.interfaces.len());
-            assert_eq!(c.fields.capacity(), c.fields.len());
-            assert_eq!(c.methods.capacity(), c.methods.len());
-            assert_eq!(c.annotations.capacity(), c.annotations.len());
-            if let Some(es) = &c.es_module {
-                assert_eq!(es.imports.capacity(), es.imports.len());
-                assert_eq!(es.exports.capacity(), es.exports.len());
-                assert_eq!(es.module_requests.capacity(), es.module_requests.len());
-            }
-        }
-        for f in &m.functions {
-            assert_eq!(f.params.capacity(), f.params.len());
-            assert_eq!(f.frame_init_consts.capacity(), f.frame_init_consts.len());
-            assert_eq!(f.blocks.capacity(), f.blocks.len());
-            assert_eq!(f.try_regions.capacity(), f.try_regions.len());
-            assert_eq!(f.annotations.capacity(), f.annotations.len());
-            for r in &f.try_regions {
-                assert_eq!(r.protected.capacity(), r.protected.len());
-                assert_eq!(r.catches.capacity(), r.catches.len());
-            }
-            if let Some(dbg) = &f.debug {
-                assert_eq!(dbg.line_table.capacity(), dbg.line_table.len());
-                assert_eq!(dbg.column_table.capacity(), dbg.column_table.len());
-                assert_eq!(dbg.local_names.capacity(), dbg.local_names.len());
-                assert_eq!(dbg.param_names.capacity(), dbg.param_names.len());
-            }
-        }
-        for blk in &m.blocks {
-            assert_eq!(blk.insts.capacity(), blk.insts.len());
-            assert_eq!(blk.preds.capacity(), blk.preds.len());
-        }
-    }
-}
+mod tests;

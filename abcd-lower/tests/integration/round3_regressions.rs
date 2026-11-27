@@ -217,7 +217,7 @@ fn pure_16bit_ic_stream_beyond_u16_matches_upstream_0xffff_and_0xff_degradation(
     let body = m_out.body.as_ref().expect("body");
 
     let stobj_slots: Vec<i64> = body
-        .bytecodes
+        .bytecodes()
         .iter()
         .filter_map(|bc| match *bc {
             Bytecode::Stobjbyname(Imm(s), ..) => Some(s),

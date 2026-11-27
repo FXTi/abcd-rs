@@ -87,8 +87,8 @@ fn method(
         body: Some(abcd_file::MethodBody {
             num_vregs: 1,
             num_args: 0,
-            bytecodes,
-            entities,
+            code: abcd_file::MethodCode::Decoded(bytecodes),
+            entities: entities.into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

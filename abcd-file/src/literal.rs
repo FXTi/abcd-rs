@@ -1,8 +1,11 @@
-use std::ffi::c_void;
+//! Pure Safe Rust `LiteralDataAccessor` reader & literal-value model (`#49`).
+
+#![forbid(unsafe_code)]
 
 use abcd_file_sys as sys;
 
 use crate::Error;
+use crate::file::{AbcReader, StringItemCache, read_u8, read_u16_le, read_u32_le, read_u64_le};
 
 /// Tag identifying the type of a literal array element (internal).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -205,333 +208,350 @@ impl LiteralValue {
     }
 }
 
-/// Context passed through the C callback for collecting literal values.
-pub(crate) struct LiteralCollectCtx<'a> {
-    pub file: *const sys::AbcFileHandle,
-    pub strings: *mut crate::StringPool,
-    pub str_cache: Option<*mut crate::file::StringItemCache<'a>>,
-    pub values: Vec<LiteralValue>,
-    pub error: Option<Error>,
+/// Raw wire literal element produced by [`walk_raw_literal_array`].
+pub(crate) enum RawLiteralElem<'a> {
+    TagValue(u8),
+    Bool(bool),
+    Integer(u32),
+    Float(f32),
+    Double(f64),
+    String(u32),
+    EtsImplements(u32),
+    Method(u32),
+    GeneratorMethod(u32),
+    AsyncGeneratorMethod(u32),
+    Getter(u32),
+    Setter(u32),
+    Accessor(u8),
+    MethodAffiliate(u16),
+    LiteralArray(u32),
+    LiteralBufferIndex(u32),
+    BuiltinTypeIndex(u8),
+    NullValue(u8),
+    TypedArray {
+        tag: LiteralTag,
+        elem_count: usize,
+        payload: &'a [u8],
+    },
 }
 
-/// Intern a literal-array string item losslessly into `ctx.strings` (#30),
-/// rejecting unreadable string items with [`Error::InvalidString`].
-fn intern_literal_string(
-    ctx: &mut LiteralCollectCtx<'_>,
-    off: u32,
-) -> Result<crate::StringId, Error> {
-    // SAFETY: `ctx.strings` points to the caller's live `StringPool` with
-    // exclusive mutable access during this synchronous callback.
-    let strings = unsafe { &mut *ctx.strings };
-    if let Some(cache_ptr) = ctx.str_cache {
-        // SAFETY: `cache_ptr` points to the caller's live `StringItemCache`
-        // with exclusive mutable access during this synchronous callback.
-        let cache = unsafe { &mut *cache_ptr };
-        cache
-            .intern_lossy(off, strings)
-            .ok_or(Error::InvalidString(off))
-    } else {
-        crate::file::intern_string(ctx.file, off, strings).ok_or(Error::InvalidString(off))
+/// Reason a literal array failed structural bounds validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiteralWalkError {
+    Structural,
+    UnknownTag(u8),
+}
+
+#[inline]
+fn typed_array_elem_size(tag: LiteralTag) -> Option<usize> {
+    match tag {
+        LiteralTag::ArrayU1 | LiteralTag::ArrayU8 | LiteralTag::ArrayI8 => Some(1),
+        LiteralTag::ArrayU16 | LiteralTag::ArrayI16 => Some(2),
+        LiteralTag::ArrayU32
+        | LiteralTag::ArrayI32
+        | LiteralTag::ArrayF32
+        | LiteralTag::ArrayString => Some(4),
+        LiteralTag::ArrayU64 | LiteralTag::ArrayI64 | LiteralTag::ArrayF64 => Some(8),
+        _ => None,
     }
 }
 
-/// Read and bounds-check a typed literal array (`ARRAY_U1`..`ARRAY_STRING`) at
-/// `payload_off` (`[u32 elem_count][elem_count * elem_size]`).
-pub(crate) fn read_typed_literal_array_raw(
-    file: *const sys::AbcFileHandle,
-    payload_off: u32,
-    elem_size: u32,
-) -> Result<Vec<u64>, Error> {
-    // SAFETY: `file` is a valid live `AbcFileHandle`; null buffer queries and bounds-checks length.
-    let len = unsafe {
-        sys::abc_literal_read_typed_array(file, payload_off, elem_size, std::ptr::null_mut(), 0)
-    };
-    if len < 0 {
-        return Err(Error::Malformed {
-            field: "literal typed array",
-            context: format!("invalid or truncated typed literal array at offset {payload_off:#x}"),
-        });
+/// Pure Safe Rust bounds-checked walk of a tagged `LiteralArray` item at
+/// `array_off`, matching `abc_literal_enumerate_vals_checked` (`file_bridge.cpp:1767`).
+pub(crate) fn walk_raw_literal_array<'a, F>(
+    reader: &AbcReader<'a>,
+    array_off: u32,
+    mut on_elem: F,
+) -> Result<(), LiteralWalkError>
+where
+    F: FnMut(RawLiteralElem<'a>) -> Result<(), Error>,
+{
+    if reader.overlaps_header_tables(array_off) {
+        return Err(LiteralWalkError::Structural);
     }
-    let count = len as u32;
-    if count == 0 {
-        return Ok(Vec::new());
+    let mut sp = reader
+        .get_span(array_off)
+        .ok_or(LiteralWalkError::Structural)?;
+    let count = read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)? as usize;
+    if count > sp.len() {
+        return Err(LiteralWalkError::Structural);
     }
-    let mut raw = Vec::new();
-    raw.try_reserve_exact(count as usize)
-        .map_err(|_| Error::Malformed {
-            field: "literal typed array",
-            context: format!(
-                "allocation failed for typed literal array at offset {payload_off:#x}"
-            ),
-        })?;
-    raw.resize(count as usize, 0u64);
-    // SAFETY: `file` is valid and `raw` holds `count` writable `u64` elements.
-    let read_n = unsafe {
-        sys::abc_literal_read_typed_array(file, payload_off, elem_size, raw.as_mut_ptr(), count)
-    };
-    if read_n != len {
-        return Err(Error::Malformed {
-            field: "literal typed array",
-            context: format!("truncated typed literal array at offset {payload_off:#x}"),
-        });
-    }
-    Ok(raw)
-}
 
-/// Callback for collecting literal values from the C API.
-pub(crate) unsafe extern "C" fn collect_literal_val_cb(
-    val: *const sys::AbcLiteralVal,
-    ctx: *mut c_void,
-) {
-    // SAFETY: `ctx` is a valid non-null pointer to `LiteralCollectCtx` passed
-    // exclusively by the synchronous C enumeration caller.
-    let ctx = unsafe { &mut *ctx.cast::<LiteralCollectCtx<'_>>() };
-    if ctx.error.is_some() {
-        return;
-    }
-    // SAFETY: `val` points to a stack-allocated `AbcLiteralVal` initialized by
-    // the C bridge for the duration of this callback.
-    let v = unsafe { &*val };
-    let tag = match LiteralTag::try_from(v.tag) {
-        Ok(tag) => tag,
-        Err(err) => {
-            ctx.error = Some(err);
-            return;
-        }
-    };
-    let lit = match tag {
-        LiteralTag::Bool => {
-            // SAFETY: `v.tag == BOOL` selects `bool_val` initialized by the bridge.
-            LiteralValue::Bool(unsafe { v.data.bool_val } != 0)
-        }
-        LiteralTag::Integer => {
-            // SAFETY: `v.tag == INTEGER` selects `u32_val` initialized by the bridge.
-            LiteralValue::Integer(unsafe { v.data.u32_val })
-        }
-        LiteralTag::Float => {
-            // SAFETY: `v.tag == FLOAT` selects `f32_val` initialized by the bridge.
-            LiteralValue::Float(unsafe { v.data.f32_val })
-        }
-        LiteralTag::Double => {
-            // SAFETY: `v.tag == DOUBLE` selects `f64_val` initialized by the bridge.
-            LiteralValue::Double(unsafe { v.data.f64_val })
-        }
-        LiteralTag::String => {
-            // SAFETY: `v.tag == STRING` selects `u32_val` initialized by the bridge.
-            let off = unsafe { v.data.u32_val };
-            match intern_literal_string(ctx, off) {
-                Ok(sid) => LiteralValue::String(sid),
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
+    let mut i = 0usize;
+    while i < count {
+        let raw_tag = read_u8(&mut sp).ok_or(LiteralWalkError::Structural)?;
+        let tag =
+            LiteralTag::try_from(raw_tag).map_err(|_| LiteralWalkError::UnknownTag(raw_tag))?;
+
+        if let Some(elem_size) = typed_array_elem_size(tag) {
+            if i != 0 {
+                return Err(LiteralWalkError::Structural);
             }
-        }
-        LiteralTag::EtsImplements => {
-            // SAFETY: `v.tag == ETS_IMPLEMENTS` selects `u32_val` initialized by the bridge.
-            let off = unsafe { v.data.u32_val };
-            match intern_literal_string(ctx, off) {
-                Ok(sid) => LiteralValue::EtsImplements(sid),
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            }
-        }
-        LiteralTag::Method => {
-            // SAFETY: `v.tag == METHOD` selects `u32_val` (raw method offset, rewritten by decode).
-            LiteralValue::Method(crate::MethodIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::GeneratorMethod => {
-            // SAFETY: `v.tag == GENERATORMETHOD` selects `u32_val` (raw method offset, rewritten by decode).
-            LiteralValue::GeneratorMethod(crate::MethodIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::AsyncGeneratorMethod => {
-            // SAFETY: `v.tag == ASYNCGENERATORMETHOD` selects `u32_val` (raw method offset, rewritten by decode).
-            LiteralValue::AsyncGeneratorMethod(crate::MethodIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::Accessor => {
-            // SAFETY: `v.tag == ACCESSOR` selects `u8_val`.
-            LiteralValue::Accessor(unsafe { v.data.u8_val })
-        }
-        LiteralTag::MethodAffiliate => {
-            // SAFETY: `v.tag == METHODAFFILIATE` selects `u16_val`.
-            LiteralValue::MethodAffiliate(unsafe { v.data.u16_val })
-        }
-        LiteralTag::Getter => {
-            // SAFETY: `v.tag == GETTER` selects `u32_val` (raw method offset, rewritten by decode).
-            LiteralValue::Getter(crate::MethodIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::Setter => {
-            // SAFETY: `v.tag == SETTER` selects `u32_val` (raw method offset, rewritten by decode).
-            LiteralValue::Setter(crate::MethodIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::LiteralArray => {
-            // SAFETY: `v.tag == LITERALARRAY` selects `u32_val`.
-            LiteralValue::LiteralArray(LiteralArrayIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::LiteralBufferIndex => {
-            // SAFETY: `v.tag == LITERALBUFFERINDEX` selects `u32_val`.
-            LiteralValue::LiteralBufferIndex(LiteralArrayIdx(unsafe { v.data.u32_val }))
-        }
-        LiteralTag::BuiltinTypeIndex => {
-            // SAFETY: `v.tag == BUILTINTYPEINDEX` selects `u8_val`.
-            LiteralValue::BuiltinTypeIndex(unsafe { v.data.u8_val })
-        }
-        LiteralTag::NullValue => {
-            // SAFETY: `v.tag == NULLVALUE` selects `u8_val`.
-            LiteralValue::NullValue(unsafe { v.data.u8_val })
-        }
-        LiteralTag::ArrayU1 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayU1(raw.into_iter().map(|x| x != 0).collect())
-        }
-        LiteralTag::ArrayU8 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayU8(raw.into_iter().map(|x| x as u8).collect())
-        }
-        LiteralTag::ArrayI8 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 1) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayI8(raw.into_iter().map(|x| x as i8).collect())
-        }
-        LiteralTag::ArrayU16 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 2) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayU16(raw.into_iter().map(|x| x as u16).collect())
-        }
-        LiteralTag::ArrayI16 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 2) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayI16(raw.into_iter().map(|x| x as i16).collect())
-        }
-        LiteralTag::ArrayU32 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayU32(raw.into_iter().map(|x| x as u32).collect())
-        }
-        LiteralTag::ArrayI32 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayI32(raw.into_iter().map(|x| x as i32).collect())
-        }
-        LiteralTag::ArrayU64 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayU64(raw)
-        }
-        LiteralTag::ArrayI64 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayI64(raw.into_iter().map(|x| x as i64).collect())
-        }
-        LiteralTag::ArrayF32 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayF32(raw.into_iter().map(|x| f32::from_bits(x as u32)).collect())
-        }
-        LiteralTag::ArrayF64 => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 8) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            LiteralValue::ArrayF64(raw.into_iter().map(f64::from_bits).collect())
-        }
-        LiteralTag::ArrayString => {
-            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
-            let raw = match read_typed_literal_array_raw(ctx.file, unsafe { v.data.u32_val }, 4) {
-                Ok(r) => r,
-                Err(err) => {
-                    ctx.error = Some(err);
-                    return;
-                }
-            };
-            let mut out = Vec::with_capacity(raw.len());
-            for x in raw {
-                match intern_literal_string(ctx, x as u32) {
-                    Ok(sid) => out.push(sid),
-                    Err(err) => {
-                        ctx.error = Some(err);
-                        return;
+            let arr_len = read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)? as usize;
+            let byte_len = arr_len
+                .checked_mul(elem_size)
+                .ok_or(LiteralWalkError::Structural)?;
+            let payload = sp.get(..byte_len).ok_or(LiteralWalkError::Structural)?;
+            if tag == LiteralTag::ArrayString {
+                // Validate every string offset is inside `header_size + 1 .. file_size`.
+                let mut check_sp = payload;
+                for _ in 0..arr_len {
+                    let str_off = read_u32_le(&mut check_sp).ok_or(LiteralWalkError::Structural)?;
+                    if reader.get_span(str_off).is_none() {
+                        return Err(LiteralWalkError::Structural);
                     }
                 }
             }
-            LiteralValue::ArrayString(out)
+            let _ = on_elem(RawLiteralElem::TypedArray {
+                tag,
+                elem_count: arr_len,
+                payload,
+            });
+            return Ok(());
         }
-        // TagValue (= INTEGER_8): a legal one-byte integer literal in
-        // real 12.x files (audit finding #A1).
-        LiteralTag::TagValue => {
-            // SAFETY: `v.tag == TAGVALUE` selects `u8_val`.
-            LiteralValue::Integer8(unsafe { v.data.u8_val })
+
+        // Every scalar literal pair consumes `(tag, value)` -> 2 count slots.
+        if i + 1 >= count {
+            return Err(LiteralWalkError::Structural);
         }
-    };
-    ctx.values.push(lit);
+
+        let elem = match tag {
+            LiteralTag::TagValue => {
+                RawLiteralElem::TagValue(read_u8(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::Bool => {
+                RawLiteralElem::Bool(read_u8(&mut sp).ok_or(LiteralWalkError::Structural)? != 0)
+            }
+            LiteralTag::Accessor => {
+                RawLiteralElem::Accessor(read_u8(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::BuiltinTypeIndex => RawLiteralElem::BuiltinTypeIndex(
+                read_u8(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::NullValue => {
+                RawLiteralElem::NullValue(read_u8(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::MethodAffiliate => RawLiteralElem::MethodAffiliate(
+                read_u16_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::Integer => {
+                RawLiteralElem::Integer(read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::LiteralBufferIndex => RawLiteralElem::LiteralBufferIndex(
+                read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::LiteralArray => RawLiteralElem::LiteralArray(
+                read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::Float => RawLiteralElem::Float(f32::from_bits(
+                read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            )),
+            LiteralTag::Double => RawLiteralElem::Double(f64::from_bits(
+                read_u64_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            )),
+            LiteralTag::String => {
+                let off = read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?;
+                if reader.get_span(off).is_none() {
+                    return Err(LiteralWalkError::Structural);
+                }
+                RawLiteralElem::String(off)
+            }
+            LiteralTag::EtsImplements => {
+                let off = read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?;
+                if reader.get_span(off).is_none() {
+                    return Err(LiteralWalkError::Structural);
+                }
+                RawLiteralElem::EtsImplements(off)
+            }
+            LiteralTag::Method => {
+                RawLiteralElem::Method(read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::GeneratorMethod => RawLiteralElem::GeneratorMethod(
+                read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::AsyncGeneratorMethod => RawLiteralElem::AsyncGeneratorMethod(
+                read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?,
+            ),
+            LiteralTag::Getter => {
+                RawLiteralElem::Getter(read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            LiteralTag::Setter => {
+                RawLiteralElem::Setter(read_u32_le(&mut sp).ok_or(LiteralWalkError::Structural)?)
+            }
+            _ => unreachable!("typed array tags returned above"),
+        };
+
+        // Note: like `collect_literal_val_cb`, even if `on_elem` records a semantic
+        // string error, finish validating structural bounds across the rest of the array!
+        let _ = on_elem(elem);
+        i += 2;
+    }
+
+    Ok(())
+}
+
+/// Decode a single `LiteralArray` at `array_off` into `Vec<LiteralValue>`
+/// (carrying raw source offsets in `MethodIdx` / `LiteralArrayIdx` until the
+/// file-level post-pass rewrites them to dense table indices).
+pub(crate) fn decode_literal_array_values(
+    reader: &AbcReader<'_>,
+    array_off: u32,
+    strings: &mut crate::StringPool,
+    str_cache: &mut StringItemCache,
+) -> Result<Vec<LiteralValue>, Error> {
+    let mut values = Vec::new();
+    let mut first_err: Option<Error> = None;
+
+    let walk_res = walk_raw_literal_array(reader, array_off, |elem| {
+        if first_err.is_some() {
+            return Ok(());
+        }
+        let val = match elem {
+            RawLiteralElem::TagValue(v) => LiteralValue::Integer8(v),
+            RawLiteralElem::Bool(v) => LiteralValue::Bool(v),
+            RawLiteralElem::Integer(v) => LiteralValue::Integer(v),
+            RawLiteralElem::Float(v) => LiteralValue::Float(v),
+            RawLiteralElem::Double(v) => LiteralValue::Double(v),
+            RawLiteralElem::String(off) => match str_cache.intern_lossy(reader, off, strings) {
+                Some(sid) => LiteralValue::String(sid),
+                None => {
+                    let e = Error::InvalidString(off);
+                    first_err = Some(e.clone());
+                    return Err(e);
+                }
+            },
+            RawLiteralElem::EtsImplements(off) => {
+                match str_cache.intern_lossy(reader, off, strings) {
+                    Some(sid) => LiteralValue::EtsImplements(sid),
+                    None => {
+                        let e = Error::InvalidString(off);
+                        first_err = Some(e.clone());
+                        return Err(e);
+                    }
+                }
+            }
+            RawLiteralElem::Method(off) => LiteralValue::Method(crate::MethodIdx(off)),
+            RawLiteralElem::GeneratorMethod(off) => {
+                LiteralValue::GeneratorMethod(crate::MethodIdx(off))
+            }
+            RawLiteralElem::AsyncGeneratorMethod(off) => {
+                LiteralValue::AsyncGeneratorMethod(crate::MethodIdx(off))
+            }
+            RawLiteralElem::Getter(off) => LiteralValue::Getter(crate::MethodIdx(off)),
+            RawLiteralElem::Setter(off) => LiteralValue::Setter(crate::MethodIdx(off)),
+            RawLiteralElem::Accessor(v) => LiteralValue::Accessor(v),
+            RawLiteralElem::MethodAffiliate(v) => LiteralValue::MethodAffiliate(v),
+            RawLiteralElem::LiteralArray(off) => LiteralValue::LiteralArray(LiteralArrayIdx(off)),
+            RawLiteralElem::LiteralBufferIndex(idx) => {
+                LiteralValue::LiteralBufferIndex(LiteralArrayIdx(idx))
+            }
+            RawLiteralElem::BuiltinTypeIndex(v) => LiteralValue::BuiltinTypeIndex(v),
+            RawLiteralElem::NullValue(v) => LiteralValue::NullValue(v),
+            RawLiteralElem::TypedArray {
+                tag,
+                elem_count,
+                mut payload,
+            } => match tag {
+                LiteralTag::ArrayU1 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for &b in payload {
+                        out.push(b != 0);
+                    }
+                    LiteralValue::ArrayU1(out)
+                }
+                LiteralTag::ArrayU8 => LiteralValue::ArrayU8(payload.to_vec()),
+                LiteralTag::ArrayI8 => {
+                    LiteralValue::ArrayI8(payload.iter().map(|&b| b as i8).collect())
+                }
+                LiteralTag::ArrayU16 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u16_le(&mut payload).unwrap_or(0));
+                    }
+                    LiteralValue::ArrayU16(out)
+                }
+                LiteralTag::ArrayI16 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u16_le(&mut payload).unwrap_or(0) as i16);
+                    }
+                    LiteralValue::ArrayI16(out)
+                }
+                LiteralTag::ArrayU32 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u32_le(&mut payload).unwrap_or(0));
+                    }
+                    LiteralValue::ArrayU32(out)
+                }
+                LiteralTag::ArrayI32 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u32_le(&mut payload).unwrap_or(0) as i32);
+                    }
+                    LiteralValue::ArrayI32(out)
+                }
+                LiteralTag::ArrayU64 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u64_le(&mut payload).unwrap_or(0));
+                    }
+                    LiteralValue::ArrayU64(out)
+                }
+                LiteralTag::ArrayI64 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(read_u64_le(&mut payload).unwrap_or(0) as i64);
+                    }
+                    LiteralValue::ArrayI64(out)
+                }
+                LiteralTag::ArrayF32 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(f32::from_bits(read_u32_le(&mut payload).unwrap_or(0)));
+                    }
+                    LiteralValue::ArrayF32(out)
+                }
+                LiteralTag::ArrayF64 => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        out.push(f64::from_bits(read_u64_le(&mut payload).unwrap_or(0)));
+                    }
+                    LiteralValue::ArrayF64(out)
+                }
+                LiteralTag::ArrayString => {
+                    let mut out = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        let off = read_u32_le(&mut payload).unwrap_or(0);
+                        match str_cache.intern_lossy(reader, off, strings) {
+                            Some(sid) => out.push(sid),
+                            None => {
+                                let e = Error::InvalidString(off);
+                                first_err = Some(e.clone());
+                                return Err(e);
+                            }
+                        }
+                    }
+                    LiteralValue::ArrayString(out)
+                }
+                _ => unreachable!("non-array tag on TypedArray"),
+            },
+        };
+        values.push(val);
+        Ok(())
+    });
+
+    match walk_res {
+        Ok(()) => match first_err {
+            Some(e) => Err(e),
+            None => Ok(values),
+        },
+        Err(LiteralWalkError::UnknownTag(tag)) => match first_err {
+            Some(e) => Err(e),
+            None => Err(Error::UnknownLiteralTag(tag)),
+        },
+        Err(LiteralWalkError::Structural) => Err(Error::InvalidOffset(array_off)),
+    }
 }
 
 #[cfg(test)]
@@ -551,38 +571,5 @@ mod tests {
             err.to_string().contains("unknown literal tag 238"),
             "Display must name the tag: {err}"
         );
-    }
-
-    /// The collector callback records `UnknownLiteralTag` and skips pushing
-    /// when driven with an unknown tag byte.
-    #[test]
-    fn collector_skips_unparsable_tag() {
-        let mut strings = crate::StringPool::default();
-        let mut ctx = LiteralCollectCtx {
-            file: std::ptr::null(),
-            strings: &mut strings,
-            str_cache: None,
-            values: Vec::new(),
-            error: None,
-        };
-        let val = sys::AbcLiteralVal {
-            tag: 0xEE,
-            // SAFETY: `AbcLiteralVal_data` is a POD union of integer/float primitives;
-            // all-zero bytes are valid for every variant, and `collect_literal_val_cb`
-            // returns on the unknown tag before reading `data`.
-            data: unsafe { std::mem::zeroed() },
-            str_data: std::ptr::null(),
-            str_utf16_len: 0,
-        };
-        // SAFETY: `ctx` and `val` outlive the synchronous callback; `ctx.file`
-        // is never dereferenced on the unknown-tag path.
-        unsafe {
-            collect_literal_val_cb(&val, (&raw mut ctx).cast::<c_void>());
-        }
-        assert!(
-            ctx.values.is_empty(),
-            "an unparsable tag must be skipped, not pushed"
-        );
-        assert!(matches!(ctx.error, Some(Error::UnknownLiteralTag(0xEE))));
     }
 }

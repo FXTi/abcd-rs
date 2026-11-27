@@ -194,14 +194,21 @@ impl EntryData<'_> {
         }
     }
 
+    /// Consume into a reference-counted `Arc<[u8]>` in `O(1)` (zero copy) when
+    /// already [`EntryData::Owned`], or copy once when [`EntryData::Borrowed`].
+    #[must_use]
+    pub fn into_arc(self) -> Arc<[u8]> {
+        match self {
+            EntryData::Borrowed(s) => Arc::from(s),
+            EntryData::Owned(a) => a,
+        }
+    }
+
     /// Lift into an `'static` owned payload in `O(1)` when already [`EntryData::Owned`]
     /// (used for nested containers whose backing bytes do not outlive the
     /// caller's archive).
     pub(crate) fn into_static(self) -> EntryData<'static> {
-        match self {
-            EntryData::Borrowed(s) => EntryData::Owned(Arc::from(s)),
-            EntryData::Owned(a) => EntryData::Owned(a),
-        }
+        EntryData::Owned(self.into_arc())
     }
 }
 
@@ -639,12 +646,30 @@ impl<'a> ZipArchive<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32_ieee;
+    use std::sync::Arc;
+
+    use super::{EntryData, crc32_ieee};
 
     #[test]
     fn crc32_ieee_matches_standard_vectors() {
         assert_eq!(crc32_ieee(b""), 0x0000_0000);
         assert_eq!(crc32_ieee(b"a"), 0xE8B7_BE43);
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn entry_data_into_arc_zero_copy_for_owned_and_copies_borrowed() {
+        let owned_buf: Arc<[u8]> = Arc::from(&b"deflated abc payload"[..]);
+        let ptr_before = owned_buf.as_ptr();
+        let arc = EntryData::Owned(owned_buf).into_arc();
+        assert!(std::ptr::eq(ptr_before, arc.as_ptr()));
+        assert_eq!(Arc::strong_count(&arc), 1);
+        assert_eq!(arc.as_ref(), b"deflated abc payload");
+
+        let slice = &b"stored abc payload"[..];
+        let borrowed_arc = EntryData::Borrowed(slice).into_arc();
+        assert!(!std::ptr::eq(slice.as_ptr(), borrowed_arc.as_ptr()));
+        assert_eq!(Arc::strong_count(&borrowed_arc), 1);
+        assert_eq!(borrowed_arc.as_ref(), slice);
     }
 }

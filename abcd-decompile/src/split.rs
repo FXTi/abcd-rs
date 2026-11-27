@@ -19,11 +19,11 @@ use rayon::prelude::*;
 
 use crate::consts::{render_pool_string, render_sym_string, sym_str};
 use crate::emit::{
-    DecompileStats, EmitOptions, Emitter, MAX_BATCH_PREPARED_FUNCS, PreparedFunc,
+    BatchLimits, DecompileStats, EmitOptions, Emitter, ORPHAN_SCAN_BATCH, PreparedFunc,
     accumulate_decompile_stats, collect_orphans_for_funcs, consumed_functions, emit_esm_imports,
     func_may_have_orphan_lexenv, index_has_fallback_module_slot, module_facing_name,
-    next_bounded_top_batch, orphan_lexenv_names_in_func, prepare_func, prepare_func_only,
-    try_extend_batch_funcs,
+    next_bounded_top_batch, orphan_lexenv_names_in_func, precompute_func_inst_weights,
+    prepare_func, prepare_func_only, try_extend_batch_funcs,
 };
 use crate::legalize::{Legalizer, sanitize};
 use crate::names::{DecompileIndex, module_slot_fallback};
@@ -237,11 +237,35 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
     SplitDecompiledModule { files, stats }
 }
 
+/// Test-only helper exposing [`decompile_module_split`] with custom [`BatchLimits`].
+#[cfg(test)]
+pub(crate) fn split_with_limits(
+    module: &Module,
+    opts: &EmitOptions,
+    limits: BatchLimits,
+) -> SplitDecompiledModule {
+    let mut files = Vec::new();
+    let stats = match decompile_module_split_each_with_limits(
+        module,
+        opts,
+        limits,
+        |sf| -> Result<(), Infallible> {
+            files.push(sf);
+            Ok(())
+        },
+    ) {
+        Ok(stats) => stats,
+        Err(never) => match never {},
+    };
+    SplitDecompiledModule { files, stats }
+}
+
 /// Partition and stream each emitted [`SplitFile`] of `module` in deterministic
 /// class-table order to `on_file` without buffering all function ASTs or all
 /// [`SplitFile`] payloads in memory.
 ///
-/// Records are prepared in adaptive parallel batches capped at `512` total
+/// Records are prepared in adaptive parallel batches capped at `65,536`
+/// deduplicated transitive instructions (`MAX_BATCH_PREPARED_INSTS`) and `512`
 /// transitive functions (`MAX_BATCH_PREPARED_FUNCS`), delivered one-by-one to
 /// `on_file` in exact `planned` order, and their ASTs are dropped before
 /// starting the next batch. Behavior, file contents, and [`DecompileStats`] are
@@ -249,6 +273,18 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
 pub fn decompile_module_split_each<F, E>(
     module: &Module,
     opts: &EmitOptions,
+    on_file: F,
+) -> Result<DecompileStats, E>
+where
+    F: FnMut(SplitFile) -> Result<(), E>,
+{
+    decompile_module_split_each_with_limits(module, opts, BatchLimits::default(), on_file)
+}
+
+pub(crate) fn decompile_module_split_each_with_limits<F, E>(
+    module: &Module,
+    opts: &EmitOptions,
+    limits: BatchLimits,
     mut on_file: F,
 ) -> Result<DecompileStats, E>
 where
@@ -263,6 +299,7 @@ where
     };
 
     let consumed = consumed_functions(module);
+    let inst_weights = precompute_func_inst_weights(module);
     let index = DecompileIndex::build_split(module);
     let has_fallback_slot = index_has_fallback_module_slot(&index);
 
@@ -338,15 +375,17 @@ where
         }
     }
 
+    let max_records_per_batch = limits.max_funcs.max(1);
     let mut total_stats = DecompileStats::default();
     let mut batch_start = 0usize;
 
     while batch_start < planned.len() {
         let mut visited_fids: BTreeSet<FuncId> = BTreeSet::new();
+        let mut batch_inst_weight = 0usize;
         let mut single_oversized = false;
         let mut batch_end = batch_start;
 
-        while batch_end < planned.len() && batch_end - batch_start < MAX_BATCH_PREPARED_FUNCS {
+        while batch_end < planned.len() && batch_end - batch_start < max_records_per_batch {
             let plan = &planned[batch_end];
             if plan.kind == SplitFileKind::Json {
                 batch_end += 1;
@@ -354,36 +393,44 @@ where
             }
             let tfs = class_funcs.get(&plan.cid).map(Vec::as_slice).unwrap_or(&[]);
             if batch_end == batch_start {
-                if tfs.len() > 1
-                    && !try_extend_batch_funcs(
+                if tfs.len() <= 1 {
+                    let _ = try_extend_batch_funcs(
                         module,
+                        &inst_weights,
                         tfs,
                         &mut visited_fids,
-                        Some(MAX_BATCH_PREPARED_FUNCS),
-                    )
-                {
+                        &mut batch_inst_weight,
+                        None,
+                    );
+                } else if !try_extend_batch_funcs(
+                    module,
+                    &inst_weights,
+                    tfs,
+                    &mut visited_fids,
+                    &mut batch_inst_weight,
+                    Some(limits),
+                ) {
                     single_oversized = true;
                     batch_end = batch_start + 1;
                     break;
                 }
-                if !single_oversized && tfs.len() <= 1 {
-                    let _ = try_extend_batch_funcs(module, tfs, &mut visited_fids, None);
-                }
                 batch_end = batch_start + 1;
-                if visited_fids.len() >= MAX_BATCH_PREPARED_FUNCS {
+                if visited_fids.len() >= limits.max_funcs || batch_inst_weight >= limits.max_insts {
                     break;
                 }
             } else {
                 if !try_extend_batch_funcs(
                     module,
+                    &inst_weights,
                     tfs,
                     &mut visited_fids,
-                    Some(MAX_BATCH_PREPARED_FUNCS),
+                    &mut batch_inst_weight,
+                    Some(limits),
                 ) {
                     break;
                 }
                 batch_end += 1;
-                if visited_fids.len() >= MAX_BATCH_PREPARED_FUNCS {
+                if visited_fids.len() >= limits.max_funcs || batch_inst_weight >= limits.max_insts {
                     break;
                 }
             }
@@ -455,10 +502,10 @@ where
                 }
             }
 
-            if !extra_orphan_fids.is_empty() {
-                let extra: Vec<(ClassId, BTreeSet<String>)> = extra_orphan_fids
-                    .into_par_iter()
-                    .filter_map(|fid| {
+            for chunk in extra_orphan_fids.chunks(ORPHAN_SCAN_BATCH) {
+                let extra: Vec<(ClassId, BTreeSet<String>)> = chunk
+                    .par_iter()
+                    .filter_map(|&fid| {
                         let cid = module.func(fid)?.class_id;
                         let rf = recover_func_with_index(module, fid, &index);
                         let orphans = orphan_lexenv_names_in_func(&rf);
@@ -533,6 +580,8 @@ where
                 top_funcs,
                 orphans,
                 &consumed,
+                &inst_weights,
+                limits,
                 single_oversized,
                 &planned,
                 &spec_to_idx,
@@ -634,7 +683,7 @@ struct PlannedRecord {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "per-record split emitter threads record metadata, ESM tables, function slices, and specifier maps"
+    reason = "per-record split emitter threads record metadata, ESM tables, function slices, batch limits, and specifier maps"
 )]
 fn emit_single_record(
     em: &mut Emitter<'_>,
@@ -645,6 +694,8 @@ fn emit_single_record(
     top_funcs: &[FuncId],
     orphan_names: BTreeSet<String>,
     consumed: &BTreeSet<FuncId>,
+    inst_weights: &[u32],
+    limits: BatchLimits,
     chunk_top_funcs: bool,
     planned: &[PlannedRecord],
     spec_to_idx: &HashMap<String, usize>,
@@ -754,6 +805,9 @@ fn emit_single_record(
                 arkui_structs.extend(crate::arkui::arkui_main_struct_names(&pre));
             }
         }
+        if chunk_top_funcs {
+            em.prepared.clear();
+        }
     }
     for sname in &arkui_structs {
         em.fn_names.reserve(sname);
@@ -812,7 +866,7 @@ fn emit_single_record(
         let mut cursor = 0usize;
         while cursor < top_funcs.len() {
             let (take, batch_fids) =
-                next_bounded_top_batch(module, &top_funcs[cursor..], MAX_BATCH_PREPARED_FUNCS);
+                next_bounded_top_batch(module, inst_weights, &top_funcs[cursor..], limits);
             let chunk = &top_funcs[cursor..cursor + take];
             cursor += take;
             let prepared_batch: Vec<(FuncId, PreparedFunc)> = batch_fids
@@ -835,11 +889,15 @@ fn emit_single_record(
                         .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
                     && crate::arkui::try_emit_arkui_main(em, f, &mut out)
                 {
+                    em.arkui_components.clear();
                     continue;
                 }
                 let emitted = em.emit_top_level_function(f, &mut out);
                 if opts.call_entry && emitted.1 == "func_main_0" {
                     entry_call = Some(emitted.0);
+                }
+                if opts.arkui {
+                    em.arkui_components.clear();
                 }
             }
             em.prepared.clear();
@@ -857,11 +915,15 @@ fn emit_single_record(
                     .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
                 && crate::arkui::try_emit_arkui_main(em, f, &mut out)
             {
+                em.arkui_components.clear();
                 continue;
             }
             let emitted = em.emit_top_level_function(f, &mut out);
             if opts.call_entry && emitted.1 == "func_main_0" {
                 entry_call = Some(emitted.0);
+            }
+            if opts.arkui {
+                em.arkui_components.clear();
             }
         }
     }
@@ -1011,4 +1073,346 @@ fn relative_posix_path(from_file: &str, to_target: &str) -> String {
         out.push(seg.to_string());
     }
     out.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abcd_ir::ValueDef;
+    use abcd_ir::function::{Block, FunctionData, Inst, Value};
+    use abcd_ir::id::{BlockId, ValueId};
+    use abcd_ir::module::{Dialect, FieldData, ImportDecl, Modifiers, ModuleRequest, SourceLang};
+    use abcd_ir::op::{BinOp, LexEnvKind};
+    use abcd_ir::ty::Ty;
+
+    fn add_cls(m: &mut Module, desc: &str) -> ClassId {
+        let cid = ClassId::new(m.classes.len() as u32);
+        let sym = m.sym.intern(desc);
+        m.classes.push(ClassData::new(sym, sym));
+        cid
+    }
+
+    fn add_fn_to_cls(m: &mut Module, cid: ClassId, name: &str, kind: FunctionKind) -> FuncId {
+        let sym = m.sym.intern(name);
+        let fid = FuncId::new(m.functions.len() as u32);
+        let mut fd = FunctionData::new(cid, sym, kind);
+        fd.modifiers |= Modifiers::STATIC;
+        m.functions.push(fd);
+        m.classes[cid.index()].methods.push(fid);
+        let bid = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(fid).unwrap().blocks.push(bid);
+        for _ in 0..3 {
+            add_param(m, fid);
+        }
+        fid
+    }
+
+    fn add_param(m: &mut Module, fid: FuncId) -> ValueId {
+        let idx = m.func(fid).unwrap().params.len() as u16;
+        let vid = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(idx),
+            ty: Ty::Any,
+        });
+        m.func_mut(fid).unwrap().params.push(vid);
+        vid
+    }
+
+    fn entry_of(m: &Module, fid: FuncId) -> BlockId {
+        m.func(fid).unwrap().blocks[0]
+    }
+
+    fn emit_val(m: &mut Module, b: BlockId, op: Op) -> ValueId {
+        let iid = abcd_ir::InstId::new(m.insts.len() as u32);
+        let vid = ValueId::new(m.values.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: Some(vid),
+            block: b,
+            loc: None,
+        });
+        m.values.push(Value {
+            def: ValueDef::Inst(iid),
+            ty: Ty::Any,
+        });
+        m.block_mut(b).unwrap().insts.push(iid);
+        vid
+    }
+
+    fn emit_void(m: &mut Module, b: BlockId, op: Op) {
+        let iid = abcd_ir::InstId::new(m.insts.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: None,
+            block: b,
+            loc: None,
+        });
+        m.block_mut(b).unwrap().insts.push(iid);
+    }
+
+    #[test]
+    fn split_with_limits_matches_byte_for_byte_across_budgets_and_oversized_records() {
+        let mut m = Module::with_dialect(Dialect::DynamicEcma);
+        let _synth = add_cls(&mut m, "L_ESModuleRecord;");
+
+        // Shared inline closure referenced across multiple records and functions.
+        let cid_shared_owner = add_cls(&mut m, "Lcom.demo/app/ets/util/Shared;");
+        let s_shared = m.sym.intern("sharedAdd");
+        m.classes[cid_shared_owner.index()].es_module = Some(EsModule {
+            module_requests: vec![],
+            imports: vec![],
+            exports: vec![ExportDecl::Local {
+                local_name: s_shared,
+                export_name: s_shared,
+            }],
+        });
+        let f_shared_cb = add_fn_to_cls(
+            &mut m,
+            cid_shared_owner,
+            "sharedAdd",
+            FunctionKind::Function,
+        );
+        {
+            let x = add_param(&mut m, f_shared_cb);
+            let b = entry_of(&m, f_shared_cb);
+            let lex = emit_val(
+                &mut m,
+                b,
+                Op::GetLexVar {
+                    level: 2,
+                    slot: 1,
+                    kind: LexEnvKind::Plain,
+                },
+            );
+            let sum = emit_val(
+                &mut m,
+                b,
+                Op::BinaryOp {
+                    op: BinOp::Add,
+                    left: x,
+                    right: lex,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: Some(sum) });
+        }
+        let f_shared_main = add_fn_to_cls(
+            &mut m,
+            cid_shared_owner,
+            "func_main_0",
+            FunctionKind::Function,
+        );
+        {
+            let b = entry_of(&m, f_shared_main);
+            let df = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: f_shared_cb,
+                    captures: vec![],
+                    length: 1,
+                },
+            );
+            let cl = emit_val(&mut m, b, Op::AllocClosure { func: df });
+            emit_void(
+                &mut m,
+                b,
+                Op::StoreModuleVar {
+                    index: 0,
+                    value: cl,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+
+        // JSON asset record.
+        let cid_json = add_cls(&mut m, "Lcom.demo/app/ets/config;");
+        {
+            let jf_name = m.sym.intern("jsonFileContent");
+            let jf_val = m.sym.intern("{\"env\":\"prod\"}");
+            let jf_cid = m.consts.push(Const::String(jf_val));
+            m.classes[cid_json.index()].fields.push(FieldData {
+                name: jf_name,
+                ty: Ty::Any,
+                modifiers: Modifiers::NONE,
+                initial_value: Some(jf_cid),
+                annotations: Vec::new(),
+            });
+        }
+
+        // Record with multiple top-level functions whose combined instruction weight (> 100)
+        // exceeds `max_insts = 32` (exercises `single_oversized = true` + `chunk_top_funcs`).
+        let cid_heavy_record = add_cls(&mut m, "Lcom.demo/app/ets/service/HeavyRecord;");
+        m.classes[cid_heavy_record.index()].source_lang = SourceLang::ArkTS;
+        for m_idx in 0..8 {
+            let fn_name = if m_idx == 7 {
+                "func_main_0".to_string()
+            } else {
+                format!("service_op_{m_idx}")
+            };
+            let fid = add_fn_to_cls(&mut m, cid_heavy_record, &fn_name, FunctionKind::Function);
+            let mut acc = add_param(&mut m, fid);
+            let b = entry_of(&m, fid);
+            for step in 0..8 {
+                let c = m.consts.push(Const::number((m_idx * 10 + step) as f64));
+                let v = emit_val(&mut m, b, Op::LoadConst(c));
+                acc = emit_val(
+                    &mut m,
+                    b,
+                    Op::BinaryOp {
+                        op: BinOp::Add,
+                        left: acc,
+                        right: v,
+                    },
+                );
+            }
+            if m_idx % 3 == 0 {
+                let df = emit_val(
+                    &mut m,
+                    b,
+                    Op::DefineFunc {
+                        body: f_shared_cb,
+                        captures: vec![],
+                        length: 1,
+                    },
+                );
+                let cl = emit_val(&mut m, b, Op::AllocClosure { func: df });
+                acc = emit_val(
+                    &mut m,
+                    b,
+                    Op::BinaryOp {
+                        op: BinOp::Add,
+                        left: acc,
+                        right: cl,
+                    },
+                );
+            }
+            emit_void(&mut m, b, Op::Return { value: Some(acc) });
+        }
+
+        // Record with an oversized SINGLE top-level function (> 80 instructions) + cross-record
+        // OHMUrl & JSON imports.
+        let cid_giant_fn = add_cls(&mut m, "Lcom.demo/app/ets/Entry;");
+        let req_shared = m.sym.intern("@bundle:com.demo/app/ets/util/Shared");
+        let req_cfg = m.sym.intern("./config");
+        let s_cfg = m.sym.intern("cfg");
+        let s_def = m.sym.intern("default");
+        let s_out = m.sym.intern("boot");
+        m.classes[cid_giant_fn.index()].es_module = Some(EsModule {
+            module_requests: vec![
+                ModuleRequest {
+                    specifier: req_shared,
+                    lazy: false,
+                },
+                ModuleRequest {
+                    specifier: req_cfg,
+                    lazy: false,
+                },
+            ],
+            imports: vec![
+                ImportDecl::Regular {
+                    local_name: s_shared,
+                    import_name: s_shared,
+                    module_request: req_shared,
+                },
+                ImportDecl::Regular {
+                    local_name: s_cfg,
+                    import_name: s_def,
+                    module_request: req_cfg,
+                },
+            ],
+            exports: vec![ExportDecl::Local {
+                local_name: s_out,
+                export_name: s_out,
+            }],
+        });
+        let f_entry = add_fn_to_cls(&mut m, cid_giant_fn, "func_main_0", FunctionKind::Function);
+        {
+            let b = entry_of(&m, f_entry);
+            let mut acc = emit_val(
+                &mut m,
+                b,
+                Op::LoadModuleVar {
+                    index: 0,
+                    kind: ModuleVarKind::External,
+                },
+            );
+            let cfg_v = emit_val(
+                &mut m,
+                b,
+                Op::LoadModuleVar {
+                    index: 1,
+                    kind: ModuleVarKind::External,
+                },
+            );
+            acc = emit_val(
+                &mut m,
+                b,
+                Op::BinaryOp {
+                    op: BinOp::Add,
+                    left: acc,
+                    right: cfg_v,
+                },
+            );
+            for k in 0..40 {
+                let c = m.consts.push(Const::number(k as f64));
+                let v = emit_val(&mut m, b, Op::LoadConst(c));
+                acc = emit_val(
+                    &mut m,
+                    b,
+                    Op::BinaryOp {
+                        op: BinOp::Add,
+                        left: acc,
+                        right: v,
+                    },
+                );
+            }
+            emit_void(
+                &mut m,
+                b,
+                Op::StoreModuleVar {
+                    index: 0,
+                    value: acc,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+
+        let budgets = [
+            BatchLimits {
+                max_insts: 1,
+                max_funcs: 1,
+            },
+            BatchLimits {
+                max_insts: 32,
+                max_funcs: 2,
+            },
+            BatchLimits {
+                max_insts: 48,
+                max_funcs: 3,
+            },
+            BatchLimits::default(),
+        ];
+
+        for opts in [
+            EmitOptions::default(),
+            EmitOptions {
+                ts: true,
+                call_entry: true,
+                ..EmitOptions::default()
+            },
+            EmitOptions {
+                arkui: true,
+                ..EmitOptions::default()
+            },
+        ] {
+            let baseline = decompile_module_split(&m, &opts);
+            assert_eq!(baseline.files.len(), 4);
+            for lim in budgets {
+                let got = split_with_limits(&m, &opts, lim);
+                assert_eq!(got.files, baseline.files, "files mismatch at {lim:?}");
+                assert_eq!(got.stats, baseline.stats, "stats mismatch at {lim:?}");
+            }
+        }
+    }
 }

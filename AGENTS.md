@@ -28,8 +28,12 @@ For binding architectural rules and historical design rulings, read:
 | **CLI & Integration** | `abcd-cli`, root `abcd-rs` (`tests/*`) | Top-level consumers; `abcd-cli` is the **only** crate permitted to set `#[global_allocator]` |
 
 ### Multi-Agent Coordination Rule
-- **Sub-crate threads** own code, unit/integration tests, and `README.md` strictly inside their assigned crate directory (`abcd-<name>/**`). Sub-crate threads must **never** run mutating `git` commands (`commit`, `checkout`, `restore`, `clean`, `push`).
-- **Coordinator thread** exclusively owns root files (`Cargo.toml`, `README.md`, `AGENTS.md`, `design/**`, `tests/**`, `scripts/**`, `.github/**`) and serializes all Git/GitHub operations and CI checks.
+- **Sub-crate threads (`ABCD · abcd-<name>`)** own code, unit/integration tests, and `README.md` strictly inside their assigned crate directory (`abcd-<name>/**`). Sub-crate threads must **never** run mutating `git` commands (`commit`, `checkout`, `restore`, `clean`, `push`).
+- **Coordinator thread (`ABCD 主线程`)** exclusively owns root files (`Cargo.toml`, `README.md`, `AGENTS.md`, `design/**`, `tests/**`, `scripts/**`, `.github/**`) and serializes all Git/GitHub operations and CI checks.
+- **T3 Code Dispatch Protocol**:
+  - **Crate implementation waves**: Always dispatch per-crate tasks to the persistent `ABCD · abcd-<name>` threads via `t3_thread_list` → `t3_thread_send` (pass `freshContext: true` across major milestone boundaries when accumulated thread history is stale/heavy) followed by `t3_thread_wait` + `t3_thread_read`. This preserves a clean 1-thread-per-crate sidebar, live `running` status in T3 Code, and `full-access` command permissions.
+  - **Cross-provider / multi-model blind reviews**: Dispatch read-only review agents via `delegate_task` (`orchestrator_capabilities` → `delegate_task`).
+  - **Ban on provider-internal `invoke_subagent` under T3 Code**: Never spawn ACP `invoke_subagent` workers in T3 Code — `creationSource: "provider"` subagents neither expose a T3 `latestRunId` (rendering as `idle` in the UI) nor inherit T3 `full-access` command permissions.
 
 ---
 
@@ -42,6 +46,9 @@ For binding architectural rules and historical design rulings, read:
    - Never introduce an `Unsupported*` error variant to paper over an unimplemented or buggy internal path unless upstream `arkcompiler_runtime_core` / `ets_runtime` / `es2panda` itself leaves the construct unimplemented or invalid.
    - Library crates (including C++ bridges and `vendor/shim/`) must **never** write to `stdout` or `stderr`.
 4. **Read-Only Vendor Snapshot**: Never hand-edit `vendor/arkcompiler_runtime_core/` or `**/generated/*`. Manage upstream updates and FFI/ISA code generation solely via `python3 scripts/vendor-gen.py {sync|codegen|verify}`.
+5. **Module Cohesion, File Granularity & Test Placement (`design/standards.md` §1.4)**:
+   - Grounded in the `W = 800`-line (`~46 KiB`) single-read window, keep non-exempt `.rs` files within **`~2,400` lines (`3W` target)** and strictly below **`4,000` lines (`5W` refactoring ceiling)** by splitting along cohesive subsystem/pass boundaries (never mechanical `part1.rs` / `part2.rs` slices). Flat exhaustive ~200-opcode `match` tables (`op.rs`, `verify.rs`, `translate.rs`, `isel.rs`) are exempt for production code.
+   - Keep small, foundational unit tests (`≤ ~300–400` lines) inline (`#[cfg(test)] mod tests`) next to the implementation when total file length stays `≤ ~2,400` lines; once tests grow larger or span multiple themes, extract and split them **by topic** (`foo/tests/<topic>.rs` or `tests/integration/<topic>.rs`) rather than growing monolithic `tests.rs` files. When adding a new subsystem to a crate, create a dedicated submodule file instead of appending hundreds of lines to an already large file.
 
 ---
 

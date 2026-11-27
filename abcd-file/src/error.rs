@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 /// Errors from ABC file operations.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {

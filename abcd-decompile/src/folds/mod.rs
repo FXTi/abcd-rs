@@ -116,6 +116,7 @@ use abcd_ir::op::{CmpOp, UnOp};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod control;
+mod for_await;
 mod literals;
 mod loops;
 pub(crate) mod machines;

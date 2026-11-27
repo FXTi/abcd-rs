@@ -17,3 +17,4 @@ mod lift_super_call_kinds;
 mod lift_this_by_unsupported;
 mod lift_try_store_global;
 mod lift_unit;
+mod lift_wave2_options_parallel;

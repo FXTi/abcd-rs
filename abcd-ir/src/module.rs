@@ -160,7 +160,7 @@ pub struct Annotation {
 }
 
 /// A class field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldData {
     /// Field name.
     pub name: Sym,
@@ -175,7 +175,7 @@ pub struct FieldData {
 }
 
 /// Class structure metadata.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassData {
     /// Class descriptor (e.g. `Lfoo/Bar;`) — a name, not a file offset.
     pub descriptor: Sym,

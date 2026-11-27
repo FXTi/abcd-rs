@@ -87,7 +87,7 @@ fn build_input_file() -> (File, SourceEntities) {
         .unwrap();
     let mut string_id = None;
     let mut array_idx = None;
-    for bc in &body.bytecodes {
+    for bc in body.bytecodes().iter() {
         for (kind, id) in bc.entity_operands() {
             match body.entities[&(kind, id.0)] {
                 EntityRef::String { id: sid, .. } => string_id = Some(sid),
@@ -168,7 +168,7 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
     assert_eq!(body.num_vregs, u32::from(result.num_regs));
     assert_eq!(body.num_args, 0);
 
-    for bc in &body.bytecodes {
+    for bc in body.bytecodes().iter() {
         for (kind, id) in bc.entity_operands() {
             match (kind, body.entities[&(kind, id.0)]) {
                 (EntityKind::MethodId, EntityRef::Method(midx)) => {
@@ -198,7 +198,7 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
     let mut saw_method = false;
     let mut saw_string = false;
     let mut saw_array = false;
-    for bc in &out_body.bytecodes {
+    for bc in out_body.bytecodes().iter() {
         for (kind, id) in bc.entity_operands() {
             match (kind, out_body.entities[&(kind, id.0)]) {
                 (EntityKind::MethodId, EntityRef::Method(midx)) => {
@@ -285,7 +285,7 @@ fn string_first_name_collision_relocates_method_operand_to_the_method() {
     let out_body = method_by_name(&output, "caller").body.clone().unwrap();
     let mut saw_method = false;
     let mut saw_string = false;
-    for bc in &out_body.bytecodes {
+    for bc in out_body.bytecodes().iter() {
         for (kind, id) in bc.entity_operands() {
             match (kind, out_body.entities[&(kind, id.0)]) {
                 (EntityKind::MethodId, EntityRef::Method(midx)) => {
@@ -355,8 +355,8 @@ fn same_named_method_references_keep_their_own_offsets() {
     assert_ne!(m1_out, m2_out);
 
     let out_body = method_by_name(&output, "caller").body.clone().unwrap();
-    let method_refs: Vec<MethodIdx> = out_body
-        .bytecodes
+    let out_bcs = out_body.bytecodes();
+    let method_refs: Vec<MethodIdx> = out_bcs
         .iter()
         .flat_map(|bc| bc.entity_operands())
         .filter(|(kind, _)| *kind == EntityKind::MethodId)
@@ -367,7 +367,7 @@ fn same_named_method_references_keep_their_own_offsets() {
         .collect();
     assert_eq!(method_refs, vec![m1_out, m2_out]);
 
-    let saw_string = out_body.bytecodes.iter().any(|bc| {
+    let saw_string = out_bcs.iter().any(|bc| {
         bc.entity_operands().iter().any(|(kind, id)| {
             *kind == EntityKind::StringId
                 && matches!(
@@ -487,13 +487,13 @@ fn copydataproperties_survives_lift_lower_encode_as_the_real_opcode() {
         .expect("copydataproperties has no entity operands and must relocate cleanly");
 
     assert!(
-        body.bytecodes
+        body.bytecodes()
             .iter()
             .any(|bc| matches!(bc, Bytecode::Copydataproperties(_)))
     );
     assert!(
         !body
-            .bytecodes
+            .bytecodes()
             .iter()
             .any(|bc| matches!(bc, Bytecode::Stobjbyname(..)))
     );
@@ -507,13 +507,13 @@ fn copydataproperties_survives_lift_lower_encode_as_the_real_opcode() {
         .as_ref()
         .unwrap()
         .clone();
+    let out_bcs = out_body.bytecodes();
     assert!(
-        out_body
-            .bytecodes
+        out_bcs
             .iter()
             .any(|bc| matches!(bc, Bytecode::Copydataproperties(_)))
     );
-    let saw_payload = out_body.bytecodes.iter().any(|bc| {
+    let saw_payload = out_bcs.iter().any(|bc| {
         bc.entity_operands().iter().any(|(kind, id)| {
             *kind == EntityKind::StringId
                 && matches!(
@@ -551,7 +551,7 @@ fn deprecated_copydataproperties_lifts_and_lowers_to_the_modern_opcode() {
     let result = lower_function(&module, spread_id).expect("lower");
     let body = to_method_body(&module, spread_id, &result, &file).expect("method body");
     assert!(
-        body.bytecodes
+        body.bytecodes()
             .iter()
             .any(|bc| matches!(bc, Bytecode::Copydataproperties(_)))
     );
@@ -563,7 +563,7 @@ fn deprecated_copydataproperties_lifts_and_lowers_to_the_modern_opcode() {
     let out_body = method_by_name(&output, "spread").body.clone().unwrap();
     assert!(
         out_body
-            .bytecodes
+            .bytecodes()
             .iter()
             .any(|bc| matches!(bc, Bytecode::Copydataproperties(_)))
     );
@@ -603,8 +603,8 @@ fn push_array(file: &mut File, values: Vec<LiteralValue>) -> LiteralArrayIdx {
 }
 
 fn resolved_lit_idx(body: &abcd_file::MethodBody) -> LiteralArrayIdx {
-    let (kind, local_id) = body
-        .bytecodes
+    let bcs = body.bytecodes();
+    let (kind, local_id) = bcs
         .iter()
         .flat_map(|bc| bc.entity_operands())
         .find(|(k, _)| *k == EntityKind::LiteralarrayId)
@@ -928,9 +928,9 @@ fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
     let assert_decoded_strings = |decoded: &File, expected: &[&str]| {
         let m = method_by_name(decoded, "high_sym_fn");
         let body = m.body.as_ref().expect("method body");
-        encode_bytecodes(&body.bytecodes).expect("decoded body bytecodes fit u16");
-        let resolved: Vec<&str> = body
-            .bytecodes
+        let bcs = body.bytecodes();
+        encode_bytecodes(&bcs).expect("decoded body bytecodes fit u16");
+        let resolved: Vec<&str> = bcs
             .iter()
             .flat_map(|bc| bc.entity_operands())
             .filter(|(k, _)| *k == EntityKind::StringId)
@@ -952,7 +952,7 @@ fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
     // 1. `to_method_body` path:
     let body = to_method_body(&module, func, &lowered, &base_file)
         .expect("to_method_body must compact Sym >= 65536");
-    encode_bytecodes(&body.bytecodes)
+    encode_bytecodes(&body.bytecodes())
         .expect("to_method_body compacted bytecodes must pass abcd_isa::encode");
     assert_eq!(body.entities.len(), 2);
     let spliced = splice_body(&base_file, fn_idx, &body);
@@ -973,16 +973,22 @@ fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
     }
     assert!(verify_module(&module).is_ok());
 
-    // 2. `rewrite_file` path:
+    // 2. `rewrite_file` / `rewrite_file_owned` path:
     let rewritten = rewrite_file(&module, &base_file, LowerOptions::default())
         .expect("rewrite_file must compact Sym >= 65536");
+    let rewritten_owned =
+        abcd_lower::rewrite_file_owned(&module, base_file.clone(), LowerOptions::default())
+            .expect("rewrite_file_owned must compact Sym >= 65536");
     let rw_body = method_by_name(&rewritten, "high_sym_fn")
         .body
         .as_ref()
         .expect("rewritten body");
-    encode_bytecodes(&rw_body.bytecodes)
+    encode_bytecodes(&rw_body.bytecodes())
         .expect("rewrite_file compacted bytecodes must pass abcd_isa::encode");
     let enc2 = abcd_file::encode(&rewritten).expect("abcd_file::encode after rewrite_file");
+    let enc2_owned =
+        abcd_file::encode(&rewritten_owned).expect("abcd_file::encode after rewrite_file_owned");
+    assert_eq!(enc2, enc2_owned);
     let dec2 = abcd_file::decode(&enc2).expect("decode after rewrite_file");
     assert_decoded_strings(&dec2, &[TARGET_STR, TARGET_PROP, "high_sym_synth_65592"]);
 
@@ -993,7 +999,7 @@ fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
         .body
         .as_ref()
         .expect("standalone body");
-    encode_bytecodes(&st_body.bytecodes)
+    encode_bytecodes(&st_body.bytecodes())
         .expect("lower_module compacted bytecodes must pass abcd_isa::encode");
     let enc3 = abcd_file::encode(&standalone).expect("abcd_file::encode after lower_module");
     let dec3 = abcd_file::decode(&enc3).expect("decode after lower_module");

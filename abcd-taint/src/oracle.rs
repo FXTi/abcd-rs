@@ -26,15 +26,36 @@
 //!   stands); `Some(answer)` on rung 2, consumed by the lexical-slot
 //!   rules in `problem.rs` (b2).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use abcd_analysis::dataflow::alias::Rung1AliasOracle;
 use abcd_analysis::dataflow::heap::{
     self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, Rung0AliasOracle,
     SingletonSiteClassifier, SiteInfo,
 };
 use abcd_analysis::dataflow::pta::{EnvAnswer, Rung2AliasOracle};
-use abcd_ir::{InstId, ValueId};
+use abcd_ir::{InstId, Module, ValueId};
 
 use crate::fact::{TaintBase, TaintFact};
+
+/// Memoized local def-chain resolution cache (`ValueId -> SiteInfo`) shared by
+/// refined oracle arms (`Rung1`, `Rung2`) so fallback floor queries run in `O(1)`
+/// amortized instead of re-walking `Phi`/`Mov` def chains (`#78`, `#84`).
+#[derive(Default)]
+pub struct ResolveMemo(RefCell<HashMap<ValueId, SiteInfo>>);
+
+impl ResolveMemo {
+    #[inline]
+    fn resolve_with(&self, module: &Module, value: ValueId) -> SiteInfo {
+        if let Some(hit) = self.0.borrow().get(&value) {
+            return hit.clone();
+        }
+        let info = heap::resolve_alloc_sites(module, value);
+        self.0.borrow_mut().insert(value, info.clone());
+        info
+    }
+}
 
 /// The oracle the [`crate::problem::TaintProblem`] runs against.
 #[expect(
@@ -44,32 +65,68 @@ use crate::fact::{TaintBase, TaintFact};
 pub enum Oracle<'m> {
     /// Rung 0: local def chains only.
     Rung0(Rung0AliasOracle<'m>),
-    /// Rung 1: the demand-driven engine + rung-0 fallback.
-    Rung1(Rung1AliasOracle<'m>),
-    /// Rung 2: the whole-module PTA + rung-0 fallback.
-    Rung2(Rung2AliasOracle<'m>),
+    /// Rung 1: the demand-driven engine + memoized rung-0 fallback.
+    Rung1(Rung1AliasOracle<'m>, ResolveMemo),
+    /// Rung 2: the whole-module PTA + memoized rung-0 fallback.
+    Rung2(Rung2AliasOracle<'m>, ResolveMemo),
 }
 
 impl<'m> Oracle<'m> {
+    /// Construct a [`Self::Rung1`] oracle with an empty fallback memo.
+    #[must_use]
+    pub fn rung1(engine: Rung1AliasOracle<'m>) -> Self {
+        Self::Rung1(engine, ResolveMemo::default())
+    }
+
+    /// Construct a [`Self::Rung2`] oracle with an empty fallback memo.
+    #[must_use]
+    pub fn rung2(pta: Rung2AliasOracle<'m>) -> Self {
+        Self::Rung2(pta, ResolveMemo::default())
+    }
+
     /// The rung-0 local def-chain resolution (identical on all arms —
-    /// the floor every refined answer is checked against).
+    /// the floor every refined answer is checked against), memoized per `ValueId`.
     pub fn resolve(&self, value: ValueId) -> SiteInfo {
         match self {
             Oracle::Rung0(o) => o.resolve(value),
-            Oracle::Rung1(o) => heap::resolve_alloc_sites(o.module(), value),
-            Oracle::Rung2(o) => heap::resolve_alloc_sites(o.module(), value),
+            Oracle::Rung1(o, memo) => memo.resolve_with(o.module(), value),
+            Oracle::Rung2(o, memo) => memo.resolve_with(o.module(), value),
         }
     }
 
     /// The point-aware resolution: the refined arms answer through
     /// their engines when the answer is complete; rung 0 (and any
-    /// imprecise query) answers with the local def chain, gated by
+    /// imprecise query) answers with the memoized local def chain, gated by
     /// [`SingletonSiteClassifier`] (`D5`).
     pub fn site_info_at(&self, value: ValueId, at: InstId) -> SiteInfo {
         match self {
             Oracle::Rung0(o) => o.site_info_at(value, at),
-            Oracle::Rung1(o) => o.site_info_at(value, at),
-            Oracle::Rung2(o) => o.site_info_at(value, at),
+            Oracle::Rung1(o, memo) => {
+                let ans = o.query(value, at);
+                let raw = if ans.precise_for_keying() {
+                    SiteInfo {
+                        sites: ans.sites,
+                        has_phi: ans.has_phi,
+                        has_unknown: false,
+                    }
+                } else {
+                    memo.resolve_with(o.module(), value)
+                };
+                o.singletons().gate_site_info(raw)
+            }
+            Oracle::Rung2(o, memo) => {
+                let ans = o.query(value, at);
+                let raw = if ans.precise_for_keying() {
+                    SiteInfo {
+                        sites: ans.sites,
+                        has_phi: ans.has_phi,
+                        has_unknown: false,
+                    }
+                } else {
+                    memo.resolve_with(o.module(), value)
+                };
+                o.singletons().gate_site_info(raw)
+            }
         }
     }
 
@@ -78,8 +135,8 @@ impl<'m> Oracle<'m> {
     pub fn singletons(&self) -> &SingletonSiteClassifier {
         match self {
             Oracle::Rung0(o) => o.singletons(),
-            Oracle::Rung1(o) => o.singletons(),
-            Oracle::Rung2(o) => o.singletons(),
+            Oracle::Rung1(o, _) => o.singletons(),
+            Oracle::Rung2(o, _) => o.singletons(),
         }
     }
 
@@ -88,8 +145,8 @@ impl<'m> Oracle<'m> {
     pub fn is_concrete_singleton_site(&self, site: InstId) -> bool {
         match self {
             Oracle::Rung0(o) => o.is_concrete_singleton_site(site),
-            Oracle::Rung1(o) => o.is_concrete_singleton_site(site),
-            Oracle::Rung2(o) => o.is_concrete_singleton_site(site),
+            Oracle::Rung1(o, _) => o.is_concrete_singleton_site(site),
+            Oracle::Rung2(o, _) => o.is_concrete_singleton_site(site),
         }
     }
 
@@ -103,7 +160,7 @@ impl<'m> Oracle<'m> {
     pub fn may_sites_at(&self, value: ValueId, at: InstId) -> AllocSiteSet {
         match self {
             Oracle::Rung0(o) => o.resolve(value).sites,
-            Oracle::Rung1(o) => {
+            Oracle::Rung1(o, _) => {
                 let ans = o.query(value, at);
                 if ans.complete_for_resolution() {
                     ans.sites
@@ -111,7 +168,7 @@ impl<'m> Oracle<'m> {
                     self.resolve(value).sites
                 }
             }
-            Oracle::Rung2(o) => {
+            Oracle::Rung2(o, _) => {
                 let ans = o.query(value, at);
                 if ans.complete_for_resolution() {
                     ans.sites
@@ -129,8 +186,8 @@ impl<'m> Oracle<'m> {
         let mut out = self.resolve(value).sites;
         match self {
             Oracle::Rung0(_) => {}
-            Oracle::Rung1(o) => out.union_with(&o.query(value, at).sites),
-            Oracle::Rung2(o) => out.union_with(&o.query(value, at).sites),
+            Oracle::Rung1(o, _) => out.union_with(&o.query(value, at).sites),
+            Oracle::Rung2(o, _) => out.union_with(&o.query(value, at).sites),
         }
         out
     }
@@ -141,8 +198,34 @@ impl<'m> Oracle<'m> {
     /// stands there.
     pub fn lex_env_at(&self, at: InstId, level: u16) -> Option<EnvAnswer> {
         match self {
-            Oracle::Rung2(o) => Some(o.lex_env_at(at, level)),
+            Oracle::Rung2(o, _) => Some(o.lex_env_at(at, level)),
             _ => None,
+        }
+    }
+
+    /// Whether `site` (`result`) was analyzed inside Rung-2 PTA (`#78`, `#84`).
+    #[must_use]
+    pub fn is_analyzed_alloc_site(&self, site: InstId, result: ValueId) -> bool {
+        match self {
+            Oracle::Rung2(o, _) => !o.query(result, site).sites.is_empty(),
+            Oracle::Rung0(_) | Oracle::Rung1(..) => false,
+        }
+    }
+
+    /// Return the Rung-2 points-to site set of `value` at `at` only when the
+    /// Rung-2 PTA answer is complete and free of unknown aliases (`precise_for_keying`).
+    #[must_use]
+    pub(crate) fn rung2_precise_sites_at(
+        &self,
+        value: ValueId,
+        at: InstId,
+    ) -> Option<AllocSiteSet> {
+        match self {
+            Oracle::Rung2(o, _) => {
+                let ans = o.query(value, at);
+                ans.precise_for_keying().then_some(ans.sites)
+            }
+            Oracle::Rung0(_) | Oracle::Rung1(..) => None,
         }
     }
 
@@ -150,7 +233,7 @@ impl<'m> Oracle<'m> {
     /// may-direction env fallback's fact filter; `false` on rungs 0/1).
     pub fn is_env_site(&self, site: InstId) -> bool {
         match self {
-            Oracle::Rung2(o) => o.is_env_site(site),
+            Oracle::Rung2(o, _) => o.is_env_site(site),
             // unreachable: the only caller (problem.rs GetLexVar fallback)
             // is guarded by lex_env_at(...) -> Some, which fires only on
             // Oracle::Rung2, so `self` here always dispatches above.
@@ -173,8 +256,8 @@ impl<'m> Oracle<'m> {
     ) -> Vec<TaintFact> {
         let ans = match self {
             Oracle::Rung0(_) => return Vec::new(),
-            Oracle::Rung1(o) => o.query(object, store),
-            Oracle::Rung2(o) => o.query(object, store),
+            Oracle::Rung1(o, _) => o.query(object, store),
+            Oracle::Rung2(o, _) => o.query(object, store),
         };
         if !ans.precise_for_keying() {
             return Vec::new();

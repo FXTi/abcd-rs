@@ -20,6 +20,7 @@ readme = "README.md"
 abcd-ir = { workspace = true }
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
+hashbrown = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 

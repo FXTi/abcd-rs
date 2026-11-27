@@ -18,9 +18,9 @@ fn dis_asm_roundtrip_preserves_shape() {
         f.all_methods()
             .map(|(_, m)| {
                 (
-                    m.body.as_ref().map(|b| b.bytecodes.len()),
+                    m.body.as_ref().map(|b| b.insn_count()),
                     m.body.as_ref().map(|b| {
-                        b.bytecodes
+                        b.bytecodes()
                             .iter()
                             .map(|bc| bc.mnemonic())
                             .collect::<Vec<_>>()

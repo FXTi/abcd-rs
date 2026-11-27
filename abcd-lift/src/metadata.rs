@@ -21,21 +21,19 @@
 //!   to specifier syms; `moduleRequestPhaseIdx` blobs → per-request
 //!   lazy flags on [`ModuleRequest`].
 
-use std::sync::Arc;
-
 use abcd_file::{
     self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord,
     ModuleRequestPhase, Type,
 };
 use abcd_ir::{
     AnnValue, Annotation, ClassData, ClassId, Const, ConstId, EsModule, ExportDecl, FieldData,
-    FunctionKind, ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest,
-    Signature, SourceLang, StaticTy, Sym, Ty, ValueId,
+    FunctionData, FunctionKind, ImportDecl, LineEntry, LocalName, LocalScope, Modifiers,
+    ModuleRequest, Signature, SourceLang, StaticTy, Sym, Ty, ValueId,
 };
 
 use crate::resolve;
 use crate::translate::FnLift;
-use crate::{LiftError, Lifter};
+use crate::{IrArenas, LiftBackend, LiftError, Lifter};
 
 /// Map file access flags to the semantic modifier set (JVM-legacy bits
 /// with no JS/TS meaning are dropped — documented).
@@ -113,7 +111,7 @@ pub fn function_kind(method: &Method) -> FunctionKind {
 /// module's class table (stub-appending foreign descriptors — the same
 /// policy as annotation classes); an unresolvable descriptor degrades
 /// to `Ty::Any` (documented).
-pub fn ty_of(lf: &mut Lifter, ty: &Type) -> Ty {
+pub(crate) fn ty_of<'f, B: LiftBackend<'f>>(lf: &mut B, ty: &Type) -> Ty {
     match ty {
         Type::Void => Ty::Static(StaticTy::Void),
         Type::Bool => Ty::Static(StaticTy::U1),
@@ -128,7 +126,7 @@ pub fn ty_of(lf: &mut Lifter, ty: &Type) -> Ty {
         Type::F32 => Ty::Static(StaticTy::F32),
         Type::F64 => Ty::Static(StaticTy::F64),
         Type::Tagged => Ty::Any,
-        Type::Reference(sid) => match lf.class_of_descriptor(*sid) {
+        Type::Reference(sid) => match lf.backend_class_of_descriptor(*sid) {
             Some(cid) => Ty::Static(StaticTy::Reference(cid)),
             None => Ty::Any,
         },
@@ -137,7 +135,7 @@ pub fn ty_of(lf: &mut Lifter, ty: &Type) -> Ty {
 
 /// The declared signature, when the source carried one (format fact
 /// #A7: absent on 12+/24 — the IR reflects reality).
-pub fn signature(lf: &mut Lifter, method: &Method) -> Option<Signature> {
+pub(crate) fn signature<'f, B: LiftBackend<'f>>(lf: &mut B, method: &Method) -> Option<Signature> {
     if method.return_type.is_none() && method.arg_types.is_empty() {
         return None;
     }
@@ -150,12 +148,13 @@ pub fn signature(lf: &mut Lifter, method: &Method) -> Option<Signature> {
 /// Parameters of a body-less external declaration: the proto's declared
 /// argument types (on 12+ files there is no shorty — zero params;
 /// documented).
-pub fn external_params(lf: &mut Lifter, method: &Method) -> Vec<ValueId> {
+pub(crate) fn external_params<'f, B: LiftBackend<'f>>(lf: &mut B, method: &Method) -> Vec<ValueId> {
     let mut params = Vec::with_capacity(method.arg_types.len());
     for (i, ty) in method.arg_types.iter().enumerate() {
         let ty = ty_of(lf, ty);
-        let val = ValueId::new(lf.module.values.len() as u32);
-        lf.module.values.push(abcd_ir::Value {
+        let values = lf.arenas_mut().values_mut();
+        let val = ValueId::new(values.len() as u32);
+        values.push(abcd_ir::Value {
             def: abcd_ir::ValueDef::Param(i as u16),
             ty,
         });
@@ -319,18 +318,18 @@ fn lift_field<'f>(
 }
 
 /// Lift one bucket list of file annotations.
-fn lift_annotation_list(
-    lf: &mut Lifter,
+fn lift_annotation_list<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     list: &[abcd_file::Annotation],
     out: &mut Vec<Annotation>,
 ) {
     for a in list {
-        let Some(class_id) = lf.class_of_descriptor(a.class_descriptor) else {
+        let Some(class_id) = lf.backend_class_of_descriptor(a.class_descriptor) else {
             continue; // dangling descriptor (hand-built) — documented skip
         };
         let mut elements = Vec::with_capacity(a.elements.len());
         for e in &a.elements {
-            let Some(name) = lf.sym_of_file_sid(e.name) else {
+            let Some(name) = lf.backend_sym_of_file_sid(e.name) else {
                 continue;
             };
             elements.push((name, annotation_value(lf, &e.value)));
@@ -345,7 +344,10 @@ fn lift_annotation_list(
 /// Merge the four file buckets into ONE annotation list, in the
 /// documented order: `compile_time`, `runtime`, `compile_time_type`,
 /// `runtime_type`.
-pub fn lift_annotations(lf: &mut Lifter, anns: &abcd_file::Annotations) -> Vec<Annotation> {
+pub(crate) fn lift_annotations<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
+    anns: &abcd_file::Annotations,
+) -> Vec<Annotation> {
     let mut out = Vec::new();
     lift_annotation_list(lf, &anns.compile_time, &mut out);
     lift_annotation_list(lf, &anns.runtime, &mut out);
@@ -357,10 +359,10 @@ pub fn lift_annotations(lf: &mut Lifter, anns: &abcd_file::Annotations) -> Vec<A
 /// Convert an annotation element value to an [`AnnValue`] (elements
 /// reference only IR-owned identities: Const / ClassId / FieldId /
 /// Sym).
-fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
-    let number = |lf: &mut Lifter, x: f64| AnnValue::Const(lf.const_scalar(Const::number(x)));
+fn annotation_value<'f, B: LiftBackend<'f>>(lf: &mut B, v: &AnnotationValue) -> AnnValue {
+    let number = |lf: &mut B, x: f64| AnnValue::Const(lf.backend_const_scalar(Const::number(x)));
     match v {
-        AnnotationValue::Bool(b) => AnnValue::Const(lf.const_scalar(Const::Bool(*b))),
+        AnnotationValue::Bool(b) => AnnValue::Const(lf.backend_const_scalar(Const::Bool(*b))),
         AnnotationValue::I8(x) => number(lf, *x as f64),
         AnnotationValue::U8(x) => number(lf, *x as f64),
         AnnotationValue::I16(x) => number(lf, *x as f64),
@@ -372,15 +374,15 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         AnnotationValue::F32(x) => number(lf, *x as f64),
         AnnotationValue::F64(x) => number(lf, *x),
         AnnotationValue::String(sid) => {
-            let sym = lf.sym_of_file_sid(*sid);
+            let sym = lf.backend_sym_of_file_sid(*sid);
             match sym {
-                Some(s) => AnnValue::Const(lf.const_scalar(Const::String(s))),
-                None => AnnValue::Const(lf.const_scalar(Const::Null)),
+                Some(s) => AnnValue::Const(lf.backend_const_scalar(Const::String(s))),
+                None => AnnValue::Const(lf.backend_const_scalar(Const::Null)),
             }
         }
-        AnnotationValue::Record(sid) => match lf.class_of_descriptor(*sid) {
+        AnnotationValue::Record(sid) => match lf.backend_class_of_descriptor(*sid) {
             Some(cid) => AnnValue::Class(cid),
-            None => AnnValue::Const(lf.const_scalar(Const::Null)),
+            None => AnnValue::Const(lf.backend_const_scalar(Const::Null)),
         },
         // Method references are constants in the module pool
         // (Const::MethodRef — the same identity path as bytecode method
@@ -388,22 +390,22 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         // documented for hand-built models).
         AnnotationValue::Method { name, method, .. } => {
             match method.and_then(|midx| resolve::func_of_idx(lf, midx).ok()) {
-                Some(fid) => AnnValue::Const(lf.const_shape(Const::method_ref(fid))),
+                Some(fid) => AnnValue::Const(lf.backend_const_shape(Const::method_ref(fid))),
                 None => {
                     let sym = lf
-                        .sym_of_file_sid(*name)
-                        .unwrap_or_else(|| lf.sym("<unresolved>"));
+                        .backend_sym_of_file_sid(*name)
+                        .unwrap_or_else(|| lf.backend_sym("<unresolved>"));
                     AnnValue::Name(sym)
                 }
             }
         }
         AnnotationValue::Enum { name, field, .. } => {
-            match field.and_then(|fidx| lf.field_ids.get(fidx.index()).copied()) {
+            match field.and_then(|fidx| lf.backend_field_id(fidx)) {
                 Some((cid, fid)) => AnnValue::Field(cid, fid),
                 None => {
                     let sym = lf
-                        .sym_of_file_sid(*name)
-                        .unwrap_or_else(|| lf.sym("<unresolved>"));
+                        .backend_sym_of_file_sid(*name)
+                        .unwrap_or_else(|| lf.backend_sym("<unresolved>"));
                     AnnValue::Name(sym)
                 }
             }
@@ -412,31 +414,27 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         // by the nested annotation's CLASS (its element list is
         // unrepresentable — registered taxonomy gap).
         AnnotationValue::Annotation(nested) => {
-            match lf.class_of_descriptor(nested.class_descriptor) {
+            match lf.backend_class_of_descriptor(nested.class_descriptor) {
                 Some(cid) => AnnValue::Class(cid),
-                None => AnnValue::Const(lf.const_scalar(Const::Null)),
+                None => AnnValue::Const(lf.backend_const_scalar(Const::Null)),
             }
         }
         // Method handles have no AnnValue home (registered gap): resolve
         // the display name from `entity`, falling back to `target_method` /
         // `target_field` in the dense pass-1 tables (`#50`).
         AnnotationValue::MethodHandle(rmh) => {
-            let sym = method_handle_sym(lf, rmh).unwrap_or_else(|| lf.sym("<unresolved>"));
+            let sym = method_handle_sym(lf, rmh).unwrap_or_else(|| lf.backend_sym("<unresolved>"));
             AnnValue::Name(sym)
         }
         AnnotationValue::LiteralArray(values) => {
             let mut consts = Vec::with_capacity(values.len());
             for v in values {
-                let cid = match resolve::const_for_literal_value(lf, v) {
-                    Ok(id) => id,
-                    Err(_) => lf.const_scalar(Const::Null),
-                };
-                consts.push(cid);
+                consts.push(resolve::const_for_literal_value_or_null(lf, v));
             }
-            AnnValue::Const(lf.const_shape(Const::ArrayLiteral(consts)))
+            AnnValue::Const(lf.backend_const_shape(Const::ArrayLiteral(consts)))
         }
-        AnnotationValue::Void => AnnValue::Const(lf.const_scalar(Const::Undefined)),
-        AnnotationValue::StringNullptr => AnnValue::Const(lf.const_scalar(Const::Null)),
+        AnnotationValue::Void => AnnValue::Const(lf.backend_const_scalar(Const::Undefined)),
+        AnnotationValue::StringNullptr => AnnValue::Const(lf.backend_const_scalar(Const::Null)),
         AnnotationValue::Array { .. } => {
             // Typed element tag is not part of v0.2's Const
             // (documented); elements convert to pooled ConstIds iteratively,
@@ -457,7 +455,10 @@ struct AnnArrayFrame<'a> {
 /// Convert an annotation value inside an annotation ARRAY to a pooled
 /// [`ConstId`] iteratively (scalars/strings/methods exact; name-carrying
 /// payloads as string constants — documented).
-fn annotation_value_as_const_id(lf: &mut Lifter, root: &AnnotationValue) -> ConstId {
+fn annotation_value_as_const_id<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
+    root: &AnnotationValue,
+) -> ConstId {
     let AnnotationValue::Array { values, .. } = root else {
         return scalar_annotation_value_as_const_id(lf, root);
     };
@@ -491,7 +492,7 @@ fn annotation_value_as_const_id(lf: &mut Lifter, root: &AnnotationValue) -> Cons
             let Some(finished) = stack.pop() else {
                 break;
             };
-            let arr_cid = lf.const_shape(Const::ArrayLiteral(finished.consts));
+            let arr_cid = lf.backend_const_shape(Const::ArrayLiteral(finished.consts));
             if let Some(parent) = stack.last_mut() {
                 parent.consts.push(arr_cid);
             } else {
@@ -503,7 +504,10 @@ fn annotation_value_as_const_id(lf: &mut Lifter, root: &AnnotationValue) -> Cons
 }
 
 /// Convert a single non-`Array` [`AnnotationValue`] element to a pooled [`ConstId`].
-fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> ConstId {
+fn scalar_annotation_value_as_const_id<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
+    v: &AnnotationValue,
+) -> ConstId {
     let c = match v {
         AnnotationValue::Bool(b) => Const::Bool(*b),
         AnnotationValue::I8(x) => Const::number(*x as f64),
@@ -518,14 +522,14 @@ fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> 
         AnnotationValue::F64(x) => Const::number(*x),
         AnnotationValue::String(sid)
         | AnnotationValue::Record(sid)
-        | AnnotationValue::Enum { name: sid, .. } => match lf.sym_of_file_sid(*sid) {
+        | AnnotationValue::Enum { name: sid, .. } => match lf.backend_sym_of_file_sid(*sid) {
             Some(s) => Const::String(s),
             None => Const::Null,
         },
         AnnotationValue::Method { name, method, .. } => {
             match method.and_then(|midx| resolve::func_of_idx(lf, midx).ok()) {
                 Some(fid) => Const::method_ref(fid),
-                None => match lf.sym_of_file_sid(*name) {
+                None => match lf.backend_sym_of_file_sid(*name) {
                     Some(s) => Const::String(s),
                     None => Const::Null,
                 },
@@ -535,20 +539,18 @@ fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> 
             Some(s) => Const::String(s),
             None => Const::Null,
         },
-        AnnotationValue::Annotation(nested) => match lf.sym_of_file_sid(nested.class_descriptor) {
-            Some(s) => Const::String(s),
-            None => Const::Null,
-        },
+        AnnotationValue::Annotation(nested) => {
+            match lf.backend_sym_of_file_sid(nested.class_descriptor) {
+                Some(s) => Const::String(s),
+                None => Const::Null,
+            }
+        }
         AnnotationValue::LiteralArray(values) => {
             let mut consts = Vec::with_capacity(values.len());
             for v in values {
-                let cid = match resolve::const_for_literal_value(lf, v) {
-                    Ok(id) => id,
-                    Err(_) => lf.const_scalar(Const::Null),
-                };
-                consts.push(cid);
+                consts.push(resolve::const_for_literal_value_or_null(lf, v));
             }
-            return lf.const_shape(Const::ArrayLiteral(consts));
+            return lf.backend_const_shape(Const::ArrayLiteral(consts));
         }
         AnnotationValue::Void => Const::Undefined,
         AnnotationValue::StringNullptr => Const::Null,
@@ -556,29 +558,28 @@ fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> 
             unreachable!("handled iteratively by annotation_value_as_const_id")
         }
     };
-    lf.module.consts.intern(c)
+    lf.backend_const_shape(c)
 }
 
 /// Resolve the display symbol of a [`abcd_file::ResolvedMethodHandle`] via its
 /// interned `entity` string or dense `target_method` / `target_field` index (`#50`).
-fn method_handle_sym(lf: &mut Lifter, rmh: &abcd_file::ResolvedMethodHandle) -> Option<Sym> {
-    if let Some(s) = lf.sym_of_file_sid(rmh.entity) {
+fn method_handle_sym<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
+    rmh: &abcd_file::ResolvedMethodHandle,
+) -> Option<Sym> {
+    if let Some(s) = lf.backend_sym_of_file_sid(rmh.entity) {
         return Some(s);
     }
     if let Some(midx) = rmh.target_method
-        && let Some(&name) = lf.method_names.get(midx.index())
+        && let Some(name) = lf.backend_method_name(midx)
     {
         return Some(name);
     }
     if let Some(fidx) = rmh.target_field
-        && let Some(&(cid, fid)) = lf.field_ids.get(fidx.index())
-        && let Some(fd) = lf
-            .module
-            .classes
-            .get(cid.index())
-            .and_then(|c| c.fields.get(fid.index()))
+        && let Some((cid, fid)) = lf.backend_field_id(fidx)
+        && let Some(name) = lf.backend_field_name(cid, fid)
     {
-        return Some(fd.name);
+        return Some(name);
     }
     None
 }
@@ -592,10 +593,13 @@ fn method_handle_sym(lf: &mut Lifter, rmh: &abcd_file::ResolvedMethodHandle) -> 
 /// content is entirely empty (a degenerate line program) — treated as
 /// "no debug info" at this boundary (empty strings are not content,
 /// 980ec16).
-fn debug_is_empty_invention(lf: &Lifter, debug: &abcd_file::MethodDebugInfo) -> bool {
+fn debug_is_empty_invention<'f, B: LiftBackend<'f>>(
+    lf: &B,
+    debug: &abcd_file::MethodDebugInfo,
+) -> bool {
     let empty_source = match debug.source_file {
         None => true,
-        Some(sid) => lf.file.strings.resolve(sid).is_some_and(|s| s.is_empty()),
+        Some(sid) => lf.file().strings.resolve(sid).is_some_and(|s| s.is_empty()),
     };
     empty_source
         && debug.source_code.is_none()
@@ -609,7 +613,10 @@ fn debug_is_empty_invention(lf: &Lifter, debug: &abcd_file::MethodDebugInfo) -> 
 /// line/column tables keyed by the lifted InstIds, local names with
 /// scope extents, param names, source file/code, and the home-record
 /// scope names.
-pub fn finish_debug(fx: &mut FnLift) {
+pub(crate) fn finish_debug<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
+    fd: &mut FunctionData,
+) {
     let Some(debug) = fx.method.debug.as_ref() else {
         return;
     };
@@ -617,17 +624,12 @@ pub fn finish_debug(fx: &mut FnLift) {
         return;
     }
 
-    let func_id = fx.func_id;
-    let source_file = debug.source_file.and_then(|s| fx.lf.sym_of_file_sid(s));
-    let source_code = debug.source_code.and_then(|sid| {
-        if let Some(arc) = fx.lf.source_code_cache.get(&sid) {
-            return Some(Arc::clone(arc));
-        }
-        let s = fx.lf.file.strings.resolve(sid)?;
-        let arc: Arc<str> = Arc::from(s);
-        fx.lf.source_code_cache.insert(sid, Arc::clone(&arc));
-        Some(arc)
-    });
+    let source_file = debug
+        .source_file
+        .and_then(|s| fx.lf.backend_sym_of_file_sid(s));
+    let source_code = debug
+        .source_code
+        .and_then(|sid| fx.lf.backend_resolve_source_code(sid));
 
     // Line/column tables, keyed by the LIFTED InstIds (block order).
     let mut line_table = Vec::new();
@@ -636,10 +638,9 @@ pub fn finish_debug(fx: &mut FnLift) {
     // no source position and are skipped; blocks are ordered monotonically
     // by raw leader pc, so `inst_pcs` is sorted ascending by `pc`).
     let mut inst_pcs: Vec<(abcd_ir::InstId, u32)> = Vec::new();
-    let blocks = fx.lf.module.functions[func_id.index()].blocks.clone();
-    for bb in &blocks {
-        let insts = fx.lf.module.blocks[bb.index()].insts.clone();
-        for iid in insts {
+    for &bb in &fd.blocks {
+        let insts = &fx.lf.arenas().blocks()[bb.index()].insts;
+        for &iid in insts {
             let Some(&pc) = fx.inst_pc.get(&iid) else {
                 continue;
             };
@@ -658,7 +659,7 @@ pub fn finish_debug(fx: &mut FnLift) {
     // at-or-after `lv.start`; `end` = last lifted inst at-or-before `lv.end`).
     let mut local_names: Vec<LocalName> = Vec::new();
     for lv in &debug.local_vars {
-        let Some(name) = fx.lf.sym_of_file_sid(lv.name) else {
+        let Some(name) = fx.lf.backend_sym_of_file_sid(lv.name) else {
             continue;
         };
         let ty = local_var_ty(fx.lf, lv.type_signature);
@@ -681,30 +682,15 @@ pub fn finish_debug(fx: &mut FnLift) {
     let param_names: Vec<Sym> = debug
         .params
         .iter()
-        .filter_map(|p| fx.lf.sym_of_file_sid(p.name))
+        .filter_map(|p| fx.lf.backend_sym_of_file_sid(p.name))
         .collect();
 
     // The home record's scope names come from the owning class (`--merge-abc`
     // `scopeNames` field on the record class) or fall back to matching
     // `source_file` against standalone `_ESScopeNamesRecord` fields.
-    let class_idx = fx.lf.module.functions[func_id.index()].class_id.index();
-    let scope_names = fx
-        .lf
-        .module
-        .classes
-        .get(class_idx)
-        .and_then(|c| c.scope_names)
-        .or_else(|| {
-            source_file.and_then(|sf| {
-                fx.lf
-                    .scope_name_fields
-                    .iter()
-                    .find(|(name, _)| *name == sf)
-                    .map(|(_, c)| *c)
-            })
-        });
+    let scope_names = fx.lf.backend_lookup_scope_names(fd.class_id, source_file);
 
-    fx.lf.module.functions[func_id.index()].debug = Some(abcd_ir::DebugData {
+    fd.debug = Some(abcd_ir::DebugData {
         source_file,
         source_code,
         line_table,
@@ -718,8 +704,8 @@ pub fn finish_debug(fx: &mut FnLift) {
 /// Parse a local variable's type signature: primitive descriptors map
 /// to static types; anything else is a class-table reference (or `None`
 /// when the signature is empty/unresolvable — documented).
-fn local_var_ty(lf: &mut Lifter, sig: abcd_file::StringId) -> Option<Ty> {
-    let descriptor = lf.file.strings.resolve(sig)?;
+fn local_var_ty<'f, B: LiftBackend<'f>>(lf: &mut B, sig: abcd_file::StringId) -> Option<Ty> {
+    let descriptor = lf.file().strings.resolve(sig)?;
     if descriptor.is_empty() {
         return None;
     }

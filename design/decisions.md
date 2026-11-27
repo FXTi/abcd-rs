@@ -1,10 +1,10 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-22`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-23`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-22`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-23`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
 - **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; `Catch::type_class: Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
@@ -134,6 +134,14 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
   4. **Sound Taint Strong-Kill & Zero-Copy IFDS Identity (`D5`, `D6`, `#94`)**: `abcd-taint` never strong-kills on `EdgeKind::Exceptional` edges and gates heap strong updates on `abcd_analysis::heap::is_concrete_singleton_site` (non-loop, single-execution entry/module-init allocation sites only); `IfdsProblem` supports `FlowOut::PassThrough` (`FactId(u32)`) to bypass `D::Fact` cloning/hashing on identity edges.
   5. **Workspace-Wide Zero Recursion (`#95`)**: Direct recursion, mutual function-call cycles, and compiler-derived recursive traits on recursive types are banned across all 13 Rust crates, C/C++ bridges/shims, and `scripts/*.py`, enforced by `unconditional_recursion = "deny"` and `tests/zero_recursion_gate.rs`.
 - **Crates**: All 13 workspace crates + root `abcd-rs`.
+
+### ADR-23 — Pure-Rust Zero-Copy `.abc` Reader, Flat Arenas, Sub-3-GiB Taint Scaling & Parallel Lifting (`#49`, `#71`–`#78`, `#84`)
+- **Ruling**:
+  1. **100% Safe Rust `.abc` Container Reader (`#49`)**: `abcd-file` decodes all `.abc` headers (`60B` dynamic `0.0.0.2`/`0.0.0.3`/`9.0`–`24.0`, `64B` static `0.0.0.5`, `72B` static `0.0.0.6`/`0.1.0.7`), index regions, classes, methods, fields, protos, code items, annotations, literal arrays, module records, and LNP debug streams in `#![forbid(unsafe_code)]` Rust with `DecodeMode::{Strict, Forensic}`, owned `Arc<[u8]>` `MethodCode::Span` (`abcd_hap::EntryData::into_arc`), and binary-searched `MethodEntities`, relegating `abcd-file-sys` reader routines strictly to differential test oracles.
+  2. **Flat String/Symbol Arenas & Droppable `HashTable<u32>` Indexes (`#72`, `#77`)**: `abcd_file::StringPool` and `abcd_ir::SymbolTable` store contiguous `Arc<Arena>` (`text` + `offs` + sorted `cold` raw MUTF-8) with `RandomState`-seeded `hashbrown::HashTable<u32>` indexes (`drop_index()`), checked `< u32::MAX` bounds, `HashTable<u32>`-backed `ConstPool` and `SummaryStrings`, dense `StringId → Sym` memoization in `abcd-lift`, and borrowed byte-keyed `EntityResolver` lookup in `abcd-lower`.
+  3. **Zero-Clone `PreparedModule` & IFDS/PTA Memory Compaction (`#71`, `#73`–`#76`, `#78`)**: `EntryPlan::append` + `ModuleLinkTable::extend_appended` + `PreparedModule::owned` synthesize the OHOS lifecycle harness in-place without cloning `Module` or dangling `"context"` symbols (`#74`), identify the harness strictly by `Option<FuncId>` (`#75`, `#76`), eliminate IFDS `reached`/`worklist` tables in favor of cursor-driven `ordered_edges` + shared `IfdsResult` CSR, stream sparse `Rung2Tables::answers` from `pta::Solver::into_solved`, and compact `TaintProblem` cones into `[u64]` bitsets with lazy `GlobalReaderIndex` and zero-upfront `LocalLiveness`.
+  4. **Bit-Identical Parallel Lifting, Batched Lowering/Decompile & Inline Solver Keys (`#84`)**: `abcd-lift` translates method bodies in parallel across Rayon workers and replays global table events sequentially via `abcd_ir::remap::FragmentRemapper` to guarantee `100%` `modules_structurally_eq` parity; `abcd-decompile` and `abcd-lower` (`rewrite_file_owned`) bound peak memory via deduplicated instruction-weight batches; `AllocSiteSet` (`<= 4`), `FieldChain` (`<= 5`), and `PackedCtx` (`0 = None`, `x + 1 = Some(x)`) eliminate small-set heap churn; and `abcd-cli` owns an explicit `8 MiB`-stack `rayon::ThreadPool` (`--jobs`, `--timings`, `--forensic`).
+- **Crates**: `abcd-hap`, `abcd-file`, `abcd-ir`, `abcd-lift`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`, `abcd-cli`.
 
 ---
 

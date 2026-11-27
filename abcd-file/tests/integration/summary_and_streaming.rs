@@ -16,7 +16,7 @@ fn summary_from_decoded(file: &File, entity_index_entries: usize, verify: bool) 
         let instructions_decoded = methods
             .iter()
             .filter_map(|(_, m)| m.body.as_ref())
-            .map(|b| b.bytecodes.len())
+            .map(|b| b.insn_count())
             .sum();
         VerifySummary {
             methods_checked: methods_with_body,

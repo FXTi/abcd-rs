@@ -372,10 +372,11 @@ mod field_chain {
         let cls = b.add_global_class();
         let proto = b.create_proto(Type::Void, &[]);
         let placeholder = EntityId(u16::MAX as u32);
-        // `num_vregs = 2, num_args = 4`: `Reg(5)` is formal parameter 0 (`obj`).
+        // `num_vregs = 2, num_args = 5`: `Reg(5)` is formal parameter 0 (`obj`),
+        // `Reg(6)` is formal parameter 1 (`key`).
         let (code, offsets) = abcd_isa::encode(&[
             Bytecode::Ldai(Imm(0)),                           // 0: key = 0
-            Bytecode::Sta(Reg(0)),                            // 1: v0 = dynamic key
+            Bytecode::Sta(Reg(0)),                            // 1: v0 = numeric key (0)
             Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 2: acc = TAINT
             store,                                            // 3: obj.<key> = acc
             Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 4: acc = print
@@ -383,7 +384,7 @@ mod field_chain {
             Bytecode::Returnundefined,                        // 6
         ])
         .unwrap();
-        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 2, 4);
+        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 2, 5);
         let taint = b.add_string("TAINT");
         b.relocate_code_id(m, offsets[2], 0, CodeEntity::String(taint))
             .unwrap();
@@ -417,11 +418,17 @@ mod field_chain {
     fn index_load_renders_the_any_index_chain() {
         let fact = run_store_chain(Bytecode::Stobjbyindex(Imm(0), Reg(5), Imm(7)), |_, _, _| {});
         assert!(fact.ends_with("[*]"), "fact: {fact}");
+
+        // `Stobjbyvalue` with a known-numeric register (`Ldai(Imm(0))` in `Reg(0)`)
+        // narrows to `FieldKey::AnyIndex` (`[*]`).
+        let numeric_dyn =
+            run_store_chain(Bytecode::Stobjbyvalue(Imm(0), Reg(5), Reg(0)), |_, _, _| {});
+        assert!(numeric_dyn.ends_with("[*]"), "fact: {numeric_dyn}");
     }
 
     #[test]
     fn dynamic_load_renders_the_any_dynamic_chain() {
-        let fact = run_store_chain(Bytecode::Stobjbyvalue(Imm(0), Reg(5), Reg(0)), |_, _, _| {});
+        let fact = run_store_chain(Bytecode::Stobjbyvalue(Imm(0), Reg(5), Reg(6)), |_, _, _| {});
         assert!(fact.ends_with("[dyn]"), "fact: {fact}");
     }
 
@@ -794,13 +801,13 @@ fn report_linked_connects_cross_module_exports_to_ohos_sink() {
 
     let m1 = input::InputModule {
         name: "shared/sec".to_string(),
-        abc: sec_abc,
+        abc: std::sync::Arc::from(sec_abc),
         module_json: None,
         provenance: "app.app::sec.hsp".to_string(),
     };
     let m2 = input::InputModule {
         name: "entry/app".to_string(),
-        abc: app_abc,
+        abc: std::sync::Arc::from(app_abc),
         module_json: None,
         provenance: "app.app::entry.hap".to_string(),
     };
@@ -1080,4 +1087,193 @@ fn taint_surfaces_pta_root_sliced_ohos_lifecycle_and_any_param_from_summaries() 
     let rep_miss = run(&large_abc, &cfg_miss);
     assert!(rep_miss.pta_root_sliced);
     assert_eq!(rep_miss.hits.len(), 0, "{rep_miss:?}");
+}
+
+/// `#74` CLI regression test: an OpenHarmony `UIAbility` `.abc` whose string
+/// pool does NOT contain `"context"` (nor `"__abcd_ohos_harness__"`) renders
+/// `.context` and `__abcd_ohos_harness__` cleanly — never `<sym N>` or
+/// `<unnamed>` — under `abcd taint --preset ohos`.
+#[test]
+fn issue74_ability_without_context_string_renders_dot_context_never_sym_placeholder() {
+    use abcd_file::ModuleRecordDef;
+
+    let placeholder = EntityId(u16::MAX as u32);
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+
+    // Import `@ohos.hilog` so `@ohos.hilog.info` from `--preset ohos` acts as sink.
+    let es_rec = b.add_class("L_ESModuleRecord;");
+    let es_field = b.class_add_field(es_rec, "entry", Type::U32, AccessFlags::PUBLIC);
+    let req_hl = b.add_string("@ohos.hilog");
+    let s_hl = b.add_string("hilog");
+    let s_def = b.add_string("default");
+    let mod_lit = b.add_literal_array("entry_mod");
+    b.literal_array_add_module_data(
+        mod_lit,
+        &[req_hl],
+        &[ModuleRecordDef::RegularImport {
+            local_name: s_hl,
+            import_name: s_def,
+            module_request_idx: 0,
+        }],
+    )
+    .unwrap();
+    b.field_set_value_literalarray(es_field, mod_lit).unwrap();
+
+    let proto = b.create_proto(Type::Void, &[]);
+
+    // Constructor `EntryAbility(func, new.target, this)`: returns `this` (`Reg(2)`).
+    let (ctor_code, _) = abcd_isa::encode(&[Bytecode::Lda(Reg(2)), Bytecode::Return]).unwrap();
+    let ctor = b.class_add_method(
+        cls,
+        "EntryAbility",
+        proto,
+        AccessFlags::STATIC,
+        &ctor_code,
+        0,
+        3,
+    );
+
+    // `onCreate(func, new.target, this, want, launchParam)`:
+    // `num_vregs = 6, num_args = 5` => `Reg(8)` = `this`, `Reg(9)` = `want`.
+    // Logs BOTH `this` (whose `.context` field is populated by `__abcd_ohos_harness__`)
+    // and `want` via `hilog.info(0, "TAG", ...)` WITHOUT mentioning `"context"`!
+    let (oc_code, oc_offsets) = abcd_isa::encode(&[
+        Bytecode::Ldexternalmodulevar(Imm(0)),      // 0: acc = hilog
+        Bytecode::Sta(Reg(0)),                      // 1: v0 = hilog
+        Bytecode::Ldobjbyname(Imm(0), placeholder), // 2: acc = hilog.info
+        Bytecode::Sta(Reg(1)),                      // 3: v1 = info
+        Bytecode::Ldai(Imm(0)),                     // 4: domain = 0
+        Bytecode::Sta(Reg(2)),                      // 5: v2 = 0
+        Bytecode::LdaStr(placeholder),              // 6: acc = "TAG"
+        Bytecode::Sta(Reg(3)),                      // 7: v3 = "TAG"
+        Bytecode::Lda(Reg(1)),                      // 8: acc = info
+        Bytecode::Callthis3(Imm(2), Reg(0), Reg(2), Reg(3), Reg(8)), // 9: hilog.info(0, "TAG", this)
+        Bytecode::Lda(Reg(1)),                                       // 10: acc = info
+        Bytecode::Callthis3(Imm(4), Reg(0), Reg(2), Reg(3), Reg(9)), // 11: hilog.info(0, "TAG", want)
+        Bytecode::Returnundefined,                                   // 12
+    ])
+    .unwrap();
+    let on_create = b.class_add_method(cls, "onCreate", proto, AccessFlags::STATIC, &oc_code, 6, 5);
+    let s_info = b.add_string("info");
+    let s_tag = b.add_string("TAG");
+    b.relocate_code_id(on_create, oc_offsets[2], 0, CodeEntity::String(s_info))
+        .unwrap();
+    b.relocate_code_id(on_create, oc_offsets[6], 0, CodeEntity::String(s_tag))
+        .unwrap();
+
+    // Class member buffer `[ "onCreate", on_create, affiliate=2, count=1 ]`.
+    let members_lit = b.add_literal_array("ability_members");
+    let s_oc = b.add_string("onCreate");
+    b.literal_array_add_string(members_lit, s_oc);
+    b.literal_array_add_method(members_lit, on_create);
+    b.literal_array_add_method_affiliate(members_lit, 2);
+    b.literal_array_add_integer(members_lit, 1);
+
+    // `func_main_0`: `class EntryAbility extends UIAbility { onCreate(...) { ... } }`
+    let (main_code, main_offsets) = abcd_isa::encode(&[
+        Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 0: acc = UIAbility
+        Bytecode::Sta(Reg(0)),                            // 1: v0 = UIAbility
+        Bytecode::Defineclasswithbuffer(Imm(1), placeholder, placeholder, Imm(0), Reg(0)), // 2
+        Bytecode::Returnundefined,                        // 3
+    ])
+    .unwrap();
+    let main = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::STATIC,
+        &main_code,
+        2,
+        3,
+    );
+    let s_uiab = b.add_string("UIAbility");
+    b.relocate_code_id(main, main_offsets[0], 0, CodeEntity::String(s_uiab))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[2], 0, CodeEntity::Method(ctor))
+        .unwrap();
+    b.relocate_code_id(
+        main,
+        main_offsets[2],
+        1,
+        CodeEntity::LiteralArray(members_lit),
+    )
+    .unwrap();
+
+    b.deduplicate();
+    let ability_abc = b.finalize().expect("ability fixture must finalize");
+
+    // Precondition: `"context"` is NOT present anywhere in the `.abc` string pool!
+    let decoded = abcd_file::decode(&ability_abc).expect("decode ability fixture");
+    assert_eq!(
+        decoded.strings.get("context"),
+        None,
+        "fixture must not contain \"context\" in user strings"
+    );
+
+    let dir = common::tempdir("issue74-ability-context");
+    let abc_path = dir.join("ability.abc");
+    std::fs::write(&abc_path, &ability_abc).unwrap();
+
+    // 1. Pure `--preset ohos` subprocess run: `want` hit resolves cleanly on `onCreate`
+    //    and emits zero `<sym N>` placeholders.
+    let want_out = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"))
+        .args(["taint", abc_path.to_str().unwrap(), "--preset", "ohos"])
+        .output()
+        .expect("spawn abcd taint --preset ohos");
+    assert!(
+        want_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&want_out.stderr)
+    );
+    let want_stdout = String::from_utf8(want_out.stdout).expect("utf8 stdout");
+    assert!(want_stdout.contains("@ohos.hilog.info"), "{want_stdout}");
+    assert!(want_stdout.contains("onCreate"), "{want_stdout}");
+    assert!(!want_stdout.contains("<sym "), "{want_stdout}");
+    assert!(!want_stdout.contains("<unnamed>"), "{want_stdout}");
+
+    // 2. `--preset ohos` + `OHOS_CONTEXT_GLOBAL` source: `this` carries `.context`
+    //    interned solely by `PreparedModule::owned`'s lifecycle harness, and the CLI
+    //    renders `.context` (never `<sym N>`) in both text and `--json` modes!
+    let ctx_cfg_path = dir.join("ctx.toml");
+    std::fs::write(
+        &ctx_cfg_path,
+        format!(
+            "[[sources]]\nkind = \"global_load\"\nname = {:?}\n",
+            abcd_analysis::ohos_lifecycle::OHOS_CONTEXT_GLOBAL,
+        ),
+    )
+    .unwrap();
+
+    for json_flag in [false, true] {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_abcd"));
+        cmd.args([
+            "taint",
+            abc_path.to_str().unwrap(),
+            "--preset",
+            "ohos",
+            "--config",
+            ctx_cfg_path.to_str().unwrap(),
+        ]);
+        if json_flag {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().expect("spawn abcd taint");
+        assert!(
+            out.status.success(),
+            "json={json_flag}, stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+        assert!(
+            stdout.contains(".context"),
+            "expected rendered `.context` field in json={json_flag}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("<sym "),
+            "must never render `<sym N>` in json={json_flag}:\n{stdout}"
+        );
+    }
 }

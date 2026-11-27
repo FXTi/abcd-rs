@@ -91,22 +91,27 @@ const N72_ROWS: [(&str, Expect); 5] = [
 
 /// Count modern range-call instructions with the given argc immediate.
 fn range_calls_with_argc(file: &abcd_file::File, argc: i64) -> usize {
-    file.classes
-        .values()
-        .flat_map(|class| class.methods.iter())
-        .filter_map(|method| method.body.as_ref())
-        .flat_map(|body| body.bytecodes.iter())
-        .filter(|bc| {
-            matches!(
-                bc,
-                Bytecode::Callthisrange(_, imm, _)
-                | Bytecode::WideCallthisrange(imm, _)
-                | Bytecode::Callthisrangewithname(_, imm, _, _)
-                | Bytecode::WideCallthisrangewithname(imm, _, _)
-                if imm.0 == argc
-            )
-        })
-        .count()
+    let mut count = 0usize;
+    for class in file.classes.values() {
+        for method in &class.methods {
+            let Some(body) = &method.body else {
+                continue;
+            };
+            for bc in body.bytecodes().iter() {
+                if matches!(
+                    bc,
+                    Bytecode::Callthisrange(_, imm, _)
+                    | Bytecode::WideCallthisrange(imm, _)
+                    | Bytecode::Callthisrangewithname(_, imm, _, _)
+                    | Bytecode::WideCallthisrangewithname(imm, _, _)
+                    if imm.0 == argc
+                ) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
 }
 
 #[test]

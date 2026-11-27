@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 /// Try-catch block information.
 ///
 /// All indices/counts refer to positions in

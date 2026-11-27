@@ -14,8 +14,8 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 | Arena / Table | Purpose |
 | :--- | :--- |
-| `SymbolTable` (`module.sym`) | Content-deduplicated string interner (`Sym`) with a lossless raw-MUTF-8 side table reserved strictly for unpaired UTF-16 surrogates (`ADR-09`) |
-| `ConstPool` (`module.consts`) | Append-only / deduplicable flat constant arena (`Undefined`, `Hole`, `Null`, `LitNull`, `Bool`, `Int8`, `Int32`, `Float32`, `Number(u64)`, `Int64(i64)`, `UInt64(u64)`, `Accessor`, `MethodAffiliate`, `BuiltinTypeIndex`, `EtsImplements`, `String(Sym)`, `BigInt(Sym)`, `ArrayLiteral(Vec<ConstId>)`, `TypedArrayLiteral`, `ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }`, `LiteralBufferRef`, `MethodRef { func, kind }`) (`ADR-17`, `ADR-18`) |
+| `SymbolTable` (`module.sym`) | Flat-arena (`Arc<Arena>` `text` + `offs` + sorted `cold` raw-MUTF-8 side table) string interner (`Sym`) with droppable `HashTable<u32>` index (`drop_index()`) and `< u32::MAX` bounds (`ADR-09`, `ADR-23`) |
+| `ConstPool` (`module.consts`) | `HashTable<u32>`-indexed flat constant arena (`drop_index()`, zero duplicate key clones) covering scalars, `Int64`/`UInt64`, `ArrayLiteral`, `TypedArrayLiteral`, `ObjectLiteral`, `LiteralBufferRef`, and `MethodRef` (`ADR-17`, `ADR-18`, `ADR-23`) |
 | `classes: Vec<ClassData>` | Records/classes with `SourceLang` (`EcmaScript`, `ArkTs`, `PandaAssembly`), fields, methods, annotations, per-record `EsModule` (`--merge-abc`), and `scope_names` |
 | `functions: Vec<FunctionData>` | Functions with `FunctionKind`, `Signature`, `params`, `frame_init_consts`, `blocks`, `try_regions`, annotations, and `DebugData` |
 | `blocks: Vec<Block>` | Basic blocks holding `preds: Vec<Edge>` (`EdgeKind::{Normal, Exceptional}`) and ordered `insts: Vec<InstId>` |
@@ -43,7 +43,7 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 ## 3. Lifting (`abcd-lift`: `File → Module`)
 
-1. **Two-Pass Entity Reservation**: Pre-reserves `ClassId` and `FuncId` slots by file declaration and `method_offset` (`S1`/`N2`) before translating bodies so forward method/class/literal references resolve deterministically.
+1. **Two-Pass Entity Reservation & Bit-Identical Parallel Lifting (`#84`, `ADR-23`)**: Pre-reserves `ClassId` and `FuncId` slots plus `ClassData` headers (`D3`) and `sid_to_sym` (`#72`) before translating method bodies across Rayon workers (`LiftOptions { retain_tail_capacity, parallel }`), replaying per-method global symbol/class/constant/literal-array events sequentially via `abcd_ir::remap::FragmentRemapper` to produce a `100%` `modules_structurally_eq` `Module`.
 2. **CFG, Exact Try Boundaries & Pre-Throw Block Splitting (`R2-D1`)**: Splits decoded `Bytecode` streams at jump/fallthrough leaders, exact `[try_start, try_end)` boundaries, catch-handler entries, and before any register write (`sta` / `mov`) following a throwing bytecode inside a protected `try` range. If bytecode offset `0` has incoming jump or catch edges, `lift_method` synthesizes a pure zero-predecessor `pre_entry` trampoline so `blocks[0]` satisfies the entry invariant without disturbing standard functions.
 3. **Braun SSA & Exceptional Seeding**:
    - Materializes `EdgeKind::Normal` and `EdgeKind::Exceptional` predecessor edges up front.

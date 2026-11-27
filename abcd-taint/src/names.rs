@@ -17,7 +17,11 @@
 //! Resolved-callee [`abcd_ir::FunctionData`] names are matched by the driver on
 //! top of these candidates (directly-resolved internal functions).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::ops::Deref;
+use std::rc::Rc;
 
 use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
 use abcd_analysis::ohos_lifecycle::OHOS_CONTEXT_GLOBAL;
@@ -25,12 +29,78 @@ use abcd_analysis::{OhmUrl, OhmUrlKind};
 use abcd_ir::module::ExportDecl;
 use abcd_ir::{CallKind, ClassId, Const, FuncId, Module, Op, Sym, ValueDef, ValueId};
 
+/// Per-root safety step cap on `resolve_iterative` and `resolve_namespace_classes`
+/// so cyclic cross-module `StoreModuleVar` / `Phi` webs where `had_cycle`
+/// suppresses memoization always terminate in bounded `O(1)` work (`#78`, `#84`).
+const MAX_RESOLVE_STEPS: usize = 8_192;
+
+type CalleeMemoMap = HashMap<(FuncId, ValueId), Rc<[String]>>;
+type NsMemoMap = HashMap<(FuncId, ValueId), Rc<[ClassId]>>;
+
+/// Allocation-free slice view over resolved internal ES module namespace [`ClassId`]s.
+pub(crate) enum NsClasses {
+    Empty,
+    Shared(Rc<[ClassId]>),
+    Owned(Vec<ClassId>),
+}
+
+impl Deref for NsClasses {
+    type Target = [ClassId];
+
+    #[inline]
+    fn deref(&self) -> &[ClassId] {
+        match self {
+            Self::Empty => &[],
+            Self::Shared(rc) => rc,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
 /// Pre-indexed `(ClassId, prop_name)` -> `(method FuncId, stored ValueId)` table
-/// so SDK receiver field lookups (`this.controller = new WebviewController()`)
-/// run in `O(1)` per property access instead of rescanning class bodies.
-#[derive(Clone, Debug, Default)]
+/// plus shared single-threaded `(FuncId, ValueId)` callee-name and namespace-class
+/// memoization tables across `compute_pta_roots`, `TaintProblem`, and `collect_hits`
+/// (`#78`, `#84`).
 pub(crate) struct ClassPropStores {
     by_class_prop: HashMap<(ClassId, Sym), Vec<(FuncId, ValueId)>>,
+    callee_memo: RefCell<CalleeMemoMap>,
+    ns_memo: RefCell<NsMemoMap>,
+    empty_strings: Rc<[String]>,
+    empty_classes: Rc<[ClassId]>,
+}
+
+impl Default for ClassPropStores {
+    fn default() -> Self {
+        Self {
+            by_class_prop: HashMap::new(),
+            callee_memo: RefCell::new(HashMap::new()),
+            ns_memo: RefCell::new(HashMap::new()),
+            empty_strings: Rc::from(&[][..]),
+            empty_classes: Rc::from(&[][..]),
+        }
+    }
+}
+
+impl Clone for ClassPropStores {
+    fn clone(&self) -> Self {
+        Self {
+            by_class_prop: self.by_class_prop.clone(),
+            callee_memo: RefCell::new(self.callee_memo.borrow().clone()),
+            ns_memo: RefCell::new(self.ns_memo.borrow().clone()),
+            empty_strings: Rc::clone(&self.empty_strings),
+            empty_classes: Rc::clone(&self.empty_classes),
+        }
+    }
+}
+
+impl fmt::Debug for ClassPropStores {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClassPropStores")
+            .field("class_props", &self.by_class_prop.len())
+            .field("callee_memo_len", &self.callee_memo.borrow().len())
+            .field("ns_memo_len", &self.ns_memo.borrow().len())
+            .finish()
+    }
 }
 
 impl ClassPropStores {
@@ -61,7 +131,10 @@ impl ClassPropStores {
                 }
             }
         }
-        Self { by_class_prop }
+        Self {
+            by_class_prop,
+            ..Self::default()
+        }
     }
 
     fn get(&self, cid: ClassId, prop_name: Sym) -> &[(FuncId, ValueId)] {
@@ -158,7 +231,7 @@ pub(crate) fn quick_callee_leaf_sym(
                     ) {
                         return None;
                     }
-                    if may_be_module_namespace_object(module, links, *object) {
+                    if may_be_module_namespace_object(module, links, prop_stores, caller, *object) {
                         return None;
                     }
                     let cid = links
@@ -207,8 +280,10 @@ enum ResolveStep {
 }
 
 /// Iterative def-chain name resolver (zero call-stack recursion), separating
-/// active-path cycle detection (`visiting`) from DAG memoization (`memo`) so
-/// diamond `Phi`/`LoadProp` sharing runs in `O(N)` without losing candidates.
+/// active-path cycle detection (`visiting`) from shared DAG memoization
+/// (`ClassPropStores::callee_memo` / `local_memo`) so diamond `Phi`/`LoadProp`
+/// sharing runs in `O(1)` amortized across call sites while bounding cyclic
+/// cross-module graphs via [`MAX_RESOLVE_STEPS`].
 fn resolve_iterative(
     module: &Module,
     links: Option<&ModuleLinkTable>,
@@ -216,27 +291,54 @@ fn resolve_iterative(
     root_func: FuncId,
     root_value: ValueId,
 ) -> Vec<String> {
+    let share_memo = links.is_some();
+    if share_memo
+        && let Some(ps) = prop_stores
+        && let Some(cached) = ps.callee_memo.borrow().get(&(root_func, root_value))
+    {
+        return if cached.is_empty() {
+            Vec::new()
+        } else {
+            cached.to_vec()
+        };
+    }
+
     let mut visiting: HashSet<(FuncId, ValueId)> = HashSet::new();
-    let mut memo: HashMap<(FuncId, ValueId), Vec<String>> = HashMap::new();
+    let mut local_memo: CalleeMemoMap = HashMap::new();
     let mut bufs: Vec<Vec<String>> = vec![Vec::new()];
     let mut had_cycle: Vec<bool> = vec![false];
+    let mut steps = 0usize;
     let mut stack: Vec<ResolveStep> = vec![ResolveStep::Enter {
         func: root_func,
         value: root_value,
     }];
 
     while let Some(step) = stack.pop() {
+        steps += 1;
         match step {
             ResolveStep::Enter { func, value } => {
-                if let Some(cached) = memo.get(&(func, value)) {
+                if share_memo
+                    && let Some(ps) = prop_stores
+                    && let Some(cached) = ps.callee_memo.borrow().get(&(func, value)).cloned()
+                {
                     if let Some(out) = bufs.last_mut() {
-                        for cand in cached {
+                        for cand in cached.iter() {
                             push_unique(out, cand.clone());
                         }
                     }
                     continue;
                 }
-                if !visiting.insert((func, value)) {
+                if (!share_memo || prop_stores.is_none())
+                    && let Some(cached) = local_memo.get(&(func, value))
+                {
+                    if let Some(out) = bufs.last_mut() {
+                        for cand in cached.iter() {
+                            push_unique(out, cand.clone());
+                        }
+                    }
+                    continue;
+                }
+                if steps > MAX_RESOLVE_STEPS || !visiting.insert((func, value)) {
                     if let Some(hc) = had_cycle.last_mut() {
                         *hc = true;
                     }
@@ -370,10 +472,15 @@ fn resolve_iterative(
                             // Internal namespace member (`import * as ns`, `export * as ns`,
                             // and nested `ns.sub.foo()` chains).
                             if let Some(links) = links {
-                                let ns_classes =
-                                    resolve_namespace_classes(module, links, func, *object);
+                                let ns_classes = resolve_namespace_classes_cached(
+                                    module,
+                                    links,
+                                    prop_stores,
+                                    func,
+                                    *object,
+                                );
                                 let mut ns_defs = Vec::new();
-                                for ns_cid in ns_classes {
+                                for &ns_cid in ns_classes.iter() {
                                     if let Some(slots) =
                                         links.namespace_exports(ns_cid).and_then(|m| m.get(name))
                                     {
@@ -399,13 +506,19 @@ fn resolve_iterative(
                         }
                     }
                     Some(Op::Call { callee, kind, .. }) => {
-                        bufs.push(Vec::new());
-                        had_cycle.push(false);
-                        stack.push(ResolveStep::FinishCall { kind: *kind });
-                        stack.push(ResolveStep::Enter {
-                            func,
-                            value: *callee,
-                        });
+                        if steps > MAX_RESOLVE_STEPS {
+                            if let Some(hc) = had_cycle.last_mut() {
+                                *hc = true;
+                            }
+                        } else {
+                            bufs.push(Vec::new());
+                            had_cycle.push(false);
+                            stack.push(ResolveStep::FinishCall { kind: *kind });
+                            stack.push(ResolveStep::Enter {
+                                func,
+                                value: *callee,
+                            });
+                        }
                     }
                     Some(Op::LoadConst(c)) => {
                         if let Some(Const::MethodRef { func: f, .. }) = module.consts.get(*c)
@@ -446,7 +559,17 @@ fn resolve_iterative(
                     *parent_hc = true;
                 }
                 if !node_cycled {
-                    memo.insert((func, value), node_cands.clone());
+                    if share_memo && let Some(ps) = prop_stores {
+                        let rc = if node_cands.is_empty() {
+                            Rc::clone(&ps.empty_strings)
+                        } else {
+                            Rc::<[String]>::from(node_cands.as_slice())
+                        };
+                        ps.callee_memo.borrow_mut().insert((func, value), rc);
+                    } else {
+                        let rc = Rc::<[String]>::from(node_cands.as_slice());
+                        local_memo.insert((func, value), rc);
+                    }
                 }
                 if let Some(out) = bufs.last_mut() {
                     for cand in node_cands {
@@ -455,6 +578,12 @@ fn resolve_iterative(
                 }
             }
             ResolveStep::StartObjectPrefix { func, object, name } => {
+                if steps > MAX_RESOLVE_STEPS {
+                    if let Some(hc) = had_cycle.last_mut() {
+                        *hc = true;
+                    }
+                    continue;
+                }
                 bufs.push(Vec::new());
                 had_cycle.push(false);
                 stack.push(ResolveStep::FinishObjectPrefix { func, object, name });
@@ -504,6 +633,12 @@ fn resolve_iterative(
                 }
             }
             ResolveStep::StartSdkStore { func, value } => {
+                if steps > MAX_RESOLVE_STEPS {
+                    if let Some(hc) = had_cycle.last_mut() {
+                        *hc = true;
+                    }
+                    continue;
+                }
                 bufs.push(Vec::new());
                 had_cycle.push(false);
                 stack.push(ResolveStep::FinishSdkStore);
@@ -607,7 +742,13 @@ fn scan_class_prop_stores(module: &Module, cid: ClassId, prop_name: Sym) -> Vec<
     stores
 }
 
-fn may_be_module_namespace_object(module: &Module, links: &ModuleLinkTable, v: ValueId) -> bool {
+fn may_be_module_namespace_object(
+    module: &Module,
+    links: &ModuleLinkTable,
+    prop_stores: &ClassPropStores,
+    caller: FuncId,
+    v: ValueId,
+) -> bool {
     let v = abcd_analysis::dataflow::heap::peel_movs(module, v);
     let Some(ValueDef::Inst(iid)) = module.value(v).map(|val| val.def) else {
         return false;
@@ -616,32 +757,105 @@ fn may_be_module_namespace_object(module: &Module, links: &ModuleLinkTable, v: V
         return false;
     };
     match op {
-        Op::GetModuleNamespace { .. } => true,
-        Op::LoadModuleVar { .. } | Op::LoadProp { .. } | Op::Phi { .. } => {
-            links.has_multi_record_esm()
+        Op::GetModuleNamespace { index } => links
+            .func_class(caller)
+            .and_then(|cid| links.namespace_target(cid, *index))
+            .is_some(),
+        Op::LoadModuleVar { index, kind } => {
+            if !links.has_multi_record_esm() {
+                return false;
+            }
+            let Some(cid) = links.func_class(caller) else {
+                return false;
+            };
+            if !kind.is_local() {
+                let Some(t) = links.external_load(cid, *index) else {
+                    return false;
+                };
+                if t.namespace_classes.is_empty() && t.slots.is_empty() {
+                    return false;
+                }
+            }
+            let (classes, hit_cap) =
+                resolve_namespace_classes_inner(module, links, Some(prop_stores), caller, v);
+            !classes.is_empty() || hit_cap
+        }
+        Op::LoadProp { .. } | Op::Phi { .. } => {
+            if !links.has_multi_record_esm() {
+                return false;
+            }
+            let (classes, hit_cap) =
+                resolve_namespace_classes_inner(module, links, Some(prop_stores), caller, v);
+            !classes.is_empty() || hit_cap
         }
         _ => false,
     }
 }
 
 enum NsEvalStep {
-    Enter(FuncId, ValueId),
-    FinishSubProp(FuncId, Sym),
+    Enter { func: FuncId, value: ValueId },
+    Leave { func: FuncId, value: ValueId },
+    FinishSubProp { name: Sym },
 }
 
 /// Resolve all internal record [`ClassId`]s whose ES module namespace `value`
 /// (in `func`) may denote via `GetModuleNamespace`, `export * as ns` external
 /// imports (`ExternalSlotTarget::namespace_classes`), local module-slot copies,
-/// or chained sub-namespace `LoadProp` reads (`ModuleLinkTable::namespace_submodules`).
-pub(crate) fn resolve_namespace_classes(
+/// or chained sub-namespace `LoadProp` reads (`ModuleLinkTable::namespace_submodules`),
+/// sharing [`ClassPropStores::ns_memo`] across call sites (`#78`, `#84`).
+pub(crate) fn resolve_namespace_classes_cached(
     module: &Module,
     links: &ModuleLinkTable,
+    prop_stores: Option<&ClassPropStores>,
     root_func: FuncId,
     root_value: ValueId,
-) -> Vec<ClassId> {
+) -> NsClasses {
+    resolve_namespace_classes_inner(module, links, prop_stores, root_func, root_value).0
+}
+
+fn resolve_namespace_classes_inner(
+    module: &Module,
+    links: &ModuleLinkTable,
+    prop_stores: Option<&ClassPropStores>,
+    root_func: FuncId,
+    root_value: ValueId,
+) -> (NsClasses, bool) {
+    let peeled = peel_movs_fast(module, root_value);
+    if let Some(ps) = prop_stores
+        && let Some(cached) = ps.ns_memo.borrow().get(&(root_func, peeled)).cloned()
+    {
+        return if cached.is_empty() {
+            (NsClasses::Empty, false)
+        } else {
+            (NsClasses::Shared(cached), false)
+        };
+    }
+    let Some(ValueDef::Inst(root_iid)) = module.value(peeled).map(|v| v.def) else {
+        return (NsClasses::Empty, false);
+    };
+    let Some(root_op) = module.inst(root_iid).map(|i| &i.op) else {
+        return (NsClasses::Empty, false);
+    };
+    if !matches!(
+        root_op,
+        Op::GetModuleNamespace { .. }
+            | Op::LoadModuleVar { .. }
+            | Op::LoadProp { .. }
+            | Op::Phi { .. }
+    ) {
+        return (NsClasses::Empty, false);
+    }
+
     let mut visiting: HashSet<(FuncId, ValueId)> = HashSet::new();
+    let mut local_memo: NsMemoMap = HashMap::new();
     let mut frames: Vec<Vec<ClassId>> = vec![Vec::new()];
-    let mut stack: Vec<NsEvalStep> = vec![NsEvalStep::Enter(root_func, root_value)];
+    let mut had_cycle: Vec<bool> = vec![false];
+    let mut steps = 0usize;
+    let mut hit_step_cap = false;
+    let mut stack: Vec<NsEvalStep> = vec![NsEvalStep::Enter {
+        func: root_func,
+        value: peeled,
+    }];
 
     let push_cid = |out: &mut Vec<ClassId>, cid: ClassId| {
         if !out.contains(&cid) {
@@ -650,9 +864,27 @@ pub(crate) fn resolve_namespace_classes(
     };
 
     while let Some(step) = stack.pop() {
+        steps += 1;
         match step {
-            NsEvalStep::Enter(func, value) => {
-                if !visiting.insert((func, value)) {
+            NsEvalStep::Enter { func, value } => {
+                if let Some(ps) = prop_stores
+                    && let Some(cached) = ps.ns_memo.borrow().get(&(func, value)).cloned()
+                {
+                    if let Some(out) = frames.last_mut() {
+                        for &cid in cached.iter() {
+                            push_cid(out, cid);
+                        }
+                    }
+                    continue;
+                }
+                if prop_stores.is_none()
+                    && let Some(cached) = local_memo.get(&(func, value))
+                {
+                    if let Some(out) = frames.last_mut() {
+                        for &cid in cached.iter() {
+                            push_cid(out, cid);
+                        }
+                    }
                     continue;
                 }
                 let Some(ValueDef::Inst(iid)) = module.value(value).map(|v| v.def) else {
@@ -661,11 +893,41 @@ pub(crate) fn resolve_namespace_classes(
                 let Some(op) = module.inst(iid).map(|i| &i.op) else {
                     continue;
                 };
+                if !matches!(
+                    op,
+                    Op::Mov { .. }
+                        | Op::Phi { .. }
+                        | Op::GetModuleNamespace { .. }
+                        | Op::LoadModuleVar { .. }
+                        | Op::LoadProp { .. }
+                ) {
+                    continue;
+                }
+                if steps > MAX_RESOLVE_STEPS {
+                    hit_step_cap = true;
+                    if let Some(hc) = had_cycle.last_mut() {
+                        *hc = true;
+                    }
+                    continue;
+                }
+                if !visiting.insert((func, value)) {
+                    if let Some(hc) = had_cycle.last_mut() {
+                        *hc = true;
+                    }
+                    continue;
+                }
+                frames.push(Vec::new());
+                had_cycle.push(false);
+                stack.push(NsEvalStep::Leave { func, value });
+
                 match op {
-                    Op::Mov { src } => stack.push(NsEvalStep::Enter(func, *src)),
+                    Op::Mov { src } => stack.push(NsEvalStep::Enter { func, value: *src }),
                     Op::Phi { entries } => {
                         for (_, incoming) in entries.iter().rev() {
-                            stack.push(NsEvalStep::Enter(func, *incoming));
+                            stack.push(NsEvalStep::Enter {
+                                func,
+                                value: *incoming,
+                            });
                         }
                     }
                     Op::GetModuleNamespace { index } => {
@@ -686,7 +948,10 @@ pub(crate) fn resolve_namespace_classes(
                                 slot: *index,
                             });
                             for &(def_fn, def_val) in stored.iter().rev() {
-                                stack.push(NsEvalStep::Enter(def_fn, def_val));
+                                stack.push(NsEvalStep::Enter {
+                                    func: def_fn,
+                                    value: def_val,
+                                });
                             }
                         } else if let Some(target) = links.external_load(cid, *index) {
                             if let Some(out) = frames.last_mut() {
@@ -701,20 +966,40 @@ pub(crate) fn resolve_namespace_classes(
                                 }
                             }
                             for (def_fn, def_val) in defs.into_iter().rev() {
-                                stack.push(NsEvalStep::Enter(def_fn, def_val));
+                                stack.push(NsEvalStep::Enter {
+                                    func: def_fn,
+                                    value: def_val,
+                                });
                             }
                         }
                     }
                     Op::LoadProp { object, name } => {
-                        frames.push(Vec::new());
-                        stack.push(NsEvalStep::FinishSubProp(func, *name));
-                        stack.push(NsEvalStep::Enter(func, *object));
+                        if steps > MAX_RESOLVE_STEPS {
+                            hit_step_cap = true;
+                            if let Some(hc) = had_cycle.last_mut() {
+                                *hc = true;
+                            }
+                        } else {
+                            frames.push(Vec::new());
+                            had_cycle.push(false);
+                            stack.push(NsEvalStep::FinishSubProp { name: *name });
+                            stack.push(NsEvalStep::Enter {
+                                func,
+                                value: *object,
+                            });
+                        }
                     }
                     _ => {}
                 }
             }
-            NsEvalStep::FinishSubProp(_func, name) => {
+            NsEvalStep::FinishSubProp { name } => {
                 let parent_ns = frames.pop().unwrap_or_default();
+                let sub_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && sub_cycled
+                {
+                    *parent_hc = true;
+                }
                 let mut defs = Vec::new();
                 for p_cid in parent_ns {
                     if let Some(sub_cids) =
@@ -734,13 +1019,55 @@ pub(crate) fn resolve_namespace_classes(
                     }
                 }
                 for (def_fn, def_val) in defs.into_iter().rev() {
-                    stack.push(NsEvalStep::Enter(def_fn, def_val));
+                    stack.push(NsEvalStep::Enter {
+                        func: def_fn,
+                        value: def_val,
+                    });
+                }
+            }
+            NsEvalStep::Leave { func, value } => {
+                visiting.remove(&(func, value));
+                let node_cids = frames.pop().unwrap_or_default();
+                let node_cycled = had_cycle.pop().unwrap_or(false);
+                if let Some(parent_hc) = had_cycle.last_mut()
+                    && node_cycled
+                {
+                    *parent_hc = true;
+                }
+                // Monotone fixed-point property: when `visiting.is_empty()` and
+                // `!hit_step_cap` with `node_cids.is_empty()`, zero namespace
+                // generators are reachable anywhere in this closed SCC, so `[]`
+                // is exact even across cyclic non-namespace loop `Phi`s.
+                let exact = !hit_step_cap
+                    && (!node_cycled || (visiting.is_empty() && node_cids.is_empty()));
+                if exact {
+                    if let Some(ps) = prop_stores {
+                        let rc = if node_cids.is_empty() {
+                            Rc::clone(&ps.empty_classes)
+                        } else {
+                            Rc::<[ClassId]>::from(node_cids.as_slice())
+                        };
+                        ps.ns_memo.borrow_mut().insert((func, value), rc);
+                    } else {
+                        let rc = Rc::<[ClassId]>::from(node_cids.as_slice());
+                        local_memo.insert((func, value), rc);
+                    }
+                }
+                if let Some(out) = frames.last_mut() {
+                    for cid in node_cids {
+                        push_cid(out, cid);
+                    }
                 }
             }
         }
     }
 
-    frames.pop().unwrap_or_default()
+    let root_out = frames.pop().unwrap_or_default();
+    if root_out.is_empty() {
+        (NsClasses::Empty, hit_step_cap)
+    } else {
+        (NsClasses::Owned(root_out), hit_step_cap)
+    }
 }
 
 /// Emit external SDK candidate names when an internal barrel namespace `ns_cid`
@@ -790,8 +1117,42 @@ fn emit_namespace_external_reexports(
     }
 }
 
+/// Allocation-free `Op::Mov` def-chain peeler using Floyd's tortoise-and-hare
+/// cycle guard (`O(steps)`, zero heap allocation).
+#[inline]
+pub(crate) fn peel_movs_fast(module: &Module, v: ValueId) -> ValueId {
+    let step_mov = |cur: ValueId| -> Option<ValueId> {
+        let ValueDef::Inst(iid) = module.value(cur)?.def else {
+            return None;
+        };
+        match &module.inst(iid)?.op {
+            Op::Mov { src } => Some(*src),
+            _ => None,
+        }
+    };
+    let Some(mut cur) = step_mov(v) else {
+        return v;
+    };
+    if cur == v {
+        return v;
+    }
+    let mut slow = v;
+    let mut advance_slow = false;
+    while let Some(next) = step_mov(cur) {
+        if next == cur || next == slow {
+            return cur;
+        }
+        cur = next;
+        if advance_slow && let Some(s_next) = step_mov(slow) {
+            slow = s_next;
+        }
+        advance_slow = !advance_slow;
+    }
+    cur
+}
+
 fn is_this_or_lex_receiver(module: &Module, v: ValueId) -> bool {
-    let v = abcd_analysis::dataflow::heap::peel_movs(module, v);
+    let v = peel_movs_fast(module, v);
     let Some(val) = module.value(v) else {
         return false;
     };
@@ -1040,4 +1401,290 @@ fn leaf_through_movs(module: &Module, value: ValueId) -> Option<Sym> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abcd_ir::BlockId;
+    use abcd_ir::function::{Block, Edge, EdgeKind, FunctionData, Inst, Value};
+    use abcd_ir::module::{
+        ClassData, EsModule, ExportDecl, FunctionKind, ImportDecl, Modifiers, ModuleRequest,
+    };
+    use abcd_ir::op::ModuleVarKind;
+    use abcd_ir::ty::Ty;
+
+    fn emit_val(m: &mut Module, block: BlockId, op: Op) -> ValueId {
+        let iid = abcd_ir::InstId::new(m.insts.len() as u32);
+        let vid = ValueId::new(m.values.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: Some(vid),
+            block,
+            loc: None,
+        });
+        m.values.push(Value {
+            def: ValueDef::Inst(iid),
+            ty: Ty::Any,
+        });
+        m.blocks[block.index()].insts.push(iid);
+        vid
+    }
+
+    fn emit_void(m: &mut Module, block: BlockId, op: Op) {
+        let iid = abcd_ir::InstId::new(m.insts.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: None,
+            block,
+            loc: None,
+        });
+        m.blocks[block.index()].insts.push(iid);
+    }
+
+    #[test]
+    fn quick_callee_leaf_and_shared_memos_handle_multi_record_esm_and_aliased_namespaces() {
+        let mut m = Module::new();
+
+        // Class 0 (`./lib`): exports `realSecretFn` as `aliasedFn`.
+        let d0 = m.sym.intern("L@bundle:app/entry/ets/lib;");
+        let n0 = m.sym.intern("@bundle:app/entry/ets/lib");
+        let s_real = m.sym.intern("realSecretFn");
+        let s_alias = m.sym.intern("aliasedFn");
+        let mut c0 = ClassData::new(d0, n0);
+        c0.es_module = Some(EsModule {
+            imports: Vec::new(),
+            exports: vec![ExportDecl::Local {
+                export_name: s_alias,
+                local_name: s_real,
+            }],
+            module_requests: Vec::new(),
+        });
+        m.classes.push(c0);
+
+        // Class 1 (`./entry`): `import * as libNs from './lib'` AND `import http from '@ohos.net.http'`.
+        let d1 = m.sym.intern("L@bundle:app/entry/ets/entry;");
+        let n1 = m.sym.intern("@bundle:app/entry/ets/entry");
+        let s_req_lib = m.sym.intern("./lib");
+        let s_req_http = m.sym.intern("@ohos.net.http");
+        let s_default = m.sym.intern("default");
+        let s_http_local = m.sym.intern("http");
+        let mut c1 = ClassData::new(d1, n1);
+        c1.es_module = Some(EsModule {
+            imports: vec![ImportDecl::Regular {
+                local_name: s_http_local,
+                import_name: s_default,
+                module_request: s_req_http,
+            }],
+            exports: Vec::new(),
+            module_requests: vec![
+                ModuleRequest {
+                    specifier: s_req_lib,
+                    lazy: false,
+                },
+                ModuleRequest {
+                    specifier: s_req_http,
+                    lazy: false,
+                },
+            ],
+        });
+        m.classes.push(c1);
+
+        // `lib.realSecretFn` + `lib.func_main_0` storing `realSecretFn` into slot 0.
+        let b_real = abcd_ir::BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        let f_real = FuncId::new(m.functions.len() as u32);
+        let mut fd_real = FunctionData::new(ClassId::new(0), s_real, FunctionKind::Function);
+        fd_real.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+        fd_real.blocks.push(b_real);
+        m.functions.push(fd_real);
+        m.classes[0].methods.push(f_real);
+        emit_void(&mut m, b_real, Op::Return { value: None });
+
+        let s_main = m.sym.intern("func_main_0");
+        let b_m0 = abcd_ir::BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        let f_m0 = FuncId::new(m.functions.len() as u32);
+        let mut fd_m0 = FunctionData::new(ClassId::new(0), s_main, FunctionKind::Function);
+        fd_m0.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+        fd_m0.blocks.push(b_m0);
+        m.functions.push(fd_m0);
+        m.classes[0].methods.push(f_m0);
+        let df_real = emit_val(
+            &mut m,
+            b_m0,
+            Op::DefineFunc {
+                body: f_real,
+                captures: Vec::new(),
+                length: 0,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_m0,
+            Op::StoreModuleVar {
+                index: 0,
+                value: df_real,
+            },
+        );
+        emit_void(&mut m, b_m0, Op::Return { value: None });
+
+        // `entry.func_main_0`
+        let b_m1 = abcd_ir::BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        let f_m1 = FuncId::new(m.functions.len() as u32);
+        let mut fd_m1 = FunctionData::new(ClassId::new(1), s_main, FunctionKind::Function);
+        fd_m1.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+        fd_m1.blocks.push(b_m1);
+        let p_this = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(2),
+            ty: Ty::Any,
+        });
+        fd_m1.params.push(p_this);
+        m.functions.push(fd_m1);
+        m.classes[1].methods.push(f_m1);
+
+        // 1) `this.helper.doWork`: chained `LoadProp` on non-namespace receiver in multi-record ESM!
+        let s_helper = m.sym.intern("helper");
+        let s_do_work = m.sym.intern("doWork");
+        let v_helper = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: p_this,
+                name: s_helper,
+            },
+        );
+        let v_do_work = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: v_helper,
+                name: s_do_work,
+            },
+        );
+
+        // 2) `http.createHttp`: external SDK `LoadModuleVar` in multi-record ESM!
+        let s_create_http = m.sym.intern("createHttp");
+        let v_http = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        let v_create_http = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: v_http,
+                name: s_create_http,
+            },
+        );
+
+        // 3) Cyclic non-namespace loop `Phi` (`phi = Phi(v_helper, LoadProp(phi, "next"))`)!
+        let s_next = m.sym.intern("next");
+        let phi_iid = abcd_ir::InstId::new(m.insts.len() as u32);
+        let phi_vid = ValueId::new(m.values.len() as u32);
+        m.insts.push(Inst {
+            op: Op::Phi {
+                entries: Vec::new(),
+            },
+            result: Some(phi_vid),
+            block: b_m1,
+            loc: None,
+        });
+        m.values.push(Value {
+            def: ValueDef::Inst(phi_iid),
+            ty: Ty::Any,
+        });
+        m.blocks[b_m1.index()].insts.push(phi_iid);
+        let v_phi_next = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: phi_vid,
+                name: s_next,
+            },
+        );
+        m.insts[phi_iid.index()].op = Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: b_m1,
+                        kind: EdgeKind::Normal,
+                    },
+                    v_helper,
+                ),
+                (
+                    Edge {
+                        from: b_m1,
+                        kind: EdgeKind::Normal,
+                    },
+                    v_phi_next,
+                ),
+            ],
+        };
+        let v_phi_method = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: phi_vid,
+                name: s_do_work,
+            },
+        );
+
+        // 4) Genuine internal namespace `libNs.aliasedFn` (where exported name != `realSecretFn`)!
+        let v_lib_ns = emit_val(&mut m, b_m1, Op::GetModuleNamespace { index: 0 });
+        let v_aliased_call = emit_val(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: v_lib_ns,
+                name: s_alias,
+            },
+        );
+        emit_void(&mut m, b_m1, Op::Return { value: None });
+
+        let links = ModuleLinkTable::build(&m);
+        assert!(links.has_multi_record_esm());
+        let ps = ClassPropStores::build(&m);
+
+        // Fast `quick_callee_leaf_sym` succeeds on `this.helper.doWork`, `http.createHttp`,
+        // AND cyclic non-namespace `phi.doWork`, while soundly returning `None` on `libNs.aliasedFn`!
+        assert_eq!(
+            quick_callee_leaf_sym(&m, &links, &ps, f_m1, v_do_work),
+            Some(s_do_work)
+        );
+        assert_eq!(
+            quick_callee_leaf_sym(&m, &links, &ps, f_m1, v_create_http),
+            Some(s_create_http)
+        );
+        assert_eq!(
+            quick_callee_leaf_sym(&m, &links, &ps, f_m1, v_phi_method),
+            Some(s_do_work)
+        );
+        assert!(ps.ns_memo.borrow().contains_key(&(f_m1, phi_vid)));
+        assert_eq!(
+            quick_callee_leaf_sym(&m, &links, &ps, f_m1, v_aliased_call),
+            None,
+            "internal namespace member must defer to full resolution because aliasedFn -> realSecretFn"
+        );
+
+        let cands = callee_name_candidates_indexed(&m, &links, Some(&ps), f_m1, v_aliased_call);
+        assert!(
+            cands.iter().any(|c| c == "realSecretFn"),
+            "cands: {cands:?}"
+        );
+        assert!(
+            ps.callee_memo
+                .borrow()
+                .contains_key(&(f_m1, v_aliased_call))
+        );
+        let cands_cached =
+            callee_name_candidates_indexed(&m, &links, Some(&ps), f_m1, v_aliased_call);
+        assert_eq!(cands, cands_cached);
+    }
 }

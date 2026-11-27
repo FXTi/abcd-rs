@@ -1,8 +1,9 @@
 //! # abcd-analysis — static analysis infrastructure on `abcd-ir`
 //!
 //! Format-independent static analysis library (`design/analysis.md`,
-//! `design/ir.md`): everything here consumes only [`abcd_ir`], never the
-//! container, ISA, lift, lower, or optimizer crates.
+//! `design/ir.md`): everything here consumes only [`abcd_ir`] (and `hashbrown`
+//! for compact index-only deduplication), never the container, ISA, lift,
+//! lower, or optimizer crates.
 //!
 //! Four module families plus cross-module & OpenHarmony support:
 //!

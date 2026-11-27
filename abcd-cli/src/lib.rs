@@ -28,12 +28,24 @@ pub mod taint;
 pub mod taint_config;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cli::{
     AnalyzeArgs, Command, DecompileArgs, DisArgs, ExtractArgs, InfoArgs, RewriteArgs, TaintArgs,
 };
 use decompile::DecompileOptions;
 use input::ModuleSelection;
+
+/// Worker thread stack size (8 MiB) for the CLI-owned Rayon thread pool.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Execution toggles shared across subcommand handlers (`--forensic`, `--timings`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExecContext {
+    pub forensic: bool,
+    pub timings: bool,
+}
 
 /// Error channel of the CLI: user errors exit 1, tool errors exit 2.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,24 +166,164 @@ pub fn write_stderr_fmt_line(args: std::fmt::Arguments<'_>) {
         .and_then(|()| std::io::Write::flush(&mut err));
 }
 
-/// Dispatch a parsed command line. Prints results to stdout; diagnostics
-/// are the caller's job (see `main`).
-pub fn run(cli: cli::Cli) -> Result<(), CliError> {
-    match cli.command {
-        Command::Extract(args) => run_extract(&args),
-        Command::Info(args) => run_info(&args),
-        Command::Dis(args) => run_dis(&args),
-        Command::Asm(args) => {
-            asm::run_asm(&args.input, args.output.as_ref(), args.version, args.check)
-        }
-        Command::Decompile(args) => run_decompile(&args),
-        Command::Rewrite(args) => run_rewrite(&args),
-        Command::Analyze(args) => run_analyze(&args),
-        Command::Taint(args) => run_taint(&args),
+/// Emit a single phase timing line strictly to `stderr` when `--timings` is active.
+pub(crate) fn log_timing(timings: bool, label: &str, phase: &str, elapsed: Duration) {
+    if timings {
+        write_stderr_fmt_line(format_args!(
+            "timing: {label}: {phase} {:.3}ms",
+            elapsed.as_secs_f64() * 1_000.0,
+        ));
     }
 }
 
-fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
+/// Emit deterministic forensic decode warnings strictly to `stderr`.
+pub(crate) fn emit_forensic_diagnostics(
+    name: &str,
+    provenance: &str,
+    diagnostics: &[abcd_file::DecodeDiagnostic],
+) {
+    for d in diagnostics {
+        match d.offset {
+            Some(off) => write_stderr_fmt_line(format_args!(
+                "warning: {name} ({provenance}): forensic decode [{kind} @ {off:#x}]: {msg}",
+                kind = d.kind,
+                msg = d.message,
+            )),
+            None => write_stderr_fmt_line(format_args!(
+                "warning: {name} ({provenance}): forensic decode [{kind}]: {msg}",
+                kind = d.kind,
+                msg = d.message,
+            )),
+        }
+    }
+}
+
+/// Lazily decode `abc` (`MethodCode::Span` zero-copy bodies) in `Strict` or
+/// `Forensic` mode, emitting any forensic warnings and optional `decode` timing
+/// strictly to `stderr`.
+pub(crate) fn decode_abc_arc(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    ctx: ExecContext,
+) -> Result<abcd_file::File, CliError> {
+    let t0 = ctx.timings.then(Instant::now);
+    let file = if ctx.forensic {
+        let opts = abcd_file::DecodeOptions {
+            mode: abcd_file::DecodeMode::Forensic,
+            lazy_code: true,
+        };
+        let (file, diagnostics) = abcd_file::decode_with_options(abc, &opts)
+            .map_err(|e| CliError::Tool(format!("failed to decode {name} ({provenance}): {e}")))?;
+        emit_forensic_diagnostics(name, provenance, &diagnostics);
+        file
+    } else {
+        abcd_file::decode_lazy(abc)
+            .map_err(|e| CliError::Tool(format!("failed to decode {name} ({provenance}): {e}")))?
+    };
+    if let Some(start) = t0 {
+        log_timing(true, name, "decode", start.elapsed());
+    }
+    Ok(file)
+}
+
+/// Lazily decode `abc`, lift to SSA IR with `lift_opts`, and immediately drop
+/// both the decoded [`abcd_file::File`] and `abc: Arc<[u8]>` before returning
+/// [`abcd_ir::Module`].
+pub(crate) fn lift_abc_arc(
+    abc: Arc<[u8]>,
+    name: &str,
+    provenance: &str,
+    lift_opts: &abcd_lift::LiftOptions,
+    ctx: ExecContext,
+) -> Result<abcd_ir::Module, CliError> {
+    let mut file = decode_abc_arc(abc, name, provenance, ctx)?;
+    if ctx.forensic {
+        // In forensic mode, methods whose corrupt code_item was skipped by
+        // `decode_with_options` (or carried 0 instructions) become bodyless
+        // external stubs so `abcd_lift` preserves MethodIdx->FuncId parity and
+        // lifts all healthy methods cleanly.
+        for cls in file.classes.values_mut() {
+            for method in &mut cls.methods {
+                if !method.is_external && method.body.as_ref().is_none_or(|b| b.insn_count() == 0) {
+                    if method.body.is_some() {
+                        write_stderr_fmt_line(format_args!(
+                            "warning: {name} ({provenance}): forensic decode [method_body @ {:#x}]: empty bytecode body degraded to external stub",
+                            method.offset,
+                        ));
+                    }
+                    method.body = None;
+                    method.is_external = true;
+                }
+            }
+        }
+    }
+    let t_lift = ctx.timings.then(Instant::now);
+    let ir = abcd_lift::lift_file_with_options(&file, lift_opts)
+        .map_err(|e| CliError::Tool(format!("failed to lift {name} ({provenance}): {e}")))?;
+    if let Some(start) = t_lift {
+        log_timing(true, name, "lift", start.elapsed());
+    }
+    drop(file);
+    Ok(ir)
+}
+
+/// Dispatch a parsed command line inside a dedicated host-owned Rayon thread
+/// pool. Prints results to stdout; diagnostics are the caller's job (see `main`).
+pub fn run(cli: cli::Cli) -> Result<(), CliError> {
+    if cli.jobs == Some(0) {
+        return Err(CliError::User("--jobs must be at least 1".to_string()));
+    }
+    if cli.forensic
+        && !matches!(
+            cli.command,
+            Command::Dis(_) | Command::Decompile(_) | Command::Analyze(_) | Command::Taint(_)
+        )
+    {
+        return Err(CliError::User(
+            "--forensic is only supported on read-only inspection commands (dis, decompile, analyze, taint)"
+                .to_string(),
+        ));
+    }
+
+    let ctx = ExecContext {
+        forensic: cli.forensic,
+        timings: cli.timings,
+    };
+    let mut builder = rayon::ThreadPoolBuilder::new().stack_size(WORKER_STACK_BYTES);
+    if let Some(jobs) = cli.jobs {
+        builder = builder.num_threads(jobs);
+    }
+    let pool = builder
+        .build()
+        .map_err(|e| CliError::Tool(format!("failed to initialize worker thread pool: {e}")))?;
+
+    let command = cli.command;
+    pool.install(|| match command {
+        Command::Extract(args) => run_extract(&args, ctx),
+        Command::Info(args) => run_info(&args, ctx),
+        Command::Dis(args) => run_dis(&args, ctx),
+        Command::Asm(args) => {
+            let t0 = ctx.timings.then(Instant::now);
+            let res = asm::run_asm(&args.input, args.output.as_ref(), args.version, args.check);
+            if let Some(start) = t0 {
+                log_timing(
+                    true,
+                    &args.input.display().to_string(),
+                    "asm",
+                    start.elapsed(),
+                );
+            }
+            res
+        }
+        Command::Decompile(args) => run_decompile(&args, ctx),
+        Command::Rewrite(args) => run_rewrite(&args, ctx),
+        Command::Analyze(args) => run_analyze(&args, ctx),
+        Command::Taint(args) => run_taint(&args, ctx),
+    })
+}
+
+fn run_rewrite(args: &RewriteArgs, ctx: ExecContext) -> Result<(), CliError> {
     let opts = rewrite::RewriteOptions {
         optimize: args.opt,
         check: args.check,
@@ -189,7 +341,7 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
                 ));
             }
         };
-        let written = rewrite::write_all(&modules, &out_dir, opts)?;
+        let written = rewrite::write_all_owned(modules, &out_dir, opts, ctx.timings)?;
         let mut summary = String::new();
         for (name, path, size) in &written {
             use std::fmt::Write as _;
@@ -200,16 +352,17 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
     }
 
     let module = modules
-        .first()
+        .into_iter()
+        .next()
         .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
-    let out = rewrite::rewrite(module, opts)?;
+    let out = rewrite::rewrite_owned(module, opts, ctx.timings)?;
     match &args.output {
         Some(path) => {
             std::fs::write(path, &out.abc)
                 .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
             write_stdout_fmt_line(format_args!(
                 "{}: {} bytes -> {} ({} methods, {} lowered, instructions {} -> {}{})",
-                module.name,
+                out.name,
                 out.abc.len(),
                 path.display(),
                 out.stats.methods,
@@ -246,7 +399,7 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<u8, CliError> {
     Ok(alias_rung)
 }
 
-fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
+fn run_analyze(args: &AnalyzeArgs, ctx: ExecContext) -> Result<(), CliError> {
     let alias_rung = validate_analyze_args(args)?;
     let opts = analyze::AnalyzeOptions {
         callgraph: args.callgraph,
@@ -257,13 +410,13 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
     let reports: Vec<analyze::AnalyzeReport> = modules
-        .iter()
-        .map(|m| analyze::report(m, opts))
+        .into_iter()
+        .map(|m| analyze::report_owned(m, opts, ctx))
         .collect::<Result<_, _>>()?;
     write_stdout_line(&analyze::render(&reports, args.json)?)
 }
 
-fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
+fn run_taint(args: &TaintArgs, ctx: ExecContext) -> Result<(), CliError> {
     let mut cfg = taint::resolve_config(args.config.as_deref(), args.preset.as_deref())?;
     if let Some(r) = args.alias_rung {
         cfg.alias_rung = r;
@@ -280,17 +433,17 @@ fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
     let reports: Vec<taint::TaintCliReport> = if args.link_modules {
-        vec![taint::report_linked(&modules, &cfg)?]
+        vec![taint::report_linked_owned(modules, &cfg, ctx)?]
     } else {
         modules
-            .iter()
-            .map(|m| taint::report(m, &cfg))
+            .into_iter()
+            .map(|m| taint::report_owned(m, &cfg, ctx))
             .collect::<Result<_, _>>()?
     };
     write_stdout_line(&taint::render(&reports, args.json)?)
 }
 
-fn run_dis(args: &DisArgs) -> Result<(), CliError> {
+fn run_dis(args: &DisArgs, ctx: ExecContext) -> Result<(), CliError> {
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
 
@@ -304,7 +457,7 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
                 ));
             }
         };
-        let written = dis::write_all(&modules, &out_dir)?;
+        let written = dis::write_all_owned(modules, &out_dir, ctx)?;
         let mut summary = String::new();
         for (name, path, size) in &written {
             use std::fmt::Write as _;
@@ -315,34 +468,39 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
     }
 
     let module = modules
-        .first()
+        .into_iter()
+        .next()
         .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
     match &args.output {
         Some(path) => {
-            let size = dis::disassemble_to_path(module, path)?;
+            let mod_name = module.name.clone();
+            let size = dis::disassemble_owned_to_path(module, path, ctx)?;
             write_stdout_fmt_line(format_args!(
-                "{}: {size} bytes -> {}",
-                module.name,
+                "{mod_name}: {size} bytes -> {}",
                 path.display()
             ))?;
         }
         None => {
             let stdout = std::io::stdout();
-            dis::disassemble_to_writer(module, stdout.lock())?;
+            dis::disassemble_owned_to_writer(module, stdout.lock(), ctx)?;
         }
     }
     Ok(())
 }
 
-fn run_extract(args: &ExtractArgs) -> Result<(), CliError> {
+fn run_extract(args: &ExtractArgs, ctx: ExecContext) -> Result<(), CliError> {
     let out_dir = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    let source = args.container.display().to_string();
+    let t0 = ctx.timings.then(Instant::now);
     let modules = extract::extract_path(&args.container, &out_dir, args.force)?;
-    let summary =
-        extract::render_summary(&args.container.display().to_string(), &out_dir, &modules);
+    if let Some(start) = t0 {
+        log_timing(true, &source, "extract", start.elapsed());
+    }
+    let summary = extract::render_summary(&source, &out_dir, &modules);
     write_stdout_bytes(summary.as_bytes())
 }
 
-fn run_info(args: &InfoArgs) -> Result<(), CliError> {
+fn run_info(args: &InfoArgs, ctx: ExecContext) -> Result<(), CliError> {
     let selection = selection_of(&args.select.module, args.select.all);
     let source_name = args.input.display().to_string();
     let padded = input::read_padded_file(&args.input)?;
@@ -356,21 +514,33 @@ fn run_info(args: &InfoArgs) -> Result<(), CliError> {
                 "{source_name} has no module named {want:?}; available modules: {stem}"
             )));
         }
+        let t0 = ctx.timings.then(Instant::now);
         let report = info::report_zeropadded(&stem, &source_name, &padded, args.verify)?;
+        if let Some(start) = t0 {
+            log_timing(true, &stem, "info", start.elapsed());
+        }
         drop(padded);
         vec![report]
     } else {
         let modules = input::load_bytes(logical, &source_name, selection)?;
         drop(padded);
         modules
-            .iter()
-            .map(|m| info::report(m, args.verify))
-            .collect::<Result<_, _>>()?
+            .into_iter()
+            .map(|m| {
+                let t0 = ctx.timings.then(Instant::now);
+                let rep = info::report(&m, args.verify)?;
+                if let Some(start) = t0 {
+                    log_timing(true, &m.name, "info", start.elapsed());
+                }
+                drop(m);
+                Ok(rep)
+            })
+            .collect::<Result<_, CliError>>()?
     };
     write_stdout_line(&info::render(&reports, args.json)?)
 }
 
-fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
+fn run_decompile(args: &DecompileArgs, ctx: ExecContext) -> Result<(), CliError> {
     let opts = DecompileOptions {
         ts: args.ts,
         line_anchors: args.line_anchors,
@@ -391,28 +561,27 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
         };
         if args.select.all && modules.len() > 1 {
             let mut summary = String::new();
-            for m in &modules {
-                let sub = out_dir.join(&m.name);
-                let (files, bytes) = decompile::write_split(m, &sub, opts)?;
+            for m in modules {
+                let mod_name = m.name.clone();
+                let sub = out_dir.join(&mod_name);
+                let (files, bytes) = decompile::write_split_owned(m, &sub, opts, ctx)?;
                 use std::fmt::Write as _;
                 let _ = writeln!(
                     summary,
-                    "{}: {} files ({bytes} bytes) -> {}",
-                    m.name,
-                    files,
+                    "{mod_name}: {files} files ({bytes} bytes) -> {}",
                     sub.display()
                 );
             }
             write_stdout_bytes(summary.as_bytes())?;
         } else {
             let module = modules
-                .first()
+                .into_iter()
+                .next()
                 .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
-            let (files, bytes) = decompile::write_split(module, &out_dir, opts)?;
+            let mod_name = module.name.clone();
+            let (files, bytes) = decompile::write_split_owned(module, &out_dir, opts, ctx)?;
             write_stdout_fmt_line(format_args!(
-                "{}: {} files ({bytes} bytes) -> {}",
-                module.name,
-                files,
+                "{mod_name}: {files} files ({bytes} bytes) -> {}",
                 out_dir.display()
             ))?;
         }
@@ -429,7 +598,7 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
                 ));
             }
         };
-        let written = decompile::write_all(&modules, &out_dir, opts)?;
+        let written = decompile::write_all_owned(modules, &out_dir, opts, ctx)?;
         let mut summary = String::new();
         for (name, path, size) in &written {
             use std::fmt::Write as _;
@@ -440,20 +609,21 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
     }
 
     let module = modules
-        .first()
+        .into_iter()
+        .next()
         .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
     match &args.output {
         Some(path) => {
-            let size = decompile::decompile_to_path(module, opts, path)?;
+            let mod_name = module.name.clone();
+            let size = decompile::decompile_owned_to_path(module, opts, path, ctx)?;
             write_stdout_fmt_line(format_args!(
-                "{}: {size} bytes -> {}",
-                module.name,
+                "{mod_name}: {size} bytes -> {}",
                 path.display()
             ))?;
         }
         None => {
             let stdout = std::io::stdout();
-            decompile::decompile_to_writer(module, opts, stdout.lock())?;
+            decompile::decompile_owned_to_writer(module, opts, stdout.lock(), ctx)?;
         }
     }
     Ok(())
@@ -466,5 +636,43 @@ fn selection_of(module: &Option<String>, all: bool) -> ModuleSelection<'_> {
         ModuleSelection::Named(name)
     } else {
         ModuleSelection::Single
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lift_abc_arc_drops_raw_abc_backing_immediately_before_downstream_stages() {
+        use abcd_file::{AccessFlags, Builder, Type};
+        use abcd_isa::Bytecode;
+
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (code, _) = abcd_isa::encode(&[Bytecode::Returnundefined]).unwrap();
+        b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 2, 3);
+        b.deduplicate();
+        let abc: Arc<[u8]> = Arc::from(b.finalize().expect("finalize"));
+        let weak = Arc::downgrade(&abc);
+        assert_eq!(weak.strong_count(), 1);
+
+        let ir = lift_abc_arc(
+            abc,
+            "drop_probe",
+            "drop_probe.abc",
+            &abcd_lift::LiftOptions::default(),
+            ExecContext::default(),
+        )
+        .expect("lift_abc_arc must succeed");
+
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "raw .abc Arc<[u8]> must reach strong_count == 0 immediately upon lift_abc_arc return"
+        );
+        assert_eq!(ir.functions.len(), 1);
     }
 }

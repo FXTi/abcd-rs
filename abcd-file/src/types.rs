@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use crate::Error;
 use abcd_file_sys as sys;
 
@@ -236,17 +238,28 @@ impl TryFrom<u8> for FunctionKind {
 /// Bytecode container dialect classified from `(FileType, Version)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
-    /// Modern dynamic ECMAScript / ArkTS 1.0–1.1 container (`9.0.0.0`..=`24.0.0.0`).
+    /// Modern dynamic ECMAScript / ArkTS 1.0–1.1 container (`0.0.0.3`, `9.0.0.0`..=`24.0.0.0`).
     DynamicModern,
     /// Legacy pre-2022-08-18 dynamic container (`0.0.0.2`).
     DynamicLegacy,
-    /// Static ArkTS 1.2 / Panda static VM container (`0.1.0.7`).
+    /// Static ArkTS 1.2 / Panda static VM container (`0.0.0.5`, `0.0.0.6`, `0.1.0.7`).
     Static,
 }
 
 impl Dialect {
     /// Legacy dynamic `.abc` format version (`0.0.0.2`).
     pub const LEGACY_VERSION: abcd_isa::Version = abcd_isa::Version::new(0, 0, 0, 2);
+
+    /// Whether `version` is a known static ArkTS 1.2 / `static_core` header
+    /// version (`0.0.0.5` HarmonyOS 6.0, `0.0.0.6` HarmonyOS 6.1, or `0.1.0.7`
+    /// HarmonyOS 7.0). Note that `0.0.0.3` is dynamic (quickfix `.abc`).
+    #[inline]
+    pub const fn is_static_version(version: abcd_isa::Version) -> bool {
+        matches!(
+            version.as_bytes(),
+            [0, 0, 0, 5] | [0, 0, 0, 6] | [0, 1, 0, 7]
+        )
+    }
 
     /// Classify an `.abc` header `(file_type, version)` into its [`Dialect`].
     /// Returns `None` when `file_type` is [`sys::FileType::Invalid`].
@@ -255,14 +268,39 @@ impl Dialect {
         match file_type {
             sys::FileType::Static => Some(Self::Static),
             sys::FileType::Dynamic => {
-                let b = version.as_bytes();
-                if b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 2 {
-                    Some(Self::DynamicLegacy)
+                if Self::is_static_version(version) {
+                    Some(Self::Static)
                 } else {
-                    Some(Self::DynamicModern)
+                    let b = version.as_bytes();
+                    if b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 2 {
+                        Some(Self::DynamicLegacy)
+                    } else {
+                        Some(Self::DynamicModern)
+                    }
                 }
             }
             sys::FileType::Invalid => None,
         }
+    }
+}
+
+/// Convert `FieldItem::type_off` encoding (`vendor/generated/type.h`
+/// `Type::GetTypeFromFieldEncoding`) into [`TypeId`].
+#[inline]
+pub(crate) const fn field_encoding_to_type_id(enc: u32) -> TypeId {
+    match enc {
+        0x00 => TypeId::U1,
+        0x01 => TypeId::I8,
+        0x02 => TypeId::U8,
+        0x03 => TypeId::I16,
+        0x04 => TypeId::U16,
+        0x05 => TypeId::I32,
+        0x06 => TypeId::U32,
+        0x07 => TypeId::F32,
+        0x08 => TypeId::F64,
+        0x09 => TypeId::I64,
+        0x0a => TypeId::U64,
+        0x0c => TypeId::Tagged,
+        _ => TypeId::Reference,
     }
 }

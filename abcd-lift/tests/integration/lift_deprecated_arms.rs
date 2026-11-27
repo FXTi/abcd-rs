@@ -886,13 +886,13 @@ fn deprecated_ldmodulevar_polarity_and_es_module_slot_resolution() {
         body: Some(abcd_file::MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // External `secondImp` -> slot 1
                 Bytecode::DeprecatedStmodulevar(EntityId(1)),         // Local `secondPub` -> slot 1
                 Bytecode::DeprecatedLdmodulevar(EntityId(2), Imm(1)), // Local `secondLocal` -> slot 1
                 Bytecode::DeprecatedGetmodulenamespace(EntityId(3)), // Namespace `nsB` -> request 1
                 Bytecode::Return,
-            ],
+            ]),
             entities: std::collections::HashMap::from([
                 (
                     (abcd_isa::EntityKind::StringId, 0),
@@ -910,7 +910,8 @@ fn deprecated_ldmodulevar_polarity_and_es_module_slot_resolution() {
                     (abcd_isa::EntityKind::StringId, 3),
                     abcd_file::EntityRef::string(ns_local),
                 ),
-            ]),
+            ])
+            .into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

@@ -145,15 +145,15 @@ use std::collections::HashMap;
 
 use abcd_file::{Method, MethodBody};
 use abcd_ir::{
-    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, DynPrim, FuncId, InstId, LexEnvKind, Loc, Op,
-    OwnStoreKind, StaticTy, SuperCheck, SuperKey, Sym, Ty, UnOp, ValueDef, ValueId,
+    BinOp, BlockId, CallKind, ClassId, CmpOp, Const, ConstId, DynPrim, FuncId, InstId, LexEnvKind,
+    Loc, Op, OwnStoreKind, StaticTy, SuperCheck, SuperKey, Sym, Ty, UnOp, ValueDef, ValueId,
 };
 use abcd_isa::{Bytecode, EntityId, EntityKind, Reg};
 
 use crate::cfg::RawCfg;
 use crate::resolve;
 use crate::ssa::{RegOrAcc, SsaBuilder};
-use crate::{LiftError, Lifter, emit_inst};
+use crate::{IrArenas, LiftBackend, LiftError, emit_inst};
 
 /// A super-property key in the three conceivable forms; the ISA
 /// provides name/dynamic producers only.
@@ -179,15 +179,17 @@ pub fn super_key(form: SuperKeyForm) -> Result<SuperKey, LiftError> {
 }
 
 /// Per-function translation context.
-pub struct FnLift<'l, 'f> {
-    /// The module-level conversion state.
-    pub lf: &'l mut Lifter<'f>,
+pub(crate) struct FnLift<'l, 'f, B: LiftBackend<'f>> {
+    /// The module-level or worker-local conversion state.
+    pub lf: &'l mut B,
     /// The method being lifted.
     pub method: &'f Method,
     /// Its body.
     pub body: &'f MethodBody,
-    /// The reserved function-table slot.
-    pub func_id: FuncId,
+    /// Owning class-table slot.
+    pub class_id: ClassId,
+    /// Decoded instruction count of `body`.
+    pub bytecode_len: usize,
     /// Total valid register count (`num_vregs + num_args`, `R3-M3`).
     pub frame_limit: u16,
     /// Dense raw block index → IR block (`R3-A4`).
@@ -214,25 +216,26 @@ pub struct FnLift<'l, 'f> {
     pub this_param: Option<ValueId>,
 }
 
-impl<'l, 'f> FnLift<'l, 'f> {
+impl<'l, 'f, B: LiftBackend<'f>> FnLift<'l, 'f, B> {
     /// Build the translation context.
     #[expect(
         clippy::too_many_arguments,
         reason = "lifts all per-function frame/CFG/SSA state into FnLift in one call"
     )]
     pub fn new(
-        lf: &'l mut Lifter<'f>,
+        lf: &'l mut B,
         method: &'f Method,
         body: &'f MethodBody,
-        func_id: FuncId,
+        class_id: ClassId,
+        bytecode_len: usize,
         frame_limit: u16,
         block_base: usize,
         num_fn_blocks: usize,
         block_map: Vec<BlockId>,
         raw_cfg: RawCfg,
     ) -> Self {
-        let undefined_const = lf.const_scalar(Const::Undefined);
-        let hole_const = lf.const_scalar(Const::Hole);
+        let undefined_const = lf.backend_const_scalar(Const::Undefined);
+        let hole_const = lf.backend_const_scalar(Const::Hole);
         let mut line_table = Vec::new();
         let mut col_table = Vec::new();
         if let Some(debug) = &method.debug {
@@ -249,7 +252,8 @@ impl<'l, 'f> FnLift<'l, 'f> {
             lf,
             method,
             body,
-            func_id,
+            class_id,
+            bytecode_len,
             frame_limit,
             block_map,
             raw_cfg,
@@ -263,8 +267,9 @@ impl<'l, 'f> FnLift<'l, 'f> {
 
     /// Push a fresh SSA value into the arena.
     pub fn new_value(&mut self, def: ValueDef, ty: Ty) -> ValueId {
-        let val = ValueId::new(self.lf.module.values.len() as u32);
-        self.lf.module.values.push(abcd_ir::Value { def, ty });
+        let values = self.lf.arenas_mut().values_mut();
+        let val = ValueId::new(values.len() as u32);
+        values.push(abcd_ir::Value { def, ty });
         val
     }
 
@@ -299,7 +304,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
     /// Emit an instruction (recording its source position).
     pub fn emit(&mut self, block: BlockId, op: Op, pc: Option<u32>) -> (InstId, Option<ValueId>) {
         let loc = pc.and_then(|pc| self.loc_of(pc));
-        let (iid, res) = emit_inst(&mut self.lf.module, block, op, loc);
+        let (iid, res) = emit_inst(self.lf.arenas_mut(), block, op, loc);
         if let Some(pc) = pc {
             self.inst_pc.insert(iid, pc);
         }
@@ -316,7 +321,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
     /// Emit, assign an explicit [`Ty`] to the result value, and return it.
     pub fn emit_val_typed(&mut self, block: BlockId, op: Op, ty: Ty, pc: Option<u32>) -> ValueId {
         let val = self.emit_val(block, op, pc);
-        self.lf.module.values[val.index()].ty = ty;
+        self.lf.arenas_mut().values_mut()[val.index()].ty = ty;
         val
     }
 
@@ -328,7 +333,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
     /// Read the accumulator SSA value.
     pub fn read_acc(&mut self, block: BlockId) -> ValueId {
         self.ssa
-            .read_variable(RegOrAcc::Acc, block, &mut self.lf.module)
+            .read_variable(RegOrAcc::Acc, block, self.lf.arenas_mut())
     }
 
     /// Write the accumulator SSA value.
@@ -353,7 +358,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
         self.check_reg(reg.0)?;
         Ok(self
             .ssa
-            .read_variable(RegOrAcc::Reg(reg.0), block, &mut self.lf.module))
+            .read_variable(RegOrAcc::Reg(reg.0), block, self.lf.arenas_mut()))
     }
 
     /// Write a register SSA value (`R3-M3` frame-checked).
@@ -385,10 +390,11 @@ impl<'l, 'f> FnLift<'l, 'f> {
                 frame_limit: self.frame_limit,
             });
         }
+        let arenas = self.lf.arenas_mut();
         Ok((0..count_u16)
             .map(|i| {
                 self.ssa
-                    .read_variable(RegOrAcc::Reg(start + i), block, &mut self.lf.module)
+                    .read_variable(RegOrAcc::Reg(start + i), block, arenas)
             })
             .collect())
     }
@@ -408,7 +414,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
         if let Some(v) = self.this_param {
             return v;
         }
-        let c = self.lf.const_scalar(Const::Undefined);
+        let c = self.lf.backend_const_scalar(Const::Undefined);
         self.emit_val(block, Op::LoadConst(c), pc)
     }
 
@@ -444,22 +450,20 @@ impl<'l, 'f> FnLift<'l, 'f> {
         } else {
             Ty::Any
         };
-        let id = self.lf.const_scalar(c);
+        let id = self.lf.backend_const_scalar(c);
         self.emit_val_typed(block, Op::LoadConst(id), ty, pc)
     }
 
     /// Whether `val` is statically proven to hold an ECMAScript boolean (`R3-X1`).
     pub fn is_proven_bool(&self, val: ValueId) -> bool {
-        let v = &self.lf.module.values[val.index()];
+        let v = &self.lf.arenas().values()[val.index()];
         if matches!(v.ty, Ty::DynPrim(DynPrim::Bool) | Ty::Static(StaticTy::U1)) {
             return true;
         }
         match v.def {
-            ValueDef::Const(cid) => matches!(self.lf.module.consts.get(cid), Some(Const::Bool(_))),
-            ValueDef::Inst(iid) => match &self.lf.module.insts[iid.index()].op {
-                Op::LoadConst(cid) => {
-                    matches!(self.lf.module.consts.get(*cid), Some(Const::Bool(_)))
-                }
+            ValueDef::Const(cid) => self.lf.backend_is_const_bool(cid),
+            ValueDef::Inst(iid) => match &self.lf.arenas().insts()[iid.index()].op {
+                Op::LoadConst(cid) => self.lf.backend_is_const_bool(*cid),
                 Op::Compare { .. } | Op::TestPrivate { .. } | Op::TestProp { .. } => true,
                 Op::UnaryOp { op, .. } => op.is_boolean_result(),
                 _ => false,
@@ -478,7 +482,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
                 .ok_or(LiftError::JumpTargetOutOfBounds {
                     pc,
                     target,
-                    len: self.body.bytecodes.len(),
+                    len: self.bytecode_len,
                 })?;
         Ok(self.block_map[raw_bi])
     }
@@ -490,49 +494,16 @@ impl<'l, 'f> FnLift<'l, 'f> {
             .copied()
             .ok_or(LiftError::FallthroughOutOfBounds {
                 pc,
-                len: self.body.bytecodes.len(),
+                len: self.bytecode_len,
             })
-    }
-
-    /// Return `(imports, exports, module_requests)` for the enclosing class's
-    /// `EsModule` (`--merge-abc`) or top-level standalone module tables when
-    /// present (`D3`, `D8`).
-    fn active_module_tables(
-        &self,
-    ) -> Option<(
-        &[abcd_ir::ImportDecl],
-        &[abcd_ir::ExportDecl],
-        &[abcd_ir::ModuleRequest],
-    )> {
-        let class_id = self.lf.module.functions[self.func_id.index()].class_id;
-        if let Some(esm) = self
-            .lf
-            .module
-            .classes
-            .get(class_id.index())
-            .and_then(|c| c.es_module.as_ref())
-        {
-            return Some((&esm.imports, &esm.exports, &esm.module_requests));
-        }
-        if !self.lf.module.imports.is_empty()
-            || !self.lf.module.exports.is_empty()
-            || !self.lf.module.module_requests.is_empty()
-        {
-            return Some((
-                &self.lf.module.imports,
-                &self.lf.module.exports,
-                &self.lf.module.module_requests,
-            ));
-        }
-        None
     }
 
     /// Resolve a legacy `0.0.0.2` local module-var string `name` against the
     /// enclosing `EsModule` (or standalone module) distinct `ExportDecl::Local`
-    /// slots (`D8`), falling back to `name.0` when no matching export exists.
-    pub fn resolve_legacy_local_module_slot(&self, name: Sym) -> u32 {
-        let Some((_, exports, _)) = self.active_module_tables() else {
-            return name.0;
+    /// slots (`D8`), returning `Err(name)` when falling back to `name.0`.
+    fn try_resolve_legacy_local_module_slot(&self, name: Sym) -> Result<u32, Sym> {
+        let Some((_, exports, _)) = self.lf.backend_active_module_tables(self.class_id) else {
+            return Err(name);
         };
         let mut distinct_locals: Vec<Sym> = Vec::new();
         let mut export_name_fallback: Option<u32> = None;
@@ -551,22 +522,22 @@ impl<'l, 'f> FnLift<'l, 'f> {
                     }
                 };
                 if *local_name == name {
-                    return slot;
+                    return Ok(slot);
                 }
                 if *export_name == name && export_name_fallback.is_none() {
                     export_name_fallback = Some(slot);
                 }
             }
         }
-        export_name_fallback.unwrap_or(name.0)
+        export_name_fallback.ok_or(name)
     }
 
     /// Resolve a legacy `0.0.0.2` external module-var string `name` against the
     /// enclosing `EsModule` (or standalone module) 0-based `ImportDecl::Regular`
-    /// slots (`D8`), falling back to `name.0` when no matching import exists.
-    pub fn resolve_legacy_external_module_slot(&self, name: Sym) -> u32 {
-        let Some((imports, _, _)) = self.active_module_tables() else {
-            return name.0;
+    /// slots (`D8`), returning `Err(name)` when falling back to `name.0`.
+    fn try_resolve_legacy_external_module_slot(&self, name: Sym) -> Result<u32, Sym> {
+        let Some((imports, _, _)) = self.lf.backend_active_module_tables(self.class_id) else {
+            return Err(name);
         };
         let mut ext_slot = 0u32;
         let mut import_name_fallback: Option<u32> = None;
@@ -578,7 +549,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
             } = imp
             {
                 if *local_name == name {
-                    return ext_slot;
+                    return Ok(ext_slot);
                 }
                 if *import_name == name && import_name_fallback.is_none() {
                     import_name_fallback = Some(ext_slot);
@@ -586,18 +557,19 @@ impl<'l, 'f> FnLift<'l, 'f> {
                 ext_slot += 1;
             }
         }
-        import_name_fallback.unwrap_or(name.0)
+        import_name_fallback.ok_or(name)
     }
 
     /// Resolve a legacy `0.0.0.2` module-namespace string `name` against the
     /// enclosing `EsModule` (or standalone module) 0-based `module_requests`
-    /// table (`D8`), falling back to `name.0` when no matching request exists.
-    pub fn resolve_legacy_module_namespace_slot(&self, name: Sym) -> u32 {
-        let Some((imports, _, requests)) = self.active_module_tables() else {
-            return name.0;
+    /// table (`D8`), returning `Err(name)` when falling back to `name.0`.
+    fn try_resolve_legacy_module_namespace_slot(&self, name: Sym) -> Result<u32, Sym> {
+        let Some((imports, _, requests)) = self.lf.backend_active_module_tables(self.class_id)
+        else {
+            return Err(name);
         };
         if let Some(idx) = requests.iter().position(|r| r.specifier == name) {
-            return idx as u32;
+            return Ok(idx as u32);
         }
         for imp in imports {
             if let abcd_ir::ImportDecl::Namespace {
@@ -607,16 +579,16 @@ impl<'l, 'f> FnLift<'l, 'f> {
                 && *local_name == name
                 && let Some(idx) = requests.iter().position(|r| r.specifier == *module_request)
             {
-                return idx as u32;
+                return Ok(idx as u32);
             }
         }
-        name.0
+        Err(name)
     }
 }
 
 /// Translate a single bytecode instruction into v0.2 IR.
-pub fn translate_bytecode(
-    fx: &mut FnLift,
+pub(crate) fn translate_bytecode<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
     bc: &Bytecode,
     idx: usize,
     bi: usize,
@@ -2200,7 +2172,7 @@ pub fn translate_bytecode(
             // method closure's `[[HomeObject]]` internal slot
             // (`JSFunction::GetHomeObject()`), never the closure itself.
             let func = fx.emit_val(block, Op::LoadFunction, loc);
-            let name = fx.lf.sym("[[HomeObject]]");
+            let name = fx.lf.backend_sym("[[HomeObject]]");
             let v = fx.emit_val(block, Op::LoadProp { object: func, name }, loc);
             fx.write_acc(block, v);
         }
@@ -2216,14 +2188,18 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCreatearraywithbuffer(idx) => {
-            let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
+            let shape = fx
+                .lf
+                .backend_resolve_lit_array(idx.0 as u32, resolve::LitWrap::PlainArray)?;
             let v = fx.emit_val(block, Op::AllocArray { shape: Some(shape) }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCreateobjectwithbuffer(idx) => {
             // `R3-M4`: `deprecated.createobjectwithbuffer` allocates an OBJECT
             // literal (`AllocObject`), never an array.
-            let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
+            let shape = fx
+                .lf
+                .backend_resolve_lit_array(idx.0 as u32, resolve::LitWrap::PlainArray)?;
             let v = fx.emit_val(block, Op::AllocObject { shape }, loc);
             fx.write_acc(block, v);
         }
@@ -2462,9 +2438,11 @@ pub fn translate_bytecode(
                 let member_attrs = fx.resolve_class_member_attrs(lit_eid, false)?;
                 (members, member_attrs)
             } else {
-                let members = resolve::const_for_literal_array(fx.lf, raw_lit)?;
+                let members = fx
+                    .lf
+                    .backend_resolve_lit_array(raw_lit, resolve::LitWrap::PlainArray)?;
                 let member_attrs =
-                    resolve::class_member_attrs_for_index(fx.lf.file, raw_lit, false)?;
+                    resolve::class_member_attrs_for_index(fx.lf.file(), raw_lit, false)?;
                 (members, member_attrs)
             };
             let _lexenv = fx.read_reg(*lexenv_reg, block)?;
@@ -2581,15 +2559,23 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedGetmodulenamespace(eid) => {
             let name = fx.resolve_str(*eid)?;
-            let index = fx.resolve_legacy_module_namespace_slot(name);
-            let v = fx.emit_val(block, Op::GetModuleNamespace { index }, loc);
-            fx.write_acc(block, v);
+            let slot = fx.try_resolve_legacy_module_namespace_slot(name);
+            let index = slot.unwrap_or_else(|s| s.raw());
+            let (iid, res) = fx.emit(block, Op::GetModuleNamespace { index }, loc);
+            if let Err(sym) = slot {
+                fx.lf.backend_record_legacy_modvar_fallback(iid, sym);
+            }
+            fx.write_acc(block, res.expect("GetModuleNamespace has result"));
         }
         Bytecode::DeprecatedStmodulevar(eid) => {
             let name = fx.resolve_str(*eid)?;
-            let index = fx.resolve_legacy_local_module_slot(name);
+            let slot = fx.try_resolve_legacy_local_module_slot(name);
+            let index = slot.unwrap_or_else(|s| s.raw());
             let value = fx.read_acc(block);
-            fx.emit_void(block, Op::StoreModuleVar { index, value }, loc);
+            let (iid, _) = fx.emit(block, Op::StoreModuleVar { index, value }, loc);
+            if let Err(sym) = slot {
+                fx.lf.backend_record_legacy_modvar_fallback(iid, sym);
+            }
         }
         Bytecode::DeprecatedLdobjbyname(eid, obj_reg) => {
             let name = fx.resolve_str(*eid)?;
@@ -2612,19 +2598,23 @@ pub fn translate_bytecode(
             // (`LocalExport`). Resolve string `name` against enclosing
             // `EsModule` import/export tables when present.
             let name = fx.resolve_str(*eid)?;
-            let (kind, index) = if flag.0 == 0 {
+            let (kind, slot) = if flag.0 == 0 {
                 (
                     abcd_ir::ModuleVarKind::External,
-                    fx.resolve_legacy_external_module_slot(name),
+                    fx.try_resolve_legacy_external_module_slot(name),
                 )
             } else {
                 (
                     abcd_ir::ModuleVarKind::Local,
-                    fx.resolve_legacy_local_module_slot(name),
+                    fx.try_resolve_legacy_local_module_slot(name),
                 )
             };
-            let v = fx.emit_val(block, Op::LoadModuleVar { index, kind }, loc);
-            fx.write_acc(block, v);
+            let index = slot.unwrap_or_else(|s| s.raw());
+            let (iid, res) = fx.emit(block, Op::LoadModuleVar { index, kind }, loc);
+            if let Err(sym) = slot {
+                fx.lf.backend_record_legacy_modvar_fallback(iid, sym);
+            }
+            fx.write_acc(block, res.expect("LoadModuleVar has result"));
         }
         Bytecode::DeprecatedStconsttoglobalrecord(eid) => {
             let name = fx.resolve_str(*eid)?;
@@ -2654,7 +2644,9 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::DeprecatedCreateobjecthavingmethod(idx) => {
-            let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
+            let shape = fx
+                .lf
+                .backend_resolve_lit_array(idx.0 as u32, resolve::LitWrap::PlainArray)?;
             let v = fx.emit_val(block, Op::AllocObject { shape }, loc);
             fx.write_acc(block, v);
         }
@@ -2678,8 +2670,8 @@ pub fn translate_bytecode(
 // ─── Helper functions ────────────────────────────────────────────────────────
 
 /// Emit a binary operation: acc = acc OP reg.
-fn binary_op(
-    fx: &mut FnLift,
+fn binary_op<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
     op: BinOp,
     r: &Reg,
     block: BlockId,
@@ -2693,8 +2685,8 @@ fn binary_op(
 }
 
 /// Emit a comparison: acc = acc CMP reg.
-fn compare_op(
-    fx: &mut FnLift,
+fn compare_op<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
     op: CmpOp,
     r: &Reg,
     block: BlockId,
@@ -2713,7 +2705,12 @@ fn compare_op(
 }
 
 /// Emit a unary operation: acc = OP acc.
-fn unary_op(fx: &mut FnLift, op: UnOp, block: BlockId, loc: Option<u32>) {
+fn unary_op<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
+    op: UnOp,
+    block: BlockId,
+    loc: Option<u32>,
+) {
     let operand = fx.read_acc(block);
     let ty = if op.is_boolean_result() {
         Ty::DynPrim(DynPrim::Bool)
@@ -2725,8 +2722,8 @@ fn unary_op(fx: &mut FnLift, op: UnOp, block: BlockId, loc: Option<u32>) {
 }
 
 /// Read a MODERN callthisrange-family register window `[this, args...]` (`argc + 1` slots).
-fn call_this_args(
-    fx: &mut FnLift,
+fn call_this_args<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
     start: u16,
     argc: i64,
     block: BlockId,
@@ -2750,8 +2747,8 @@ fn call_this_args(
 /// - Otherwise, emit `Op::UnaryOp { op: JumpNez | JumpEqz, operand: acc }`
 ///   (preserving ArkCompiler's non-`ToBoolean` raw `jeqz`/`jnez` semantics on
 ///   `null`, `undefined`, `NaN`, strings, and objects) followed by `Op::CondBranch`.
-fn cond_branch_acc(
-    fx: &mut FnLift,
+fn cond_branch_acc<'f, B: LiftBackend<'f>>(
+    fx: &mut FnLift<'_, 'f, B>,
     truthy: bool,
     label: abcd_isa::Label,
     idx: usize,

@@ -23,6 +23,7 @@ mod file_type;
 mod foreign_items;
 mod format_v24;
 mod indexed_entities;
+mod issue49_pure_rust_reader;
 mod issue91_remediations;
 mod legacy_decode;
 mod literal_all_tags;

@@ -9,19 +9,21 @@
 //!   ([`FuncId`]) of the referenced method;
 //! - `LiteralarrayId` operands carry the [`ConstId`] of the literal shape.
 //!
-//! `abcd_file::encode` first encodes `MethodBody.bytecodes` via
-//! `abcd_isa::encode` (where every entity operand occupies a 16-bit `id:u16`
-//! slot) and then relocates those slots through `MethodBody.entities`
-//! (`(kind, local_id) → EntityRef`) and `Builder::relocate_code_id`.
-//! Because module-wide [`Sym`] / [`FuncId`] / [`ConstId`] arenas in large
-//! `--merge-abc` bundles routinely exceed `65,536` entries (#32),
-//! `relocate_and_compact_entities` compacts each method's raw IR entity IDs
-//! into deduplicated method-local `u16` indices (`0, 1, 2, …` per
-//! [`EntityKind`] in first-appearance order) inside `MethodBody.bytecodes`
-//! while keying `MethodBody.entities` by those same compacted `u16` IDs:
+//! `abcd_file::encode` first encodes `MethodBody.code` (`MethodCode::Decoded`)
+//! via `abcd_isa::encode` (where every entity operand occupies a 16-bit
+//! `id:u16` slot) and then relocates those slots through `MethodBody.entities`
+//! (`MethodEntities`: `(kind, local_id) → EntityRef`) and
+//! `Builder::relocate_code_id`. Because module-wide [`Sym`] / [`FuncId`] /
+//! [`ConstId`] arenas in large `--merge-abc` bundles routinely exceed `65,536`
+//! entries (#32), `relocate_and_compact_entities_in_place` compacts each
+//! method's raw IR entity IDs in-place into deduplicated method-local `u16`
+//! indices (`0, 1, 2, …` per [`EntityKind`] in first-appearance order) while
+//! populating [`abcd_file::MethodEntities`] directly:
 //!
 //! - a [`Sym`] resolves by MUTF-8 CONTENT to an interned [`abcd_file::StringId`]
-//!   of the file (`EntityRef::String`), preserving optional wire
+//!   of the file (`EntityRef::String`), using a borrowed byte-keyed
+//!   `hashbrown::HashTable<u32>` (`#72`) with zero per-string heap allocations
+//!   for ASCII, BMP, and raw lossy MUTF-8 entries, and preserving optional wire
 //!   `source_offset` provenance when present on existing method bodies;
 //! - a [`FuncId`] resolves by function-table position to its dense
 //!   [`abcd_file::MethodIdx`] (`File::all_methods()` order is the lift's
@@ -38,14 +40,17 @@
 //! [`LowerError::EntityIndexOverflow`], and any ISA/visitor operand-count
 //! mismatch is a release-active [`LowerError::EntityOperandMismatch`] (`R3-M9`).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 
 use abcd_file::{
-    CatchBlock, EntityRef, File, LiteralArrayIdx, LiteralValue, MethodBody, MethodIdx, StringId,
-    TryBlock,
+    CatchBlock, EntityRef, File, LiteralArrayIdx, LiteralValue, MethodBody, MethodCode,
+    MethodEntities, MethodIdx, StringId, StringPool, TryBlock,
 };
 use abcd_ir::{Const, ConstId, FuncId, LitMethodKind, Module, Sym, TypedArrayTag};
 use abcd_isa::{Bytecode, EntityId, EntityKind};
+use hashbrown::HashTable;
 use rayon::prelude::*;
 
 use crate::layout::{LayoutResult, LoweredTryBlock};
@@ -73,7 +78,7 @@ pub fn to_method_body(
 }
 
 /// Lower every function in `module` in parallel and relocate its entity
-/// operands through a single shared [`EntityResolver`] (#29).
+/// operands in-place through a single shared [`EntityResolver`] (#29, `#84`).
 ///
 /// Bodyless functions (`blocks.is_empty()`) yield `None`; errors are
 /// deterministic (the lowest [`FuncId`]'s error wins, matching sequential
@@ -95,11 +100,91 @@ pub fn lower_module_bodies(
                 return Ok(None);
             }
             let layout = lower_function_with_options(module, func_id, options)?;
-            let body = resolver.to_method_body(func_id, &layout)?;
+            let body = resolver.into_method_body(func_id, layout)?;
             Ok(Some(body))
         })
         .collect();
     results.into_iter().collect()
+}
+
+/// Borrowed byte-keyed MUTF-8 index over a [`StringPool`] (`#72`).
+///
+/// Stores raw `StringId` `u32` indices in a `hashbrown::HashTable<u32>`.
+/// Entries whose MUTF-8 wire bytes borrow directly from `StringPool` (99.9%+:
+/// ASCII, BMP including PUA, and raw lone-surrogate MUTF-8) incur zero
+/// per-string heap allocations; only entries requiring `C0 80` NUL or 6-byte
+/// CESU-8 astral expansion store `(id, Box<[u8]>)` in `owned_mutf8` (sorted by
+/// `id`). First-appearance (`or_insert`) tie-breaking is preserved.
+pub(crate) struct StringMutf8Index {
+    hasher: RandomState,
+    table: HashTable<u32>,
+    owned_mutf8: Vec<(u32, Box<[u8]>)>,
+}
+
+impl StringMutf8Index {
+    pub(crate) fn build(pool: &StringPool) -> Self {
+        let hasher = RandomState::new();
+        let len = pool.len();
+        let mut table = HashTable::with_capacity(len);
+        let mut owned_mutf8: Vec<(u32, Box<[u8]>)> = Vec::new();
+
+        for i in 0..len {
+            let id = i as u32;
+            let sid = StringId::new(id);
+            let Some(cow) = pool.to_mutf8_bytes(sid) else {
+                continue;
+            };
+            let hash = hasher.hash_one(cow.as_ref());
+            let already_present = table
+                .find(hash, |&existing_id| {
+                    Self::bytes_of(pool, &owned_mutf8, existing_id) == Some(cow.as_ref())
+                })
+                .is_some();
+            if already_present {
+                continue;
+            }
+            if let Cow::Owned(vec) = cow {
+                owned_mutf8.push((id, vec.into_boxed_slice()));
+            }
+            table.insert_unique(hash, id, |&existing_id| {
+                hasher.hash_one(Self::bytes_of(pool, &owned_mutf8, existing_id).unwrap_or(&[]))
+            });
+        }
+
+        Self {
+            hasher,
+            table,
+            owned_mutf8,
+        }
+    }
+
+    #[inline]
+    fn bytes_of<'p>(
+        pool: &'p StringPool,
+        owned_mutf8: &'p [(u32, Box<[u8]>)],
+        id: u32,
+    ) -> Option<&'p [u8]> {
+        if !owned_mutf8.is_empty()
+            && let Ok(pos) = owned_mutf8.binary_search_by_key(&id, |(k, _)| *k)
+        {
+            return Some(&owned_mutf8[pos].1);
+        }
+        let sid = StringId::new(id);
+        if let Some(raw) = pool.raw_mutf8(sid) {
+            Some(raw)
+        } else {
+            pool.resolve(sid).map(str::as_bytes)
+        }
+    }
+
+    pub(crate) fn get(&self, pool: &StringPool, target: &[u8]) -> Option<StringId> {
+        let hash = self.hasher.hash_one(target);
+        self.table
+            .find(hash, |&id| {
+                Self::bytes_of(pool, &self.owned_mutf8, id) == Some(target)
+            })
+            .map(|&id| StringId::new(id))
+    }
 }
 
 /// Hash-consed flat shape identifier (eliminates recursive `Drop`, `Hash`, and
@@ -141,41 +226,25 @@ enum FlatLitElem {
     ArrayString(Vec<Sym>),
 }
 
-/// Module-scoped reverse entity resolver: IR identities → [`EntityRef`]
-/// handles (`design/ir.md` §5, `ADR-10`, `#50` `R3-D2`).
+/// Detached reverse entity index over a base [`File`]'s initial string, method,
+/// and literal-array tables (`#72`, `#84`).
 ///
-/// Built once per `(Module, File)` pair and safe to share across threads
-/// (`Sync`). Lookups run in `O(1)` amortized time for strings and methods and
-/// `O(shape_size)` iterative bottom-up hash-consing for literal shapes.
-pub struct EntityResolver<'a> {
-    module: &'a Module,
-    /// Canonical MUTF-8 wire bytes → first [`StringId`] in `file.strings` (#30).
-    string_ids: HashMap<Box<[u8]>, StringId>,
-    /// Optional wire `source_offset` provenance preserved from existing
-    /// `MethodBody::entities` entries (smallest offset wins deterministically).
+/// Stores only `u32` `StringId` indices (borrowed against the append-only
+/// [`StringPool`] at lookup time), optional wire `source_offset` provenance,
+/// method count, and flat hash-consed literal shapes so `rewrite_file_owned`
+/// can mutate `File` in-place (`Arc::strong_count == 1` on `StringPool`) and
+/// drop old `MethodBody` buffers before lowering begins.
+pub(crate) struct BaseEntityIndex {
+    string_index: StringMutf8Index,
     string_source_offsets: HashMap<StringId, u32>,
-    /// Total method count in `file.all_methods()` (`FuncId` reservation bound).
     method_count: usize,
-    /// Hash-consed flat element sequence → canonical [`ShapeId`].
     shape_interner: HashMap<Vec<FlatLitElem>, ShapeId>,
-    /// Canonical [`ShapeId`] → smallest matching [`LiteralArrayIdx`] in `file`.
     shape_to_min_index: HashMap<ShapeId, LiteralArrayIdx>,
 }
 
-impl<'a> EntityResolver<'a> {
-    /// Index `file`'s string, method, and literal-array tables once for
-    /// `module`.
-    pub fn new(module: &'a Module, file: &File) -> Self {
-        let mut string_ids: HashMap<Box<[u8]>, StringId> =
-            HashMap::with_capacity(file.strings.len());
-        for i in 0..file.strings.len() {
-            let sid = StringId::new(i as u32);
-            if let Some(bytes) = file.strings.to_mutf8_bytes(sid) {
-                string_ids
-                    .entry(bytes.into_owned().into_boxed_slice())
-                    .or_insert(sid);
-            }
-        }
+impl BaseEntityIndex {
+    pub(crate) fn from_file(module: &Module, file: &File) -> Self {
+        let string_index = StringMutf8Index::build(&file.strings);
 
         let mut string_source_offsets: HashMap<StringId, u32> = HashMap::new();
         let mut method_count = 0usize;
@@ -223,8 +292,7 @@ impl<'a> EntityResolver<'a> {
         }
 
         Self {
-            module,
-            string_ids,
+            string_index,
             string_source_offsets,
             method_count,
             shape_interner,
@@ -232,8 +300,75 @@ impl<'a> EntityResolver<'a> {
         }
     }
 
-    /// Relocate a lowered function's [`LayoutResult`] into an encodable
-    /// [`MethodBody`].
+    pub(crate) fn string_id(
+        &self,
+        module: &Module,
+        strings: &StringPool,
+        sym: Sym,
+    ) -> Option<StringId> {
+        let bytes = module.sym.to_mutf8_bytes(sym)?;
+        self.string_index.get(strings, bytes.as_ref())
+    }
+
+    pub(crate) fn string_ref(
+        &self,
+        module: &Module,
+        strings: &StringPool,
+        sym: Sym,
+    ) -> Option<EntityRef> {
+        let id = self.string_id(module, strings, sym)?;
+        Some(EntityRef::String {
+            id,
+            source_offset: self.string_source_offsets.get(&id).copied(),
+        })
+    }
+
+    pub(crate) fn method_ref(&self, func: FuncId) -> Option<EntityRef> {
+        (func.index() < self.method_count).then_some(EntityRef::Method(MethodIdx(func.0)))
+    }
+
+    pub(crate) fn literal_array_idx(
+        &self,
+        module: &Module,
+        shape: ConstId,
+    ) -> Option<LiteralArrayIdx> {
+        let shape_id = canonicalize_const_shape(module, &self.shape_interner, shape)?;
+        self.shape_to_min_index.get(&shape_id).copied()
+    }
+
+    pub(crate) fn literal_array_ref(&self, module: &Module, shape: ConstId) -> Option<EntityRef> {
+        self.literal_array_idx(module, shape)
+            .map(EntityRef::LiteralArray)
+    }
+}
+
+/// Module-scoped reverse entity resolver: IR identities → [`EntityRef`]
+/// handles (`design/ir.md` §5, `ADR-10`, `#50` `R3-D2`, `#72`).
+///
+/// Built once per `(Module, File)` pair and safe to share across threads
+/// (`Sync`). Lookups run in `O(1)` amortized time for strings and methods (with
+/// zero per-string heap allocations for borrowed MUTF-8 entries) and
+/// `O(shape_size)` iterative bottom-up hash-consing for literal shapes.
+pub struct EntityResolver<'a> {
+    module: &'a Module,
+    file: &'a File,
+    index: BaseEntityIndex,
+}
+
+impl<'a> EntityResolver<'a> {
+    /// Index `file`'s string, method, and literal-array tables once for
+    /// `module`.
+    pub fn new(module: &'a Module, file: &'a File) -> Self {
+        let index = BaseEntityIndex::from_file(module, file);
+        Self {
+            module,
+            file,
+            index,
+        }
+    }
+
+    /// Relocate a lowered function's borrowed [`LayoutResult`] into an
+    /// encodable [`MethodBody`].
     pub fn to_method_body(
         &self,
         func_id: FuncId,
@@ -246,31 +381,8 @@ impl<'a> EntityResolver<'a> {
             .unwrap_or_default();
 
         let (bytecodes, entities) =
-            relocate_and_compact_entities(func_id, &result.bytecodes, |kind, raw| match kind {
-                EntityKind::StringId => {
-                    self.string_ref(Sym::new(raw))
-                        .ok_or(LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw,
-                        })
-                }
-                EntityKind::MethodId => {
-                    self.method_ref(FuncId::new(raw))
-                        .ok_or(LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw,
-                        })
-                }
-                EntityKind::LiteralarrayId => {
-                    self.literal_array_ref(ConstId::new(raw))
-                        .ok_or(LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw,
-                        })
-                }
+            relocate_and_compact_entities(func_id, &result.bytecodes, |kind, raw| {
+                self.resolve_entity_operand(func_id, kind, raw)
             })?;
 
         let try_blocks = self.resolve_try_blocks(&result.try_blocks, func_id)?;
@@ -278,37 +390,96 @@ impl<'a> EntityResolver<'a> {
         Ok(MethodBody {
             num_vregs: u32::from(result.num_regs),
             num_args: param_count as u32,
-            bytecodes,
+            code: MethodCode::Decoded(bytecodes),
             entities,
             try_blocks,
             ic_size: Some(result.ic_size),
         })
     }
 
+    /// Relocate an owned [`LayoutResult`] in-place into an encodable
+    /// [`MethodBody`], moving `result.bytecodes` directly into
+    /// [`MethodCode::Decoded`] without cloning (`#84`).
+    pub fn into_method_body(
+        &self,
+        func_id: FuncId,
+        mut result: LayoutResult,
+    ) -> Result<MethodBody, LowerError> {
+        let param_count = self
+            .module
+            .func(func_id)
+            .map(|f| f.params.len())
+            .unwrap_or_default();
+
+        let entities =
+            relocate_and_compact_entities_in_place(func_id, &mut result.bytecodes, |kind, raw| {
+                self.resolve_entity_operand(func_id, kind, raw)
+            })?;
+
+        let try_blocks = self.resolve_try_blocks(&result.try_blocks, func_id)?;
+
+        Ok(MethodBody {
+            num_vregs: u32::from(result.num_regs),
+            num_args: param_count as u32,
+            code: MethodCode::Decoded(result.bytecodes),
+            entities,
+            try_blocks,
+            ic_size: Some(result.ic_size),
+        })
+    }
+
+    fn resolve_entity_operand(
+        &self,
+        func_id: FuncId,
+        kind: EntityKind,
+        raw: u32,
+    ) -> Result<EntityRef, LowerError> {
+        match kind {
+            EntityKind::StringId => {
+                self.string_ref(Sym::new(raw))
+                    .ok_or(LowerError::UntraceableEntity {
+                        func: func_id,
+                        kind,
+                        raw,
+                    })
+            }
+            EntityKind::MethodId => {
+                self.method_ref(FuncId::new(raw))
+                    .ok_or(LowerError::UntraceableEntity {
+                        func: func_id,
+                        kind,
+                        raw,
+                    })
+            }
+            EntityKind::LiteralarrayId => {
+                self.literal_array_ref(ConstId::new(raw))
+                    .ok_or(LowerError::UntraceableEntity {
+                        func: func_id,
+                        kind,
+                        raw,
+                    })
+            }
+        }
+    }
+
     /// [`Sym`] → interned [`StringId`] in `file.strings` matching exact MUTF-8 wire bytes.
     pub(crate) fn string_id(&self, sym: Sym) -> Option<StringId> {
-        let bytes = self.module.sym.to_mutf8_bytes(sym)?;
-        self.string_ids.get(bytes.as_ref()).copied()
+        self.index.string_id(self.module, &self.file.strings, sym)
     }
 
     /// [`Sym`] → [`EntityRef::String`] carrying preserved `source_offset` when known.
     pub(crate) fn string_ref(&self, sym: Sym) -> Option<EntityRef> {
-        let id = self.string_id(sym)?;
-        Some(EntityRef::String {
-            id,
-            source_offset: self.string_source_offsets.get(&id).copied(),
-        })
+        self.index.string_ref(self.module, &self.file.strings, sym)
     }
 
     /// [`FuncId`] → [`EntityRef::Method`] at that dense function-table index.
     pub(crate) fn method_ref(&self, func: FuncId) -> Option<EntityRef> {
-        (func.index() < self.method_count).then_some(EntityRef::Method(MethodIdx(func.0)))
+        self.index.method_ref(func)
     }
 
     /// [`ConstId`] (a literal shape) → smallest matching [`LiteralArrayIdx`] in `file`.
     pub(crate) fn literal_array_idx(&self, shape: ConstId) -> Option<LiteralArrayIdx> {
-        let shape_id = canonicalize_const_shape(self.module, &self.shape_interner, shape)?;
-        self.shape_to_min_index.get(&shape_id).copied()
+        self.index.literal_array_idx(self.module, shape)
     }
 
     /// [`ConstId`] (a literal shape) → [`EntityRef::LiteralArray`].
@@ -936,25 +1107,24 @@ fn scalar_literal_value_elem(
     }
 }
 
-/// Method-local `(EntityKind, u16_local_id) → EntityRef` relocation map (`#50`).
-pub(crate) type EntityMap = HashMap<(EntityKind, u32), EntityRef>;
-
-/// Resolve every entity operand in `bytecodes` through `resolve` and compact
-/// module-global `EntityId(u32)` values into method-local `u16` placeholder
-/// indices (`0, 1, 2, …` per [`EntityKind`] in first-appearance order, #32).
-pub(crate) fn relocate_and_compact_entities(
+/// Resolve every entity operand in `bytecodes` in-place through `resolve` and
+/// compact module-global `EntityId(u32)` values into method-local `u16`
+/// placeholder indices (`0, 1, 2, …` per [`EntityKind`] in first-appearance
+/// order, `#32`, `#49`, `#84`).
+///
+/// Populates [`MethodEntities`] directly in canonical `(kind as u8, local_id)`
+/// ascending order (`O(1)` append fast path, zero `HashMap` bucket overhead).
+pub(crate) fn relocate_and_compact_entities_in_place(
     func_id: FuncId,
-    bytecodes: &[Bytecode],
+    bytecodes: &mut [Bytecode],
     mut resolve: impl FnMut(EntityKind, u32) -> Result<EntityRef, LowerError>,
-) -> Result<(Vec<Bytecode>, EntityMap), LowerError> {
-    let mut out_bytecodes = bytecodes.to_vec();
-    let mut entities: EntityMap = HashMap::new();
+) -> Result<MethodEntities, LowerError> {
     let mut local_ids: HashMap<(EntityKind, u32), u16> = HashMap::new();
-    let mut next_string: u32 = 0;
-    let mut next_method: u32 = 0;
-    let mut next_literal: u32 = 0;
+    let mut strings_out: Vec<EntityRef> = Vec::new();
+    let mut methods_out: Vec<EntityRef> = Vec::new();
+    let mut literals_out: Vec<EntityRef> = Vec::new();
 
-    for bc in &mut out_bytecodes {
+    for bc in bytecodes {
         let expected_len = bc.entity_operands().len();
         let mut visited = 0usize;
         for_each_entity_operand_mut(bc, |kind, id_mut| {
@@ -964,16 +1134,15 @@ pub(crate) fn relocate_and_compact_entities(
                 existing
             } else {
                 let entity_ref = resolve(kind, raw)?;
-                let counter = match kind {
-                    EntityKind::StringId => &mut next_string,
-                    EntityKind::MethodId => &mut next_method,
-                    EntityKind::LiteralarrayId => &mut next_literal,
+                let bucket = match kind {
+                    EntityKind::StringId => &mut strings_out,
+                    EntityKind::MethodId => &mut methods_out,
+                    EntityKind::LiteralarrayId => &mut literals_out,
                 };
-                let assigned = u16::try_from(*counter)
+                let assigned = u16::try_from(bucket.len())
                     .map_err(|_| LowerError::EntityIndexOverflow(func_id))?;
-                *counter += 1;
+                bucket.push(entity_ref);
                 local_ids.insert((kind, raw), assigned);
-                entities.insert((kind, u32::from(assigned)), entity_ref);
                 assigned
             };
             *id_mut = EntityId(u32::from(local_id));
@@ -989,6 +1158,32 @@ pub(crate) fn relocate_and_compact_entities(
         }
     }
 
+    let total = strings_out.len() + methods_out.len() + literals_out.len();
+    let mut entities = MethodEntities::with_capacity(total);
+    let mut kind_buckets = [
+        (EntityKind::StringId, strings_out),
+        (EntityKind::MethodId, methods_out),
+        (EntityKind::LiteralarrayId, literals_out),
+    ];
+    kind_buckets.sort_by_key(|(k, _)| *k as u8);
+    for (kind, bucket) in kind_buckets {
+        for (idx, eref) in bucket.into_iter().enumerate() {
+            entities.insert((kind, idx as u32), eref);
+        }
+    }
+
+    Ok(entities)
+}
+
+/// Clone `bytecodes` and relocate/compact its entity operands via
+/// [`relocate_and_compact_entities_in_place`].
+pub(crate) fn relocate_and_compact_entities(
+    func_id: FuncId,
+    bytecodes: &[Bytecode],
+    resolve: impl FnMut(EntityKind, u32) -> Result<EntityRef, LowerError>,
+) -> Result<(Vec<Bytecode>, MethodEntities), LowerError> {
+    let mut out_bytecodes = bytecodes.to_vec();
+    let entities = relocate_and_compact_entities_in_place(func_id, &mut out_bytecodes, resolve)?;
     Ok((out_bytecodes, entities))
 }
 
@@ -1145,5 +1340,201 @@ mod tests {
         })
         .expect_err("65537 distinct strings in one method must overflow u16");
         assert!(matches!(err, LowerError::EntityIndexOverflow(f) if f == FuncId::new(7)));
+    }
+
+    #[test]
+    fn entity_resolver_borrowed_mutf8_table_resolves_ascii_pua_nul_astral_and_lone_surrogates() {
+        use std::collections::BTreeMap;
+
+        use abcd_file::{
+            AccessFlags, Annotations, Class, FileType, FunctionKind as FileFunctionKind, Method,
+            ParamAnnotations, SourceLang, Type, Version,
+        };
+        use abcd_ir::{ClassData, ClassId, FunctionData, FunctionKind};
+
+        let mut strings = StringPool::new();
+        let global_sid = strings.get_or_intern("L_GLOBAL;");
+        let fn_sid = strings.get_or_intern("f");
+        let ascii_sid = strings.get_or_intern("hello_ascii");
+        let pua_sid = strings.get_or_intern("\u{E000}pua\u{F8FF}");
+        let fffd_sid = strings.get_or_intern("\u{FFFD}\u{FFFD}\u{FFFD}");
+        let nul_sid = strings.get_or_intern("nul\0mid");
+        let astral_sid = strings.get_or_intern("🚀🔥");
+        let raw_hi = [0xED, 0xA0, 0xB4]; // U+D834
+        let raw_lo = [0xED, 0xBC, 0x86]; // U+DF06
+        let lone_hi_sid = strings.intern_mutf8(&raw_hi);
+        let lone_lo_sid = strings.intern_mutf8(&raw_lo);
+
+        // Exercise `EntityResolver` after `StringPool::drop_index()` as well.
+        strings.drop_index();
+
+        // Record two different `source_offset`s for `ascii_sid` and `nul_sid`
+        // across existing method entities; smallest offset must win.
+        let mut ents_a = MethodEntities::with_capacity(2);
+        ents_a.insert(
+            (EntityKind::StringId, 0),
+            EntityRef::string_with_offset(ascii_sid, 0x240),
+        );
+        ents_a.insert(
+            (EntityKind::StringId, 1),
+            EntityRef::string_with_offset(nul_sid, 0x310),
+        );
+        let mut ents_b = MethodEntities::with_capacity(2);
+        ents_b.insert(
+            (EntityKind::StringId, 0),
+            EntityRef::string_with_offset(ascii_sid, 0x120),
+        );
+        ents_b.insert(
+            (EntityKind::StringId, 1),
+            EntityRef::string_with_offset(astral_sid, 0x400),
+        );
+
+        let mk_method = |entities: MethodEntities| Method {
+            name: fn_sid,
+            offset: 0,
+            access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+            function_kind: FileFunctionKind::Function,
+            source_lang: SourceLang::EcmaScript,
+            is_external: false,
+            return_type: Some(Type::Tagged),
+            arg_types: Vec::new(),
+            body: Some(MethodBody {
+                num_vregs: 0,
+                num_args: 0,
+                code: MethodCode::Decoded(vec![Bytecode::Returnundefined]),
+                entities,
+                try_blocks: Vec::new(),
+                ic_size: None,
+            }),
+            annotations: Annotations::default(),
+            param_annotations: ParamAnnotations::default(),
+            debug: None,
+        };
+
+        let mut classes = BTreeMap::new();
+        classes.insert(
+            global_sid,
+            Class {
+                descriptor: global_sid,
+                name: global_sid,
+                access_flags: AccessFlags::PUBLIC,
+                source_lang: SourceLang::EcmaScript,
+                source_file: None,
+                is_external: false,
+                super_class: None,
+                interfaces: Vec::new(),
+                methods: vec![mk_method(ents_a), mk_method(ents_b)],
+                fields: Vec::new(),
+                annotations: Annotations::default(),
+            },
+        );
+        let file = File {
+            version: Version::new(12, 0, 6, 0),
+            checksum: 0,
+            size: 0,
+            file_type: FileType::Dynamic,
+            strings,
+            classes,
+            literal_arrays: Vec::new(),
+            literal_array_header_offsets: Vec::new(),
+        };
+
+        let mut module = Module::new();
+        let g_sym = module.sym.intern("L_GLOBAL;");
+        module.classes.push(ClassData::new(g_sym, g_sym));
+        let fn_sym = module.sym.intern("f");
+        module.functions.push(FunctionData::new(
+            ClassId::new(0),
+            fn_sym,
+            FunctionKind::Function,
+        ));
+
+        let sym_ascii = module.sym.intern("hello_ascii");
+        let sym_pua = module.sym.intern("\u{E000}pua\u{F8FF}");
+        let sym_fffd = module.sym.intern("\u{FFFD}\u{FFFD}\u{FFFD}");
+        let sym_nul = module.sym.intern("nul\0mid");
+        let sym_astral = module.sym.intern("🚀🔥");
+        let sym_hi = module.sym.intern_raw_mutf8(&raw_hi);
+        let sym_lo = module.sym.intern_raw_mutf8(&raw_lo);
+
+        let resolver = EntityResolver::new(&module, &file);
+        // Only `nul\0mid` and `"🚀🔥"` require owned MUTF-8 buffers; ASCII, PUA,
+        // `U+FFFD`, and lone surrogates borrow directly with zero `Box<[u8]>`.
+        assert_eq!(resolver.index.string_index.owned_mutf8.len(), 2);
+
+        assert_eq!(
+            resolver.string_ref(sym_ascii),
+            Some(EntityRef::string_with_offset(ascii_sid, 0x120))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_pua),
+            Some(EntityRef::string(pua_sid))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_fffd),
+            Some(EntityRef::string(fffd_sid))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_nul),
+            Some(EntityRef::string_with_offset(nul_sid, 0x310))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_astral),
+            Some(EntityRef::string_with_offset(astral_sid, 0x400))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_hi),
+            Some(EntityRef::string(lone_hi_sid))
+        );
+        assert_eq!(
+            resolver.string_ref(sym_lo),
+            Some(EntityRef::string(lone_lo_sid))
+        );
+
+        let bytecodes = vec![
+            Bytecode::LdaStr(EntityId(sym_ascii.0)),
+            Bytecode::LdaStr(EntityId(sym_pua.0)),
+            Bytecode::LdaStr(EntityId(sym_fffd.0)),
+            Bytecode::LdaStr(EntityId(sym_nul.0)),
+            Bytecode::LdaStr(EntityId(sym_astral.0)),
+            Bytecode::LdaStr(EntityId(sym_hi.0)),
+            Bytecode::LdaStr(EntityId(sym_lo.0)),
+            Bytecode::Return,
+        ];
+        let orig_ptr = bytecodes.as_ptr();
+        let layout_for_ref = LayoutResult {
+            bytecodes: bytecodes.clone(),
+            try_blocks: Vec::new(),
+            inst_pcs: HashMap::new(),
+            num_regs: 0,
+            entity_traces: HashMap::new(),
+            ic_size: 0,
+        };
+        let layout_owned = LayoutResult {
+            bytecodes,
+            try_blocks: Vec::new(),
+            inst_pcs: HashMap::new(),
+            num_regs: 0,
+            entity_traces: HashMap::new(),
+            ic_size: 0,
+        };
+
+        let body_cloned = resolver
+            .to_method_body(FuncId::new(0), &layout_for_ref)
+            .expect("to_method_body");
+        let body_owned = resolver
+            .into_method_body(FuncId::new(0), layout_owned)
+            .expect("into_method_body");
+
+        assert_eq!(body_cloned.code, body_owned.code);
+        assert_eq!(body_cloned.entities, body_owned.entities);
+        let MethodCode::Decoded(owned_vec) = &body_owned.code else {
+            panic!("expected MethodCode::Decoded");
+        };
+        assert_eq!(
+            owned_vec.as_ptr(),
+            orig_ptr,
+            "into_method_body must relocate in-place without reallocating Vec<Bytecode>"
+        );
     }
 }

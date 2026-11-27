@@ -83,8 +83,8 @@ fn single_body_model(
         body: Some(MethodBody {
             num_vregs,
             num_args,
-            bytecodes,
-            entities,
+            code: abcd_file::MethodCode::Decoded(bytecodes),
+            entities: entities.into(),
             try_blocks,
             ic_size: None,
         }),
@@ -629,16 +629,17 @@ fn r3_d2_a6_h9_typed_catch_synthesizes_external_class_and_deduplicates_source_co
         body: Some(MethodBody {
             num_vregs: 1,
             num_args: 0,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::Createarraywithbuffer(Imm(0), EntityId(0)), // 0 (try)
                 Bytecode::Return,                                     // 1
                 Bytecode::Return,                                     // 2 (typed catch)
                 Bytecode::Returnundefined,                            // 3 (catch-all)
-            ],
+            ]),
             entities: HashMap::from([(
                 (EntityKind::LiteralarrayId, 0),
                 EntityRef::LiteralArray(LiteralArrayIdx(0)),
-            )]),
+            )])
+            .into(),
             try_blocks: vec![TryBlock {
                 start: 0,
                 len: 2,
@@ -674,8 +675,8 @@ fn r3_d2_a6_h9_typed_catch_synthesizes_external_class_and_deduplicates_source_co
         body: Some(MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes: vec![Bytecode::Returnundefined],
-            entities: HashMap::new(),
+            code: abcd_file::MethodCode::Decoded(vec![Bytecode::Returnundefined]),
+            entities: abcd_file::MethodEntities::new(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),
@@ -1107,14 +1108,15 @@ fn deep_5000_nested_literal_and_typed_arrays_lift_on_256kib_stack() {
                 body: Some(MethodBody {
                     num_vregs: 0,
                     num_args: 0,
-                    bytecodes: vec![
+                    code: abcd_file::MethodCode::Decoded(vec![
                         Bytecode::Createarraywithbuffer(Imm(0), EntityId(0)),
                         Bytecode::Return,
-                    ],
+                    ]),
                     entities: HashMap::from([(
                         (EntityKind::LiteralarrayId, 0),
                         EntityRef::LiteralArray(LiteralArrayIdx(0)),
-                    )]),
+                    )])
+                    .into(),
                     try_blocks: Vec::new(),
                     ic_size: None,
                 }),
@@ -1235,15 +1237,16 @@ fn module_dialect_and_pre_method_es_module_visibility() {
         body: Some(MethodBody {
             num_vregs: 0,
             num_args: 0,
-            bytecodes: vec![
+            code: abcd_file::MethodCode::Decoded(vec![
                 Bytecode::DeprecatedLdmodulevar(EntityId(0), Imm(0)), // External `impB` -> slot 1
                 Bytecode::DeprecatedStmodulevar(EntityId(1)),         // Local `expY` -> slot 1
                 Bytecode::Returnundefined,
-            ],
+            ]),
             entities: HashMap::from([
                 ((EntityKind::StringId, 0), EntityRef::string(imp_b)),
                 ((EntityKind::StringId, 1), EntityRef::string(exp_y)),
-            ]),
+            ])
+            .into(),
             try_blocks: Vec::new(),
             ic_size: None,
         }),

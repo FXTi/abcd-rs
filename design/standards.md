@@ -4,7 +4,7 @@ This document establishes the binding architectural, algorithmic, safety, and te
 
 ---
 
-## 1. Repository & Documentation Hygiene
+## 1. Repository, Module & Documentation Hygiene
 
 1. **Evergreen Design & Guidance Only**:
    - Tracked Markdown files consist solely of root `README.md`, `AGENTS.md`, subsystem specifications and policies under `design/*.md`, and concise crate `README.md`s.
@@ -14,6 +14,15 @@ This document establishes the binding architectural, algorithmic, safety, and te
    - Each crate `README.md` stays concise (~50–140 lines) and follows five sections: **(1) Purpose & Layering Contract**, **(2) Architecture / Module Map**, **(3) Key Invariants** (linking to [`decisions.md`](decisions.md)), **(4) Compiling Quick Start**, and **(5) Verification** (`./scripts/test-local.sh`).
 3. **Rustdoc Zero-Warning Gate**:
    - Public items in enforced crates carry doc comments (`#![deny(missing_docs)]`), and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` must pass with zero broken intra-doc links.
+4. **Module Cohesion, File Granularity & Test Organization**:
+   - **Cohesion-First Decomposition**: Organize source files around a single cohesive pass, data structure, or subsystem—never split mechanically by line numbers (`part1.rs`, `part2.rs`).
+   - **Tool-Window Granularity Thresholds (`W = 800` lines / `~46 KiB` single-read window)**:
+     - **`≤ 2,400` lines (`3W`) — Target Span**: Non-exempt production and test `.rs` files should stay within `~2,400` lines so a reviewer or coding agent can read the entire module in one parallel batch without partial-slice blind spots.
+     - **`4,000` lines (`5W`) — Structural Refactoring Ceiling**: Any non-exempt `.rs` file exceeding `4,000` lines must be split along cohesive subsystem or topic boundaries to eliminate cross-file context blowup and multi-thousand-line edit stalls.
+     - **Flat Exhaustive Dispatch Exemption**: Single-pass files whose length comes from exhaustive `match` arms over the ~200+ Panda/IR opcodes or wire tags (e.g., `abcd-ir/src/op.rs`, `abcd-ir/src/verify.rs`, `abcd-lift/src/translate.rs`, `abcd-lower/src/isel.rs`) are exempt from line-count splitting so Rust's exhaustiveness checks and side-by-side opcode audits remain in one place.
+   - **Topic- & Scale-Driven Unit Test Placement**:
+     - **Small foundational unit tests stay inline**: Concise tests (`≤ ~300–400` lines) exercising local data-structure invariants or low-level helpers belong inline (`#[cfg(test)] mod tests`) at the bottom of the implementation file for immediate co-located readability, provided the total file stays within `~2,400` lines.
+     - **Large or multi-theme suites are externalized by topic**: Once unit tests grow substantial (`> ~400` lines or pushing the host file past `~2,400` lines) or span distinct functional themes, extract them into topic-organized sibling modules (`foo/tests.rs`, `foo/tests/<topic>.rs`, or `tests/integration/<topic>.rs`)—never accumulate monolithic `4,000+`-line catch-all `tests.rs` files either.
 
 ---
 

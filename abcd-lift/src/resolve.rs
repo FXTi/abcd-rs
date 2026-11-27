@@ -13,7 +13,7 @@ use abcd_ir::op::MemberAttrs;
 use abcd_ir::{Const, ConstId, FuncId, LitMethodKind, Sym, TypedArrayTag};
 use abcd_isa::{EntityId, EntityKind};
 
-use crate::{LiftError, Lifter};
+use crate::{LiftBackend, LiftError, Lifter};
 
 /// Wrapper shape produced when finishing an expanded literal-array buffer (`#57` `R3-H9`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,8 +27,8 @@ pub(crate) enum LitWrap {
 
 /// Resolve an [`EntityId`] through the owning method's typed [`EntityRef`]
 /// table to a symbol (string-pool entities).
-pub fn resolve_sym(
-    lf: &mut Lifter,
+pub(crate) fn resolve_sym<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     body: &MethodBody,
     id: EntityId,
     kind: EntityKind,
@@ -40,14 +40,14 @@ pub fn resolve_sym(
         EntityRef::String { id: sid, .. } => sid,
         _ => return Err(LiftError::UnresolvedEntity(id.0)),
     };
-    lf.sym_of_file_sid(file_sid)
+    lf.backend_sym_of_file_sid(file_sid)
         .ok_or(LiftError::UnresolvedEntity(id.0))
 }
 
 /// Resolve a method-reference [`EntityId`] to its display name and its
 /// function-table index.
-pub fn resolve_method(
-    lf: &mut Lifter,
+pub(crate) fn resolve_method<'f, B: LiftBackend<'f>>(
+    lf: &B,
     body: &MethodBody,
     id: EntityId,
 ) -> Result<(Sym, FuncId), LiftError> {
@@ -58,9 +58,7 @@ pub fn resolve_method(
         EntityRef::Method(midx) => {
             let func_id = func_of_idx(lf, midx).map_err(|_| LiftError::UnresolvedEntity(id.0))?;
             let name = lf
-                .method_names
-                .get(midx.index())
-                .copied()
+                .backend_method_name(midx)
                 .ok_or(LiftError::UnresolvedEntity(id.0))?;
             Ok((name, func_id))
         }
@@ -69,8 +67,11 @@ pub fn resolve_method(
 }
 
 /// Resolve a dense [`MethodIdx`] to its [`FuncId`].
-pub fn func_of_idx(lf: &Lifter, idx: MethodIdx) -> Result<FuncId, LiftError> {
-    if idx.index() < lf.method_names.len() {
+pub(crate) fn func_of_idx<'f, B: LiftBackend<'f>>(
+    lf: &B,
+    idx: MethodIdx,
+) -> Result<FuncId, LiftError> {
+    if idx.index() < lf.backend_method_count() {
         Ok(FuncId::new(idx.0))
     } else {
         Err(LiftError::UnresolvedEntity(idx.0))
@@ -86,13 +87,13 @@ fn literal_table_index(body: &MethodBody, id: EntityId) -> Result<u32, LiftError
 }
 
 /// Resolve a literal-array [`EntityId`] to its pooled shape constant.
-pub fn resolve_literal_const(
-    lf: &mut Lifter,
+pub(crate) fn resolve_literal_const<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     body: &MethodBody,
     id: EntityId,
 ) -> Result<ConstId, LiftError> {
     let idx = literal_table_index(body, id)?;
-    const_for_literal_array(lf, idx)
+    lf.backend_resolve_lit_array(idx, LitWrap::PlainArray)
 }
 
 /// Parse the per-member attribute payloads (B2 — [`MemberAttrs`]) out of
@@ -117,14 +118,14 @@ pub fn resolve_literal_const(
 /// payloads, data-valued members, nested arrays, a missing/mismatched
 /// trailing count) yields an EMPTY vector — the documented conservative
 /// fallback: consumers treat the attributes as unknown, never guessed.
-pub fn class_member_attrs(
-    lf: &mut Lifter,
+pub(crate) fn class_member_attrs<'f, B: LiftBackend<'f>>(
+    lf: &B,
     body: &MethodBody,
     id: EntityId,
     is_sendable: bool,
 ) -> Result<Vec<MemberAttrs>, LiftError> {
     let idx = literal_table_index(body, id)?;
-    class_member_attrs_for_index(lf.file, idx, is_sendable)
+    class_member_attrs_for_index(lf.file(), idx, is_sendable)
 }
 
 /// Parse the per-member attribute payloads ([`MemberAttrs`]) out of the
@@ -232,7 +233,7 @@ pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstI
 /// Convert the literal array at `table_idx` under `root_wrap` into a pooled
 /// [`ConstId`] iteratively (memoized per `(table_idx, wrap)`, cycle-guarded,
 /// O(1) native stack).
-fn const_for_literal_array_with_wrap(
+pub(crate) fn const_for_literal_array_with_wrap(
     lf: &mut Lifter,
     table_idx: u32,
     root_wrap: LitWrap,
@@ -374,22 +375,28 @@ fn enter_literal_array<'f>(
     }))
 }
 
-/// Convert one literal value to a pooled [`ConstId`].
-pub(crate) fn const_for_literal_value(
-    lf: &mut Lifter,
+/// Convert one literal value inside an annotation `LiteralArray` element to a
+/// pooled [`ConstId`], degrading any unresolvable/cyclic element to
+/// [`Const::Null`].
+pub(crate) fn const_for_literal_value_or_null<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
     v: &LiteralValue,
-) -> Result<ConstId, LiftError> {
-    match step_literal_value(lf, v)? {
-        LitStep::Ready(c) => Ok(lf.module.consts.intern(c)),
-        LitStep::Nested { child_idx, wrap } => {
-            const_for_literal_array_with_wrap(lf, child_idx, wrap)
+) -> ConstId {
+    match step_literal_value(lf, v) {
+        Ok(LitStep::Ready(c)) => lf.backend_const_scalar(c),
+        Ok(LitStep::Nested { child_idx, wrap }) => {
+            lf.backend_try_lit_array_or_null(child_idx, wrap)
         }
+        Err(_) => lf.backend_const_scalar(Const::Null),
     }
 }
 
 /// Classify a single [`LiteralValue`] into its lossless [`Const`] or a nested
 /// literal-array expansion without recursing (`#57` `R3-H9`).
-fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, LiftError> {
+fn step_literal_value<'f, B: LiftBackend<'f>>(
+    lf: &mut B,
+    v: &LiteralValue,
+) -> Result<LitStep, LiftError> {
     Ok(match v {
         LiteralValue::Bool(b) => LitStep::Ready(Const::Bool(*b)),
         LiteralValue::Integer8(n) => LitStep::Ready(Const::Int8(*n)),
@@ -398,13 +405,13 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::Double(d) => LitStep::Ready(Const::number(*d)),
         LiteralValue::String(sid) => {
             let sym = lf
-                .sym_of_file_sid(*sid)
+                .backend_sym_of_file_sid(*sid)
                 .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
             LitStep::Ready(Const::String(sym))
         }
         LiteralValue::EtsImplements(sid) => {
             let sym = lf
-                .sym_of_file_sid(*sid)
+                .backend_sym_of_file_sid(*sid)
                 .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
             LitStep::Ready(Const::EtsImplements(sym))
         }
@@ -443,7 +450,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayU1(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Bool(x)))
+                .map(|&x| lf.backend_const_scalar(Const::Bool(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::U1,
@@ -453,7 +460,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayU8(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int8(x)))
+                .map(|&x| lf.backend_const_scalar(Const::Int8(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::U8,
@@ -463,7 +470,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayI8(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int8(x as u8)))
+                .map(|&x| lf.backend_const_scalar(Const::Int8(x as u8)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::I8,
@@ -473,7 +480,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayU16(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int32(u32::from(x))))
+                .map(|&x| lf.backend_const_scalar(Const::Int32(u32::from(x))))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::U16,
@@ -483,7 +490,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayI16(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int32(i32::from(x) as u32)))
+                .map(|&x| lf.backend_const_scalar(Const::Int32(i32::from(x) as u32)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::I16,
@@ -493,7 +500,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayU32(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int32(x)))
+                .map(|&x| lf.backend_const_scalar(Const::Int32(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::U32,
@@ -503,7 +510,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayI32(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int32(x as u32)))
+                .map(|&x| lf.backend_const_scalar(Const::Int32(x as u32)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::I32,
@@ -513,7 +520,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayU64(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::UInt64(x)))
+                .map(|&x| lf.backend_const_scalar(Const::UInt64(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::U64,
@@ -523,7 +530,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayI64(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::Int64(x)))
+                .map(|&x| lf.backend_const_scalar(Const::Int64(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::I64,
@@ -533,7 +540,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayF32(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::float32(x)))
+                .map(|&x| lf.backend_const_scalar(Const::float32(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::F32,
@@ -543,7 +550,7 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
         LiteralValue::ArrayF64(elems) => {
             let items = elems
                 .iter()
-                .map(|&x| lf.module.consts.intern(Const::number(x)))
+                .map(|&x| lf.backend_const_scalar(Const::number(x)))
                 .collect();
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::F64,
@@ -554,9 +561,9 @@ fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, Lift
             let mut items = Vec::with_capacity(sids.len());
             for &sid in sids {
                 let sym = lf
-                    .sym_of_file_sid(sid)
+                    .backend_sym_of_file_sid(sid)
                     .ok_or(LiftError::UnresolvedEntity(sid.index() as u32))?;
-                items.push(lf.module.consts.intern(Const::String(sym)));
+                items.push(lf.backend_const_scalar(Const::String(sym)));
             }
             LitStep::Ready(Const::TypedArrayLiteral {
                 tag: TypedArrayTag::String,

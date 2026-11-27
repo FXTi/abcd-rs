@@ -1,7 +1,11 @@
+//! Pure Safe Rust bounded DWARF / `LineNumberProgram` debug decoder (`D2`, `#49`).
+
+#![forbid(unsafe_code)]
+
 use abcd_file_sys as sys;
 
 use crate::error::Error;
-use crate::file::ABSENT;
+use crate::file::{AbcReader, RawMethod, read_sleb128_i32, read_uleb128};
 use crate::types::TypeId;
 
 /// Line number entry.
@@ -44,44 +48,6 @@ pub struct ParamInfo {
 // Pure-Rust bounded DWARF / LineNumberProgram decoder (D2)
 // ---------------------------------------------------------------------------
 
-struct ProtoGuard(*mut sys::AbcProtoAccessor);
-
-impl Drop for ProtoGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: `self.0` was returned by `abc_proto_open` and is non-null.
-            unsafe { sys::abc_proto_close(self.0) };
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn read_sleb128_slice(sp: &mut &[u8]) -> Option<i32> {
-    let mut result = 0u32;
-    for i in 0..5usize {
-        let &b = sp.get(i)?;
-        if i == 4 {
-            if (b & 0x80) != 0 {
-                return None;
-            }
-            let top = b & 0x78;
-            if top != 0 && top != 0x78 {
-                return None;
-            }
-        }
-        result |= u32::from(b & 0x7F) << (7 * i);
-        if (b & 0x80) == 0 {
-            let shift = 7 * (i + 1);
-            if shift < 32 && (b & 0x40) != 0 {
-                result |= !0u32 << shift;
-            }
-            *sp = &sp[i + 1..];
-            return Some(result as i32);
-        }
-    }
-    None
-}
-
 fn primitive_type_signature(type_id_raw: u8) -> Option<&'static str> {
     match TypeId::try_from(type_id_raw).ok()? {
         TypeId::Void => Some("V"),
@@ -106,34 +72,24 @@ pub(crate) enum RawDebugStr<'a> {
     Empty,
     /// Static descriptor literal (e.g. primitive parameter type signature).
     Static(&'static str),
-    /// Valid UTF-8 slice borrowed directly from `file_bytes[start..start + len]`.
-    Borrowed(&'a str, usize, usize),
+    /// Valid UTF-8 slice borrowed directly from `reader.bytes()`.
+    Borrowed(&'a str),
     /// Decoded MUTF-8 (embedded NUL / 6-byte CESU-8 astral) or lossy fallback.
     Owned(String),
 }
 
-pub(crate) fn decode_debug_cstr(file_bytes: &[u8], offset: u32) -> Result<RawDebugStr<'_>, Error> {
-    if offset <= 60 || (offset as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let mut sp = &file_bytes[offset as usize..];
-    let before = sp.len();
-    crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-    let prefix_len = before - sp.len();
-    let nul_pos = sp
-        .iter()
-        .position(|&b| b == 0)
+pub(crate) fn decode_debug_cstr<'a>(
+    reader: &AbcReader<'a>,
+    offset: u32,
+) -> Result<RawDebugStr<'a>, Error> {
+    let raw = reader
+        .raw_cstr_at(offset)
         .ok_or(Error::DebugInfoExtraction)?;
-    if nul_pos == 0 {
+    if raw.is_empty() {
         return Ok(RawDebugStr::Empty);
     }
-    let raw = &sp[..nul_pos];
     if let Ok(s) = std::str::from_utf8(raw) {
-        return Ok(RawDebugStr::Borrowed(
-            s,
-            offset as usize + prefix_len,
-            nul_pos,
-        ));
+        return Ok(RawDebugStr::Borrowed(s));
     }
     if let Some(decoded) = crate::string_pool::mutf8_decode_utf8(raw) {
         return Ok(RawDebugStr::Owned(decoded));
@@ -188,7 +144,7 @@ impl<'s> ModelDebugSink<'s> {
     fn intern_required(&mut self, s: RawDebugStr<'_>) -> crate::StringId {
         match s {
             RawDebugStr::Empty => self.strings.get_or_intern(""),
-            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text, _, _) => {
+            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text) => {
                 self.strings.get_or_intern(text)
             }
             RawDebugStr::Owned(text) => self.strings.get_or_intern(&text),
@@ -199,7 +155,7 @@ impl<'s> ModelDebugSink<'s> {
     fn intern_optional(&mut self, s: RawDebugStr<'_>) -> Option<crate::StringId> {
         match s {
             RawDebugStr::Empty => None,
-            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text, _, _) => {
+            RawDebugStr::Static(text) | RawDebugStr::Borrowed(text) => {
                 Some(self.strings.get_or_intern(text))
             }
             RawDebugStr::Owned(text) => {
@@ -313,69 +269,49 @@ impl DebugSink for ModelDebugSink<'_> {
 }
 
 /// Decode a single `DebugInfoItem` + its `LineNumberProgramItem` directly from
-/// `file_bytes` with exact parity against upstream `DebugInfoExtractor` and
-/// zero C++ `DebugInfoExtractor` heap / `LOG(FATAL)` exposure (`D2`).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "debug decoder threads class/method FFI context, code size bound, and sink directly"
-)]
+/// `reader` with exact parity against upstream `DebugInfoExtractor` and zero
+/// C++ FFI handles (`D2`, `#49`).
 pub(crate) fn decode_method_debug_item<S: DebugSink>(
-    f: *const sys::AbcFileHandle,
-    file_bytes: &[u8],
+    reader: &AbcReader<'_>,
     class_id: u32,
-    class_source_file_off: u32,
-    mr: *mut sys::AbcMethodAccessor,
+    class_source_file_off: Option<u32>,
+    method: &RawMethod,
     code_size: u32,
     debug_off: u32,
     sink: &mut S,
 ) -> Result<(), Error> {
-    if debug_off <= 60 || (debug_off as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let mut sp = &file_bytes[debug_off as usize..];
-    let line_start = crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-    let num_params = crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let mut sp = reader
+        .get_span(debug_off)
+        .ok_or(Error::DebugInfoExtraction)?;
+    let line_start = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let num_params = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let header_size = reader.header_size();
 
     // Mirror DebugInfoExtractor::ExtractMethodParams (debug_info_extractor.cpp:176-232).
-    // SAFETY: `mr` and `f` are live, valid handles owned by the caller.
-    let has_valid_proto = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
-    let pr_guard = if has_valid_proto && num_params > 0 {
-        // SAFETY: `mr` is a valid `AbcMethodAccessor`.
-        let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
-        if proto_id == ABSENT {
-            return Err(Error::DebugInfoExtraction);
-        }
-        // SAFETY: `f` is a valid `AbcFileHandle`.
-        let p = unsafe { sys::abc_proto_open(f, proto_id) };
-        if p.is_null() {
-            return Err(Error::DebugInfoExtraction);
-        }
-        ProtoGuard(p)
+    let has_valid_proto = method.proto_idx != u16::MAX;
+    let proto_opt = if has_valid_proto && num_params > 0 {
+        let proto_off = reader
+            .method_proto_off(method)
+            .ok_or(Error::DebugInfoExtraction)?;
+        Some(
+            reader
+                .open_proto(proto_off)
+                .ok_or(Error::DebugInfoExtraction)?,
+        )
     } else {
-        ProtoGuard(std::ptr::null_mut())
+        None
     };
-    let pr = pr_guard.0;
 
     if num_params > 0 {
-        // SAFETY: `mr` is a valid `AbcMethodAccessor`.
-        let is_static =
-            (unsafe { sys::abc_method_access_flags(mr) } & sys::AbcAccessFlags_ABC_ACC_STATIC) != 0;
-        let proto_num_args = if pr.is_null() {
-            0
-        } else {
-            // SAFETY: `pr` is non-null and valid.
-            unsafe { sys::abc_proto_num_args(pr) }
-        };
-        let proto_ref_num = if pr.is_null() {
-            0
-        } else {
-            // SAFETY: `pr` is non-null and valid.
-            unsafe { sys::abc_proto_get_ref_num(pr) }
-        };
+        let is_static = (method.access_flags & sys::AbcAccessFlags_ABC_ACC_STATIC) != 0;
+        let proto_num_args = proto_opt.as_ref().map_or(0, |p| p.num_args() as u32);
+        let proto_ref_num = proto_opt
+            .as_ref()
+            .map_or(0, |p| (p.ref_types_sp.len() / 2) as u32);
         let mut idx_arg = 0u32;
-        let mut idx_ref = if !pr.is_null()
-            // SAFETY: `pr` is non-null and valid.
-            && unsafe { sys::abc_proto_get_return_type(pr) } == TypeId::Reference as u8
+        let mut idx_ref = if proto_opt
+            .as_ref()
+            .is_some_and(|p| p.return_type_raw() == TypeId::Reference as u8)
         {
             1u32
         } else {
@@ -384,37 +320,39 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
         let mut first_param = true;
 
         for _ in 0..num_params {
-            let param_id =
-                crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-            if param_id > 60 && !has_valid_proto {
-                let name = decode_debug_cstr(file_bytes, param_id)?;
+            let param_id = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+            if param_id > header_size && !has_valid_proto {
+                let name = decode_debug_cstr(reader, param_id)?;
                 sink.push_param(name, RawDebugStr::Static("A"));
                 continue;
             }
-            if param_id <= 60 {
+            if param_id <= header_size {
                 first_param = false;
                 sink.push_param(RawDebugStr::Empty, RawDebugStr::Empty);
                 continue;
             }
-            let name = decode_debug_cstr(file_bytes, param_id)?;
+            let name = decode_debug_cstr(reader, param_id)?;
             if first_param && !is_static {
-                let sig = decode_debug_cstr(file_bytes, class_id)?;
+                let sig = decode_debug_cstr(reader, class_id)?;
                 sink.push_param(name, sig);
             } else {
                 if idx_arg >= proto_num_args {
                     return Err(Error::DebugInfoExtraction);
                 }
-                // SAFETY: `pr` is non-null when `proto_num_args > 0` (`idx_arg < proto_num_args`).
-                let arg_tid = unsafe { sys::abc_proto_get_arg_type(pr, idx_arg) };
+                let Some(ref proto) = proto_opt else {
+                    return Err(Error::DebugInfoExtraction);
+                };
+                let arg_tid = proto.arg_type_raw(idx_arg as usize);
                 idx_arg += 1;
                 if arg_tid == TypeId::Reference as u8 {
                     if idx_ref >= proto_ref_num {
                         return Err(Error::DebugInfoExtraction);
                     }
-                    // SAFETY: `pr` is non-null and `idx_ref < proto_ref_num`.
-                    let ref_off = unsafe { sys::abc_proto_get_reference_type(pr, idx_ref) };
+                    let ref_off = proto
+                        .reference_type_off(reader, idx_ref as usize)
+                        .ok_or(Error::DebugInfoExtraction)?;
                     idx_ref += 1;
-                    let sig = decode_debug_cstr(file_bytes, ref_off)?;
+                    let sig = decode_debug_cstr(reader, ref_off)?;
                     sink.push_param(name, sig);
                 } else {
                     let sig =
@@ -426,55 +364,23 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
         }
     }
 
-    let cp_size =
-        crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)? as usize;
+    let cp_size = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)? as usize;
     if sp.len() < cp_size {
         return Err(Error::DebugInfoExtraction);
     }
     let mut cp = &sp[..cp_size];
     sp = &sp[cp_size..];
-    let lnp_idx = crate::file::read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let lnp_idx = read_uleb128(&mut sp).ok_or(Error::DebugInfoExtraction)?;
 
-    // Header layout: num_lnps at 36..40, lnp_idx_off at 40..44.
-    let num_lnps = u32::from_le_bytes(
-        file_bytes
-            .get(36..40)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    let lnp_idx_off = u32::from_le_bytes(
-        file_bytes
-            .get(40..44)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    if lnp_idx >= num_lnps {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let entry_off = lnp_idx
-        .checked_mul(4)
-        .and_then(|n| lnp_idx_off.checked_add(n))
-        .and_then(|o| usize::try_from(o).ok())
+    let lnp_off = reader
+        .lnp_off_by_idx(lnp_idx)
         .ok_or(Error::DebugInfoExtraction)?;
-    let lnp_off = u32::from_le_bytes(
-        file_bytes
-            .get(entry_off..entry_off + 4)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    if lnp_off <= 60 || (lnp_off as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
+    let mut prog = reader.get_span(lnp_off).ok_or(Error::DebugInfoExtraction)?;
 
     // Mirror LineNumberProgramProcessor::Process (line_number_program.h).
-    let mut prog = &file_bytes[lnp_off as usize..];
     let mut address = 0u32;
     let mut line = line_start;
-    let mut file_off = if class_source_file_off == ABSENT {
-        0
-    } else {
-        class_source_file_off
-    };
+    let mut file_off = class_source_file_off.unwrap_or(0);
     let mut source_code_off = 0u32;
 
     // ProcessBegin() unconditionally emits `{ offset: 0, line: line_start }`.
@@ -502,49 +408,43 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             0x00 => break, // END_SEQUENCE
             0x01 => {
                 // ADVANCE_PC
-                let pc_diff =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let pc_diff = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 address = address.wrapping_add(pc_diff);
                 res = true;
             }
             0x02 => {
                 // ADVANCE_LINE
-                let line_diff = read_sleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let line_diff = read_sleb128_i32(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 line = line.wrapping_add(line_diff as u32);
                 res = true;
             }
             0x03 => {
                 // START_LOCAL
                 check_row_cap(&mut emitted_rows)?;
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
-                let name_id =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let type_id =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let name = decode_debug_cstr(file_bytes, name_id)?;
-                let type_name = decode_debug_cstr(file_bytes, type_id)?;
+                let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                let name_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let type_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let name = decode_debug_cstr(reader, name_id)?;
+                let type_name = decode_debug_cstr(reader, type_id)?;
                 sink.start_local(reg, name, type_name, None, address);
                 res = true;
             }
             0x04 => {
                 // START_LOCAL_EXTENDED
                 check_row_cap(&mut emitted_rows)?;
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
-                let name_id =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let type_id =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let sig_id =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let name = decode_debug_cstr(file_bytes, name_id)?;
-                let type_name = decode_debug_cstr(file_bytes, type_id)?;
-                let sig_name = decode_debug_cstr(file_bytes, sig_id)?;
+                let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                let name_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let type_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let sig_id = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let name = decode_debug_cstr(reader, name_id)?;
+                let type_name = decode_debug_cstr(reader, type_id)?;
+                let sig_name = decode_debug_cstr(reader, sig_id)?;
                 sink.start_local(reg, name, type_name, Some(sig_name), address);
                 res = true;
             }
             0x05 => {
                 // END_LOCAL
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                let reg = read_sleb128_i32(&mut prog).ok_or(Error::DebugInfoExtraction)?;
                 sink.end_local(reg, address)?;
                 res = true;
             }
@@ -558,21 +458,18 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
             }
             0x09 => {
                 // SET_FILE
-                file_off =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                file_off = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 res = true;
             }
             0x0a => {
                 // SET_SOURCE_CODE
-                source_code_off =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                source_code_off = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 res = true;
             }
             0x0b => {
                 // SET_COLUMN
                 check_row_cap(&mut emitted_rows)?;
-                let column =
-                    crate::file::read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let column = read_uleb128(&mut cp).ok_or(Error::DebugInfoExtraction)?;
                 sink.push_column(address, column);
                 res = true;
             }
@@ -596,10 +493,10 @@ pub(crate) fn decode_method_debug_item<S: DebugSink>(
     sink.finish_locals(address);
 
     // N55: GetFile() reads GetStringData(file_), throwing if !file_.IsValid().
-    let sf = decode_debug_cstr(file_bytes, file_off)?;
+    let sf = decode_debug_cstr(reader, file_off)?;
     sink.set_source_file(sf);
-    if source_code_off > 60 {
-        let sc = decode_debug_cstr(file_bytes, source_code_off)?;
+    if source_code_off > header_size {
+        let sc = decode_debug_cstr(reader, source_code_off)?;
         sink.set_source_code(sc);
     }
     Ok(())

@@ -1502,3 +1502,309 @@ fn flow_sink_pass_through_is_zero_clone() {
         2
     );
 }
+
+#[test]
+fn lazy_supergraph_shared_block_func_and_compact_csr_queries() {
+    use crate::module_link::ModuleLinkTable;
+
+    let mut m = mk_module();
+    let seeded_fn = add_func_named(&mut m, "entry_fn");
+    let b_entry = entry_of(&m, seeded_fn);
+    let b_tail = add_block(&mut m, seeded_fn);
+    let secret = load_string(&mut m, b_entry, "secret");
+    emit_void(&mut m, b_entry, Op::Branch { dest: b_tail });
+    link(&mut m, b_entry, b_tail);
+
+    // Insert 200 unvisited functions between `b_entry` and `b_tail`'s instructions
+    // so `seeded_fn`'s instructions span a wide ID gap (exercising `FuncSupergraph`'s
+    // sparse sorted-ID path AND proving `EdgeCsr::offsets` sizes to `max_target_idx + 2`
+    // rather than `module.insts.len() + 1` when trailing functions are unreached!).
+    for idx in 0..200 {
+        let uf = add_func_named(&mut m, &format!("unvisited_{idx}"));
+        let ub = entry_of(&m, uf);
+        let _ = load_number(&mut m, ub, idx as f64);
+        emit_void(&mut m, ub, Op::Return { value: None });
+    }
+
+    let copied = emit(&mut m, b_tail, Op::Mov { src: secret });
+    let ret_iid = emit_void(
+        &mut m,
+        b_tail,
+        Op::Return {
+            value: Some(copied),
+        },
+    );
+
+    // Append another 200 unvisited functions AFTER `ret_iid`.
+    for idx in 200..400 {
+        let uf = add_func_named(&mut m, &format!("unvisited_{idx}"));
+        let ub = entry_of(&m, uf);
+        let _ = load_number(&mut m, ub, idx as f64);
+        emit_void(&mut m, ub, Op::Return { value: None });
+    }
+    let last_unvisited_iid = InstId::new((m.insts.len() - 1) as u32);
+
+    let links = ModuleLinkTable::build(&m);
+    let cg = MapCallGraph::default();
+    let seeds = vec![(seeded_fn, Fact::Zero)];
+
+    struct Seeded<'a> {
+        inner: &'a MicroTaint,
+        seeds: Vec<(FuncId, Fact)>,
+    }
+    impl IfdsProblem for Seeded<'_> {
+        type Fact = Fact;
+        fn zero(&self) -> Fact {
+            self.inner.zero()
+        }
+        fn initial_seeds(&self) -> Vec<(FuncId, Fact)> {
+            self.seeds.clone()
+        }
+        fn normal_flow(&self, m: &Module, c: InstId, s: InstId, src: &Fact, out: &mut Vec<Fact>) {
+            self.inner.normal_flow(m, c, s, src, out);
+        }
+    }
+
+    let prob = Seeded {
+        inner: &MicroTaint,
+        seeds,
+    };
+    let res_owned_bf = IfdsSolver::new(&m, &prob, &cg, IfdsConfig::default()).solve();
+    let res_shared_bf = IfdsSolver::new(&m, &prob, &cg, IfdsConfig::default())
+        .solve_with_block_func(Some(links.block_func_slice()));
+
+    assert_eq!(
+        res_owned_bf.raw_path_edges(),
+        res_shared_bf.raw_path_edges()
+    );
+    assert_eq!(
+        res_shared_bf.facts_at(ret_iid, &Fact::Zero),
+        vec![Fact::V(secret), Fact::V(copied)]
+    );
+    assert!(res_shared_bf.has_any_fact_at(ret_iid));
+    assert!(res_shared_bf.has_non_zero_fact_at(ret_iid, &Fact::Zero));
+    assert!(!res_shared_bf.has_any_fact_at(last_unvisited_iid));
+    assert!(!res_shared_bf.has_non_zero_fact_at(last_unvisited_iid, &Fact::Zero));
+    assert!(res_shared_bf.edge_indices_at(last_unvisited_iid).is_empty());
+
+    let eidxs = res_shared_bf.edge_indices_at(ret_iid);
+    assert_eq!(eidxs.len(), 3); // Zero, V(secret), V(copied)
+    for &ei in eidxs {
+        let (src_f, tgt_node, dst_f) = res_shared_bf.edge_at(ei).expect("valid edge_idx");
+        assert_eq!(tgt_node, ret_iid);
+        assert_eq!(*src_f, Fact::Zero);
+        assert!(matches!(dst_f, Fact::Zero | Fact::V(_)));
+    }
+    assert!(res_shared_bf.edge_at(u32::MAX).is_none());
+
+    // CSR `offsets` length must be `ret_iid.index() + 2`, NOT `m.insts.len() + 1`!
+    let csr = res_shared_bf.csr.get().expect("CSR initialized");
+    assert_eq!(csr.offsets.len(), ret_iid.index() + 2);
+    assert!(csr.offsets.len() < m.insts.len());
+
+    let cloned = res_shared_bf.clone();
+    assert_eq!(
+        cloned.facts_at(ret_iid, &Fact::Zero),
+        vec![Fact::V(secret), Fact::V(copied)]
+    );
+}
+
+#[test]
+fn follow_returns_past_seeds_does_not_auto_cascade_zero_to_unseeded_callers() {
+    let mut m = mk_module();
+
+    // 1. Taint-free seeded leaf: `unseeded_outer -> unseeded_mid -> seeded_leaf`.
+    let seeded_leaf = add_func_named(&mut m, "seeded_leaf");
+    let b_leaf = entry_of(&m, seeded_leaf);
+    let benign = load_number(&mut m, b_leaf, 1.0);
+    emit_void(
+        &mut m,
+        b_leaf,
+        Op::Return {
+            value: Some(benign),
+        },
+    );
+
+    let unseeded_mid = add_func_named(&mut m, "unseeded_mid");
+    let b_mid = entry_of(&m, unseeded_mid);
+    let leaf_ref = load_method_ref(&mut m, b_mid, seeded_leaf);
+    let mid_call_val = emit(
+        &mut m,
+        b_mid,
+        Op::Call {
+            callee: leaf_ref,
+            this: None,
+            args: Vec::new(),
+            kind: abcd_ir::CallKind::Direct,
+        },
+    );
+    let mid_call_iid = match m.value(mid_call_val).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        other => panic!("expected inst def: {other:?}"),
+    };
+    let mid_ret_iid = emit_void(
+        &mut m,
+        b_mid,
+        Op::Return {
+            value: Some(mid_call_val),
+        },
+    );
+
+    let unseeded_outer = add_func_named(&mut m, "unseeded_outer");
+    let b_outer = entry_of(&m, unseeded_outer);
+    let mid_ref = load_method_ref(&mut m, b_outer, unseeded_mid);
+    let outer_call_val = emit(
+        &mut m,
+        b_outer,
+        Op::Call {
+            callee: mid_ref,
+            this: None,
+            args: Vec::new(),
+            kind: abcd_ir::CallKind::Direct,
+        },
+    );
+    let outer_call_iid = match m.value(outer_call_val).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        other => panic!("expected inst def: {other:?}"),
+    };
+    let outer_ret_iid = emit_void(
+        &mut m,
+        b_outer,
+        Op::Return {
+            value: Some(outer_call_val),
+        },
+    );
+
+    // 2. Source-bearing seeded leaf: `unseeded_caller2 -> seeded_source_leaf`.
+    let seeded_source_leaf = add_func_named(&mut m, "seeded_source_leaf");
+    let b_src_leaf = entry_of(&m, seeded_source_leaf);
+    let secret = load_string(&mut m, b_src_leaf, "secret");
+    emit_void(
+        &mut m,
+        b_src_leaf,
+        Op::Return {
+            value: Some(secret),
+        },
+    );
+
+    let unseeded_caller2 = add_func_named(&mut m, "unseeded_caller2");
+    let b_caller2 = entry_of(&m, unseeded_caller2);
+    let src_leaf_ref = load_method_ref(&mut m, b_caller2, seeded_source_leaf);
+    let call_result = emit(
+        &mut m,
+        b_caller2,
+        Op::Call {
+            callee: src_leaf_ref,
+            this: None,
+            args: Vec::new(),
+            kind: abcd_ir::CallKind::Direct,
+        },
+    );
+    let caller2_call_iid = match m.value(call_result).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        other => panic!("expected inst def: {other:?}"),
+    };
+    let copied = emit(&mut m, b_caller2, Op::Mov { src: call_result });
+    let caller2_mov_iid = match m.value(copied).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        other => panic!("expected inst def: {other:?}"),
+    };
+    let caller2_ret_iid = emit_void(
+        &mut m,
+        b_caller2,
+        Op::Return {
+            value: Some(copied),
+        },
+    );
+
+    let mut cg = MapCallGraph::default();
+    cg.add(mid_call_iid, seeded_leaf);
+    cg.add(outer_call_iid, unseeded_mid);
+    cg.add(caller2_call_iid, seeded_source_leaf);
+
+    struct PartialSeededProblem<'a> {
+        inner: &'a MicroTaint,
+        seeds: Vec<(FuncId, Fact)>,
+    }
+    impl IfdsProblem for PartialSeededProblem<'_> {
+        type Fact = Fact;
+        fn zero(&self) -> Fact {
+            self.inner.zero()
+        }
+        fn initial_seeds(&self) -> Vec<(FuncId, Fact)> {
+            self.seeds.clone()
+        }
+        fn normal_flow(&self, m: &Module, c: InstId, s: InstId, src: &Fact, out: &mut Vec<Fact>) {
+            self.inner.normal_flow(m, c, s, src, out);
+        }
+        fn call_flow(&self, m: &Module, c: InstId, f: FuncId, src: &Fact, out: &mut Vec<Fact>) {
+            self.inner.call_flow(m, c, f, src, out);
+        }
+        fn return_flow(
+            &self,
+            m: &Module,
+            c: Option<InstId>,
+            f: FuncId,
+            e: InstId,
+            r: Option<InstId>,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            self.inner.return_flow(m, c, f, e, r, src, out);
+        }
+        fn call_to_return_flow(
+            &self,
+            m: &Module,
+            c: InstId,
+            r: InstId,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            self.inner.call_to_return_flow(m, c, r, src, out);
+        }
+    }
+
+    let prob = PartialSeededProblem {
+        inner: &MicroTaint,
+        seeds: vec![(seeded_leaf, Fact::Zero), (seeded_source_leaf, Fact::Zero)],
+    };
+    let res = IfdsSolver::new(
+        &m,
+        &prob,
+        &cg,
+        IfdsConfig {
+            follow_returns_past_seeds: true,
+        },
+    )
+    .solve();
+
+    // `seeded_leaf` emits nothing from `return_flow_out` on `Fact::Zero`, so
+    // neither `unseeded_mid` nor `unseeded_outer` may be woken up with `Λ`!
+    for &iid in m
+        .block(b_mid)
+        .unwrap()
+        .insts
+        .iter()
+        .chain(m.block(b_outer).unwrap().insts.iter())
+    {
+        assert!(
+            !res.has_any_fact_at(iid),
+            "unseeded caller instruction {iid:?} must not receive Λ or any fact"
+        );
+        assert!(res.facts_at(iid, &Fact::Zero).is_empty());
+    }
+    let _ = (mid_ret_iid, outer_ret_iid);
+
+    // `seeded_source_leaf` DOES generate `Fact::V(secret)` and return it, so
+    // `Fact::V(call_result)` propagates into `unseeded_caller2` via unbalanced
+    // return flow without injecting `Fact::Zero`.
+    assert!(!res.is_reached(caller2_mov_iid, &Fact::Zero));
+    assert_eq!(
+        res.facts_at(caller2_mov_iid, &Fact::Zero),
+        vec![Fact::V(call_result)]
+    );
+    assert_eq!(
+        res.facts_at(caller2_ret_iid, &Fact::Zero),
+        vec![Fact::V(call_result), Fact::V(copied)]
+    );
+}

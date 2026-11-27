@@ -8,10 +8,12 @@
 
 Every bytecode-consuming subcommand (`info`, `dis`, `decompile`, `rewrite`, `analyze`, `taint`) shares a single input loader (`abcd-cli/src/input.rs`):
 
-1. **Magic-Byte Sniffing**:
-   - `PANDA\0\0\0` → decoded directly as a standalone `.abc` file.
-   - `PK\x03\x04` / `PK\x05\x06` → unpacked in memory via `abcd_hap::abc_modules`.
-2. **Multi-Module Disambiguation**:
+1. **Magic-Byte Sniffing & Zero-Copy `Arc<[u8]>` Handoff (`#49`, `#78`)**:
+   - `PANDA\0\0\0` → wrapped once as `Arc<[u8]>` and decoded lazily via `abcd_file::decode_lazy` (`MethodCode::Span`).
+   - `PK\x03\x04` / `PK\x05\x06` → unpacked in memory via `abcd_hap::abc_modules` and handed off via `EntryData::into_arc` (`O(1)` zero copy on inflated payloads), dropping the backing `Arc<[u8]>` immediately once IR lifting finishes.
+2. **Global Execution Flags (`#49`, `#84`)**:
+   - `-j` / `--jobs <N>` configures a host-owned `rayon::ThreadPool` (`8 MiB` worker stacks); `--timings` emits phase wall-clock durations strictly to `stderr`; `--forensic` enables best-effort `DecodeMode::Forensic` recovery on read-only inspection subcommands (`dis`, `decompile`, `analyze`, `taint`), surfacing `DecodeDiagnostics` on `stderr`.
+3. **Multi-Module Disambiguation**:
    - Single-module `.hap`/`.hsp`/`.hqf` inputs run directly without extra flags.
    - Multi-module containers (`.app` bundles or per-ability `.hap`s) **never** pick an arbitrary module silently: the user must pass either `--module <NAME>` or `--all` (disambiguated as `<module>__<entry-stem>` when multiple `.abc` entries share a package).
 

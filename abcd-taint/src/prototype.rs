@@ -101,6 +101,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use abcd_analysis::callgraph::CallGraph;
+use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::module_link::ModuleLinkTable;
 use abcd_ir::{Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
@@ -203,6 +205,7 @@ pub struct PrototypeResolver<'o, 'm> {
     links: Option<&'o ModuleLinkTable>,
     prop_stores: Option<&'o ClassPropStores>,
     global_stores: Option<&'o HashMap<Sym, Vec<ValueId>>>,
+    callgraph: Option<&'o CallGraph>,
 }
 
 enum ProtoStep {
@@ -212,6 +215,34 @@ enum ProtoStep {
     FinishPromiseChain,
     Walk(ValueId),
     LeaveWalk(ValueId),
+}
+
+fn is_async_promise_func(module: &Module, fid: FuncId) -> bool {
+    let Some(fd) = module.func(fid) else {
+        return false;
+    };
+    if matches!(
+        fd.kind,
+        abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
+    ) {
+        return true;
+    }
+    if matches!(
+        fd.kind,
+        abcd_ir::FunctionKind::Generator | abcd_ir::FunctionKind::AsyncGenerator
+    ) {
+        return false;
+    }
+    fd.blocks.first().is_some_and(|&entry_b| {
+        module.block(entry_b).is_some_and(|bb| {
+            bb.insts.iter().take(4).any(|&iid| {
+                matches!(
+                    module.inst(iid).map(|i| &i.op),
+                    Some(Op::AsyncFunctionEnter)
+                )
+            })
+        })
+    })
 }
 
 impl<'o, 'm> PrototypeResolver<'o, 'm> {
@@ -229,6 +260,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
             links: None,
             prop_stores: None,
             global_stores: None,
+            callgraph: None,
         }
     }
 
@@ -249,7 +281,15 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
             links: Some(links),
             prop_stores: Some(prop_stores),
             global_stores: Some(global_stores),
+            callgraph: None,
         }
+    }
+
+    /// Attach a [`CallGraph`] so calls resolved to `async` methods/functions
+    /// also type their returned Promise (`#84`).
+    pub(crate) fn with_callgraph(mut self, callgraph: &'o CallGraph) -> Self {
+        self.callgraph = Some(callgraph);
+        self
     }
 
     /// The prototype families of a receiver value at a program point.
@@ -600,6 +640,17 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 }
             }
         }
+        if let Some(cg) = self.callgraph {
+            let callees = cg.callees_of_call_at(at);
+            if !callees.is_empty()
+                && callees
+                    .iter()
+                    .all(|&f| is_async_promise_func(self.module, f))
+            {
+                ans.families.insert(ProtoFamily::Promise);
+                return None;
+            }
+        }
         // Chained `.then` / `.catch` / `.finally` on a Promise receiver (peeling Movs).
         let peeled_callee = abcd_analysis::dataflow::heap::peel_movs(self.module, callee);
         if let Some(ValueDef::Inst(ciid)) = self.module.value(peeled_callee).map(|v| v.def) {
@@ -613,12 +664,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     }
                 }
                 Some(Op::DefineFunc { body, .. }) => {
-                    if self.module.func(*body).is_some_and(|fd| {
-                        matches!(
-                            fd.kind,
-                            abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
-                        )
-                    }) {
+                    if is_async_promise_func(self.module, *body) {
                         ans.families.insert(ProtoFamily::Promise);
                     }
                 }
@@ -626,24 +672,14 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     if let Some(ValueDef::Inst(df_iid)) = self.module.value(*func).map(|v| v.def)
                         && let Some(Op::DefineFunc { body, .. }) =
                             self.module.inst(df_iid).map(|i| &i.op)
-                        && self.module.func(*body).is_some_and(|fd| {
-                            matches!(
-                                fd.kind,
-                                abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
-                            )
-                        })
+                        && is_async_promise_func(self.module, *body)
                     {
                         ans.families.insert(ProtoFamily::Promise);
                     }
                 }
                 Some(Op::LoadConst(cid)) => {
                     if let Some(Const::MethodRef { func: f, .. }) = self.module.consts.get(*cid)
-                        && self.module.func(*f).is_some_and(|fd| {
-                            matches!(
-                                fd.kind,
-                                abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
-                            )
-                        })
+                        && is_async_promise_func(self.module, *f)
                     {
                         ans.families.insert(ProtoFamily::Promise);
                     }

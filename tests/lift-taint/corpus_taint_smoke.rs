@@ -206,3 +206,122 @@ fn taint_smoke_all_fixtures() {
         "corpus taint smoke: any hit on the self-contained corpus is a false positive"
     );
 }
+
+#[test]
+#[ignore = "requires local-only modules.abc (gitignored)"]
+fn modules_abc_ohos_prepared_and_pta_smoke() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("modules.abc");
+    if !path.is_file() {
+        eprintln!(
+            "skipping modules.abc ohos prepared+pta gate: {} absent",
+            path.display()
+        );
+        return;
+    }
+    let start = std::time::Instant::now();
+    let raw: std::sync::Arc<[u8]> =
+        std::sync::Arc::from(std::fs::read(&path).expect("read modules.abc"));
+    let file = abcd_file::decode_lazy(raw).expect("pure-Rust decode_lazy modules.abc");
+    let config = abcd_taint::ohos_preset();
+    let ir = abcd_lift::lift_file_with_options(
+        &file,
+        &abcd_lift::LiftOptions {
+            retain_tail_capacity: config.ohos_lifecycle,
+            parallel: true,
+        },
+    )
+    .expect("parallel lift modules.abc");
+    drop(file);
+
+    // #71 / #74 / #75 / #76: zero-clone in-place harness append + context symbol
+    // interning + explicit `harness_func` tracking.
+    let prepared = abcd_taint::PreparedModule::owned(ir, &config);
+    let module = prepared.module();
+    let links = prepared.links();
+    let harness_fid = prepared.harness().and_then(|h| h.func);
+    assert!(
+        harness_fid.is_some(),
+        "ohos_lifecycle must synthesize an explicit harness_func on modules.abc (#75)"
+    );
+    assert!(
+        (0..module.sym.len())
+            .any(|i| module.sym.resolve(abcd_ir::Sym::new(i as u32)) == Some("context")),
+        "context symbol interned during harness append must persist on PreparedModule::module() (#74)"
+    );
+
+    // #78 / #84: CallGraph + root-sliced Rung-2 PTA must converge uncapped within 30s in --release.
+    let bg = abcd_analysis::callgraph::CallGraph::build_with_links(module, links);
+    let pta_cfg = abcd_analysis::dataflow::pta::PtaConfig {
+        harness_func: harness_fid,
+        ..Default::default()
+    };
+    let roots: Vec<abcd_ir::FuncId> = harness_fid.into_iter().collect();
+    let pta_out = abcd_analysis::dataflow::pta::analyze_with_links_and_roots(
+        module,
+        links,
+        &bg,
+        &pta_cfg,
+        Some(&roots),
+    );
+    assert!(
+        !pta_out.stats().capped,
+        "harness-rooted Rung-2 PTA on modules.abc must finish uncapped"
+    );
+    let elapsed = start.elapsed();
+    let max_secs = if cfg!(debug_assertions) { 180 } else { 30 };
+    assert!(
+        elapsed.as_secs() < max_secs,
+        "modules.abc prepared+pta pipeline regressed in wall-clock time: {elapsed:?} (budget < {max_secs}s)"
+    );
+    eprintln!(
+        "MODULES-ABC-OHOS-PREPARED-PTA funcs={} pta_activations={} elapsed={elapsed:?}",
+        module.functions.len(),
+        pta_out.stats().activations,
+    );
+}
+
+/// Full unbounded IFDS taint gate on `modules.abc` (`54,515` functions);
+/// tracked by upstream `abcd-analysis` / `abcd-lift` architectural issues
+/// `#97` (ArkUI `@State`/`ObservedProperty*PU` CHA), `#98` (demand-driven PTA),
+/// `#99` (source-cone unbalanced returns + `IfdsConfig::step_budget`), and
+/// `#100` (non-throwing `Exceptional` CFG edge pruning).
+#[test]
+#[ignore = "full unbounded modules.abc IFDS benchmark tracked by #97-#100"]
+fn modules_abc_ohos_taint_full_ifds_gate() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("modules.abc");
+    if !path.is_file() {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let raw: std::sync::Arc<[u8]> =
+        std::sync::Arc::from(std::fs::read(&path).expect("read modules.abc"));
+    let file = abcd_file::decode_lazy(raw).expect("pure-Rust decode_lazy modules.abc");
+    let config = abcd_taint::ohos_preset();
+    let ir = abcd_lift::lift_file_with_options(
+        &file,
+        &abcd_lift::LiftOptions {
+            retain_tail_capacity: config.ohos_lifecycle,
+            parallel: true,
+        },
+    )
+    .expect("parallel lift modules.abc");
+    drop(file);
+
+    let prepared = abcd_taint::PreparedModule::owned(ir, &config);
+    let report = abcd_taint::run_taint_prepared(&prepared, &config);
+    let elapsed = start.elapsed();
+
+    for hit in &report.hits {
+        if let abcd_taint::TaintBase::Global(sym) = hit.fact.base {
+            assert!(
+                prepared.module().sym.resolve(sym).is_some(),
+                "every Global(sym) in SinkHit must resolve in PreparedModule::module() (#74)"
+            );
+        }
+    }
+    let max_secs = if cfg!(debug_assertions) { 300 } else { 60 };
+    assert!(
+        elapsed.as_secs() < max_secs,
+        "modules.abc taint --preset ohos regressed in wall-clock time: {elapsed:?} (budget < {max_secs}s)"
+    );
+}

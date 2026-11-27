@@ -6,8 +6,9 @@
 //! allocation with Boissinot CSSA isolation and biased coalescing, slot-level
 //! parallel-copy cycle breaking, accumulator-as-cache instruction selection,
 //! basic-block layout with edge trampolines, try-range reconstruction, entity
-//! relocation and per-method `u16` compaction, in-place file rewriting
-//! ([`rewrite_file`]), and standalone whole-module lowering ([`lower_module`]).
+//! relocation and per-method `u16` compaction, in-place / owned file rewriting
+//! ([`rewrite_file`], [`rewrite_file_owned`]), and standalone whole-module
+//! lowering ([`lower_module`]).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -26,7 +27,7 @@ use abcd_ir::{BlockId, FuncId, Module, ValueId};
 pub use layout::{LayoutResult, LoweredCatchBlock, LoweredTryBlock};
 pub use method_body::{EntityResolver, lower_module_bodies, to_method_body};
 pub use module_lower::{
-    lower_module, lower_module_with_options, rebuild_method_debug, rewrite_file,
+    lower_module, lower_module_with_options, rebuild_method_debug, rewrite_file, rewrite_file_owned,
 };
 pub use regalloc::RegAlloc;
 

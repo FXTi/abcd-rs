@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use abcd_file_sys as sys;
