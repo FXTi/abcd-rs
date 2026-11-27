@@ -648,7 +648,7 @@ fn decode_core(
 
     for (&cls_desc, class) in &mut classes {
         let cls_ops = pending_ops_by_class.remove(&cls_desc).unwrap_or_default();
-        for (method, ops_opt) in class.methods.iter_mut().zip(cls_ops.into_iter()) {
+        for (method, ops_opt) in class.methods.iter_mut().zip(cls_ops) {
             let cur_flat = flat_idx;
             flat_idx += 1;
             let (Some(body), Some(ops)) = (&mut method.body, ops_opt) else {
