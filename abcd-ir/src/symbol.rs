@@ -798,9 +798,17 @@ mod tests {
 
     #[test]
     fn capacity_checks_reserve_u32_max_sentinel_and_catch_text_overflow() {
+        // `arena.offs` stores `cur_entries + 1` offsets (`cur_entries + 2` after
+        // appending one entry), so 32-bit `usize` caps at `usize::MAX - 2` while
+        // 64-bit `usize` caps at `(u32::MAX as usize) - 1` (`Sym(u32::MAX)` sentinel).
+        let max_entries = ((u32::MAX as usize) - 1).min(usize::MAX - 2);
         assert_eq!(
-            check_arena_capacity((u32::MAX as usize) - 1, 10, 5),
-            Ok((u32::MAX - 1, 15))
+            check_arena_capacity(max_entries, 10, 5),
+            Ok((max_entries as u32, 15))
+        );
+        assert_eq!(
+            check_arena_capacity(max_entries + 1, 10, 5),
+            Err(SymbolTableOverflow::TooManySymbols)
         );
         assert_eq!(
             check_arena_capacity(u32::MAX as usize, 10, 5),
