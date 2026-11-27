@@ -889,10 +889,9 @@ pub(super) fn eval_closed_prov_iter(
                                     prop,
                                 ) {
                                     parent.insert(ClosedProvItem::Callable(mfid));
-                                } else if let Some(fp) = static_field_prov.get(&(cidx, prop)) {
-                                    parent.extend(fp.iter().copied());
                                 } else {
-                                    return None;
+                                    let fp = static_field_prov.get(&(cidx, prop))?;
+                                    parent.extend(fp.iter().copied());
                                 }
                             }
                             ClosedProvItem::ClassInstExact(cidx) => {
@@ -906,10 +905,9 @@ pub(super) fn eval_closed_prov_iter(
                                     false,
                                 ) {
                                     parent.extend(mset);
-                                } else if let Some(fp) = inst_field_prov.get(&(cidx, prop)) {
-                                    parent.extend(fp.iter().copied());
                                 } else {
-                                    return None;
+                                    let fp = inst_field_prov.get(&(cidx, prop))?;
+                                    parent.extend(fp.iter().copied());
                                 }
                             }
                             ClosedProvItem::ClassInstSubtree(cidx) => {
@@ -1045,22 +1043,20 @@ pub(super) fn eval_closed_prov_iter(
                                 ctor_owner.get(func.index()).copied().flatten()
                             {
                                 top.insert(ClosedProvItem::ClassInstSubtree(cidx));
-                            } else if let Some(pp) = param_prov.get(&pv) {
+                            } else {
+                                let pp = param_prov.get(&pv)?;
                                 top.extend(pp.iter().copied());
                                 if top.len() > MAX_CLOSED_PROV {
                                     return None;
                                 }
-                            } else {
-                                return None;
                             }
-                        } else if let Some(pp) = param_prov.get(&pv) {
+                        } else {
+                            let pp = param_prov.get(&pv)?;
                             let top = accum_stack.last_mut()?;
                             top.extend(pp.iter().copied());
                             if top.len() > MAX_CLOSED_PROV {
                                 return None;
                             }
-                        } else {
-                            return None;
                         }
                     }
                     ValueDef::ExceptionParam(_) => return None,

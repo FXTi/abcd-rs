@@ -1606,48 +1606,47 @@ impl ClosedHarvest {
                                     break 'scan_m;
                                 }
                             }
-                            Op::Call { callee, args, .. } => {
+                            Op::Call { callee, args, .. }
                                 if args
                                     .first()
-                                    .is_none_or(|&t| !is_fresh_plain_alloc_val(module, t))
+                                    .is_none_or(|&t| !is_fresh_plain_alloc_val(module, t)) =>
+                            {
+                                let pcal = crate::names::peel_movs_fast(module, *callee);
+                                if let Some(ValueDef::Inst(ciid)) =
+                                    module.value(pcal).map(|v| v.def)
                                 {
-                                    let pcal = crate::names::peel_movs_fast(module, *callee);
-                                    if let Some(ValueDef::Inst(ciid)) =
-                                        module.value(pcal).map(|v| v.def)
-                                    {
-                                        match module.inst(ciid).map(|i| &i.op) {
-                                            Some(Op::LoadProp { name, .. })
-                                                if matches!(
-                                                    module.sym.resolve(*name),
-                                                    Some(
-                                                        "defineProperty"
-                                                            | "defineProperties"
-                                                            | "setPrototypeOf"
-                                                    )
-                                                ) =>
-                                            {
-                                                is_mut = true;
-                                                break 'scan_m;
-                                            }
-                                            Some(Op::LoadProp { object, name })
-                                                if matches!(
-                                                    module.sym.resolve(*name),
-                                                    Some("assign" | "set")
-                                                ) && is_object_or_reflect_global(
-                                                    module, *object,
-                                                ) =>
-                                            {
-                                                is_mut = true;
-                                                break 'scan_m;
-                                            }
-                                            Some(Op::TryGetGlobal { name, .. })
-                                                if module.sym.resolve(*name) == Some("Proxy") =>
-                                            {
-                                                is_mut = true;
-                                                break 'scan_m;
-                                            }
-                                            _ => {}
+                                    match module.inst(ciid).map(|i| &i.op) {
+                                        Some(Op::LoadProp { name, .. })
+                                            if matches!(
+                                                module.sym.resolve(*name),
+                                                Some(
+                                                    "defineProperty"
+                                                        | "defineProperties"
+                                                        | "setPrototypeOf"
+                                                )
+                                            ) =>
+                                        {
+                                            is_mut = true;
+                                            break 'scan_m;
                                         }
+                                        Some(Op::LoadProp { object, name })
+                                            if matches!(
+                                                module.sym.resolve(*name),
+                                                Some("assign" | "set")
+                                            ) && is_object_or_reflect_global(
+                                                module, *object,
+                                            ) =>
+                                        {
+                                            is_mut = true;
+                                            break 'scan_m;
+                                        }
+                                        Some(Op::TryGetGlobal { name, .. })
+                                            if module.sym.resolve(*name) == Some("Proxy") =>
+                                        {
+                                            is_mut = true;
+                                            break 'scan_m;
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -1676,14 +1675,13 @@ impl ClosedHarvest {
                             | Op::StoreModuleVar { value, .. }
                             | Op::StoreGlobal { value, .. }
                             | Op::StoreGlobalRecord { value, .. }
-                            | Op::TryStoreGlobal { value, .. } => {
+                            | Op::TryStoreGlobal { value, .. }
                                 if !is_definitely_primitive_val(module, *value)
                                     && peel_method_or_closure_func(module, *value).is_none()
-                                    && !val_cls.contains_key(value)
-                                {
-                                    func_writes_shared_nonprim[fi] = true;
-                                    break 'scan_sh;
-                                }
+                                    && !val_cls.contains_key(value) =>
+                            {
+                                func_writes_shared_nonprim[fi] = true;
+                                break 'scan_sh;
                             }
                             _ => {}
                         }

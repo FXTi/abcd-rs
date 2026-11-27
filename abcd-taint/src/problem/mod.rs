@@ -700,20 +700,18 @@ impl<'m> TaintProblem<'m> {
                                 self.site_class.borrow_mut().insert(iid, cls);
                             }
                         }
-                        Op::Throw { value } => {
-                            if result.has_non_zero_fact_at(iid, &zero) {
-                                let mut union_sites = {
-                                    let oracle = self.oracle.borrow();
-                                    let mut s = oracle.known_sites_at(*value, iid);
-                                    s.union_with(&oracle.may_sites_at(*value, iid));
-                                    s.union_with(&oracle.site_info_at(*value, iid).sites);
-                                    s
-                                };
-                                if let Some(fs) = self.fresh_result_site(*value) {
-                                    union_sites.insert(fs);
-                                }
-                                self.throw_replay_sites.insert((iid, *value), union_sites);
+                        Op::Throw { value } if result.has_non_zero_fact_at(iid, &zero) => {
+                            let mut union_sites = {
+                                let oracle = self.oracle.borrow();
+                                let mut s = oracle.known_sites_at(*value, iid);
+                                s.union_with(&oracle.may_sites_at(*value, iid));
+                                s.union_with(&oracle.site_info_at(*value, iid).sites);
+                                s
+                            };
+                            if let Some(fs) = self.fresh_result_site(*value) {
+                                union_sites.insert(fs);
                             }
+                            self.throw_replay_sites.insert((iid, *value), union_sites);
                         }
                         _ => {}
                     }
