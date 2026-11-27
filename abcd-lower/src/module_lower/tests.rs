@@ -1138,8 +1138,8 @@ fn deep_diamond_const_shape_dag_lowers_and_rewrites_in_linear_pool_time() {
             let synth_2 = m
                 .consts
                 .push_object(vec![c_ka, c_kb], vec![synth_1, synth_1]);
-            for fi in 0..4usize {
-                let bb = m.functions[fi].blocks[0];
+            for fdata in m.functions.iter().take(4) {
+                let bb = fdata.blocks[0];
                 for &iid in &m.blocks[bb.index()].insts {
                     if let Op::AllocArray { shape } = &mut m.insts[iid.index()].op {
                         *shape = Some(synth_2);
@@ -1449,8 +1449,7 @@ fn rewrite_file_multi_field_class_merging_preserves_order_annotations_and_remaps
 
     // Existing fields `0..EXISTING_COUNT` retained exact original order,
     // initial values (`i`), and base annotations (`10_000 + i`).
-    for i in 0..EXISTING_COUNT {
-        let f = &out_target.fields[i];
+    for (i, f) in out_target.fields.iter().enumerate().take(EXISTING_COUNT) {
         assert_eq!(
             rw_owned.strings.as_str(f.name),
             Some(format!("existing_{i}").as_str())
@@ -1464,8 +1463,13 @@ fn rewrite_file_multi_field_class_merging_preserves_order_annotations_and_remaps
 
     // Synthesized fields `EXISTING_COUNT..EXISTING_COUNT + SYNTH_COUNT` appended
     // in exact declaration order with synthesized initializers and annotations.
-    for i in 0..SYNTH_COUNT {
-        let f = &out_target.fields[EXISTING_COUNT + i];
+    for (i, f) in out_target
+        .fields
+        .iter()
+        .skip(EXISTING_COUNT)
+        .take(SYNTH_COUNT)
+        .enumerate()
+    {
         assert_eq!(
             rw_owned.strings.as_str(f.name),
             Some(format!("synth_{i}").as_str())
